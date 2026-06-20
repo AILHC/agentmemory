@@ -150,6 +150,45 @@ describe("mem::replay::load pagination", () => {
     expect(result.timeline.events[0].truncated.toolOutput).toBe(true);
     expect(JSON.stringify(result).length).toBeLessThan(1_000_000);
   });
+
+  it("keeps a 15000 observation replay load response bounded by bytes", async () => {
+    const kv = mockKV();
+    const sdk = mockSdk();
+    registerReplayFunctions(sdk, kv as any);
+    await kv.set(KV.sessions, "sess-huge", {
+      id: "sess-huge",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T04:10:00.000Z",
+      project: "project",
+      cwd: "/workspace/project",
+      observationCount: 15000,
+    });
+    const hugeOutput = "x".repeat(50_000);
+    for (let index = 0; index < 15000; index++) {
+      await kv.set(KV.observations("sess-huge"), `obs-${index}`, {
+        id: `obs-${index}`,
+        sessionId: "sess-huge",
+        timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+        hookType: "post_tool_use",
+        toolName: "Bash",
+        toolInput: { command: `echo ${index}`, context: hugeOutput },
+        toolOutput: hugeOutput,
+        raw: {},
+      });
+    }
+
+    const result = await sdk.trigger("mem::replay::load", { sessionId: "sess-huge" });
+    const serialized = JSON.stringify(result);
+
+    expect(result.success).toBe(true);
+    expect(result.timeline.eventCount).toBe(15000);
+    expect(result.timeline.events).toHaveLength(500);
+    expect(result.timeline.events[0].truncated.toolInput).toBe(true);
+    expect(result.timeline.events[0].truncated.toolOutput).toBe(true);
+    expect(serialized.length).toBeLessThan(1_000_000);
+    expect(serialized).not.toContain("x".repeat(10_000));
+    expect(result.timeline.page.hasMore).toBe(true);
+  });
 });
 
 describe("api::replay::load pagination passthrough", () => {
