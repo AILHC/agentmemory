@@ -20,6 +20,10 @@ import { logger } from "../logger.js";
 
 export const MAX_FILES_DEFAULT = 200;
 export const MAX_FILES_UPPER_BOUND = 1000;
+export const DEFAULT_REPLAY_LOAD_LIMIT = 500;
+export const MAX_REPLAY_LOAD_LIMIT = 1000;
+export const DEFAULT_REPLAY_EVENT_PAYLOAD_CHARS = 1200;
+export const MAX_REPLAY_EVENT_PAYLOAD_CHARS = 5000;
 
 const SENSITIVE_PATH_PATTERNS: RegExp[] = [
   /(^|[\\/_.-])secret([\\/_.-]|s?$)/i,
@@ -119,6 +123,25 @@ const LESSON_PATTERNS: RegExp[] = [
   /\b(always|never|don'?t|do not|make sure|remember to|note:|caveat:|warning:)\b[^.\n]{10,200}[.!\n]/gi,
   /\b(prefer|avoid)\s[^.\n]{10,200}[.!\n]/gi,
 ];
+
+function normalizeReplayLoadLimit(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_REPLAY_LOAD_LIMIT;
+  }
+  return Math.max(1, Math.min(MAX_REPLAY_LOAD_LIMIT, Math.trunc(value)));
+}
+
+function normalizeReplayLoadOffset(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 0;
+  return Math.max(0, Math.trunc(value));
+}
+
+function normalizeReplayEventPayloadChars(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return DEFAULT_REPLAY_EVENT_PAYLOAD_CHARS;
+  }
+  return Math.max(200, Math.min(MAX_REPLAY_EVENT_PAYLOAD_CHARS, Math.trunc(value)));
+}
 
 async function deriveCrystalAndLessons(
   kv: StateKV,
@@ -334,16 +357,26 @@ async function findJsonlFiles(
 export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction(
     "mem::replay::load",
-    async (data: { sessionId: string }): Promise<
+    async (data: {
+      sessionId: string;
+      offset?: number;
+      limit?: number;
+      maxEventPayloadChars?: number;
+    }): Promise<
       | { success: true; timeline: Timeline; session: Session | null }
       | { success: false; error: string }
     > => {
       if (!data?.sessionId || typeof data.sessionId !== "string") {
         return { success: false, error: "sessionId is required" };
       }
+      const offset = normalizeReplayLoadOffset(data.offset);
+      const limit = normalizeReplayLoadLimit(data.limit);
+      const maxEventPayloadChars = normalizeReplayEventPayloadChars(
+        data.maxEventPayloadChars,
+      );
       const session = await kv.get<Session>(KV.sessions, data.sessionId);
       const observations = await loadObservations(kv, data.sessionId);
-      const timeline = projectTimeline(observations);
+      const timeline = projectTimeline(observations, { offset, limit, maxEventPayloadChars });
       return { success: true, timeline, session };
     },
   );
