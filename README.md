@@ -496,6 +496,14 @@ npx @agentmemory/agentmemory import-jsonl ~/.claude/projects/-my-project/abc123.
 
 Imported sessions show up in the Replay picker alongside native ones. Under the hood each entry routes through the `mem::replay::load`, `mem::replay::sessions`, and `mem::replay::import-jsonl` iii functions — no side-channel servers.
 
+`GET /agentmemory/replay/load?sessionId=<id>` returns a bounded preview page by default.
+
+- `timeline.eventCount` is the total number of replay events in the session.
+- `timeline.events.length` is the number of events returned in this page.
+- Use `offset` and `limit` to load additional pages.
+- `timeline.page.nextOffset` is the next offset to request when `timeline.page.hasMore=true`.
+- Large event fields are previewed and may include `truncated.body`, `truncated.toolInput`, or `truncated.toolOutput`.
+
 > **Heads-up if you rely on `import-jsonl` as your primary capture path:** Claude Code's `cleanupPeriodDays` (in `~/.claude/settings.json`, default **30**) auto-deletes JSONL transcripts older than that window from `~/.claude/projects/`. If you install agentmemory fresh on a months-old Claude Code history, anything older than 30 days is already gone before the first import. Either run `import-jsonl` on a cron, raise `cleanupPeriodDays` to something higher, or wire the auto-capture hooks (the default plugin install path) so each turn lands in agentmemory while the session is live and the JSONL cleanup stops mattering.
 
 ### Upgrade / Maintenance

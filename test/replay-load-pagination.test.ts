@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { registerReplayFunctions } from "../src/functions/replay.js";
+import { parseReplayLoadPageParam, registerApiTriggers } from "../src/triggers/api.js";
 import { KV } from "../src/state/schema.js";
 
 vi.mock("../src/logger.js", () => ({
@@ -36,6 +37,17 @@ function mockSdk() {
     },
   } as any;
 }
+
+describe("parseReplayLoadPageParam", () => {
+  it("parses non-negative integer query parameters and rejects decimals", () => {
+    expect(parseReplayLoadPageParam("25")).toBe(25);
+    expect(parseReplayLoadPageParam("0")).toBe(0);
+    expect(parseReplayLoadPageParam("1.9")).toBeUndefined();
+    expect(parseReplayLoadPageParam("-1")).toBeUndefined();
+    expect(parseReplayLoadPageParam("abc")).toBeUndefined();
+    expect(parseReplayLoadPageParam(undefined)).toBeUndefined();
+  });
+});
 
 async function seedObservations(kv: ReturnType<typeof mockKV>, sessionId: string, count: number) {
   await kv.set(KV.sessions, sessionId, {
@@ -137,5 +149,42 @@ describe("mem::replay::load pagination", () => {
     expect(result.timeline.events[0].truncated.toolInput).toBe(true);
     expect(result.timeline.events[0].truncated.toolOutput).toBe(true);
     expect(JSON.stringify(result).length).toBeLessThan(1_000_000);
+  });
+});
+
+describe("api::replay::load pagination passthrough", () => {
+  it("passes replay load pagination query params to mem::replay::load", async () => {
+    const triggerCalls: unknown[] = [];
+    const kv = mockKV();
+    const sdk = {
+      registerFunction: (_id: string, handler: Function) => {
+        if (_id === "api::replay::load") {
+          sdk.apiReplayLoad = handler;
+        }
+      },
+      registerTrigger: () => {},
+      trigger: async (input: unknown) => {
+        triggerCalls.push(input);
+        return { success: true, timeline: { events: [], eventCount: 0 } };
+      },
+      apiReplayLoad: undefined as undefined | Function,
+    };
+
+    registerApiTriggers(sdk as any, kv as any, "");
+
+    const response = await sdk.apiReplayLoad!({
+      query_params: {
+        sessionId: "sess-1",
+        offset: "25",
+        limit: "50",
+      },
+      headers: {},
+    });
+
+    expect(response.status_code).toBe(200);
+    expect(triggerCalls[0]).toEqual({
+      function_id: "mem::replay::load",
+      payload: { sessionId: "sess-1", offset: 25, limit: 50 },
+    });
   });
 });
