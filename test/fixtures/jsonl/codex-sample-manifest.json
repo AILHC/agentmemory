@@ -1,0 +1,16 @@
+{
+  "schema": "agentmemory_codex_sample_manifest.v1",
+  "publicReferences": [
+    "openai/codex:codex-rs/app-server/tests/common/rollout.rs",
+    "openai/codex:codex-rs/tui/tests/fixtures/oss-story.jsonl",
+    "MemPalace/mempalace:mempalace/normalize.py",
+    "MemPalace/mempalace:tests/test_normalize.py",
+    "MemPalace/mempalace:pull/61"
+  ],
+  "localValidation": {
+    "requiredLongSessions": 5,
+    "requiredDevelopmentSessions": 3,
+    "requiredNonDevelopmentSessions": 2,
+    "pathPolicy": "do-not-commit-local-absolute-paths"
+  }
+}

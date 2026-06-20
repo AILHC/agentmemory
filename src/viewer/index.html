@@ -3997,7 +3997,7 @@
           '<select id="replay-session-select">' + options + '</select>' +
           '<button data-action="replay-refresh">Refresh</button>' +
           '<span class="sep"></span>' +
-          '<input type="text" id="replay-import-path" placeholder="~/.claude/projects or file.jsonl" style="width:280px">' +
+          '<input type="text" id="replay-import-path" placeholder="~/.claude/projects, ~/.codex/sessions, ~/.codex/archived_sessions, or file.jsonl" style="width:280px">' +
           '<button data-action="replay-import">Import JSONL</button>' +
         '</div>' +
         (hasTl
@@ -4029,7 +4029,7 @@
               '</div>' +
               '<div class="replay-detail">' + renderReplayDetail(cursorEvent) + '</div>' +
             '</div>'
-          : '<div class="empty">Pick a session to replay, or import Claude Code JSONL transcripts from ~/.claude/projects.</div>');
+          : '<div class="empty">Import Claude Code or Codex JSONL transcripts.</div>');
 
       var sel = document.getElementById('replay-session-select');
       if (sel) sel.addEventListener('change', function() { selectReplaySession(sel.value); });

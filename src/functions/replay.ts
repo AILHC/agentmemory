@@ -11,7 +11,7 @@ import type {
 } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId, fingerprintId } from "../state/schema.js";
-import { parseJsonlText } from "../replay/jsonl-parser.js";
+import { parseTranscriptText } from "../replay/format.js";
 import { projectTimeline, type Timeline } from "../replay/timeline.js";
 import { safeAudit } from "./audit.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
@@ -37,6 +37,22 @@ export function isSensitive(path: string): boolean {
   return SENSITIVE_PATH_PATTERNS.some((re) => re.test(path));
 }
 
+type ReplayStoredObservation = CompressedObservation &
+  Partial<
+    Pick<
+      RawObservation,
+      | "hookType"
+      | "userPrompt"
+      | "assistantResponse"
+      | "toolName"
+      | "toolInput"
+      | "toolOutput"
+      | "modality"
+      | "imageData"
+      | "agentId"
+    >
+  >;
+
 async function isSymlink(path: string): Promise<boolean> {
   try {
     const st = await lstat(path);
@@ -46,18 +62,56 @@ async function isSymlink(path: string): Promise<boolean> {
   }
 }
 
-function rawFromCompressed(obs: CompressedObservation): RawObservation {
+function inferHookTypeFromStoredObservation(
+  obs: ReplayStoredObservation,
+): RawObservation["hookType"] {
+  if (obs.hookType) return obs.hookType;
+  if (obs.type === "error") return "post_tool_failure";
+  if (typeof obs.assistantResponse === "string" && !obs.userPrompt) {
+    return "stop";
+  }
+  if (typeof obs.userPrompt === "string" && !obs.assistantResponse) {
+    return "prompt_submit";
+  }
+  if (obs.type === "conversation" && typeof obs.narrative === "string") {
+    if (typeof obs.assistantResponse === "string") return "stop";
+    return "prompt_submit";
+  }
+  return "post_tool_use";
+}
+
+function rawFromCompressed(obs: ReplayStoredObservation): RawObservation {
+  const hookType = inferHookTypeFromStoredObservation(obs);
+  const syntheticRaw = { title: obs.title, narrative: obs.narrative, facts: obs.facts };
+  if (obs.hookType) {
+    return {
+      id: obs.id,
+      sessionId: obs.sessionId,
+      timestamp: obs.timestamp,
+      hookType,
+      toolName: obs.toolName,
+      toolInput: obs.toolInput,
+      toolOutput: obs.toolOutput,
+      userPrompt: obs.userPrompt,
+      assistantResponse: obs.assistantResponse,
+      raw: syntheticRaw,
+      modality: obs.modality,
+      imageData: obs.imageData,
+      agentId: obs.agentId,
+    };
+  }
+
   return {
     id: obs.id,
     sessionId: obs.sessionId,
     timestamp: obs.timestamp,
-    hookType: "post_tool_use",
-    toolName: undefined,
-    toolInput: undefined,
-    toolOutput: undefined,
-    userPrompt: obs.type === "conversation" ? obs.narrative : undefined,
-    assistantResponse: undefined,
-    raw: { title: obs.title, narrative: obs.narrative, facts: obs.facts },
+    hookType,
+    toolName: obs.toolName,
+    toolInput: obs.toolInput,
+    toolOutput: obs.toolOutput,
+    userPrompt: obs.userPrompt ?? (obs.type === "conversation" ? obs.narrative : undefined),
+    assistantResponse: obs.assistantResponse,
+    raw: syntheticRaw,
   };
 }
 
@@ -187,7 +241,7 @@ async function deriveCrystalAndLessons(
   } catch {}
 }
 
-function isRawShape(o: unknown): o is RawObservation {
+function isRawShape(o: unknown): o is ReplayStoredObservation {
   if (!o || typeof o !== "object") return false;
   const r = o as Record<string, unknown>;
   return typeof r.hookType === "string";
@@ -197,10 +251,29 @@ async function loadObservations(
   kv: StateKV,
   sessionId: string,
 ): Promise<RawObservation[]> {
-  const rows = await kv.list<RawObservation | CompressedObservation>(
+  const rows = await kv.list<RawObservation | ReplayStoredObservation>(
     KV.observations(sessionId),
   );
-  return rows.map((r) => (isRawShape(r) ? r : rawFromCompressed(r as CompressedObservation)));
+  return rows.map((r) => {
+    if (isRawShape(r)) {
+      return {
+        id: r.id,
+        sessionId: r.sessionId,
+        timestamp: r.timestamp,
+        hookType: r.hookType,
+        toolName: r.toolName,
+        toolInput: r.toolInput,
+        toolOutput: r.toolOutput,
+        userPrompt: r.userPrompt,
+        assistantResponse: r.assistantResponse,
+        raw: r.raw ?? { title: r.title, narrative: r.narrative, facts: r.facts },
+        modality: r.modality,
+        imageData: r.imageData,
+        agentId: r.agentId,
+      };
+    }
+    return rawFromCompressed(r);
+  });
 }
 
 async function findJsonlFiles(
@@ -381,7 +454,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           continue;
         }
 
-        const parsed = parseJsonlText(text, generateId("sess"));
+        const parsed = parseTranscriptText(text, generateId("sess"));
         if (parsed.observations.length === 0) continue;
 
         const firstPromptObs = parsed.observations.find(
@@ -437,8 +510,24 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
         await Promise.all(
           parsed.observations.map(async (obs) => {
             const synthetic = buildSyntheticCompression(obs);
+            const storedObservation: ReplayStoredObservation = {
+              ...synthetic,
+              hookType: obs.hookType,
+              userPrompt: obs.userPrompt,
+              assistantResponse: obs.assistantResponse,
+              toolName: obs.toolName,
+              toolInput: obs.toolInput,
+              toolOutput: obs.toolOutput,
+              modality: obs.modality,
+              imageData: obs.imageData,
+              agentId: obs.agentId,
+            };
             compressed.push(synthetic);
-            await kv.set(KV.observations(parsed.sessionId), obs.id, synthetic);
+            await kv.set(
+              KV.observations(parsed.sessionId),
+              obs.id,
+              storedObservation,
+            );
             searchIndex.add(synthetic);
           }),
         );
