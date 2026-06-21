@@ -18,6 +18,7 @@ data/
 data-*/
 agentmemory-debug/
 .gstack/
+tmp/agentmemory-integration-verify/
 
 # Lock files — never commit (see feedback_no_lockfiles memory)
 package-lock.json
