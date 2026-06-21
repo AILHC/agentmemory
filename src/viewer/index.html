@@ -1121,7 +1121,20 @@
       actions: { loaded: false, items: [], frontier: [], statusFilter: '', search: '' },
       crystals: { loaded: false, items: [], search: '', lessonMap: {} },
       profile: { loaded: false, projects: [], selectedProject: '', data: null },
-      replay: { loaded: false, sessions: [], selectedId: '', timeline: null, cursor: 0, playing: false, speed: 1, timer: null, startAt: 0, offsetAt: 0 },
+      replay: {
+        loaded: false,
+        sessions: [],
+        selectedId: '',
+        timeline: null,
+        cursor: 0,
+        playing: false,
+        speed: 1,
+        timer: null,
+        startAt: 0,
+        offsetAt: 0,
+        pageSize: 500,
+        loadingMore: false
+      },
       flagsConfig: null,
       flagsDismissed: {},
       ws: null
@@ -3956,6 +3969,10 @@
         setReplaySpeed(sp);
         return;
       }
+      if (action === 'replay-load-more') {
+        loadMoreReplayEvents().then(function() { renderReplay(); });
+        return;
+      }
       if (action === 'replay-reset') { resetReplay(); return; }
       if (action === 'replay-import') { runReplayImport(); return; }
       if (action === 'replay-refresh') { refreshReplaySessions(); return; }
@@ -3989,6 +4006,8 @@
 
       var tl = state.replay.timeline;
       var hasTl = tl && tl.events && tl.events.length > 0;
+      var page = tl && tl.page ? tl.page : null;
+      var loadedCount = hasTl ? tl.events.length : 0;
       var cursorEvent = hasTl ? tl.events[Math.min(state.replay.cursor, tl.events.length - 1)] : null;
       var progress = hasTl && tl.totalDurationMs > 0 ? Math.min(100, (state.replay.offsetAt / tl.totalDurationMs) * 100) : 0;
 
@@ -4013,7 +4032,12 @@
                 return '<button data-action="replay-speed" data-speed="' + sp + '"' + (active ? ' class="active"' : '') + '>' + sp + '×</button>';
               }).join('') +
               '<span class="sep"></span>' +
-              '<span>' + (state.replay.cursor + 1) + ' / ' + tl.eventCount + '</span>' +
+              '<span>' + (state.replay.cursor + 1) + ' / ' + loadedCount + '</span>' +
+              '<span class="sep"></span>' +
+              '<span>' + loadedCount + ' loaded / ' + tl.eventCount + ' total</span>' +
+              (page && page.hasMore
+                ? '<button data-action="replay-load-more"' + (state.replay.loadingMore ? ' disabled' : '') + '>' + (state.replay.loadingMore ? 'Loading…' : 'Load more') + '</button>'
+                : '') +
             '</div>' +
             '<div class="replay-progress"><div class="replay-progress-bar" style="width:' + progress.toFixed(1) + '%"></div></div>' +
             '<div class="replay-grid">' +
@@ -4040,6 +4064,13 @@
       var blocks = [];
       blocks.push('<div class="replay-detail-header"><b>' + esc(ev.label) + '</b> <span class="muted">' + esc(ev.kind) + '</span></div>');
       if (ev.ts) blocks.push('<div class="muted">' + esc(formatTime(ev.ts)) + '</div>');
+      if (ev.truncated && (ev.truncated.body || ev.truncated.toolInput || ev.truncated.toolOutput)) {
+        var truncatedFields = [];
+        if (ev.truncated.body) truncatedFields.push('body');
+        if (ev.truncated.toolInput) truncatedFields.push('input');
+        if (ev.truncated.toolOutput) truncatedFields.push('output');
+        blocks.push('<div class="muted">Preview truncated: ' + esc(truncatedFields.join(', ')) + '</div>');
+      }
       if (ev.body) {
         blocks.push('<pre class="replay-body">' + esc(ev.body) + '</pre>');
       }
@@ -4067,13 +4098,49 @@
       if (!sessionId) { renderReplay(); return; }
       var el = document.getElementById('view-replay');
       el.innerHTML = '<div class="loading">Loading replay…</div>';
-      var res = await apiGet('replay/load?sessionId=' + encodeURIComponent(sessionId));
+      var res = await apiGet(
+        'replay/load?sessionId=' + encodeURIComponent(sessionId) +
+        '&offset=0&limit=' + encodeURIComponent(state.replay.pageSize)
+      );
       if (res && res.success && res.timeline) {
         state.replay.timeline = res.timeline;
       } else {
-        state.replay.timeline = { events: [], eventCount: 0, totalDurationMs: 0 };
+        state.replay.timeline = {
+          events: [],
+          eventCount: 0,
+          totalDurationMs: 0,
+          page: { offset: 0, limit: state.replay.pageSize, returned: 0, hasMore: false, nextOffset: null }
+        };
       }
       renderReplay();
+    }
+
+    async function loadMoreReplayEvents() {
+      var tl = state.replay.timeline;
+      if (!state.replay.selectedId || !tl || !tl.page || !tl.page.hasMore || state.replay.loadingMore) return false;
+      var requestedSessionId = state.replay.selectedId;
+      state.replay.loadingMore = true;
+      try {
+        var nextOffset = tl.page.nextOffset;
+        var res = await apiGet(
+          'replay/load?sessionId=' + encodeURIComponent(requestedSessionId) +
+          '&offset=' + encodeURIComponent(nextOffset) +
+          '&limit=' + encodeURIComponent(state.replay.pageSize)
+        );
+        if (state.replay.selectedId !== requestedSessionId) return false;
+        if (res && res.success && res.timeline && res.timeline.events) {
+          tl.events = tl.events.concat(res.timeline.events);
+          tl.eventCount = res.timeline.eventCount;
+          tl.startedAt = res.timeline.startedAt;
+          tl.endedAt = res.timeline.endedAt;
+          tl.totalDurationMs = res.timeline.totalDurationMs;
+          tl.page = res.timeline.page;
+          return res.timeline.events.length > 0;
+        }
+        return false;
+      } finally {
+        state.replay.loadingMore = false;
+      }
     }
 
     function toggleReplayPlay() {
@@ -4101,6 +4168,11 @@
           if (events[i].offsetMs <= state.replay.offsetAt) newCursor = i;
           else break;
         }
+        if (newCursor >= events.length - 1 && state.replay.timeline.page && state.replay.timeline.page.hasMore) {
+          loadMoreReplayEvents().then(function(loaded) {
+            if (loaded) renderReplay();
+          });
+        }
         var changed = newCursor !== state.replay.cursor;
         state.replay.cursor = newCursor;
         if (state.replay.offsetAt >= state.replay.timeline.totalDurationMs) {
@@ -4126,7 +4198,18 @@
       stopReplayTimer();
       var next = state.replay.cursor + dir;
       if (next < 0) next = 0;
-      if (next >= state.replay.timeline.eventCount) next = state.replay.timeline.eventCount - 1;
+      var events = state.replay.timeline.events;
+      if (next >= events.length && state.replay.timeline.page && state.replay.timeline.page.hasMore) {
+        loadMoreReplayEvents().then(function(loaded) {
+          if (loaded) {
+            state.replay.cursor = Math.min(next, state.replay.timeline.events.length - 1);
+            state.replay.offsetAt = state.replay.timeline.events[state.replay.cursor].offsetMs;
+          }
+          renderReplay();
+        });
+        return;
+      }
+      if (next >= events.length) next = events.length - 1;
       state.replay.cursor = next;
       state.replay.offsetAt = state.replay.timeline.events[next].offsetMs;
       renderReplay();

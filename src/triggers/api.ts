@@ -36,6 +36,14 @@ function parseOptionalInt(raw: unknown): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+export function parseReplayLoadPageParam(value: unknown): number | undefined {
+  if (typeof value !== "string" || value.trim().length === 0) return undefined;
+  if (!/^\d+$/.test(value.trim())) return undefined;
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed)) return undefined;
+  return parsed;
+}
+
 function checkAuth(
   req: ApiRequest,
   secret: string | undefined,
@@ -481,9 +489,11 @@ export function registerApiTriggers(
       if (!sessionId) {
         return { status_code: 400, body: { error: "sessionId is required" } };
       }
+      const offset = parseReplayLoadPageParam(req.query_params?.["offset"]);
+      const limit = parseReplayLoadPageParam(req.query_params?.["limit"]);
       const result = await sdk.trigger({
         function_id: "mem::replay::load",
-        payload: { sessionId },
+        payload: { sessionId, offset, limit },
       });
       return { status_code: 200, body: result };
     },

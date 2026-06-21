@@ -141,5 +141,99 @@ describe("projectTimeline", () => {
     const out = parseJsonlText(text);
     expect(out.startedAt).toBe(out.endedAt);
   });
-});
 
+  it("returns a bounded page while keeping total event count", () => {
+    const observations = Array.from({ length: 1200 }, (_value, index) => ({
+      id: `obs-${index}`,
+      sessionId: "sess-large",
+      timestamp: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+      hookType: index % 2 === 0 ? "prompt_submit" : "stop",
+      userPrompt: index % 2 === 0 ? `Prompt ${index}` : undefined,
+      assistantResponse: index % 2 === 1 ? `Response ${index}` : undefined,
+      raw: {},
+    }));
+
+    const timeline = projectTimeline(observations as any, { offset: 100, limit: 50 });
+
+    expect(timeline.eventCount).toBe(1200);
+    expect(timeline.events).toHaveLength(50);
+    expect(timeline.events[0].id).toBe("obs-100");
+    expect(timeline.page).toEqual({
+      offset: 100,
+      limit: 50,
+      returned: 50,
+      hasMore: true,
+      nextOffset: 150,
+    });
+  });
+
+  it("clamps pagination offset past the end to an empty page", () => {
+    const parsed = parseJsonlText(fx("basic.jsonl"));
+    const timeline = projectTimeline(parsed.observations, { offset: 99, limit: 10 });
+
+    expect(timeline.eventCount).toBe(2);
+    expect(timeline.events).toHaveLength(0);
+    expect(timeline.page).toEqual({
+      offset: 99,
+      limit: 10,
+      returned: 0,
+      hasMore: false,
+      nextOffset: null,
+    });
+  });
+
+  it("normalizes zero limit to one so nextOffset always progresses", () => {
+    const parsed = parseJsonlText(fx("basic.jsonl"));
+    const timeline = projectTimeline(parsed.observations, { offset: 0, limit: 0 });
+
+    expect(timeline.events).toHaveLength(1);
+    expect(timeline.page).toEqual({
+      offset: 0,
+      limit: 1,
+      returned: 1,
+      hasMore: true,
+      nextOffset: 1,
+    });
+  });
+
+  it("uses timestamp plus id ordering so pages do not overlap for identical timestamps", () => {
+    const observations = ["b", "a", "c"].map((suffix) => ({
+      id: `obs-${suffix}`,
+      sessionId: "sess-same-ts",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      hookType: "prompt_submit",
+      userPrompt: `Prompt ${suffix}`,
+      raw: {},
+    }));
+
+    const first = projectTimeline(observations as any, { offset: 0, limit: 2 });
+    const second = projectTimeline(observations as any, { offset: 2, limit: 2 });
+
+    expect(first.events.map((event) => event.id)).toEqual(["obs-a", "obs-b"]);
+    expect(second.events.map((event) => event.id)).toEqual(["obs-c"]);
+  });
+
+  it("truncates large event fields in preview mode and reports truncation", () => {
+    const large = "x".repeat(10_000);
+    const observations = [{
+      id: "obs-large",
+      sessionId: "sess-large-fields",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      hookType: "post_tool_use",
+      toolName: "Bash",
+      toolInput: { command: large },
+      toolOutput: large,
+      raw: {},
+    }];
+
+    const timeline = projectTimeline(observations as any, {
+      offset: 0,
+      limit: 1,
+      maxEventPayloadChars: 1200,
+    });
+
+    expect(JSON.stringify(timeline.events[0]).length).toBeLessThan(1800);
+    expect(timeline.events[0].truncated?.toolInput).toBe(true);
+    expect(timeline.events[0].truncated?.toolOutput).toBe(true);
+  });
+});
