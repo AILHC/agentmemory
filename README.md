@@ -1238,6 +1238,38 @@ agentmemory auto-detects from your environment. By default, no LLM calls are mad
 | OpenAI API | `OPENAI_API_KEY` | Default `gpt-4o-mini`, override with `OPENAI_MODEL` |
 | **Local (Ollama / LM Studio / vLLM / llama.cpp)** | `OPENAI_API_KEY=local` + `OPENAI_BASE_URL=http://localhost:11434/v1` (Ollama) or `http://localhost:1234/v1` (LM Studio) + `OPENAI_MODEL=<your model>` | Anything OpenAI-API-compatible. Zero cost, runs on your hardware. See [Local models](#local-models-ollama-lm-studio-vllm) below. |
 | Claude subscription fallback | `AGENTMEMORY_ALLOW_AGENT_SDK=true` | Opt-in only. Spawns `@anthropic-ai/claude-agent-sdk` sessions — used to cause unbounded Stop-hook recursion (#149 follow-up) so it is no longer the default. |
+| `pi-agent-sdk` | `AGENTMEMORY_PROVIDER=pi-agent-sdk` + `AGENTMEMORY_ALLOW_PI_AGENT_SDK=true` | Pi subscription path for `pi` clients using `@earendil-works/pi-ai` + `@earendil-works/pi-coding-agent`. |
+
+> `pi-agent-sdk` is **not** eligible for fallback. `FALLBACK_PROVIDERS=pi-agent-sdk` is always ignored and never used automatically.
+
+### pi-agent-sdk 双门禁与安全边界
+
+`pi-agent-sdk` 使用双门禁，需同时满足以下条件才会激活：
+
+- `AGENTMEMORY_PROVIDER=pi-agent-sdk`
+- `AGENTMEMORY_ALLOW_PI_AGENT_SDK=true`
+
+若未设置 `AGENTMEMORY_ALLOW_PI_AGENT_SDK=true`，即使 `OPENAI_API_KEY` 存在，系统也会返回 `noop` 安全默认，按 `No-op (default)` 处理，不发起其他 provider 自动探测。
+
+建议示例（只在确认已有可用 Pi 订阅凭据时开启）：
+
+```env
+AGENTMEMORY_PROVIDER=pi-agent-sdk
+AGENTMEMORY_ALLOW_PI_AGENT_SDK=true
+PI_AGENT_MODEL=gpt-5.4
+AGENTMEMORY_AUTO_COMPRESS=true
+```
+
+该链路会强制使用 `NODE_USE_ENV_PROXY=1`，若存在 `HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY` 则会使用 `undici` 的 `ProxyAgent` 进行代理请求。
+
+错误码（PI 专用）：
+
+- `pi_sdk_import_failed`
+- `pi_model_not_found`
+- `pi_auth_failed`
+- `pi_auth_missing`
+- `pi_stream_failed`
+- `pi_empty_response`
 
 ### Local models (Ollama / LM Studio / vLLM)
 
@@ -1374,6 +1406,18 @@ AGENTMEMORY_ALLOW_AGENT_SDK=true
 AGENTMEMORY_AUTO_COMPRESS=true
 ```
 
+For `pi-agent-sdk`, configure both explicit provider and allow flag:
+
+```env
+AGENTMEMORY_PROVIDER=pi-agent-sdk
+AGENTMEMORY_ALLOW_PI_AGENT_SDK=true
+PI_AGENT_MODEL=gpt-5.4
+AGENTMEMORY_AUTO_COMPRESS=true
+```
+
+Note: `FALLBACK_PROVIDERS` can include `pi-agent-sdk` only as plain text; it is always dropped and treated as disabled for safety.
+Use `AGENTMEMORY_PROVIDER=pi-agent-sdk` + `AGENTMEMORY_ALLOW_PI_AGENT_SDK=true` when you need this provider as the primary path.
+
 Consolidation (graph nodes, lessons, crystals) is on by default whenever an LLM provider is configured. Explicitly opt out with `CONSOLIDATION_ENABLED=false` if you want LLM-free operation. Graph extraction is a separate flag:
 
 ```env
@@ -1392,6 +1436,10 @@ Create `~/.agentmemory/.env`:
 # GEMINI_API_KEY=...
 # OPENROUTER_API_KEY=...
 # MINIMAX_API_KEY=...
+# PI subscription provider (双门禁，需同时显式开启)
+# AGENTMEMORY_PROVIDER=pi-agent-sdk
+# AGENTMEMORY_ALLOW_PI_AGENT_SDK=true
+# PI_AGENT_MODEL=gpt-5.4              # Optional, defaults to gpt-5.4
 # OPENAI_API_KEY=***                       # NOTE: this same key auto-activates BOTH the
 #                                          # OpenAI LLM provider (here) AND the OpenAI
 #                                          # embedding provider (further below). Set

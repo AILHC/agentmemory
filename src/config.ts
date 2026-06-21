@@ -51,6 +51,100 @@ function hasRealValue(v: string | undefined): v is string {
 
 function detectProvider(env: Record<string, string>): ProviderConfig {
   const maxTokens = parseInt(env["MAX_TOKENS"] || "4096", 10);
+  const explicitProvider = (env["AGENTMEMORY_PROVIDER"] || "").toLowerCase();
+  const allowAgentSdk = env["AGENTMEMORY_ALLOW_AGENT_SDK"] === "true";
+  const allowPiAgentSdk = env["AGENTMEMORY_ALLOW_PI_AGENT_SDK"] === "true";
+
+  if (explicitProvider === "pi-agent-sdk") {
+    if (!allowPiAgentSdk) {
+      process.stderr.write(
+        "[agentmemory] No LLM provider key found " +
+          "(AGENTMEMORY_PROVIDER=pi-agent-sdk but AGENTMEMORY_ALLOW_PI_AGENT_SDK is not 'true'). " +
+          "LLM-backed compression and summarization are DISABLED — using no-op provider. " +
+          "Set both AGENTMEMORY_PROVIDER=pi-agent-sdk and AGENTMEMORY_ALLOW_PI_AGENT_SDK=true " +
+          "to explicitly opt into Pi subscription access.\n",
+      );
+      return {
+        provider: "noop",
+        model: "noop",
+        maxTokens,
+      };
+    }
+    return {
+      provider: "pi-agent-sdk",
+      model: env["PI_AGENT_MODEL"] || "gpt-5.4",
+      maxTokens,
+    };
+  }
+
+  if (explicitProvider === "agent-sdk") {
+    if (!allowAgentSdk) {
+      process.stderr.write(
+        "[agentmemory] No LLM provider key found " +
+          "(AGENTMEMORY_ALLOW_AGENT_SDK is not 'true'). " +
+          "LLM-backed compression and summarization are DISABLED — using no-op provider. " +
+          "Set AGENTMEMORY_AUTO_COMPRESS=true AND AGENTMEMORY_ALLOW_AGENT_SDK=true to opt-in.\n",
+      );
+      return {
+        provider: "noop",
+        model: "noop",
+        maxTokens,
+      };
+    }
+
+    process.stderr.write(
+      "[agentmemory] WARNING: agent-sdk fallback enabled via AGENTMEMORY_ALLOW_AGENT_SDK=true. " +
+        "This spawns @anthropic-ai/claude-agent-sdk child sessions that can trigger the Stop-hook " +
+        "recursion loop (#149 follow-up). A SDK-child env marker is set to block re-entry, " +
+        "but prefer setting a real API key in ~/.agentmemory/.env instead.\n",
+    );
+    return {
+      provider: "agent-sdk",
+      model: "claude-sonnet-4-20250514",
+      maxTokens,
+    };
+  }
+
+  if (explicitProvider === "openai") {
+    return {
+      provider: "openai",
+      model: env["OPENAI_MODEL"] || "gpt-4o-mini",
+      maxTokens,
+      baseURL: env["OPENAI_BASE_URL"],
+    };
+  }
+  if (explicitProvider === "anthropic") {
+    return {
+      provider: "anthropic",
+      model: env["ANTHROPIC_MODEL"] || "claude-sonnet-4-20250514",
+      maxTokens,
+      baseURL: env["ANTHROPIC_BASE_URL"],
+    };
+  }
+  if (explicitProvider === "gemini") {
+    return {
+      provider: "gemini",
+      model: env["GEMINI_MODEL"] || "gemini-2.5-flash",
+      maxTokens,
+    };
+  }
+  if (explicitProvider === "openrouter") {
+    return {
+      provider: "openrouter",
+      model: env["OPENROUTER_MODEL"] || "anthropic/claude-sonnet-4-20250514",
+      maxTokens,
+    };
+  }
+  if (explicitProvider === "minimax") {
+    return {
+      provider: "minimax",
+      model: env["MINIMAX_MODEL"] || "MiniMax-M2.7",
+      maxTokens,
+    };
+  }
+  if (explicitProvider === "noop") {
+    return { provider: "noop", model: "noop", maxTokens };
+  }
 
   // OpenAI-compatible: supports OpenAI, DeepSeek, SiliconFlow, Azure, vLLM, LM Studio
   if (hasRealValue(env["OPENAI_API_KEY"]) && env["OPENAI_API_KEY_FOR_LLM"] !== "false") {
@@ -123,18 +217,12 @@ function detectProvider(env: Record<string, string>): ProviderConfig {
     };
   }
 
-  const allowAgentSdk = env["AGENTMEMORY_ALLOW_AGENT_SDK"] === "true";
   if (!allowAgentSdk) {
     process.stderr.write(
       "[agentmemory] No LLM provider key found " +
-        "(ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, MINIMAX_API_KEY, OPENAI_API_KEY). " +
+        "(ANTHROPIC_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY, MINIMAX_API_KEY, OPENAI_API_KEY, OPENAI_BASE_URL). " +
         "LLM-backed compression and summarization are DISABLED — using no-op provider. " +
-        "This is the safe default: the agent-sdk fallback used to spawn Claude Agent SDK " +
-        "child sessions which inherit Claude Code's plugin hooks and cause infinite Stop-hook " +
-        "recursion (#149 follow-up). To opt in to the agent-sdk fallback anyway, set both " +
-        "AGENTMEMORY_AUTO_COMPRESS=true AND AGENTMEMORY_ALLOW_AGENT_SDK=true — but be aware " +
-        "it will burn your Claude Pro allocation and may still recurse if you use it from " +
-        "inside Claude Code itself.\n",
+        "Enable Pi/Claude SDK access only when explicitly opted in via the matching *_ALLOW env var.\n",
     );
     return {
       provider: "noop",
@@ -204,6 +292,24 @@ export function isDropStaleIndexEnabled(): boolean {
 
 export function detectLlmProviderKind(): "llm" | "noop" {
   const env = getMergedEnv();
+  const explicitProvider = (env["AGENTMEMORY_PROVIDER"] || "").toLowerCase();
+  if (explicitProvider === "pi-agent-sdk") {
+    return env["AGENTMEMORY_ALLOW_PI_AGENT_SDK"] === "true" ? "llm" : "noop";
+  }
+  if (explicitProvider === "agent-sdk") {
+    return env["AGENTMEMORY_ALLOW_AGENT_SDK"] === "true" ? "llm" : "noop";
+  }
+  if (
+    explicitProvider === "openai" ||
+    explicitProvider === "anthropic" ||
+    explicitProvider === "gemini" ||
+    explicitProvider === "openrouter" ||
+    explicitProvider === "minimax" ||
+    explicitProvider === "noop"
+  ) {
+    return explicitProvider === "noop" ? "noop" : "llm";
+  }
+
   if (
     hasRealValue(env["ANTHROPIC_API_KEY"]) ||
     hasRealValue(env["GEMINI_API_KEY"]) ||
@@ -361,6 +467,9 @@ export function isConsolidationEnabled(): boolean {
 function hasLLMProviderConfigured(env: Record<string, string | undefined>): boolean {
   const provider = (env["AGENTMEMORY_PROVIDER"] || "").toLowerCase();
   if (provider === "noop") return false;
+  if (provider === "pi-agent-sdk") {
+    return env["AGENTMEMORY_ALLOW_PI_AGENT_SDK"] === "true";
+  }
   const openaiKeyForLlm =
     env["OPENAI_API_KEY"] &&
     (env["OPENAI_API_KEY_FOR_LLM"] || "").toLowerCase() !== "false";
@@ -420,6 +529,7 @@ const VALID_PROVIDERS = new Set([
   "gemini",
   "openrouter",
   "agent-sdk",
+  "pi-agent-sdk",
   "minimax",
   "openai",
 ]);
@@ -436,18 +546,18 @@ export function loadFallbackConfig(): FallbackConfig {
         Boolean(p) && VALID_PROVIDERS.has(p),
     )
     .filter((p) => {
-      // Honor the same safety gate as detectProvider: agent-sdk is only
-      // permitted as a fallback target when the user has explicitly opted
-      // in. Without this filter, a user could set FALLBACK_PROVIDERS=agent-sdk
-      // and re-introduce the Stop-hook recursion loop even though
-      // detectProvider() returned the noop provider.
       if (p === "agent-sdk" && !allowAgentSdk) {
         process.stderr.write(
           "[agentmemory] Ignoring FALLBACK_PROVIDERS entry 'agent-sdk' " +
-            "(AGENTMEMORY_ALLOW_AGENT_SDK is not 'true'). The agent-sdk " +
-            "fallback can spawn Claude Agent SDK child sessions that trigger " +
-            "the Stop-hook recursion loop (#149 follow-up). Opt in explicitly " +
-            "with AGENTMEMORY_ALLOW_AGENT_SDK=true if this is intentional.\n",
+            "(AGENTMEMORY_ALLOW_AGENT_SDK is not 'true'). The agent-sdk fallback " +
+            "can re-trigger recursion and is therefore disabled by default.\n",
+        );
+        return false;
+      }
+      if (p === "pi-agent-sdk") {
+        process.stderr.write(
+          "[agentmemory] Ignoring FALLBACK_PROVIDERS entry 'pi-agent-sdk': " +
+            "pi-agent-sdk is never treated as fallback for safety.\n",
         );
         return false;
       }

@@ -4,6 +4,7 @@ import type {
   FallbackConfig,
 } from "../types.js";
 import { AgentSDKProvider } from "./agent-sdk.js";
+import { PiAgentSDKProvider } from "./pi-agent-sdk.js";
 import { AnthropicProvider } from "./anthropic.js";
 import { MinimaxProvider } from "./minimax.js";
 import { NoopProvider } from "./noop.js";
@@ -36,6 +37,8 @@ function defaultModelFor(providerType: ProviderConfig["provider"]): string {
   switch (providerType) {
     case "openai":
       return getEnvVar("OPENAI_MODEL") || "gpt-4o-mini";
+    case "pi-agent-sdk":
+      return getEnvVar("PI_AGENT_MODEL") || "gpt-5.4";
     case "anthropic":
       return getEnvVar("ANTHROPIC_MODEL") || "claude-sonnet-4-20250514";
     case "gemini":
@@ -143,6 +146,8 @@ function createBaseProvider(config: ProviderConfig): MemoryProvider {
         config.baseURL,
       );
     }
+    case "pi-agent-sdk":
+      return new PiAgentSDKProvider(config.model, config.maxTokens);
     case "noop":
       return new NoopProvider();
     case "agent-sdk":
