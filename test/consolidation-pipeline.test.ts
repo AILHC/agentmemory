@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -90,6 +90,26 @@ describe("Consolidation Pipeline", () => {
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+  });
+
+  it("fails fast for unsupported output language instead of returning success with tier errors", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "fr";
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    await expect(
+      sdk.trigger("mem::consolidate-pipeline", { tier: "semantic", force: true }),
+    ).rejects.toThrow("Unsupported AGENTMEMORY_OUTPUT_LANGUAGE: fr");
+    expect(provider.summarize).not.toHaveBeenCalled();
   });
 
   it("pipeline skips semantic when fewer than 5 summaries", async () => {
@@ -140,6 +160,7 @@ describe("Consolidation Pipeline", () => {
   });
 
   it("with enough summaries, creates semantic memories from provider response", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
     const provider = {
       name: "test",
       compress: vi.fn(),
@@ -165,9 +186,14 @@ describe("Consolidation Pipeline", () => {
     expect(stored.length).toBe(1);
     expect(stored[0].fact).toBe("TypeScript is the primary language");
     expect(stored[0].confidence).toBe(0.9);
+    expect(provider.summarize).toHaveBeenCalledWith(
+      expect.stringContaining("AgentMemory Output Language Policy"),
+      expect.any(String),
+    );
   });
 
   it("with enough patterns, creates procedural memories from provider response", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
     const provider = {
       name: "test",
       compress: vi.fn(),
@@ -194,6 +220,10 @@ describe("Consolidation Pipeline", () => {
     expect(stored[0].name).toBe("Test Workflow");
     expect(stored[0].steps.length).toBe(2);
     expect(stored[0].triggerCondition).toBe("when writing tests");
+    expect(provider.summarize).toHaveBeenCalledWith(
+      expect.stringContaining("AgentMemory Output Language Policy"),
+      expect.any(String),
+    );
   });
 
   it("consolidation records an audit entry", async () => {

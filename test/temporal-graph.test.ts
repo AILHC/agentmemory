@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, afterEach, vi } from "vitest";
 import type { GraphNode, GraphEdge, MemoryProvider } from "../src/types.js";
 
 vi.mock("../src/logger.js", () => ({
@@ -57,6 +57,10 @@ function mockSdk() {
 }
 
 describe("TemporalGraph", () => {
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+  });
+
   it("imports without errors", async () => {
     const mod = await import("../src/functions/temporal-graph.js");
     expect(mod.registerTemporalGraphFunctions).toBeDefined();
@@ -81,6 +85,7 @@ describe("TemporalGraph", () => {
   });
 
   it("extracts temporal graph with context metadata", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
     const { registerTemporalGraphFunctions } = await import(
       "../src/functions/temporal-graph.js"
     );
@@ -140,6 +145,10 @@ describe("TemporalGraph", () => {
     expect(storedEdges[0].context?.sentiment).toBe("positive");
     expect(storedEdges[0].isLatest).toBe(true);
     expect(storedEdges[0].version).toBe(1);
+    expect(provider.compress).toHaveBeenCalledWith(
+      expect.stringContaining("AgentMemory Output Language Policy"),
+      expect.any(String),
+    );
   });
 
   it("appends new edge version instead of overwriting", async () => {

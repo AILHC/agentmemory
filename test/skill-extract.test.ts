@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockKv = {
   get: vi.fn(),
@@ -32,6 +32,7 @@ describe("skill-extract", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
     mockKv.get.mockResolvedValue(null);
     mockKv.set.mockResolvedValue(undefined);
     mockKv.list.mockResolvedValue([]);
@@ -43,6 +44,10 @@ describe("skill-extract", () => {
     });
 
     registerSkillExtractFunctions(mockSdk as any, mockKv as any, mockProvider);
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
   });
 
   it("registers all skill functions", () => {
@@ -66,6 +71,7 @@ describe("skill-extract", () => {
   });
 
   it("skill-extract parses LLM response into ProceduralMemory", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
     mockKv.get.mockImplementation((scope: string, key: string) => {
       if (scope === "mem:sessions")
         return Promise.resolve({ id: "s1", project: "test", status: "completed" });
@@ -120,6 +126,10 @@ describe("skill-extract", () => {
     expect(result.skill.steps).toHaveLength(3);
     expect(result.skill.triggerCondition).toContain("JWT");
     expect(mockKv.set).toHaveBeenCalled();
+    expect(mockProvider.summarize).toHaveBeenCalledWith(
+      expect.stringContaining("AgentMemory Output Language Policy"),
+      expect.any(String),
+    );
   });
 
   it("skill-extract returns no-skill for exploratory sessions", async () => {

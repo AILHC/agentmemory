@@ -2,6 +2,7 @@ import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import type { Action, ActionEdge, Crystal, MemoryProvider } from "../types.js";
+import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 
 interface CrystalDigest {
   narrative: string;
@@ -54,7 +55,10 @@ export function registerCrystallizeFunction(
       const prompt = buildChainText(actions, relevantEdges);
 
       try {
-        const response = await provider.summarize(CRYSTALLIZE_SYSTEM, prompt);
+        const response = await provider.summarize(
+          withOutputLanguagePolicy(CRYSTALLIZE_SYSTEM),
+          prompt,
+        );
         const digest = parseDigest(response);
 
         const crystal: Crystal = {

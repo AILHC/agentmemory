@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -117,7 +117,26 @@ function makeExistingMemory(id: string, title: string, project?: string): Memory
 }
 
 describe("mem::consolidate — cross-project existingMatch guard", () => {
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+  });
+
+  it("fails fast for unsupported output language instead of swallowing it as provider failure", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "fr";
+    const sdk = makeMockSdk();
+    const kv = makeMockKV();
+    const provider = makeProvider("unused");
+
+    registerConsolidateFunction(sdk as never, kv as never, provider as never);
+
+    await expect(
+      sdk.trigger("mem::consolidate", { project: "api", minObservations: 1 }),
+    ).rejects.toThrow("Unsupported AGENTMEMORY_OUTPUT_LANGUAGE: fr");
+    expect(provider.compress).not.toHaveBeenCalled();
+  });
+
   it("does not evolve a memory from a different project even when titles match", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
     const sdk = makeMockSdk();
     const kv = makeMockKV();
     const provider = makeProvider("synthesized memory title");
@@ -150,6 +169,10 @@ describe("mem::consolidate — cross-project existingMatch guard", () => {
     const apiMemories = allMemories.filter((m) => m.project === "api" && m.isLatest);
     expect(apiMemories).toHaveLength(1);
     expect(apiMemories[0].title).toBe("synthesized memory title");
+    expect(provider.compress).toHaveBeenCalledWith(
+      expect.stringContaining("AgentMemory Output Language Policy"),
+      expect.any(String),
+    );
   });
 
   it("evolves an existing memory within the same project when titles match", async () => {

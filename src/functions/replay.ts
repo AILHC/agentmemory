@@ -10,8 +10,13 @@ import type {
   Session,
 } from "../types.js";
 import type { StateKV } from "../state/kv.js";
-import { KV, generateId, fingerprintId } from "../state/schema.js";
-import { parseTranscriptText } from "../replay/format.js";
+import { KV, fingerprintId } from "../state/schema.js";
+import { detectTranscriptFormat, parseTranscriptText } from "../replay/format.js";
+import {
+  computeSourceFileHash,
+  stableFallbackSessionId,
+  type ReplayImportContext,
+} from "../replay/import-identity.js";
 import { projectTimeline, type Timeline } from "../replay/timeline.js";
 import { safeAudit } from "./audit.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
@@ -54,6 +59,14 @@ type ReplayStoredObservation = CompressedObservation &
       | "modality"
       | "imageData"
       | "agentId"
+      | "sourceFormat"
+      | "sourceFileHash"
+      | "sourceSessionId"
+      | "sourceEventId"
+      | "sourceEventIndex"
+      | "importKey"
+      | "lineage"
+      | "parentSessionId"
     >
   >;
 
@@ -102,6 +115,14 @@ function rawFromCompressed(obs: ReplayStoredObservation): RawObservation {
       modality: obs.modality,
       imageData: obs.imageData,
       agentId: obs.agentId,
+      sourceFormat: obs.sourceFormat,
+      sourceFileHash: obs.sourceFileHash,
+      sourceSessionId: obs.sourceSessionId,
+      sourceEventId: obs.sourceEventId,
+      sourceEventIndex: obs.sourceEventIndex,
+      importKey: obs.importKey,
+      lineage: obs.lineage,
+      parentSessionId: obs.parentSessionId,
     };
   }
 
@@ -116,6 +137,14 @@ function rawFromCompressed(obs: ReplayStoredObservation): RawObservation {
     userPrompt: obs.userPrompt ?? (obs.type === "conversation" ? obs.narrative : undefined),
     assistantResponse: obs.assistantResponse,
     raw: syntheticRaw,
+    sourceFormat: obs.sourceFormat,
+    sourceFileHash: obs.sourceFileHash,
+    sourceSessionId: obs.sourceSessionId,
+    sourceEventId: obs.sourceEventId,
+    sourceEventIndex: obs.sourceEventIndex,
+    importKey: obs.importKey,
+    lineage: obs.lineage,
+    parentSessionId: obs.parentSessionId,
   };
 }
 
@@ -249,12 +278,26 @@ async function deriveCrystalAndLessons(
 
   try {
     const existingCrystal = await kv.get<Crystal>(KV.crystals, crystalId);
+    const newKeyOutcomes = Array.from(tools).slice(0, 8);
+    const newFilesAffected = Array.from(files).slice(0, 20);
+    const mergedKeyOutcomes = Array.from(
+      new Set([...(existingCrystal?.keyOutcomes ?? []), ...newKeyOutcomes]),
+    ).slice(0, 8);
+    const mergedFilesAffected = Array.from(
+      new Set([...(existingCrystal?.filesAffected ?? []), ...newFilesAffected]),
+    ).slice(0, 20);
+    const mergedLessonIds = Array.from(
+      new Set([...(existingCrystal?.lessons ?? []), ...lessonIds]),
+    );
     const crystal: Crystal = {
       id: crystalId,
-      narrative: narrativePreview || `Session ${sessionId.slice(0, 12)} (${rawObs.length} observations)`,
-      keyOutcomes: Array.from(tools).slice(0, 8),
-      filesAffected: Array.from(files).slice(0, 20),
-      lessons: lessonIds,
+      narrative:
+        narrativePreview ||
+        existingCrystal?.narrative ||
+        `Session ${sessionId.slice(0, 12)} (${rawObs.length} observations)`,
+      keyOutcomes: mergedKeyOutcomes,
+      filesAffected: mergedFilesAffected,
+      lessons: mergedLessonIds,
       sourceActionIds: existingCrystal?.sourceActionIds ?? [],
       sessionId,
       project,
@@ -293,6 +336,14 @@ async function loadObservations(
         modality: r.modality,
         imageData: r.imageData,
         agentId: r.agentId,
+        sourceFormat: r.sourceFormat,
+        sourceFileHash: r.sourceFileHash,
+        sourceSessionId: r.sourceSessionId,
+        sourceEventId: r.sourceEventId,
+        sourceEventIndex: r.sourceEventIndex,
+        importKey: r.importKey,
+        lineage: r.lineage,
+        parentSessionId: r.parentSessionId,
       };
     }
     return rawFromCompressed(r);
@@ -400,6 +451,14 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           imported: number;
           sessionIds: string[];
           observations: number;
+          created: number;
+          updated: number;
+          skippedDuplicate: number;
+          filteredChildSession: number;
+          mergedChildSession: number;
+          filteredSidechainSession: number;
+          mergedSidechainSession: number;
+          ambiguousLineage: number;
           discovered: number;
           truncated: boolean;
           traversalCapped: boolean;
@@ -455,6 +514,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
       } else {
         return { success: false, error: "path must be a .jsonl file or directory" };
       }
+      files.sort();
 
       if (files.length === 0) {
         return {
@@ -462,6 +522,14 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           imported: 0,
           sessionIds: [],
           observations: 0,
+          created: 0,
+          updated: 0,
+          skippedDuplicate: 0,
+          filteredChildSession: 0,
+          mergedChildSession: 0,
+          filteredSidechainSession: 0,
+          mergedSidechainSession: 0,
+          ambiguousLineage: 0,
           discovered,
           truncated,
           traversalCapped,
@@ -470,8 +538,19 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
         };
       }
 
-      const sessionIds: string[] = [];
-      let observationCount = 0;
+      const sessionIds = new Set<string>();
+      const sourceFileHashes = new Set<string>();
+      let created = 0;
+      const updated = 0;
+      let skippedDuplicate = 0;
+      let filteredChildSession = 0;
+      let mergedChildSession = 0;
+      let filteredSidechainSession = 0;
+      let mergedSidechainSession = 0;
+      let ambiguousLineage = 0;
+
+      const parsedFiles: Array<{ parsed: ReturnType<typeof parseTranscriptText> }> = [];
+      const batchTopLevelSessionIds = new Set<string>();
 
       for (const file of files) {
         if (isSensitive(file)) continue;
@@ -487,61 +566,150 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           continue;
         }
 
-        const parsed = parseTranscriptText(text, generateId("sess"));
-        if (parsed.observations.length === 0) continue;
-
-        const firstPromptObs = parsed.observations.find(
-          (o) => typeof o.userPrompt === "string" && o.userPrompt.trim().length > 0,
+        const sourceFormat = detectTranscriptFormat(text);
+        const sourceFileHash = computeSourceFileHash(text);
+        sourceFileHashes.add(sourceFileHash);
+        const context: ReplayImportContext = { sourceFormat, sourceFileHash };
+        const parsed = parseTranscriptText(
+          text,
+          stableFallbackSessionId(context),
+          context,
         );
-        const firstPrompt = firstPromptObs?.userPrompt
-          ? firstPromptObs.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
-          : undefined;
+        if (parsed.observations.length === 0) continue;
+        parsedFiles.push({ parsed });
 
-        const existing = await kv.get<Session>(KV.sessions, parsed.sessionId);
-        if (existing) {
-          existing.observationCount =
-            (existing.observationCount || 0) + parsed.observations.length;
-          if (parsed.endedAt > (existing.endedAt || "")) {
-            existing.endedAt = parsed.endedAt;
+        const baseTargetSessionId = parsed.targetSessionId || parsed.sessionId;
+        const hasTopLevelObservation = parsed.observations.some((obs) => {
+          const lineage = obs.lineage ?? parsed.lineage ?? "top-level";
+          return lineage !== "child" && lineage !== "sidechain";
+        });
+        if ((parsed.lineage ?? "top-level") === "top-level" || hasTopLevelObservation) {
+          batchTopLevelSessionIds.add(baseTargetSessionId);
+        }
+      }
+
+      for (const { parsed } of parsedFiles) {
+        const baseTargetSessionId = parsed.targetSessionId || parsed.sessionId;
+        const groups = new Map<
+          string,
+          {
+            lineage: string;
+            targetSessionId: string;
+            observations: RawObservation[];
           }
-          if (existing.status === "active") existing.status = "completed";
-          const existingTags = existing.tags || [];
-          if (!existingTags.includes("jsonl-import")) {
-            existing.tags = [...existingTags, "jsonl-import"];
+        >();
+
+        for (const obs of parsed.observations) {
+          const obsLineage = obs.lineage ?? parsed.lineage ?? "top-level";
+          let targetSessionId = baseTargetSessionId;
+
+          if (obsLineage === "child") {
+            const parentSessionId = obs.parentSessionId ?? parsed.parentSessionId;
+            if (!parentSessionId) {
+              ambiguousLineage += 1;
+              continue;
+            }
+            const parentExists =
+              batchTopLevelSessionIds.has(parentSessionId) ||
+              sessionIds.has(parentSessionId) ||
+              (await kv.get<Session>(KV.sessions, parentSessionId));
+            if (!parentExists) {
+              filteredChildSession += 1;
+              continue;
+            }
+            targetSessionId = parentSessionId;
+          } else if (obsLineage === "sidechain") {
+            const parentSessionId = obs.parentSessionId ?? parsed.parentSessionId;
+            if (!parentSessionId) {
+              ambiguousLineage += 1;
+              continue;
+            }
+            const parentExists =
+              batchTopLevelSessionIds.has(parentSessionId) ||
+              sessionIds.has(parentSessionId) ||
+              (await kv.get<Session>(KV.sessions, parentSessionId));
+            if (!parentExists) {
+              filteredSidechainSession += 1;
+              continue;
+            }
+            targetSessionId = parentSessionId;
           }
-          if (!existing.firstPrompt && firstPrompt) {
-            existing.firstPrompt = firstPrompt;
+
+          const groupKey = `${obsLineage}:${targetSessionId}`;
+          let group = groups.get(groupKey);
+          if (!group) {
+            group = { lineage: obsLineage, targetSessionId, observations: [] };
+            groups.set(groupKey, group);
+            if (obsLineage === "child") mergedChildSession += 1;
+            if (obsLineage === "sidechain") mergedSidechainSession += 1;
           }
-          // #775: re-key on parsed.sessionId, not existing.id. Older
-          // session rows may be missing the `id` field; existing.id
-          // would then be undefined, JSON.stringify would drop the
-          // `key` from the state::set payload, and the engine would
-          // reject the call with `missing field \`key\``. Because the
-          // rejection aborts the whole import handler, a single
-          // legacy row killed the entire batch. parsed.sessionId is
-          // always populated (parseJsonlText has a three-level
-          // fallback) and is what we just used to read the row.
-          if (!existing.id) existing.id = parsed.sessionId;
-          await kv.set(KV.sessions, parsed.sessionId, existing);
-        } else {
-          const session: Session = {
-            id: parsed.sessionId,
-            project: parsed.project,
-            cwd: parsed.cwd,
-            startedAt: parsed.startedAt,
-            endedAt: parsed.endedAt,
-            status: "completed",
-            observationCount: parsed.observations.length,
-            tags: ["jsonl-import"],
-            firstPrompt,
-          };
-          await kv.set(KV.sessions, session.id, session);
+          obs.sessionId = targetSessionId;
+          group.observations.push(obs);
         }
 
-        const searchIndex = getSearchIndex();
-        const compressed: CompressedObservation[] = [];
-        await Promise.all(
-          parsed.observations.map(async (obs) => {
+        for (const group of groups.values()) {
+          const { targetSessionId, observations } = group;
+          if (observations.length === 0) continue;
+
+          const firstPromptObs = observations.find(
+            (o) => typeof o.userPrompt === "string" && o.userPrompt.trim().length > 0,
+          );
+          const firstPrompt = firstPromptObs?.userPrompt
+            ? firstPromptObs.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
+            : undefined;
+
+          const existing = await kv.get<Session>(KV.sessions, targetSessionId);
+          let pendingNewSession: Session | null = null;
+          if (existing) {
+            if (parsed.endedAt > (existing.endedAt || "")) {
+              existing.endedAt = parsed.endedAt;
+            }
+            if (existing.status === "active") existing.status = "completed";
+            const existingTags = existing.tags || [];
+            if (!existingTags.includes("jsonl-import")) {
+              existing.tags = [...existingTags, "jsonl-import"];
+            }
+            if (!existing.firstPrompt && firstPrompt) {
+              existing.firstPrompt = firstPrompt;
+            }
+            // #775: re-key on targetSessionId, not existing.id. Older
+            // session rows may be missing the `id` field; existing.id
+            // would then be undefined, JSON.stringify would drop the
+            // `key` from the state::set payload, and the engine would
+            // reject the call with `missing field \`key\``.
+            if (!existing.id) existing.id = targetSessionId;
+            await kv.set(KV.sessions, targetSessionId, existing);
+          } else if (
+            batchTopLevelSessionIds.has(targetSessionId) &&
+            group.lineage !== "child" &&
+            group.lineage !== "sidechain"
+          ) {
+            pendingNewSession = {
+              id: targetSessionId,
+              project: parsed.project,
+              cwd: parsed.cwd,
+              startedAt: parsed.startedAt,
+              endedAt: parsed.endedAt,
+              status: "completed",
+              observationCount: 0,
+              tags: ["jsonl-import"],
+              firstPrompt,
+            };
+          }
+
+          const searchIndex = getSearchIndex();
+          const newRawObservations: RawObservation[] = [];
+          const newCompressedObservations: CompressedObservation[] = [];
+          for (const obs of observations) {
+            const existingObservation = await kv.get<ReplayStoredObservation>(
+              KV.observations(targetSessionId),
+              obs.id,
+            );
+            if (existingObservation) {
+              skippedDuplicate += 1;
+              continue;
+            }
+
             const synthetic = buildSyntheticCompression(obs);
             const storedObservation: ReplayStoredObservation = {
               ...synthetic,
@@ -554,41 +722,85 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
               modality: obs.modality,
               imageData: obs.imageData,
               agentId: obs.agentId,
+              sourceFormat: obs.sourceFormat,
+              sourceFileHash: obs.sourceFileHash,
+              sourceSessionId: obs.sourceSessionId,
+              sourceEventId: obs.sourceEventId,
+              sourceEventIndex: obs.sourceEventIndex,
+              importKey: obs.importKey,
+              lineage: obs.lineage,
+              parentSessionId: obs.parentSessionId,
             };
-            compressed.push(synthetic);
             await kv.set(
-              KV.observations(parsed.sessionId),
+              KV.observations(targetSessionId),
               obs.id,
               storedObservation,
             );
             searchIndex.add(synthetic);
-          }),
-        );
-        observationCount += parsed.observations.length;
-        sessionIds.push(parsed.sessionId);
+            newRawObservations.push(obs);
+            newCompressedObservations.push(synthetic);
+            created += 1;
+          }
 
-        await deriveCrystalAndLessons(
-          kv,
-          parsed.sessionId,
-          parsed.project,
-          parsed.observations,
-          compressed,
-          firstPrompt,
-        );
+          const storedObservations = await kv.list<ReplayStoredObservation>(
+            KV.observations(targetSessionId),
+          );
+          const sessionRow = await kv.get<Session>(KV.sessions, targetSessionId);
+          if (sessionRow) {
+            await kv.set(KV.sessions, targetSessionId, {
+              ...sessionRow,
+              observationCount: storedObservations.length,
+            });
+          } else if (pendingNewSession) {
+            await kv.set(KV.sessions, targetSessionId, {
+              ...pendingNewSession,
+              observationCount: storedObservations.length,
+            });
+          }
+
+          sessionIds.add(targetSessionId);
+
+          if (newRawObservations.length > 0) {
+            await deriveCrystalAndLessons(
+              kv,
+              targetSessionId,
+              parsed.project,
+              newRawObservations,
+              newCompressedObservations,
+              firstPrompt,
+            );
+          }
+        }
       }
 
-      await safeAudit(kv, "import", "mem::replay::import-jsonl", sessionIds, {
+      const returnedSessionIds = Array.from(sessionIds);
+      await safeAudit(kv, "import", "mem::replay::import-jsonl", returnedSessionIds, {
         source: "jsonl",
-        path: abs,
         files: files.length,
-        observations: observationCount,
+        sourceFileHashes: Array.from(sourceFileHashes),
+        created,
+        updated,
+        skippedDuplicate,
+        filteredChildSession,
+        mergedChildSession,
+        filteredSidechainSession,
+        mergedSidechainSession,
+        ambiguousLineage,
       });
 
       return {
         success: true,
         imported: files.length,
-        sessionIds,
-        observations: observationCount,
+        sessionIds: returnedSessionIds,
+        observations: created,
+        created,
+        updated,
+        skippedDuplicate,
+        filteredChildSession,
+        mergedChildSession,
+        filteredSidechainSession,
+        mergedSidechainSession,
+        ambiguousLineage,
         discovered,
         truncated,
         traversalCapped,

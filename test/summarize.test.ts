@@ -152,6 +152,7 @@ describe("mem::summarize chunking", () => {
   beforeEach(() => {
     delete process.env.SUMMARIZE_CHUNK_SIZE;
     delete process.env.SUMMARIZE_CHUNK_CONCURRENCY;
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
   });
 
   afterEach(() => {
@@ -220,6 +221,32 @@ describe("mem::summarize chunking", () => {
     // not just the final chunk.
     expect(stored?.observationCount).toBe(250);
     expect(stored?.keyDecisions).toEqual(["dA", "dB", "dC"]);
+  });
+
+  it("injects output language policy into chunk and reduce summary calls", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
+    process.env.SUMMARIZE_CHUNK_SIZE = "100";
+    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
+    const provider = makeProvider([
+      summaryXml({ title: "Chunk 1" }),
+      summaryXml({ title: "Chunk 2" }),
+      summaryXml({ title: "Chunk 3" }),
+      summaryXml({ title: "Merged" }),
+    ]);
+    const { handler } = await setupHandler({
+      sessionId: "ses_policy",
+      obsCount: 250,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_policy" });
+
+    expect(result.success).toBe(true);
+    expect(provider.calls).toHaveLength(4);
+    expect(provider.calls.every((call) =>
+      call.system.includes("AgentMemory Output Language Policy"),
+    )).toBe(true);
+    expect(provider.calls[3].system).toContain("人类可读内容使用简体中文");
   });
 
   it("SUMMARIZE_CHUNK_SIZE env override is respected", async () => {

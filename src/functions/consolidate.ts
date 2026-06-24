@@ -8,6 +8,10 @@ import type {
 import { KV, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
+import {
+  resolveOutputLanguage,
+  withOutputLanguagePolicy,
+} from "../prompts/output-language.js";
 
 const CONSOLIDATION_SYSTEM = `You are a memory consolidation engine. Given a set of related observations from coding sessions, synthesize them into a single long-term memory.
 
@@ -69,6 +73,7 @@ export function registerConsolidateFunction(
 ): void {
   sdk.registerFunction("mem::consolidate", 
     async (data: { project?: string; minObservations?: number }) => {
+      resolveOutputLanguage();
       const minObs = data.minObservations ?? 10;
 
       const sessions = await kv.list<Session>(KV.sessions);
@@ -141,7 +146,7 @@ export function registerConsolidateFunction(
         try {
           const response = await Promise.race([
             provider.compress(
-              CONSOLIDATION_SYSTEM,
+              withOutputLanguagePolicy(CONSOLIDATION_SYSTEM),
               `Concept: "${concept}"\n\nObservations:\n${prompt}`,
             ),
             new Promise<never>((_, reject) =>

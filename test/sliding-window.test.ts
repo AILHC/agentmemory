@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { CompressedObservation, MemoryProvider } from "../src/types.js";
 
 function makeObs(
@@ -80,6 +80,10 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 describe("SlidingWindow", () => {
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+  });
+
   it("imports without errors", async () => {
     const mod = await import("../src/functions/sliding-window.js");
     expect(mod.registerSlidingWindowFunction).toBeDefined();
@@ -98,6 +102,7 @@ describe("SlidingWindow", () => {
   });
 
   it("enriches observation with sliding window context", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
     const { registerSlidingWindowFunction } = await import(
       "../src/functions/sliding-window.js"
     );
@@ -154,6 +159,10 @@ describe("SlidingWindow", () => {
       "User dislikes React due to debugging difficulty",
     );
     expect(result.enriched.contextBridges.length).toBeGreaterThan(0);
+    expect(provider.compress).toHaveBeenCalledWith(
+      expect.stringContaining("AgentMemory Output Language Policy"),
+      expect.any(String),
+    );
   });
 
   it("returns null enrichment when no adjacent observations", async () => {

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -80,12 +80,18 @@ describe("Crystallize Functions", () => {
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
     provider = mockProvider();
     registerCrystallizeFunction(sdk as never, kv as never, provider);
   });
 
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+  });
+
   describe("mem::crystallize", () => {
     it("crystallizes completed actions with valid JSON response", async () => {
+      process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
       const action = makeAction({ id: "act_1", title: "Fix bug", status: "done" });
       await kv.set("mem:actions", action.id, action);
 
@@ -105,6 +111,10 @@ describe("Crystallize Functions", () => {
       expect(result.crystal.project).toBe("webapp");
       expect(result.crystal.sessionId).toBe("sess_1");
       expect(result.crystal.createdAt).toBeDefined();
+      expect(provider.summarize).toHaveBeenCalledWith(
+        expect.stringContaining("AgentMemory Output Language Policy"),
+        expect.any(String),
+      );
     });
 
     it("marks source actions with crystallizedInto", async () => {

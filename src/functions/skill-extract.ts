@@ -10,6 +10,7 @@ import { KV, generateId, fingerprintId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 
 const SKILL_EXTRACT_SYSTEM = `You are a skill extraction engine. Given a completed multi-step task session, extract a reusable procedural skill document.
 
@@ -141,7 +142,7 @@ export function registerSkillExtractFunctions(
       try {
         const prompt = buildSkillPrompt(summary, observations);
         const response = await provider.summarize(
-          SKILL_EXTRACT_SYSTEM,
+          withOutputLanguagePolicy(SKILL_EXTRACT_SYSTEM),
           prompt,
         );
         const parsed = parseSkillXml(response);

@@ -3,6 +3,7 @@ import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import type { Action, ActionEdge, RoutineRun, MemoryProvider } from "../types.js";
 import { recordAudit } from "./audit.js";
+import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 
 const FLOW_COMPRESS_SYSTEM = `You are a workflow summarizer. Given a completed action chain, produce a concise summary capturing:
 1. The overall goal and outcome
@@ -77,7 +78,7 @@ export function registerFlowCompressFunction(
 
       try {
         const response = await provider.summarize(
-          FLOW_COMPRESS_SYSTEM,
+          withOutputLanguagePolicy(FLOW_COMPRESS_SYSTEM),
           prompt,
         );
         const summary = parseFlowSummary(response);

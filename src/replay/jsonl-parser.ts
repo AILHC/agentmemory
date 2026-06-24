@@ -1,5 +1,13 @@
 import type { HookType, RawObservation } from "../types.js";
-import { generateId } from "../state/schema.js";
+import { fingerprintId, generateId } from "../state/schema.js";
+import {
+  buildReplaySourceIdentity,
+  classifyClaudeLineage,
+  resolveSourceSessionId,
+  type ReplayImportContext,
+  type ReplayLineageKind,
+  type ReplaySourceFormat,
+} from "./import-identity.js";
 
 interface JsonlEntry {
   type?: string;
@@ -22,6 +30,12 @@ export interface ParsedTranscript {
   startedAt: string;
   endedAt: string;
   observations: RawObservation[];
+  sourceFormat?: ReplaySourceFormat;
+  sourceFileHash?: string;
+  sourceSessionId?: string;
+  targetSessionId?: string;
+  lineage?: ReplayLineageKind;
+  parentSessionId?: string;
 }
 
 function deriveProject(cwd: string): string {
@@ -78,7 +92,31 @@ function extractToolResults(content: unknown): Array<{ toolUseId: string; output
   return out;
 }
 
-export function parseJsonlText(text: string, fallbackSessionId?: string): ParsedTranscript {
+function claudeSourceEventId(raw: unknown, index: number): string {
+  const wrapper =
+    raw && typeof raw === "object" && "entry" in raw
+      ? (raw as { entry?: unknown }).entry
+      : raw;
+  const entry =
+    wrapper && typeof wrapper === "object"
+      ? (wrapper as Record<string, unknown>)
+      : {};
+  const uuid = typeof entry.uuid === "string" ? entry.uuid : undefined;
+  if (uuid) return uuid;
+  const parentUuid =
+    typeof entry.parentUuid === "string" ? entry.parentUuid : undefined;
+  const type = typeof entry.type === "string" ? entry.type : "unknown";
+  const timestamp =
+    typeof entry.timestamp === "string" ? entry.timestamp : "unknown";
+  if (parentUuid) return `${parentUuid}:${type}:${timestamp}`;
+  return `line:${index}:${timestamp}:${type}`;
+}
+
+export function parseJsonlText(
+  text: string,
+  fallbackSessionId?: string,
+  context?: ReplayImportContext,
+): ParsedTranscript {
   const lines = text.split("\n").filter((l) => l.trim().length > 0);
   const entries: JsonlEntry[] = [];
   for (const line of lines) {
@@ -100,6 +138,7 @@ export function parseJsonlText(text: string, fallbackSessionId?: string): Parsed
   for (const entry of entries) {
     if (entry.sessionId && !sessionId) sessionId = entry.sessionId;
     if (entry.cwd && !cwd) cwd = entry.cwd;
+    const entryLineage = classifyClaudeLineage(entry);
     const ts = entry.timestamp || new Date().toISOString();
     if (!firstTs) firstTs = ts;
     lastTs = ts;
@@ -112,7 +151,7 @@ export function parseJsonlText(text: string, fallbackSessionId?: string): Parsed
       if (toolResults.length > 0) {
         for (const result of toolResults) {
           observations.push({
-            id: generateId("obs"),
+            id: "",
             sessionId: sessionId || "imported",
             timestamp: ts,
             hookType: (result.isError ? "post_tool_failure" : "post_tool_use") as HookType,
@@ -120,18 +159,22 @@ export function parseJsonlText(text: string, fallbackSessionId?: string): Parsed
             toolInput: { toolUseId: result.toolUseId },
             toolOutput: result.output,
             raw: entry,
+            lineage: entryLineage.lineage,
+            parentSessionId: entryLineage.parentSessionId,
           });
         }
       } else {
         const text = toText(content);
         if (text.trim().length > 0) {
           observations.push({
-            id: generateId("obs"),
+            id: "",
             sessionId: sessionId || "imported",
             timestamp: ts,
             hookType: "prompt_submit" as HookType,
             userPrompt: text,
             raw: entry,
+            lineage: entryLineage.lineage,
+            parentSessionId: entryLineage.parentSessionId,
           });
         }
       }
@@ -140,23 +183,27 @@ export function parseJsonlText(text: string, fallbackSessionId?: string): Parsed
       const tools = extractToolUses(content);
       if (text.trim().length > 0) {
         observations.push({
-          id: generateId("obs"),
+          id: "",
           sessionId: sessionId || "imported",
           timestamp: ts,
           hookType: "stop" as HookType,
           assistantResponse: text,
           raw: entry,
+          lineage: entryLineage.lineage,
+          parentSessionId: entryLineage.parentSessionId,
         });
       }
       for (const tool of tools) {
         observations.push({
-          id: generateId("obs"),
+          id: "",
           sessionId: sessionId || "imported",
           timestamp: ts,
           hookType: "pre_tool_use" as HookType,
           toolName: tool.name,
           toolInput: tool.input,
           raw: { toolUseId: tool.id, entry },
+          lineage: entryLineage.lineage,
+          parentSessionId: entryLineage.parentSessionId,
         });
       }
     } else if (entry.type === "summary" || entry.type === "system") {
@@ -164,9 +211,53 @@ export function parseJsonlText(text: string, fallbackSessionId?: string): Parsed
     }
   }
 
-  const effectiveSessionId = sessionId || fallbackSessionId || generateId("sess");
-  for (const obs of observations) {
+  const hasTopLevelObservation = observations.some(
+    (obs) => obs.lineage !== "sidechain",
+  );
+  const transcriptLineage: ReplayLineageKind =
+    observations.length > 0 && !hasTopLevelObservation ? "sidechain" : "top-level";
+  const transcriptParentSessionId =
+    transcriptLineage === "sidechain"
+      ? observations.find((obs) => obs.parentSessionId)?.parentSessionId
+      : undefined;
+
+  const generatedSessionId = sessionId || fallbackSessionId || generateId("sess");
+  const resolved = context
+    ? resolveSourceSessionId({ context, sourceSessionId: sessionId || fallbackSessionId })
+    : {
+        sourceSessionId: generatedSessionId,
+        targetSessionId: generatedSessionId,
+      };
+  const effectiveSessionId = resolved.targetSessionId;
+  for (let index = 0; index < observations.length; index++) {
+    const obs = observations[index];
     if (obs.sessionId === "imported") obs.sessionId = effectiveSessionId;
+    obs.lineage = obs.lineage ?? transcriptLineage;
+    obs.parentSessionId = obs.parentSessionId ?? transcriptParentSessionId;
+    const sourceEventIndex = index;
+    if (context) {
+      const identity = buildReplaySourceIdentity({
+        context,
+        sourceSessionId: resolved.sourceSessionId,
+        targetSessionId: resolved.targetSessionId,
+        sourceEventId: claudeSourceEventId(obs.raw, sourceEventIndex),
+        sourceEventIndex,
+        hookType: obs.hookType,
+      });
+      obs.id = identity.observationId;
+      obs.sessionId = identity.targetSessionId;
+      obs.sourceFormat = identity.sourceFormat;
+      obs.sourceFileHash = identity.sourceFileHash;
+      obs.sourceSessionId = identity.sourceSessionId;
+      obs.sourceEventId = identity.sourceEventId;
+      obs.sourceEventIndex = identity.sourceEventIndex;
+      obs.importKey = identity.importKey;
+    } else {
+      obs.id = fingerprintId(
+        "obs",
+        `claude-code:${resolved.sourceSessionId}:${claudeSourceEventId(obs.raw, sourceEventIndex)}:${sourceEventIndex}:${obs.hookType}`,
+      );
+    }
   }
 
   const nowIso = new Date().toISOString();
@@ -177,5 +268,11 @@ export function parseJsonlText(text: string, fallbackSessionId?: string): Parsed
     startedAt: firstTs || nowIso,
     endedAt: lastTs || nowIso,
     observations,
+    sourceFormat: context?.sourceFormat,
+    sourceFileHash: context?.sourceFileHash,
+    sourceSessionId: context ? resolved.sourceSessionId : undefined,
+    targetSessionId: context ? resolved.targetSessionId : undefined,
+    lineage: transcriptLineage,
+    parentSessionId: transcriptParentSessionId,
   };
 }

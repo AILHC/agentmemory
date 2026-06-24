@@ -41,6 +41,14 @@ export interface RawObservation {
   modality?: "text" | "image" | "mixed";
   imageData?: string;
   agentId?: string;
+  sourceFormat?: "codex" | "claude-code" | "unknown";
+  sourceFileHash?: string;
+  sourceSessionId?: string;
+  sourceEventId?: string;
+  sourceEventIndex?: number;
+  importKey?: string;
+  lineage?: "top-level" | "child" | "sidechain";
+  parentSessionId?: string;
 }
 
 export interface CompressedObservation {

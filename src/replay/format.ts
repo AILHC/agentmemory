@@ -2,6 +2,10 @@ import { generateId } from "../state/schema.js";
 import type { ParsedTranscript } from "./jsonl-parser.js";
 import { parseJsonlText } from "./jsonl-parser.js";
 import { parseCodexJsonlText } from "./codex-jsonl-parser.js";
+import {
+  stableFallbackSessionId,
+  type ReplayImportContext,
+} from "./import-identity.js";
 
 export type TranscriptFormat = "claude-code" | "codex" | "unknown";
 
@@ -61,24 +65,32 @@ export function detectTranscriptFormat(text: string): TranscriptFormat {
 export function parseTranscriptText(
   text: string,
   fallbackSessionId?: string,
+  context?: ReplayImportContext,
 ): ParsedTranscript {
   const format = detectTranscriptFormat(text);
 
   if (format === "claude-code") {
-    return parseJsonlText(text, fallbackSessionId);
+    return parseJsonlText(text, fallbackSessionId, context);
   }
 
   if (format === "codex") {
-    return parseCodexJsonlText(text, fallbackSessionId);
+    return parseCodexJsonlText(text, fallbackSessionId, context);
   }
 
   const nowIso = new Date().toISOString();
+  const stableSessionId =
+    fallbackSessionId || (context ? stableFallbackSessionId(context) : generateId("sess"));
   return {
-    sessionId: fallbackSessionId || generateId("sess"),
+    sessionId: stableSessionId,
     project: "unknown",
     cwd: process.cwd(),
     startedAt: nowIso,
     endedAt: nowIso,
     observations: [],
+    sourceFormat: context?.sourceFormat,
+    sourceFileHash: context?.sourceFileHash,
+    sourceSessionId: context ? stableSessionId : undefined,
+    targetSessionId: context ? stableSessionId : undefined,
+    lineage: "top-level",
   };
 }

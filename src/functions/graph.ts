@@ -13,6 +13,7 @@ import {
   GRAPH_EXTRACTION_SYSTEM,
   buildGraphExtractionPrompt,
 } from "../prompts/graph-extraction.js";
+import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 
@@ -473,7 +474,7 @@ export function registerGraphFunction(
 
       try {
         const response = await provider.compress(
-          GRAPH_EXTRACTION_SYSTEM,
+          withOutputLanguagePolicy(GRAPH_EXTRACTION_SYSTEM),
           prompt,
         );
 

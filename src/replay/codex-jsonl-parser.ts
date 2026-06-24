@@ -1,10 +1,18 @@
 import type { RawObservation } from "../types.js";
 import type { ParsedTranscript } from "./jsonl-parser.js";
-import { generateId } from "../state/schema.js";
+import { fingerprintId, generateId } from "../state/schema.js";
+import {
+  buildReplaySourceIdentity,
+  classifyCodexLineage,
+  resolveSourceSessionId,
+  type ReplayImportContext,
+  type ReplayLineageKind,
+} from "./import-identity.js";
 
 type CodexPayload = Record<string, unknown>;
 
 interface CodexJsonlEntry {
+  id?: string;
   type?: string;
   timestamp?: string;
   payload?: {
@@ -59,9 +67,38 @@ function toNumber(value: unknown): number | undefined {
   return undefined;
 }
 
+function codexSourceEventId(raw: unknown, index: number): string {
+  const row =
+    raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+  const payload =
+    row.payload && typeof row.payload === "object"
+      ? (row.payload as Record<string, unknown>)
+      : {};
+  const payloadId =
+    typeof payload.id === "string" && payload.id.trim().length > 0
+      ? payload.id
+      : undefined;
+  const callId =
+    typeof payload.call_id === "string" && payload.call_id.trim().length > 0
+      ? payload.call_id
+      : undefined;
+  const rowId =
+    typeof row.id === "string" && row.id.trim().length > 0
+      ? row.id
+      : undefined;
+  if (payloadId) return payloadId;
+  if (callId) return callId;
+  if (rowId) return rowId;
+  const timestamp =
+    typeof row.timestamp === "string" ? row.timestamp : "unknown";
+  const type = typeof payload.type === "string" ? payload.type : "unknown";
+  return `line:${index}:${timestamp}:${type}`;
+}
+
 export function parseCodexJsonlText(
   text: string,
   fallbackSessionId?: string,
+  context?: ReplayImportContext,
 ): ParsedTranscript {
   const lines = text.split("\n").filter((line) => line.trim().length > 0);
 
@@ -69,6 +106,8 @@ export function parseCodexJsonlText(
   let cwd = "";
   let firstTs = "";
   let lastTs = "";
+  let lineage: ReplayLineageKind = "top-level";
+  let parentSessionId: string | undefined;
 
   const observations: RawObservation[] = [];
   const nowIso = new Date().toISOString();
@@ -90,6 +129,11 @@ export function parseCodexJsonlText(
     lastTs = ts;
 
     if (entry.type === "session_meta") {
+      const entryLineage = classifyCodexLineage(entry);
+      if (entryLineage.lineage === "child") {
+        lineage = "child";
+        parentSessionId = entryLineage.parentSessionId;
+      }
       if (typeof payload.id === "string" && !sessionId) sessionId = payload.id;
       if (typeof payload.cwd === "string" && !cwd) cwd = payload.cwd;
       if (typeof payload.meta === "object" && payload.meta !== null && !sessionId && typeof payload.meta.id === "string") {
@@ -104,7 +148,7 @@ export function parseCodexJsonlText(
     if (entry.type === "response_item") {
       if (payload.type === "function_call") {
         observations.push({
-          id: generateId("obs"),
+          id: "",
           sessionId: sessionId || "imported",
           timestamp: ts,
           hookType: "pre_tool_use",
@@ -116,7 +160,7 @@ export function parseCodexJsonlText(
 
       if (payload.type === "function_call_output") {
         observations.push({
-          id: generateId("obs"),
+          id: "",
           sessionId: sessionId || "imported",
           timestamp: ts,
           hookType: "post_tool_use",
@@ -129,7 +173,7 @@ export function parseCodexJsonlText(
 
       if (payload.type === "custom_tool_call") {
         observations.push({
-          id: generateId("obs"),
+          id: "",
           sessionId: sessionId || "imported",
           timestamp: ts,
           hookType: "pre_tool_use",
@@ -142,7 +186,7 @@ export function parseCodexJsonlText(
 
       if (payload.type === "custom_tool_call_output") {
         observations.push({
-          id: generateId("obs"),
+          id: "",
           sessionId: sessionId || "imported",
           timestamp: ts,
           hookType: "post_tool_use",
@@ -155,7 +199,7 @@ export function parseCodexJsonlText(
 
       if (payload.type === "web_search_call") {
         observations.push({
-          id: generateId("obs"),
+          id: "",
           sessionId: sessionId || "imported",
           timestamp: ts,
           hookType: "pre_tool_use",
@@ -167,7 +211,7 @@ export function parseCodexJsonlText(
 
       if (payload.type === "tool_search_call") {
         observations.push({
-          id: generateId("obs"),
+          id: "",
           sessionId: sessionId || "imported",
           timestamp: ts,
           hookType: "pre_tool_use",
@@ -179,7 +223,7 @@ export function parseCodexJsonlText(
 
       if (payload.type === "tool_search_output") {
         observations.push({
-          id: generateId("obs"),
+          id: "",
           sessionId: sessionId || "imported",
           timestamp: ts,
           hookType: "post_tool_use",
@@ -201,7 +245,7 @@ export function parseCodexJsonlText(
       const statusText = typeof payload.status === "string" ? payload.status : "";
       const isFailed = isFailureStatus(statusText) || ((exitCode ?? 0) !== 0);
       observations.push({
-        id: generateId("obs"),
+        id: "",
         sessionId: sessionId || "imported",
         timestamp: ts,
         hookType: isFailed ? "post_tool_failure" : "post_tool_use",
@@ -229,7 +273,7 @@ export function parseCodexJsonlText(
       const successText = typeof payload.success === "boolean" ? payload.success : undefined;
       const isFailed = isFailureStatus(statusText) || successText === false;
       observations.push({
-        id: generateId("obs"),
+        id: "",
         sessionId: sessionId || "imported",
         timestamp: ts,
         hookType: isFailed ? "post_tool_failure" : "post_tool_use",
@@ -249,7 +293,7 @@ export function parseCodexJsonlText(
     if (payload.type === "mcp_tool_call_end") {
       const invocation = payload.invocation as { name?: unknown };
       observations.push({
-        id: generateId("obs"),
+        id: "",
         sessionId: sessionId || "imported",
         timestamp: ts,
         hookType: "post_tool_use",
@@ -268,7 +312,7 @@ export function parseCodexJsonlText(
 
     if (payload.type === "web_search_end") {
       observations.push({
-        id: generateId("obs"),
+        id: "",
         sessionId: sessionId || "imported",
         timestamp: ts,
         hookType: "post_tool_use",
@@ -281,7 +325,7 @@ export function parseCodexJsonlText(
 
     if (payload.type === "error") {
       observations.push({
-        id: generateId("obs"),
+        id: "",
         sessionId: sessionId || "imported",
         timestamp: ts,
         hookType: "post_tool_failure",
@@ -295,7 +339,7 @@ export function parseCodexJsonlText(
       const userPrompt = toPromptText(payload.message);
       if (!userPrompt) continue;
       observations.push({
-        id: generateId("obs"),
+        id: "",
         sessionId: sessionId || "imported",
         timestamp: ts,
         hookType: "prompt_submit",
@@ -309,7 +353,7 @@ export function parseCodexJsonlText(
       const assistantResponse = toPromptText(payload.message);
       if (!assistantResponse) continue;
       observations.push({
-        id: generateId("obs"),
+        id: "",
         sessionId: sessionId || "imported",
         timestamp: ts,
         hookType: "stop",
@@ -319,9 +363,42 @@ export function parseCodexJsonlText(
     }
   }
 
-  const effectiveSessionId = sessionId || fallbackSessionId || generateId("sess");
-  for (const obs of observations) {
+  const generatedSessionId = sessionId || fallbackSessionId || generateId("sess");
+  const resolved = context
+    ? resolveSourceSessionId({ context, sourceSessionId: sessionId || fallbackSessionId })
+    : {
+        sourceSessionId: generatedSessionId,
+        targetSessionId: generatedSessionId,
+      };
+  const effectiveSessionId = resolved.targetSessionId;
+  for (let index = 0; index < observations.length; index++) {
+    const obs = observations[index];
     if (obs.sessionId === "imported") obs.sessionId = effectiveSessionId;
+    obs.lineage = lineage;
+    obs.parentSessionId = parentSessionId;
+    if (context) {
+      const identity = buildReplaySourceIdentity({
+        context,
+        sourceSessionId: resolved.sourceSessionId,
+        targetSessionId: resolved.targetSessionId,
+        sourceEventId: codexSourceEventId(obs.raw, index),
+        sourceEventIndex: index,
+        hookType: obs.hookType,
+      });
+      obs.id = identity.observationId;
+      obs.sessionId = identity.targetSessionId;
+      obs.sourceFormat = identity.sourceFormat;
+      obs.sourceFileHash = identity.sourceFileHash;
+      obs.sourceSessionId = identity.sourceSessionId;
+      obs.sourceEventId = identity.sourceEventId;
+      obs.sourceEventIndex = identity.sourceEventIndex;
+      obs.importKey = identity.importKey;
+    } else {
+      obs.id = fingerprintId(
+        "obs",
+        `codex:${resolved.sourceSessionId}:${codexSourceEventId(obs.raw, index)}:${index}:${obs.hookType}`,
+      );
+    }
   }
 
   return {
@@ -331,5 +408,11 @@ export function parseCodexJsonlText(
     startedAt: firstTs || nowIso,
     endedAt: lastTs || nowIso,
     observations,
+    sourceFormat: context?.sourceFormat,
+    sourceFileHash: context?.sourceFileHash,
+    sourceSessionId: context ? resolved.sourceSessionId : undefined,
+    targetSessionId: context ? resolved.targetSessionId : undefined,
+    lineage,
+    parentSessionId,
   };
 }

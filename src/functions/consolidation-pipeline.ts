@@ -14,6 +14,10 @@ import {
   PROCEDURAL_EXTRACTION_SYSTEM,
   buildProceduralExtractionPrompt,
 } from "../prompts/consolidation.js";
+import {
+  resolveOutputLanguage,
+  withOutputLanguagePolicy,
+} from "../prompts/output-language.js";
 import { recordAudit } from "./audit.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
 import { logger } from "../logger.js";
@@ -49,6 +53,7 @@ export function registerConsolidationPipelineFunction(
 ): void {
   sdk.registerFunction("mem::consolidate-pipeline", 
     async (data?: { tier?: string; force?: boolean; project?: string }) => {
+      resolveOutputLanguage();
       if (!data?.force && !isConsolidationEnabled()) {
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
       }
@@ -79,7 +84,7 @@ export function registerConsolidationPipelineFunction(
 
           try {
             const response = await provider.summarize(
-              SEMANTIC_MERGE_SYSTEM,
+              withOutputLanguagePolicy(SEMANTIC_MERGE_SYSTEM),
               prompt,
             );
 
@@ -162,7 +167,7 @@ export function registerConsolidationPipelineFunction(
 
           try {
             const response = await provider.summarize(
-              PROCEDURAL_EXTRACTION_SYSTEM,
+              withOutputLanguagePolicy(PROCEDURAL_EXTRACTION_SYSTEM),
               prompt,
             );
 

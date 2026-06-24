@@ -8,6 +8,7 @@ import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 
 const SLIDING_WINDOW_SYSTEM = `You are a contextual enrichment engine. Given a primary observation and its surrounding context window (previous and next observations from the same session), produce an enriched version.
 
@@ -167,7 +168,7 @@ export function registerSlidingWindowFunction(
       try {
         const prompt = buildWindowPrompt(primary, before, after);
         const response = await provider.compress(
-          SLIDING_WINDOW_SYSTEM,
+          withOutputLanguagePolicy(SLIDING_WINDOW_SYSTEM),
           prompt,
         );
         const parsed = parseEnrichedXml(response);

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseJsonlText } from "../src/replay/jsonl-parser.js";
 import { projectTimeline } from "../src/replay/timeline.js";
+import { computeSourceFileHash } from "../src/replay/import-identity.js";
 
 const fx = (name: string) =>
   readFileSync(join(__dirname, "fixtures/jsonl", name), "utf-8");
@@ -96,6 +97,107 @@ describe("parseJsonlText", () => {
     });
     const out = parseJsonlText(text, "fb-used");
     expect(out.sessionId).toBe("fb-used");
+  });
+
+  it("returns stable observation ids across repeated parses with import context", () => {
+    const text = [
+      JSON.stringify({
+        type: "user",
+        uuid: "u-stable",
+        sessionId: "stable-session",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        message: { role: "user", content: [{ type: "text", text: "hi" }] },
+      }),
+      JSON.stringify({
+        type: "assistant",
+        uuid: "a-stable",
+        sessionId: "stable-session",
+        timestamp: "2026-01-01T00:00:01.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "hello" }] },
+      }),
+    ].join("\n");
+    const context = {
+      sourceFormat: "claude-code" as const,
+      sourceFileHash: computeSourceFileHash(text),
+    };
+
+    const first = parseJsonlText(text, undefined, context);
+    const second = parseJsonlText(text, undefined, context);
+
+    expect(first.observations.map((obs) => obs.id)).toEqual(
+      second.observations.map((obs) => obs.id),
+    );
+    expect(first.observations.every((obs) => obs.importKey === obs.id)).toBe(true);
+  });
+
+  it("marks explicit Claude sidechain rows without dropping raw data", () => {
+    const text = JSON.stringify({
+      type: "user",
+      uuid: "sidechain-user",
+      sessionId: "side-session",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      isSidechain: true,
+      message: { role: "user", content: [{ type: "text", text: "side work" }] },
+    });
+    const out = parseJsonlText(text, undefined, {
+      sourceFormat: "claude-code",
+      sourceFileHash: computeSourceFileHash(text),
+    });
+
+    expect(out.lineage).toBe("sidechain");
+    expect(out.observations[0].lineage).toBe("sidechain");
+    expect(out.observations[0].raw).toMatchObject({ isSidechain: true });
+  });
+
+  it("does not treat Claude parentUuid alone as sidechain", () => {
+    const text = JSON.stringify({
+      type: "user",
+      uuid: "child-event",
+      parentUuid: "parent-event",
+      sessionId: "main-session",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      message: { role: "user", content: [{ type: "text", text: "main work" }] },
+    });
+    const out = parseJsonlText(text, undefined, {
+      sourceFormat: "claude-code",
+      sourceFileHash: computeSourceFileHash(text),
+    });
+
+    expect(out.lineage).toBe("top-level");
+    expect(out.observations[0].lineage).toBe("top-level");
+    expect(out.observations[0].parentSessionId).toBeUndefined();
+  });
+
+  it("keeps mixed Claude main and sidechain rows at observation-level lineage", () => {
+    const text = [
+      JSON.stringify({
+        type: "user",
+        uuid: "main-event",
+        sessionId: "mixed-session",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        message: { role: "user", content: [{ type: "text", text: "main work" }] },
+      }),
+      JSON.stringify({
+        type: "user",
+        uuid: "side-event",
+        sessionId: "mixed-sidechain",
+        parentSessionId: "mixed-session",
+        timestamp: "2026-01-01T00:00:01.000Z",
+        isSidechain: true,
+        message: { role: "user", content: [{ type: "text", text: "side work" }] },
+      }),
+    ].join("\n");
+    const out = parseJsonlText(text, undefined, {
+      sourceFormat: "claude-code",
+      sourceFileHash: computeSourceFileHash(text),
+    });
+
+    expect(out.lineage).toBe("top-level");
+    expect(out.observations).toHaveLength(2);
+    expect(out.observations[0].lineage).toBe("top-level");
+    expect(out.observations[0].parentSessionId).toBeUndefined();
+    expect(out.observations[1].lineage).toBe("sidechain");
+    expect(out.observations[1].parentSessionId).toBe("mixed-session");
   });
 });
 

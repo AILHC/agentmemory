@@ -10,6 +10,7 @@ import type {
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { logger } from "../logger.js";
+import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 
 const TEMPORAL_EXTRACTION_SYSTEM = `You are a temporal knowledge extraction engine. Given observations, extract entities AND their temporal relationships with full context metadata.
 
@@ -179,7 +180,7 @@ export function registerTemporalGraphFunctions(
 
       try {
         const response = await provider.compress(
-          TEMPORAL_EXTRACTION_SYSTEM,
+          withOutputLanguagePolicy(TEMPORAL_EXTRACTION_SYSTEM),
           `Extract temporal knowledge graph from:\n\n${items}`,
         );
 

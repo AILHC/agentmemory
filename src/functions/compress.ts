@@ -13,6 +13,7 @@ import {
   COMPRESSION_SYSTEM,
   buildCompressionPrompt,
 } from "../prompts/compression.js";
+import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 import { VISION_DESCRIPTION_PROMPT } from "../prompts/vision.js";
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
 import { getSearchIndex, vectorIndexAddGuarded } from "./search.js";
@@ -135,7 +136,7 @@ export function registerCompressFunction(
 
         const { response, retried } = await compressWithRetry(
           provider,
-          COMPRESSION_SYSTEM,
+          withOutputLanguagePolicy(COMPRESSION_SYSTEM),
           prompt,
           validator,
           1,

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -129,12 +129,17 @@ describe("Reflect", () => {
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
     provider = {
       name: "test",
       compress: vi.fn(),
       summarize: vi.fn().mockResolvedValue(XML_RESPONSE),
     };
     registerReflectFunctions(sdk as never, kv as never, provider as never);
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
   });
 
   describe("mem::reflect", () => {
@@ -151,6 +156,7 @@ describe("Reflect", () => {
     });
 
     it("synthesizes insights from graph concept clusters", async () => {
+      process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
       await kv.set("mem:graph:nodes", "node_security", makeConceptNode("security"));
       await kv.set("mem:graph:nodes", "node_validation", makeConceptNode("validation"));
       await kv.set("mem:graph:nodes", "node_testing", makeConceptNode("testing"));
@@ -170,6 +176,10 @@ describe("Reflect", () => {
       expect(result.success).toBe(true);
       expect(result.newInsights).toBe(2);
       expect(provider.summarize).toHaveBeenCalled();
+      expect(provider.summarize).toHaveBeenCalledWith(
+        expect.stringContaining("AgentMemory Output Language Policy"),
+        expect.any(String),
+      );
 
       const insights = await kv.list<Insight>("mem:insights");
       expect(insights.length).toBe(2);

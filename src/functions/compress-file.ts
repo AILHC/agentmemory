@@ -5,6 +5,7 @@ import type { ISdk } from "iii-sdk";
 import type { MemoryProvider } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
+import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 
 const SENSITIVE_PATH_TERMS = [
   "secret",
@@ -134,7 +135,7 @@ export function registerCompressFileFunction(
       }
 
       const response = await provider.summarize(
-        COMPRESS_FILE_SYSTEM_PROMPT,
+        withOutputLanguagePolicy(COMPRESS_FILE_SYSTEM_PROMPT),
         `Compress this markdown file while preserving structure and code blocks:\n\n${original}`,
       );
       const compressed = stripMarkdownFence(response);

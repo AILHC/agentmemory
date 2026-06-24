@@ -13,6 +13,7 @@ import {
   REDUCE_SYSTEM,
   buildReducePrompt,
 } from "../prompts/summary.js";
+import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
 import { SummaryOutputSchema } from "../eval/schemas.js";
 import { validateOutput } from "../eval/validator.js";
@@ -68,7 +69,7 @@ async function summarizeChunkWithRetry(
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const xml = await provider.summarize(
-        SUMMARY_SYSTEM,
+        withOutputLanguagePolicy(SUMMARY_SYSTEM),
         buildSummaryPrompt(chunk),
       );
       const parsed = parseSummaryXml(xml, sessionId, project, chunk.length);
@@ -109,7 +110,7 @@ async function produceSummaryXml(
   const chunkSize = getChunkSize();
   if (compressed.length <= chunkSize) {
     const response = await provider.summarize(
-      SUMMARY_SYSTEM,
+      withOutputLanguagePolicy(SUMMARY_SYSTEM),
       buildSummaryPrompt(compressed),
     );
     return { response, mode: "single", chunks: 1 };
@@ -178,7 +179,7 @@ async function produceSummaryXml(
     };
   });
   const response = await provider.summarize(
-    REDUCE_SYSTEM,
+    withOutputLanguagePolicy(REDUCE_SYSTEM),
     buildReducePrompt(reduceInput),
   );
   return { response, mode: "chunked", chunks: chunks.length, skipped };

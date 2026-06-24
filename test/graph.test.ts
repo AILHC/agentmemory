@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -83,11 +83,17 @@ describe("Graph Functions", () => {
   beforeEach(() => {
     sdk = mockSdk();
     kv = mockKV();
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
     vi.clearAllMocks();
     registerGraphFunction(sdk as never, kv as never, mockProvider as never);
   });
 
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+  });
+
   it("graph-extract creates nodes and edges from XML response", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
     const result = (await sdk.trigger("mem::graph-extract", {
       observations: [testObs],
     })) as { success: boolean; nodesAdded: number; edgesAdded: number };
@@ -104,6 +110,14 @@ describe("Graph Functions", () => {
     const edges = await kv.list<GraphEdge>("mem:graph:edges");
     expect(edges.length).toBe(1);
     expect(edges[0].type).toBe("uses");
+    expect(mockProvider.compress).toHaveBeenCalledWith(
+      expect.stringContaining("AgentMemory Output Language Policy"),
+      expect.any(String),
+    );
+    expect(mockProvider.compress).toHaveBeenCalledWith(
+      expect.stringContaining("source/target 必须与 entity name 精确匹配"),
+      expect.any(String),
+    );
   });
 
   it("graph-extract accepts self-closing entity tags", async () => {
