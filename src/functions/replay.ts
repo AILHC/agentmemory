@@ -5,9 +5,9 @@ import type { ISdk } from "iii-sdk";
 import type {
   CompressedObservation,
   Crystal,
-  Lesson,
   RawObservation,
   Session,
+  MemoryProvider,
 } from "../types.js";
 import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
@@ -22,6 +22,12 @@ import { safeAudit } from "./audit.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
 import { getSearchIndex } from "./search.js";
 import { logger } from "../logger.js";
+import {
+  extractLessonsFromReplay,
+  type ExtractLessonsResult,
+  resolveReplayLessonExtractionConfig,
+  type ReplayLessonExtractionConfig,
+} from "./lesson-extract.js";
 
 export const MAX_FILES_DEFAULT = 200;
 export const MAX_FILES_UPPER_BOUND = 1000;
@@ -148,11 +154,6 @@ function rawFromCompressed(obs: ReplayStoredObservation): RawObservation {
   };
 }
 
-const LESSON_PATTERNS: RegExp[] = [
-  /\b(always|never|don'?t|do not|make sure|remember to|note:|caveat:|warning:)\b[^.\n]{10,200}[.!\n]/gi,
-  /\b(prefer|avoid)\s[^.\n]{10,200}[.!\n]/gi,
-];
-
 function normalizeReplayLoadLimit(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return DEFAULT_REPLAY_LOAD_LIMIT;
@@ -172,13 +173,41 @@ function normalizeReplayEventPayloadChars(value: unknown): number {
   return Math.max(200, Math.min(MAX_REPLAY_EVENT_PAYLOAD_CHARS, Math.trunc(value)));
 }
 
-async function deriveCrystalAndLessons(
+function summarizeLessonExtractionSessions(
+  sessions: Record<string, ExtractLessonsResult>,
+  mode: ReplayLessonExtractionConfig["mode"],
+) {
+  const sessionsSummary = Object.fromEntries(
+    Object.entries(sessions).map(([sessionId, result]) => [
+      sessionId,
+      {
+        lessonIds: result.lessonIds,
+        created: result.created,
+        reinforced: result.reinforced,
+        skipped: result.skipped,
+        errors: result.errors,
+      },
+    ]),
+  );
+
+  return {
+    mode,
+    sessions: sessionsSummary,
+    created: Object.values(sessions).reduce((sum, result) => sum + result.created, 0),
+    reinforced: Object.values(sessions).reduce((sum, result) => sum + result.reinforced, 0),
+    skipped: Object.values(sessions).reduce((sum, result) => sum + result.skipped, 0),
+    errors: Object.values(sessions).flatMap((result) => result.errors),
+  };
+}
+
+async function deriveCrystal(
   kv: StateKV,
   sessionId: string,
   project: string,
   rawObs: RawObservation[],
   compressed: CompressedObservation[],
   firstPrompt: string | undefined,
+  lessonIds: string[],
 ): Promise<void> {
   if (rawObs.length === 0) return;
   const createdAt = new Date().toISOString();
@@ -188,80 +217,6 @@ async function deriveCrystalAndLessons(
   for (const c of compressed) {
     for (const f of c.files || []) files.add(f);
     if (c.type && c.type !== "conversation" && c.title) tools.add(c.title);
-  }
-
-  const assistantTexts: string[] = [];
-  const userPrompts: string[] = [];
-  for (const r of rawObs) {
-    if (typeof r.assistantResponse === "string" && r.assistantResponse.trim()) {
-      assistantTexts.push(r.assistantResponse);
-    }
-    if (typeof r.userPrompt === "string" && r.userPrompt.trim()) {
-      userPrompts.push(r.userPrompt);
-    }
-  }
-
-  const lessonMatches = new Map<string, string>();
-  for (const text of assistantTexts.concat(userPrompts).slice(0, 200)) {
-    for (const pat of LESSON_PATTERNS) {
-      pat.lastIndex = 0;
-      let m: RegExpExecArray | null;
-      while ((m = pat.exec(text)) !== null && lessonMatches.size < 40) {
-        const snippet = m[0].replace(/\s+/g, " ").trim();
-        if (snippet.length >= 20 && snippet.length <= 220) {
-          const key = snippet.toLowerCase();
-          if (!lessonMatches.has(key)) lessonMatches.set(key, snippet);
-        }
-      }
-    }
-  }
-
-  const lessonEntries = Array.from(lessonMatches.values()).slice(0, 20);
-  const lessonIds: string[] = [];
-  for (const content of lessonEntries) {
-    // Content-addressed ID so re-importing the same JSONL does not
-    // duplicate lessons. fingerprintId hashes the normalized content,
-    // giving a stable lesson_xxx for identical text.
-    const lessonId = fingerprintId("lesson", content.trim().toLowerCase());
-    try {
-      const existing = await kv.get<Lesson>(KV.lessons, lessonId);
-      if (existing) {
-        const existingSources = existing.sourceIds || [];
-        const mergedSources = existingSources.includes(sessionId)
-          ? existingSources
-          : [...existingSources, sessionId];
-        const existingTags = existing.tags || [];
-        const mergedTags = existingTags.includes("auto-import")
-          ? existingTags
-          : [...existingTags, "auto-import"];
-        const merged: Lesson = {
-          ...existing,
-          sourceIds: mergedSources,
-          tags: mergedTags,
-          reinforcements: (existing.reinforcements || 0) + 1,
-          updatedAt: createdAt,
-          lastReinforcedAt: createdAt,
-        };
-        await kv.set(KV.lessons, lessonId, merged);
-      } else {
-        const lesson: Lesson = {
-          id: lessonId,
-          content,
-          context: firstPrompt || project,
-          confidence: 0.4,
-          reinforcements: 0,
-          source: "consolidation",
-          sourceIds: [sessionId],
-          project,
-          tags: ["auto-import"],
-          createdAt,
-          updatedAt: createdAt,
-          decayRate: 0.05,
-        };
-        await kv.set(KV.lessons, lessonId, lesson);
-      }
-      lessonIds.push(lessonId);
-    } catch {}
   }
 
   // Content-addressed on sessionId so re-importing the same session
@@ -405,7 +360,11 @@ async function findJsonlFiles(
   };
 }
 
-export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
+export function registerReplayFunctions(
+  sdk: ISdk,
+  kv: StateKV,
+  provider: MemoryProvider,
+): void {
   sdk.registerFunction(
     "mem::replay::load",
     async (data: {
@@ -444,7 +403,11 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
   sdk.registerFunction(
     "mem::replay::import-jsonl",
     async (
-      data: { path?: string; maxFiles?: number } = {},
+      data: {
+        path?: string;
+        maxFiles?: number;
+        lessonExtraction?: Partial<ReplayLessonExtractionConfig>;
+      } = {},
     ): Promise<
       | {
           success: true;
@@ -459,6 +422,23 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           filteredSidechainSession: number;
           mergedSidechainSession: number;
           ambiguousLineage: number;
+          lessonExtraction: {
+            mode: ReplayLessonExtractionConfig["mode"];
+            sessions: Record<
+              string,
+              {
+                lessonIds: string[];
+                created: number;
+                reinforced: number;
+                skipped: number;
+                errors: string[];
+              }
+            >;
+            created: number;
+            reinforced: number;
+            skipped: number;
+            errors: string[];
+          };
           discovered: number;
           truncated: boolean;
           traversalCapped: boolean;
@@ -502,6 +482,10 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
       let truncated = false;
       let discovered = 0;
       let traversalCapped = false;
+      const lessonExtractionConfig = resolveReplayLessonExtractionConfig(
+        process.env,
+        data.lessonExtraction || {},
+      );
       if (stat.isDirectory()) {
         const found = await findJsonlFiles(abs, maxFiles);
         files = found.files;
@@ -530,6 +514,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           filteredSidechainSession: 0,
           mergedSidechainSession: 0,
           ambiguousLineage: 0,
+          lessonExtraction: summarizeLessonExtractionSessions({}, lessonExtractionConfig.mode),
           discovered,
           truncated,
           traversalCapped,
@@ -548,6 +533,7 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
       let filteredSidechainSession = 0;
       let mergedSidechainSession = 0;
       let ambiguousLineage = 0;
+      const lessonExtractionResults: Record<string, ExtractLessonsResult> = {};
 
       const parsedFiles: Array<{ parsed: ReturnType<typeof parseTranscriptText> }> = [];
       const batchTopLevelSessionIds = new Set<string>();
@@ -761,13 +747,35 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
           sessionIds.add(targetSessionId);
 
           if (newRawObservations.length > 0) {
-            await deriveCrystalAndLessons(
+            const extraction = await extractLessonsFromReplay({
+              kv,
+              provider,
+              sessionId: targetSessionId,
+              project: parsed.project,
+              rawObservations: newRawObservations,
+              compressedObservations: newCompressedObservations,
+              firstPrompt,
+              config: lessonExtractionConfig,
+            }).catch((error) => ({
+              lessonIds: [],
+              created: 0,
+              reinforced: 0,
+              skipped: 0,
+              errors: [
+                error instanceof Error ? error.message : String(error),
+              ],
+            }));
+
+            lessonExtractionResults[targetSessionId] = extraction;
+
+            await deriveCrystal(
               kv,
               targetSessionId,
               parsed.project,
               newRawObservations,
               newCompressedObservations,
               firstPrompt,
+              extraction.lessonIds,
             );
           }
         }
@@ -801,6 +809,10 @@ export function registerReplayFunctions(sdk: ISdk, kv: StateKV): void {
         filteredSidechainSession,
         mergedSidechainSession,
         ambiguousLineage,
+        lessonExtraction: summarizeLessonExtractionSessions(
+          lessonExtractionResults,
+          lessonExtractionConfig.mode,
+        ),
         discovered,
         truncated,
         traversalCapped,

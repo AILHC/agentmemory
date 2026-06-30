@@ -331,7 +331,7 @@ async function main() {
   registerTemporalGraphFunctions(sdk, kv, provider);
   registerRetentionFunctions(sdk, kv);
   registerCompressFileFunction(sdk, kv, provider);
-  registerReplayFunctions(sdk, kv);
+  registerReplayFunctions(sdk, kv, provider);
   bootLog(
     `v0.6 advanced retrieval: sliding-window, query-expansion, temporal-graph, retention-scoring`,
   );

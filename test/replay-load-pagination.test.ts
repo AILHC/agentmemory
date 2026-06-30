@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { registerReplayFunctions } from "../src/functions/replay.js";
 import { parseReplayLoadPageParam, registerApiTriggers } from "../src/triggers/api.js";
 import { KV } from "../src/state/schema.js";
+import type { MemoryProvider } from "../src/types.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -22,6 +23,14 @@ function mockKV() {
     },
     list: async <T>(scope: string): Promise<T[]> =>
       Array.from(store.get(scope)?.values() ?? []) as T[],
+  };
+}
+
+function noopProvider(): MemoryProvider {
+  return {
+    name: "noop",
+    compress: vi.fn().mockResolvedValue(""),
+    summarize: vi.fn().mockResolvedValue(""),
   };
 }
 
@@ -75,7 +84,7 @@ describe("mem::replay::load pagination", () => {
   it("returns the first bounded page by default", async () => {
     const kv = mockKV();
     const sdk = mockSdk();
-    registerReplayFunctions(sdk, kv as any);
+    registerReplayFunctions(sdk, kv as any, noopProvider());
     await seedObservations(kv, "sess-large", 1200);
 
     const result = await sdk.trigger("mem::replay::load", { sessionId: "sess-large" });
@@ -95,7 +104,7 @@ describe("mem::replay::load pagination", () => {
   it("returns the requested page and clamps limit to the maximum", async () => {
     const kv = mockKV();
     const sdk = mockSdk();
-    registerReplayFunctions(sdk, kv as any);
+    registerReplayFunctions(sdk, kv as any, noopProvider());
     await seedObservations(kv, "sess-large", 1200);
 
     const result = await sdk.trigger("mem::replay::load", {
@@ -119,7 +128,7 @@ describe("mem::replay::load pagination", () => {
   it("keeps default replay load payload bounded even when event fields are huge", async () => {
     const kv = mockKV();
     const sdk = mockSdk();
-    registerReplayFunctions(sdk, kv as any);
+    registerReplayFunctions(sdk, kv as any, noopProvider());
     await kv.set(KV.sessions, "sess-huge-payload", {
       id: "sess-huge-payload",
       startedAt: "2026-01-01T00:00:00.000Z",
@@ -154,7 +163,7 @@ describe("mem::replay::load pagination", () => {
   it("keeps a 15000 observation replay load response bounded by bytes", async () => {
     const kv = mockKV();
     const sdk = mockSdk();
-    registerReplayFunctions(sdk, kv as any);
+    registerReplayFunctions(sdk, kv as any, noopProvider());
     await kv.set(KV.sessions, "sess-huge", {
       id: "sess-huge",
       startedAt: "2026-01-01T00:00:00.000Z",

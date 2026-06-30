@@ -60,6 +60,7 @@ import { loadConfig } from "../src/config.js";
 import { createProvider } from "../src/providers/index.js";
 import { registerReplayFunctions } from "../src/functions/replay.js";
 import { registerSummarizeFunction } from "../src/functions/summarize.js";
+import type { MemoryProvider } from "../src/types.js";
 
 const CLAUDE_FIXTURE = `{"type":"user","uuid":"u1","sessionId":"sess-claude","timestamp":"2026-04-17T10:00:00.000Z","cwd":"~/.tmp/cl-project","message":{"role":"user","content":[{"type":"text","text":"请总结这次会话"}]}}
 {"type":"assistant","uuid":"a1","sessionId":"sess-claude","timestamp":"2026-04-17T10:00:05.000Z","message":{"role":"assistant","content":[{"type":"text","text":"这是一次修复登录问题的会话。"}]}}`;
@@ -77,6 +78,14 @@ function mockKV() {
     delete: async (_scope: string, _key: string) => {},
     list: async <T>(scope: string): Promise<T[]> =>
       Array.from(store.get(scope)?.values() ?? []) as T[],
+  };
+}
+
+function noopProvider(): MemoryProvider {
+  return {
+    name: "noop",
+    compress: vi.fn().mockResolvedValue(""),
+    summarize: vi.fn().mockResolvedValue(""),
   };
 }
 
@@ -141,7 +150,7 @@ describe("mem::summarize with pi-agent-sdk provider", () => {
 
     const kv = mockKV();
     const sdk = mockSdk(kv);
-    registerReplayFunctions(sdk, kv as never);
+    registerReplayFunctions(sdk, kv as never, noopProvider());
     registerSummarizeFunction(sdk as never, kv as never, provider);
 
     const dir = join(tmpRoot, "project");

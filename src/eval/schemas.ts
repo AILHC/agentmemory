@@ -60,6 +60,17 @@ export const SummaryOutputSchema = z.object({
   concepts: z.array(z.string()),
 });
 
+export const LessonExtractionOutputSchema = z.object({
+  lessons: z.array(
+    z.object({
+      content: z.string().min(1),
+      context: z.string(),
+      confidence: z.number().min(0).max(1),
+      tags: z.array(z.string()),
+    }),
+  ),
+});
+
 export const SearchInputSchema = z.object({
   query: z.string().min(1),
   limit: z.number().int().positive().optional(),

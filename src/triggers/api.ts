@@ -12,6 +12,7 @@ import { isSlotsEnabled, isReflectEnabled } from "../functions/slots.js";
 import { renderViewerDocument } from "../viewer/document.js";
 import { getBoundViewerPort, getViewerSkipped } from "../viewer/server.js";
 import { MAX_FILES_UPPER_BOUND } from "../functions/replay.js";
+import type { ReplayLessonExtractionConfig } from "../functions/lesson-extract.js";
 import { logger } from "../logger.js";
 import {
   isGraphExtractionEnabled,
@@ -42,6 +43,111 @@ export function parseReplayLoadPageParam(value: unknown): number | undefined {
   const parsed = Number(value);
   if (!Number.isSafeInteger(parsed)) return undefined;
   return parsed;
+}
+
+function parseLessonExtractionPayload(
+  raw: unknown,
+): { payload: Partial<ReplayLessonExtractionConfig>; hasValue: boolean } | null {
+  if (raw === undefined) return { payload: {}, hasValue: false };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+
+  const payload = raw as Record<string, unknown>;
+  const allowedKeys = new Set([
+    "mode",
+    "textLimit",
+    "matchLimit",
+    "saveLimit",
+    "additionalHeuristicTerms",
+    "allowUnbounded",
+    "llmChunkSize",
+    "llmChunkConcurrency",
+  ]);
+  const unknownKeys = Object.keys(payload).filter((key) => !allowedKeys.has(key));
+  if (unknownKeys.length > 0) return null;
+
+  const out: Partial<ReplayLessonExtractionConfig> = {};
+
+  if (payload.mode !== undefined) {
+    if (
+      payload.mode !== "off" &&
+      payload.mode !== "heuristic" &&
+      payload.mode !== "llm" &&
+      payload.mode !== "hybrid"
+    ) {
+      return null;
+    }
+    out.mode = payload.mode;
+  }
+
+  if (payload.textLimit !== undefined) {
+    if (
+      typeof payload.textLimit !== "number" ||
+      !Number.isInteger(payload.textLimit) ||
+      payload.textLimit < 0
+    ) {
+      return null;
+    }
+    out.textLimit = payload.textLimit;
+  }
+
+  if (payload.matchLimit !== undefined) {
+    if (
+      typeof payload.matchLimit !== "number" ||
+      !Number.isInteger(payload.matchLimit) ||
+      payload.matchLimit < 0
+    ) {
+      return null;
+    }
+    out.matchLimit = payload.matchLimit;
+  }
+
+  if (payload.saveLimit !== undefined) {
+    if (
+      typeof payload.saveLimit !== "number" ||
+      !Number.isInteger(payload.saveLimit) ||
+      payload.saveLimit < 0
+    ) {
+      return null;
+    }
+    out.saveLimit = payload.saveLimit;
+  }
+
+  if (payload.allowUnbounded !== undefined) {
+    if (typeof payload.allowUnbounded !== "boolean") return null;
+    out.allowUnbounded = payload.allowUnbounded;
+  }
+
+  if (payload.additionalHeuristicTerms !== undefined) {
+    if (!Array.isArray(payload.additionalHeuristicTerms)) return null;
+    for (const term of payload.additionalHeuristicTerms) {
+      if (typeof term !== "string") return null;
+    }
+    out.additionalHeuristicTerms = payload.additionalHeuristicTerms;
+  }
+
+  if (payload.llmChunkSize !== undefined) {
+    if (
+      typeof payload.llmChunkSize !== "number" ||
+      !Number.isInteger(payload.llmChunkSize) ||
+      payload.llmChunkSize < 1
+    ) {
+      return null;
+    }
+    out.llmChunkSize = payload.llmChunkSize;
+  }
+
+  if (payload.llmChunkConcurrency !== undefined) {
+    if (
+      typeof payload.llmChunkConcurrency !== "number" ||
+      !Number.isInteger(payload.llmChunkConcurrency) ||
+      payload.llmChunkConcurrency < 1
+    ) {
+      return null;
+    }
+    out.llmChunkConcurrency = payload.llmChunkConcurrency;
+  }
+
+  return { payload: out, hasValue: Object.keys(payload).length > 0 };
 }
 
 function checkAuth(
@@ -523,12 +629,20 @@ export function registerApiTriggers(
 
   sdk.registerFunction("api::replay::import",
     async (
-      req: ApiRequest<{ path?: string; maxFiles?: number }>,
+      req: ApiRequest<{
+        path?: string;
+        maxFiles?: number;
+        lessonExtraction?: Record<string, unknown>;
+      }>,
     ): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
       const body = (req.body ?? {}) as Record<string, unknown>;
-      const payload: { path?: string; maxFiles?: number } = {};
+      const payload: {
+        path?: string;
+        maxFiles?: number;
+        lessonExtraction?: Partial<ReplayLessonExtractionConfig>;
+      } = {};
       if (body.path !== undefined) {
         if (typeof body.path !== "string" || body.path.trim().length === 0) {
           return {
@@ -553,6 +667,19 @@ export function registerApiTriggers(
           };
         }
         payload.maxFiles = n;
+      }
+      const parsedLessonExtraction = parseLessonExtractionPayload(body.lessonExtraction);
+      if (parsedLessonExtraction === null) {
+        return {
+          status_code: 400,
+          body: {
+            error:
+              "invalid lessonExtraction. Allowed fields: mode, textLimit, matchLimit, saveLimit, additionalHeuristicTerms, allowUnbounded, llmChunkSize, llmChunkConcurrency",
+          },
+        };
+      }
+      if (parsedLessonExtraction.hasValue) {
+        payload["lessonExtraction"] = parsedLessonExtraction.payload;
       }
       const result = await sdk.trigger({
         function_id: "mem::replay::import-jsonl",

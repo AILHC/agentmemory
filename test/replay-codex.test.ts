@@ -7,7 +7,7 @@ import { parseCodexJsonlText } from "../src/replay/codex-jsonl-parser.js";
 import { registerReplayFunctions } from "../src/functions/replay.js";
 import { computeSourceFileHash } from "../src/replay/import-identity.js";
 import { KV } from "../src/state/schema.js";
-import type { Session } from "../src/types.js";
+import type { MemoryProvider, Session } from "../src/types.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -45,6 +45,14 @@ function mockKV() {
     list: async <T>(scope: string): Promise<T[]> =>
       Array.from(store.get(scope)?.values() ?? []) as T[],
     getSetCalls: () => setCalls,
+  };
+}
+
+function noopProvider(): MemoryProvider {
+  return {
+    name: "noop",
+    compress: vi.fn().mockResolvedValue(""),
+    summarize: vi.fn().mockResolvedValue(""),
   };
 }
 
@@ -623,7 +631,7 @@ describe("replay import sdk", () => {
     kv = mockKV();
     sdk = mockSdk(kv);
     mockSearchAdd.mockClear();
-    registerReplayFunctions(sdk, kv as never);
+    registerReplayFunctions(sdk, kv as never, noopProvider());
   });
 
   function writeCodexFixture() {
@@ -830,6 +838,124 @@ describe("replay import sdk", () => {
     expect(secondLessons).toHaveLength(1);
     expect(secondLessons[0].reinforcements).toBe(0);
     expect(secondCrystals[0].lessons).toContain(firstLessons[0].id);
+  });
+
+  it("extracts Chinese replay lessons and links them to crystals", async () => {
+    const dir = join(tmpRoot, "zh-lesson");
+    mkdirSync(dir, { recursive: true });
+    const text = [
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:00.000Z",
+        type: "session_meta",
+        payload: { id: "zh-lesson-session", cwd: "/workspace/zh-lesson" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:01.000Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          id: "zh-lesson-prompt-1",
+          message: "以后回答 AgentMemory 机制问题必须依据源码和测试，不能猜测。",
+        },
+      }),
+    ].join("\n");
+    writeFileSync(join(dir, "session.jsonl"), text);
+
+    const result = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+    })) as {
+      success: boolean;
+      sessionIds?: string[];
+      lessonExtraction?: { created: number; sessions?: Record<string, unknown> };
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.lessonExtraction?.created).toBe(1);
+
+    const lessons = await kv.list<any>(KV.lessons);
+    expect(lessons).toHaveLength(1);
+    expect(lessons[0].id).toMatch(/^lesson_/);
+    expect(lessons[0].content).toContain("以后回答 AgentMemory 机制问题必须依据源码和测试");
+
+    const crystals = await kv.list<any>(KV.crystals);
+    expect(crystals).toHaveLength(1);
+    expect(crystals[0].lessons).toContain(lessons[0].id);
+    expect(result.sessionIds?.[0]).toBe(crystals[0].sessionId);
+  });
+
+  it("does not create or reinforce lessons when mode is off and still keeps crystal links", async () => {
+    const dir = join(tmpRoot, "off-mode");
+    mkdirSync(dir, { recursive: true });
+    const baseText = [
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:00.000Z",
+        type: "session_meta",
+        payload: { id: "off-mode-session", cwd: "/workspace/off-mode" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:01.000Z",
+        type: "event_msg",
+        payload: {
+          type: "user_message",
+          id: "off-mode-prompt",
+          message:
+            "Always validate import keys before writing duplicate observations.",
+        },
+      }),
+    ].join("\n");
+    writeFileSync(join(dir, "01-base.jsonl"), baseText);
+
+    await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+    });
+
+    const firstLessons = await kv.list<any>(KV.lessons);
+    const firstCrystal = (await kv.list<any>(KV.crystals))[0];
+    expect(firstLessons).toHaveLength(1);
+    expect(firstCrystal.lessons).toHaveLength(1);
+
+    const updateText = [
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:02.000Z",
+        type: "session_meta",
+        payload: { id: "off-mode-session", cwd: "/workspace/off-mode" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:03.000Z",
+        type: "event_msg",
+        payload: {
+          type: "assistant_message",
+          id: "off-mode-assistant",
+          message: "继续记录这个会话。",
+        },
+      }),
+    ].join("\n");
+    writeFileSync(join(dir, "02-update.jsonl"), updateText);
+
+    const second = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      lessonExtraction: { mode: "off" as const },
+    })) as {
+      success: boolean;
+      lessonExtraction?: {
+        mode: string;
+        created: number;
+        reinforced: number;
+        skipped: number;
+        sessions?: Record<string, unknown>;
+      };
+    };
+
+    const secondLessons = await kv.list<any>(KV.lessons);
+    const secondCrystal = (await kv.list<any>(KV.crystals))[0];
+
+    expect(second.success).toBe(true);
+    expect(second.lessonExtraction?.mode).toBe("off");
+    expect(second.lessonExtraction?.created).toBe(0);
+    expect(second.lessonExtraction?.reinforced).toBe(0);
+    expect(secondLessons).toHaveLength(1);
+    expect(secondLessons[0].id).toBe(firstLessons[0].id);
+    expect(secondCrystal.lessons).toEqual(firstCrystal.lessons);
   });
 
   it("uses one stable target session id for copied Codex JSONL without real session id", async () => {

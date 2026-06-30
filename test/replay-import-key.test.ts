@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { MemoryProvider } from "../src/types.js";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -33,6 +34,14 @@ function mockKV() {
     list: async <T>(scope: string): Promise<T[]> =>
       Array.from(store.get(scope)?.values() ?? []) as T[],
     getSetCalls: () => setCalls,
+  };
+}
+
+function noopProvider(): MemoryProvider {
+  return {
+    name: "noop",
+    compress: vi.fn().mockResolvedValue(""),
+    summarize: vi.fn().mockResolvedValue(""),
   };
 }
 
@@ -98,7 +107,7 @@ describe("import-jsonl re-key on parsed.sessionId (#775)", () => {
     writeFixture("sess-no-id");
     const kv = mockKV();
     const sdk = mockSdk(kv);
-    registerReplayFunctions(sdk, kv as never);
+    registerReplayFunctions(sdk, kv as never, noopProvider());
 
     // Seed an existing session row that is MISSING `id` — the
     // pre-fix code would re-key on `existing.id` (undefined) and
@@ -138,7 +147,7 @@ describe("import-jsonl re-key on parsed.sessionId (#775)", () => {
     writeFixture("sess-fresh");
     const kv = mockKV();
     const sdk = mockSdk(kv);
-    registerReplayFunctions(sdk, kv as never);
+    registerReplayFunctions(sdk, kv as never, noopProvider());
 
     const result = (await sdk.trigger("mem::replay::import-jsonl", {
       path: tmpRoot,
