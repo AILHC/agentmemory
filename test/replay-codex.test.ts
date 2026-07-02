@@ -934,11 +934,11 @@ describe("replay import sdk", () => {
 
     const second = (await sdk.trigger("mem::replay::import-jsonl", {
       path: dir,
-      lessonExtraction: { mode: "off" as const },
+      lessonExtraction: { enabled: false },
     })) as {
       success: boolean;
       lessonExtraction?: {
-        mode: string;
+        enabled: boolean;
         created: number;
         reinforced: number;
         skipped: number;
@@ -950,12 +950,33 @@ describe("replay import sdk", () => {
     const secondCrystal = (await kv.list<any>(KV.crystals))[0];
 
     expect(second.success).toBe(true);
-    expect(second.lessonExtraction?.mode).toBe("off");
+    expect(second.lessonExtraction?.enabled).toBe(false);
     expect(second.lessonExtraction?.created).toBe(0);
     expect(second.lessonExtraction?.reinforced).toBe(0);
     expect(secondLessons).toHaveLength(1);
     expect(secondLessons[0].id).toBe(firstLessons[0].id);
     expect(secondCrystal.lessons).toEqual(firstCrystal.lessons);
+  });
+
+  it("rejects legacy lesson extraction mode in SDK replay import calls", async () => {
+    const dir = join(tmpRoot, "reject-lesson-mode");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, "session.jsonl"),
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:00.000Z",
+        type: "session_meta",
+        payload: { id: "reject-mode-session", cwd: "/workspace/reject-mode" },
+      }),
+    );
+
+    const result = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      lessonExtraction: { mode: "off" },
+    })) as { success: boolean; error?: string };
+
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("invalid lessonExtraction");
   });
 
   it("uses one stable target session id for copied Codex JSONL without real session id", async () => {

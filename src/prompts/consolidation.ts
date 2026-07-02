@@ -11,6 +11,14 @@ Rules:
 - Combine overlapping information into single concise facts
 - Skip ephemeral details (specific error messages, temporary states)`;
 
+export const SEMANTIC_MERGE_OUTPUT_CONTRACT = {
+  semantic: [
+    "<fact> 内容必须使用简体中文，可保留 XML 结构与 attributes（如 confidence）不变。",
+    "XML tags、attributes（包括 confidence）和 XML 结构不可改写。",
+    "paths、commands、package/API/class/function/type names、URLs、代码标识符保持原文，不要翻译。",
+  ],
+} as const;
+
 export function buildSemanticMergePrompt(
   episodes: Array<{ title: string; narrative: string; concepts: string[] }>,
 ): string {

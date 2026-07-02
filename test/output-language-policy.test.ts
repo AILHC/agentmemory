@@ -4,6 +4,10 @@ import {
   resolveOutputLanguage,
   withOutputLanguagePolicy,
 } from "../src/prompts/output-language.js";
+import { LESSON_EXTRACTION_OUTPUT_CONTRACT } from "../src/prompts/lesson-extraction.js";
+import { SUMMARY_OUTPUT_CONTRACT } from "../src/prompts/summary.js";
+import { REFLECT_OUTPUT_CONTRACT } from "../src/prompts/reflect.js";
+import { SEMANTIC_MERGE_OUTPUT_CONTRACT } from "../src/prompts/consolidation.js";
 
 describe("AgentMemory output language policy", () => {
   afterEach(() => {
@@ -68,6 +72,54 @@ describe("AgentMemory output language policy", () => {
     expect(prompt).toContain("concepts/tags/sourceConceptCluster");
     expect(prompt).toContain("保留英文技术标识");
     expect(prompt).toContain("中英双语");
+  });
+
+  it("supports field-level contracts for semantic merge", () => {
+    const prompt = withOutputLanguagePolicy(
+      "Extract semantic facts.",
+      { AGENTMEMORY_OUTPUT_LANGUAGE: "zh-CN" },
+      SEMANTIC_MERGE_OUTPUT_CONTRACT,
+    );
+
+    expect(prompt).toContain("Field-level contract:");
+    expect(prompt).toContain("<fact> 内容必须");
+    expect(prompt).toContain("XML tags、attributes");
+  });
+
+  it("supports field-level contracts for lesson extraction", () => {
+    const prompt = withOutputLanguagePolicy(
+      "Extract lesson.",
+      { AGENTMEMORY_OUTPUT_LANGUAGE: "zh-CN" },
+      LESSON_EXTRACTION_OUTPUT_CONTRACT,
+    );
+
+    expect(prompt).toContain("<content> 与 <context> 必须使用简体中文");
+    expect(prompt).toContain("如出现 <evidence>");
+    expect(prompt).toContain("<tag> 可保留英文技术标识或中英双语");
+  });
+
+  it("supports field-level contracts for summary", () => {
+    const prompt = withOutputLanguagePolicy(
+      "Summarize sessions.",
+      { AGENTMEMORY_OUTPUT_LANGUAGE: "zh-CN" },
+      SUMMARY_OUTPUT_CONTRACT,
+    );
+
+    expect(prompt).toContain("title、narrative、keyDecisions");
+    expect(prompt).toContain("filesModified");
+    expect(prompt).toContain("保持原文");
+  });
+
+  it("supports field-level contracts for reflect", () => {
+    const prompt = withOutputLanguagePolicy(
+      "Reflect on observations.",
+      { AGENTMEMORY_OUTPUT_LANGUAGE: "zh-CN" },
+      REFLECT_OUTPUT_CONTRACT,
+    );
+
+    expect(prompt).toContain("<insight> 的 <title> 与正文内容使用简体中文");
+    expect(prompt).toContain("sourceConceptCluster");
+    expect(prompt).toContain("relationship");
   });
 
   it("keeps graph identifiers exact and unmodified", () => {

@@ -66,6 +66,8 @@ export const LessonExtractionOutputSchema = z.object({
       content: z.string().min(1),
       context: z.string(),
       confidence: z.number().min(0).max(1),
+      importance: z.number().min(0).max(1).optional(),
+      evidence: z.string().optional(),
       tags: z.array(z.string()),
     }),
   ),

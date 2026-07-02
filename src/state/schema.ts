@@ -59,6 +59,8 @@ export const KV = {
   lessons: "mem:lessons",
   insights: "mem:insights",
   graphEdgeHistory: "mem:graph:edge-history",
+  lessonExtractionRuns: "mem:lesson-extraction:runs",
+  lessonExtractionChunks: (runId: string) => `mem:lesson-extraction:chunks:${runId}`,
   enrichedChunks: (sessionId: string) => `mem:enriched:${sessionId}`,
   latentEmbeddings: (obsId: string) => `mem:latent:${obsId}`,
   retentionScores: "mem:retention",

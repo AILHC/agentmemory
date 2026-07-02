@@ -812,8 +812,10 @@ export interface Lesson {
   context: string;
   confidence: number;
   reinforcements: number;
-  source: "crystal" | "manual" | "consolidation";
+  source: "crystal" | "manual" | "consolidation" | "heuristic" | "llm";
+  origin?: "replay-import-heuristic" | "llm-session-extraction";
   sourceIds: string[];
+  sourceRunId?: string;
   project?: string;
   tags: string[];
   createdAt: string;
@@ -822,6 +824,57 @@ export interface Lesson {
   lastDecayedAt?: string;
   decayRate: number;
   deleted?: boolean;
+}
+
+export type LessonExtractionRunStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "retryable"
+  | "skipped";
+
+export interface LessonExtractionRun {
+  id: string;
+  sessionId: string;
+  project?: string;
+  strategy: "llm";
+  status: LessonExtractionRunStatus;
+  inputHash: string;
+  configHash: string;
+  providerName: string;
+  config: {
+    textLimit: number;
+    saveLimit: number;
+    chunkSize: number;
+    chunkConcurrency: number;
+    timeoutMs: number;
+  };
+  attempts: number;
+  createdLessonIds: string[];
+  replacedLessonIds: string[];
+  skippedReason?: string;
+  lastError?: string;
+  startedAt?: string;
+  runningLeaseUntil?: string;
+  finishedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LessonExtractionChunkRun {
+  id: string;
+  runId: string;
+  sessionId: string;
+  chunkIndex: number;
+  status: LessonExtractionRunStatus;
+  attempts: number;
+  lessonIds: string[];
+  lastError?: string;
+  startedAt?: string;
+  finishedAt?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Insight {

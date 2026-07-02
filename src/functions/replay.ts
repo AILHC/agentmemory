@@ -175,7 +175,7 @@ function normalizeReplayEventPayloadChars(value: unknown): number {
 
 function summarizeLessonExtractionSessions(
   sessions: Record<string, ExtractLessonsResult>,
-  mode: ReplayLessonExtractionConfig["mode"],
+  enabled: boolean,
 ) {
   const sessionsSummary = Object.fromEntries(
     Object.entries(sessions).map(([sessionId, result]) => [
@@ -191,13 +191,32 @@ function summarizeLessonExtractionSessions(
   );
 
   return {
-    mode,
+    enabled,
     sessions: sessionsSummary,
     created: Object.values(sessions).reduce((sum, result) => sum + result.created, 0),
     reinforced: Object.values(sessions).reduce((sum, result) => sum + result.reinforced, 0),
     skipped: Object.values(sessions).reduce((sum, result) => sum + result.skipped, 0),
     errors: Object.values(sessions).flatMap((result) => result.errors),
   };
+}
+
+function validateReplayLessonExtractionPayload(raw: unknown): string | null {
+  if (raw === undefined) return null;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return "lessonExtraction must be an object";
+  }
+  const payload = raw as Record<string, unknown>;
+  const allowedKeys = new Set([
+    "enabled",
+    "textLimit",
+    "matchLimit",
+    "saveLimit",
+    "additionalHeuristicTerms",
+    "allowUnbounded",
+  ]);
+  const unknownKeys = Object.keys(payload).filter((key) => !allowedKeys.has(key));
+  if (unknownKeys.length === 0) return null;
+  return `invalid lessonExtraction. Allowed fields: ${Array.from(allowedKeys).join(", ")}`;
 }
 
 async function deriveCrystal(
@@ -363,7 +382,7 @@ async function findJsonlFiles(
 export function registerReplayFunctions(
   sdk: ISdk,
   kv: StateKV,
-  provider: MemoryProvider,
+  _provider: MemoryProvider,
 ): void {
   sdk.registerFunction(
     "mem::replay::load",
@@ -423,7 +442,7 @@ export function registerReplayFunctions(
           mergedSidechainSession: number;
           ambiguousLineage: number;
           lessonExtraction: {
-            mode: ReplayLessonExtractionConfig["mode"];
+            enabled: boolean;
             sessions: Record<
               string,
               {
@@ -482,6 +501,12 @@ export function registerReplayFunctions(
       let truncated = false;
       let discovered = 0;
       let traversalCapped = false;
+      const lessonExtractionError = validateReplayLessonExtractionPayload(
+        data.lessonExtraction,
+      );
+      if (lessonExtractionError) {
+        return { success: false, error: lessonExtractionError };
+      }
       const lessonExtractionConfig = resolveReplayLessonExtractionConfig(
         process.env,
         data.lessonExtraction || {},
@@ -514,7 +539,10 @@ export function registerReplayFunctions(
           filteredSidechainSession: 0,
           mergedSidechainSession: 0,
           ambiguousLineage: 0,
-          lessonExtraction: summarizeLessonExtractionSessions({}, lessonExtractionConfig.mode),
+          lessonExtraction: summarizeLessonExtractionSessions(
+            {},
+            lessonExtractionConfig.enabled,
+          ),
           discovered,
           truncated,
           traversalCapped,
@@ -749,11 +777,9 @@ export function registerReplayFunctions(
           if (newRawObservations.length > 0) {
             const extraction = await extractLessonsFromReplay({
               kv,
-              provider,
               sessionId: targetSessionId,
               project: parsed.project,
               rawObservations: newRawObservations,
-              compressedObservations: newCompressedObservations,
               firstPrompt,
               config: lessonExtractionConfig,
             }).catch((error) => ({
@@ -811,7 +837,7 @@ export function registerReplayFunctions(
         ambiguousLineage,
         lessonExtraction: summarizeLessonExtractionSessions(
           lessonExtractionResults,
-          lessonExtractionConfig.mode,
+          lessonExtractionConfig.enabled,
         ),
         discovered,
         truncated,

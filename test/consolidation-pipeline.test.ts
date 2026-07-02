@@ -12,6 +12,7 @@ vi.mock("../src/config.js", () => ({
 import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled } from "../src/config.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
+import { logger } from "../src/logger.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -190,6 +191,60 @@ describe("Consolidation Pipeline", () => {
       expect.stringContaining("AgentMemory Output Language Policy"),
       expect.any(String),
     );
+  });
+
+  it("keeps non-Chinese semantic facts as warning but still saves when retry cannot fully fix", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn()
+        .mockResolvedValueOnce("<facts><fact confidence=\"0.88\">This is English only.</fact></facts>")
+        .mockResolvedValueOnce("<facts><fact confidence=\"0.88\">这是中文事实。</fact></facts>"),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { success: boolean; results: { semantic: { languageViolations?: string[] } } };
+
+    expect(result.success).toBe(true);
+    expect(result.results.semantic.languageViolations).toBeUndefined();
+    const stored = await kv.list<SemanticMemory>("mem:semantic");
+    expect(stored).toHaveLength(1);
+    expect(stored[0].fact).toBe("这是中文事实。");
+    expect(logger.warn).toHaveBeenCalled();
+  });
+
+  it("keeps non-Chinese semantic facts with warning when retry also violates language contract", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn()
+        .mockResolvedValueOnce("<facts><fact confidence=\"0.85\">This is still English.</fact></facts>")
+        .mockResolvedValueOnce("<facts><fact confidence=\"0.85\">Still English after retry.</fact></facts>"),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as { success: boolean; results: { semantic: { languageViolations?: string[] } } };
+
+    expect(result.success).toBe(true);
+    expect(result.results.semantic.languageViolations).toEqual(["Still English after retry."]);
+    const stored = await kv.list<SemanticMemory>("mem:semantic");
+    expect(stored).toHaveLength(1);
+    expect(stored[0].fact).toBe("Still English after retry.");
+    expect(logger.warn).toHaveBeenCalled();
   });
 
   it("with enough patterns, creates procedural memories from provider response", async () => {

@@ -1,9 +1,9 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import { homedir } from "node:os";
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
+import { agentMemoryHome } from "../paths.js";
 import type {
   Memory,
   Lesson,
@@ -11,7 +11,7 @@ import type {
   Session,
 } from "../types.js";
 import { recordAudit } from "./audit.js";
-const DEFAULT_EXPORT_ROOT = join(homedir(), ".agentmemory");
+const DEFAULT_EXPORT_ROOT = agentMemoryHome();
 
 function getExportRoot(): string {
   return resolve(process.env["AGENTMEMORY_EXPORT_ROOT"] || DEFAULT_EXPORT_ROOT);
@@ -246,20 +246,34 @@ export function registerObsidianExportFunction(
   kv: StateKV,
 ): void {
   sdk.registerFunction("mem::obsidian-export",
-    async (data: { vaultDir?: string; types?: string[] } | undefined) => {
+    async (data: { vaultDir?: string; types?: string[] | string } | undefined) => {
       if (!data || typeof data !== "object") {
         return { success: false, error: "payload is required" };
       }
       if (data.vaultDir !== undefined && typeof data.vaultDir !== "string") {
         return { success: false, error: "vaultDir must be a string" };
       }
-      if (data.types !== undefined) {
-        if (
-          !Array.isArray(data.types) ||
-          !data.types.every((t): t is string => typeof t === "string")
-        ) {
-          return { success: false, error: "types must be an array of strings" };
+      const parseTypes = (value: unknown): Set<string> | string => {
+        if (value === undefined) {
+          return new Set(["memories", "lessons", "crystals", "sessions"]);
         }
+        if (typeof value === "string") {
+          return new Set(
+            value
+              .split(",")
+              .map((entry) => entry.trim())
+              .filter(Boolean),
+          );
+        }
+        if (Array.isArray(value) && value.every((type): type is string => typeof type === "string")) {
+          return new Set(value);
+        }
+        return "types must be either an array of strings or a comma-separated string";
+      };
+
+      const parsedTypes = parseTypes(data.types);
+      if (typeof parsedTypes === "string") {
+        return { success: false, error: parsedTypes };
       }
 
       const vaultDir = resolveVaultDir(data.vaultDir);
@@ -269,9 +283,7 @@ export function registerObsidianExportFunction(
           error: `vaultDir must be inside ${getExportRoot()}`,
         };
       }
-      const exportTypes = new Set(
-        data.types ?? ["memories", "lessons", "crystals", "sessions"],
-      );
+      const exportTypes = parsedTypes;
 
       const dirs = {
         memories: join(vaultDir, "memories"),

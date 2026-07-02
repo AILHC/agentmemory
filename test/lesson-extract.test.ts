@@ -9,7 +9,6 @@ import {
   extractHeuristicLessonCandidates,
   extractLlmLessonCandidates,
   extractLessonsFromReplay,
-  isNoopProvider,
   resolveReplayLessonExtractionConfig,
 } from "../src/functions/lesson-extract.js";
 import {
@@ -44,14 +43,6 @@ function compressedObservation(overrides: Partial<CompressedObservation>): Compr
   };
 }
 
-function noopProvider(): MemoryProvider {
-  return {
-    name: "noop",
-    compress: vi.fn().mockResolvedValue(""),
-    summarize: vi.fn().mockResolvedValue(""),
-  };
-}
-
 describe("lesson extraction parser", () => {
   it("parses lesson XML with confidence attribute", () => {
     const parsed = parseLessonExtractionXml(`
@@ -59,6 +50,8 @@ describe("lesson extraction parser", () => {
   <lesson confidence="0.82">
     <content>以后导入 replay 数据前必须确认来源接口。</content>
     <context>AgentMemory replay import 产物评估</context>
+    <importance>0.42</importance>
+    <evidence>会话中有明确回放来源核验要求。</evidence>
     <tags>
       <tag>agentmemory</tag>
       <tag>replay-import</tag>
@@ -72,6 +65,8 @@ describe("lesson extraction parser", () => {
           content: "以后导入 replay 数据前必须确认来源接口。",
           context: "AgentMemory replay import 产物评估",
           confidence: 0.82,
+          importance: 0.42,
+          evidence: "会话中有明确回放来源核验要求。",
           tags: ["agentmemory", "replay-import"],
         },
       ],
@@ -155,7 +150,6 @@ describe("replay lesson extraction config", () => {
     const cfg = resolveReplayLessonExtractionConfig({}, {});
     expect(cfg).toMatchObject(DEFAULT_REPLAY_LESSON_CONFIG);
     expect(cfg).toMatchObject({
-      mode: "heuristic",
       textLimit: 200,
       matchLimit: 40,
       saveLimit: 20,
@@ -172,7 +166,7 @@ describe("replay lesson extraction config", () => {
     expect(
       resolveReplayLessonExtractionConfig({}, { matchLimit: 0, allowUnbounded: true }).matchLimit,
     ).toBe(0);
-    expect(resolveReplayLessonExtractionConfig({}, { saveLimit: 0 }).saveLimit).toBe(20);
+    expect(resolveReplayLessonExtractionConfig({}, { saveLimit: 0 }).saveLimit).toBe(0);
     expect(
       resolveReplayLessonExtractionConfig({}, { saveLimit: 0, allowUnbounded: true }).saveLimit,
     ).toBe(0);
@@ -204,6 +198,8 @@ describe("heuristic replay lesson extraction", () => {
         content: "Always validate import keys before writing duplicate observations.",
         context: "initial prompt",
         confidence: 0.4,
+        importance: 0.4,
+        evidence: "",
         tags: ["auto-import", "heuristic"],
         source: "heuristic",
       },
@@ -278,6 +274,8 @@ describe("heuristic replay lesson extraction", () => {
       content: "优先记录这个关键前置条件",
       context: "/repo",
       confidence: 0.4,
+      importance: 0.4,
+      evidence: "",
       tags: ["auto-import", "heuristic"],
       source: "heuristic",
     });
@@ -285,14 +283,12 @@ describe("heuristic replay lesson extraction", () => {
 });
 
 describe("lesson extraction end-to-end", () => {
-  it("mode off does not write lessons", async () => {
+  it("enabled false skips extraction", async () => {
     const kv = mockKV();
-    const config = { ...resolveReplayLessonExtractionConfig({}, {}), mode: "off" as const };
+    const config = { ...resolveReplayLessonExtractionConfig({}, {}), enabled: false };
 
-    const provider = noopProvider();
     const result = await extractLessonsFromReplay({
       kv,
-      provider,
       sessionId: "session-off",
       project: "/repo",
       rawObservations: [
@@ -300,53 +296,12 @@ describe("lesson extraction end-to-end", () => {
           userPrompt: "Always validate import keys before writing duplicate observations.",
         }),
       ],
-      compressedObservations: [],
       config,
     });
 
     const lessons = await kv.list<Lesson>(KV.lessons);
     expect(result).toEqual({ lessonIds: [], created: 0, reinforced: 0, skipped: 0, errors: [] });
     expect(lessons).toHaveLength(0);
-  });
-
-  it("noop and resilient(noop) skip LLM in llm mode", async () => {
-    const raw = [
-      rawObservation({
-        assistantResponse: "以后必须先确认来源接口，再执行。",
-      }),
-    ];
-
-    const baseConfig = resolveReplayLessonExtractionConfig({}, {});
-    const config = { ...baseConfig, mode: "llm" as const };
-
-    const noop = { ...noopProvider(), name: "noop" };
-    const noopResult = await extractLessonsFromReplay({
-      kv: mockKV(),
-      provider: noop,
-      sessionId: "session-noop",
-      project: "/repo",
-      rawObservations: raw,
-      compressedObservations: [],
-      config,
-    });
-    expect(noopResult.skipped).toBeGreaterThan(0);
-    expect(isNoopProvider(noop)).toBe(true);
-
-    const resilient = {
-      ...noopProvider(),
-      name: "resilient(noop)",
-    };
-    const resilientResult = await extractLessonsFromReplay({
-      kv: mockKV(),
-      provider: resilient,
-      sessionId: "session-resilient",
-      project: "/repo",
-      rawObservations: raw,
-      compressedObservations: [],
-      config,
-    });
-    expect(resilientResult.skipped).toBeGreaterThan(0);
-    expect(isNoopProvider(resilient)).toBe(true);
   });
 
   it("extracts with provider.compress and retries parser on first failure", async () => {
@@ -469,14 +424,18 @@ describe("lesson extraction end-to-end", () => {
     });
 
     expect(capturedPrompt).toContain("[...truncated]");
-    expect(capturedPrompt).not.toContain("tail-marker");
+    expect(capturedPrompt.length).toBeLessThan(`Session: long-prompt-session
+
+Project: /repo
+
+[1] user_prompt
+Always validate import keys. ${"x".repeat(5000)} tail-marker`.length);
   });
 
   it("strips private data before persisting heuristic lessons", async () => {
     const kv = mockKV();
     await extractLessonsFromReplay({
       kv,
-      provider: noopProvider(),
       sessionId: "heuristic-secret-session",
       project: "/repo",
       rawObservations: [
@@ -485,7 +444,6 @@ describe("lesson extraction end-to-end", () => {
             "必须不要把 api_key=abcdefghijklmnopqrstuvwxyz123456 写入持久化 lesson。",
         }),
       ],
-      compressedObservations: [],
       config: resolveReplayLessonExtractionConfig({}, {}),
     });
 
@@ -496,159 +454,29 @@ describe("lesson extraction end-to-end", () => {
     expect(lessons[0].content).not.toContain("api_key=");
   });
 
-  it("strips private data from LLM output before persisting lessons", async () => {
-    const provider: MemoryProvider = {
-      name: "mock-llm",
-      compress: vi.fn(async () => `
-<lessons>
-  <lesson confidence=\"0.8\">
-    <content>不要保存 Bearer abcdefghijklmnopqrstuvwxyz1234567890 这类令牌。</content>
-    <context>api_key=abcdefghijklmnopqrstuvwxyz123456</context>
-    <tags><tag>sk-abcdefghijklmnopqrstuvwxyz123456</tag></tags>
-  </lesson>
-</lessons>`),
-      summarize: vi.fn().mockResolvedValue(""),
-    };
+  it("creates lessons with heuristic source and replay-import-heuristic origin", async () => {
     const kv = mockKV();
+    const config = resolveReplayLessonExtractionConfig({}, {});
 
     await extractLessonsFromReplay({
       kv,
-      provider,
-      sessionId: "llm-secret-session",
+      sessionId: "heuristic-source-session",
       project: "/repo",
       rawObservations: [
         rawObservation({
-          userPrompt: "Always validate import keys before writing duplicate observations.",
+          userPrompt: "以后必须先确认来源接口，再执行。",
         }),
       ],
-      compressedObservations: [],
-      config: { ...resolveReplayLessonExtractionConfig({}, {}), mode: "llm" },
+      config,
     });
 
     const lessons = await kv.list<Lesson>(KV.lessons);
     expect(lessons).toHaveLength(1);
-    expect(JSON.stringify(lessons[0])).toContain("[REDACTED_SECRET]");
-    expect(JSON.stringify(lessons[0])).not.toContain("abcdefghijklmnopqrstuvwxyz123456");
-    expect(JSON.stringify(lessons[0])).not.toContain("Bearer");
-    expect(JSON.stringify(lessons[0])).not.toContain("api_key=");
-    expect(JSON.stringify(lessons[0])).not.toContain("sk-");
-  });
-
-  it("strips private data from fallback lesson context", async () => {
-    const provider: MemoryProvider = {
-      name: "mock-llm",
-      compress: vi.fn(async () => `
-<lessons>
-  <lesson confidence=\"0.8\">
-    <content>Always validate import keys before writing duplicate observations.</content>
-    <context></context>
-    <tags></tags>
-  </lesson>
-</lessons>`),
-      summarize: vi.fn().mockResolvedValue(""),
-    };
-    const kv = mockKV();
-
-    await extractLessonsFromReplay({
-      kv,
-      provider,
-      sessionId: "fallback-context-secret-session",
-      project: "/repo",
-      firstPrompt: "api_key=abcdefghijklmnopqrstuvwxyz123456",
-      rawObservations: [
-        rawObservation({
-          userPrompt: "Always validate import keys before writing duplicate observations.",
-        }),
-      ],
-      compressedObservations: [],
-      config: { ...resolveReplayLessonExtractionConfig({}, {}), mode: "llm" },
-    });
-
-    const lessons = await kv.list<Lesson>(KV.lessons);
-    expect(lessons).toHaveLength(1);
-    expect(lessons[0].context).toContain("[REDACTED_SECRET]");
-    expect(lessons[0].context).not.toContain("abcdefghijklmnopqrstuvwxyz123456");
-    expect(lessons[0].context).not.toContain("api_key=");
-  });
-
-  it("applies matchLimit after LLM candidate merge before saveLimit", async () => {
-    const provider: MemoryProvider = {
-      name: "mock-llm",
-      compress: vi.fn(async () => `
-<lessons>
-  <lesson confidence=\"0.8\"><content>Always validate import keys before writing duplicate observations.</content><context></context><tags></tags></lesson>
-  <lesson confidence=\"0.7\"><content>Never persist secrets in lessons.</content><context></context><tags></tags></lesson>
-  <lesson confidence=\"0.6\"><content>Prefer source-backed answers for mechanism questions.</content><context></context><tags></tags></lesson>
-</lessons>`),
-      summarize: vi.fn().mockResolvedValue(""),
-    };
-    const kv = mockKV();
-
-    const result = await extractLessonsFromReplay({
-      kv,
-      provider,
-      sessionId: "llm-limit-session",
-      project: "/repo",
-      rawObservations: [
-        rawObservation({
-          userPrompt: "Always validate import keys before writing duplicate observations.",
-        }),
-      ],
-      compressedObservations: [],
-      config: {
-        ...resolveReplayLessonExtractionConfig({}, {}),
-        mode: "llm",
-        matchLimit: 1,
-        saveLimit: 10,
-      },
-    });
-
-    expect(result.created).toBe(1);
-    expect(await kv.list<Lesson>(KV.lessons)).toHaveLength(1);
-  });
-
-  it("prefers higher-confidence hybrid candidates by normalized content", async () => {
-    const xml = `
-<lessons>
-  <lesson confidence=\"0.92\">
-    <content>Always validate import keys before writing duplicate observations.</content>
-    <context>from llm</context>
-    <tags><tag>llm</tag></tags>
-  </lesson>
-</lessons>`;
-    const provider: MemoryProvider = {
-      name: "mock-llm",
-      compress: vi.fn(async () => xml),
-      summarize: vi.fn().mockResolvedValue(""),
-    };
-
-    const kv = mockKV();
-    const result = await extractLessonsFromReplay({
-      kv,
-      provider,
-      sessionId: "session-hybrid",
-      project: "/repo",
-      rawObservations: [
-        rawObservation({
-          userPrompt: "Always validate import keys before writing duplicate observations.",
-        }),
-      ],
-      compressedObservations: [],
-      config: { ...resolveReplayLessonExtractionConfig({}, {}), mode: "hybrid" },
-    });
-
-    const lessons = await kv.list<Lesson>(KV.lessons);
-    expect(result.created).toBe(1);
-    expect(lessons).toHaveLength(1);
-    expect(lessons[0].confidence).toBe(0.92);
-    expect(lessons[0].source).toBe("consolidation");
-    expect(lessons[0].content).toBe(
-      "Always validate import keys before writing duplicate observations.",
-    );
+    expect(lessons[0].source).toBe("heuristic");
+    expect(lessons[0].origin).toBe("replay-import-heuristic");
   });
 
   it("keeps reinforcement idempotent for same session and increases on different sessions", async () => {
-    const provider = noopProvider();
     const raw = [
       rawObservation({
         userPrompt: "Always validate import keys before writing duplicate observations.",
@@ -659,11 +487,9 @@ describe("lesson extraction end-to-end", () => {
 
     const first = await extractLessonsFromReplay({
       kv,
-      provider,
       sessionId: "s1",
       project: "/repo",
       rawObservations: raw,
-      compressedObservations: [],
       config,
     });
     const afterFirst = await kv.list<Lesson>(KV.lessons);
@@ -673,11 +499,9 @@ describe("lesson extraction end-to-end", () => {
 
     const second = await extractLessonsFromReplay({
       kv,
-      provider,
       sessionId: "s1",
       project: "/repo",
       rawObservations: raw,
-      compressedObservations: [],
       config,
     });
     const afterSecond = await kv.list<Lesson>(KV.lessons);
@@ -687,11 +511,9 @@ describe("lesson extraction end-to-end", () => {
 
     const third = await extractLessonsFromReplay({
       kv,
-      provider,
       sessionId: "s2",
       project: "/repo",
       rawObservations: raw,
-      compressedObservations: [],
       config,
     });
     const afterThird = await kv.list<Lesson>(KV.lessons);

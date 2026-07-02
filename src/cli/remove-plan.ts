@@ -12,7 +12,7 @@
 //   agentmemory remove --keep-data     # remove binaries+symlinks, keep memory data
 
 import { existsSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 
 export type RemovePlanItem = {
   /** Stable id, used in tests and CLI output. */
@@ -49,6 +49,11 @@ export type RemoveContext = {
   /** Loaded connect manifest, or null if missing. */
   connectManifest: ConnectManifest | null;
 };
+
+function installHome(home: string): string {
+  const raw = process.env["AGENTMEMORY_INSTALL_HOME"]?.trim();
+  return raw ? resolve(raw) : join(home, ".agentmemory");
+}
 
 /**
  * The `agentmemory connect` PR writes this manifest at
@@ -103,9 +108,11 @@ export function legacyLocalBinIii(home: string): string {
 }
 
 // Current private install location. Lives under ~/.agentmemory/ so it
-// stays isolated from any user-managed iii on PATH.
+// stays isolated from any user-managed iii on PATH. The root can be
+// overridden by AGENTMEMORY_INSTALL_HOME; if unset, defaults to
+// ~/.agentmemory.
 export function privateIiiBin(home: string): string {
-  return join(home, ".agentmemory", "bin", iiiBinFile());
+  return join(installHome(home), "bin", iiiBinFile());
 }
 
 // Back-compat shim for any caller still importing the old name.

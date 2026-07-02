@@ -22,6 +22,14 @@ Rules:
 - List all files that were created or modified
 - Concepts should be searchable terms for future context retrieval`
 
+export const SUMMARY_OUTPUT_CONTRACT = {
+  summary: [
+    "字段 title、narrative、keyDecisions 的人类可读内容必须使用简体中文。",
+    "filesModified（或 <file>）与 schema fields 保持原文，不翻译文件路径、命令、package/API/类/函数/类型名。",
+    "命令、代码标识和技术名词保持英文或中英双语。",
+  ],
+} as const;
+
 export function buildSummaryPrompt(observations: Array<{
   type: string
   title: string

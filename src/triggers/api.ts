@@ -53,30 +53,21 @@ function parseLessonExtractionPayload(
 
   const payload = raw as Record<string, unknown>;
   const allowedKeys = new Set([
-    "mode",
     "textLimit",
     "matchLimit",
     "saveLimit",
     "additionalHeuristicTerms",
     "allowUnbounded",
-    "llmChunkSize",
-    "llmChunkConcurrency",
+    "enabled",
   ]);
   const unknownKeys = Object.keys(payload).filter((key) => !allowedKeys.has(key));
   if (unknownKeys.length > 0) return null;
 
   const out: Partial<ReplayLessonExtractionConfig> = {};
 
-  if (payload.mode !== undefined) {
-    if (
-      payload.mode !== "off" &&
-      payload.mode !== "heuristic" &&
-      payload.mode !== "llm" &&
-      payload.mode !== "hybrid"
-    ) {
-      return null;
-    }
-    out.mode = payload.mode;
+  if (payload.enabled !== undefined) {
+    if (typeof payload.enabled !== "boolean") return null;
+    out.enabled = payload.enabled;
   }
 
   if (payload.textLimit !== undefined) {
@@ -123,28 +114,6 @@ function parseLessonExtractionPayload(
       if (typeof term !== "string") return null;
     }
     out.additionalHeuristicTerms = payload.additionalHeuristicTerms;
-  }
-
-  if (payload.llmChunkSize !== undefined) {
-    if (
-      typeof payload.llmChunkSize !== "number" ||
-      !Number.isInteger(payload.llmChunkSize) ||
-      payload.llmChunkSize < 1
-    ) {
-      return null;
-    }
-    out.llmChunkSize = payload.llmChunkSize;
-  }
-
-  if (payload.llmChunkConcurrency !== undefined) {
-    if (
-      typeof payload.llmChunkConcurrency !== "number" ||
-      !Number.isInteger(payload.llmChunkConcurrency) ||
-      payload.llmChunkConcurrency < 1
-    ) {
-      return null;
-    }
-    out.llmChunkConcurrency = payload.llmChunkConcurrency;
   }
 
   return { payload: out, hasValue: Object.keys(payload).length > 0 };
@@ -247,6 +216,15 @@ function parseOptionalPositiveInt(value: unknown): number | undefined | null {
   if (parsed === undefined || parsed === null) return parsed;
   if (!Number.isInteger(parsed) || parsed < 1) return null;
   return parsed;
+}
+
+function parseOptionalBoundedPositiveInt(
+  value: unknown,
+  max: number,
+): number | undefined | null {
+  const parsed = parseOptionalPositiveInt(value);
+  if (parsed === undefined || parsed === null) return parsed;
+  return parsed <= max ? parsed : null;
 }
 
 export function registerApiTriggers(
@@ -674,7 +652,7 @@ export function registerApiTriggers(
           status_code: 400,
           body: {
             error:
-              "invalid lessonExtraction. Allowed fields: mode, textLimit, matchLimit, saveLimit, additionalHeuristicTerms, allowUnbounded, llmChunkSize, llmChunkConcurrency",
+              "invalid lessonExtraction. Allowed fields: enabled, textLimit, matchLimit, saveLimit, additionalHeuristicTerms, allowUnbounded",
           },
         };
       }
@@ -3210,6 +3188,184 @@ export function registerApiTriggers(
     return { status_code: statusCode, body: result };
   });
   sdk.registerTrigger({ type: "http", function_id: "api::lesson-save", config: { api_path: "/agentmemory/lessons", http_method: "POST" } });
+
+  sdk.registerFunction("api::lesson-extract",  async (req: ApiRequest) => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+
+    const body = req.body as Record<string, unknown>;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return { status_code: 400, body: { error: "request body is required" } };
+    }
+
+    const allowed = new Set([
+      "sessionIds",
+      "missingOnly",
+      "retryFailed",
+      "force",
+      "textLimit",
+      "saveLimit",
+      "chunkSize",
+      "chunkConcurrency",
+      "timeoutMs",
+    ]);
+    const unknown = Object.keys(body).filter((key) => !allowed.has(key));
+    if (unknown.length > 0) {
+      return {
+        status_code: 400,
+        body: {
+          error:
+            "invalid lesson extraction payload: only sessionIds, missingOnly, retryFailed, force, textLimit, saveLimit, chunkSize, chunkConcurrency, timeoutMs are allowed",
+        },
+      };
+    }
+
+    if (!Array.isArray(body.sessionIds) || body.sessionIds.length === 0) {
+      return {
+        status_code: 400,
+        body: { error: "sessionIds is required and must be a non-empty array" },
+      };
+    }
+
+    const sessionIds = body.sessionIds
+      .map((value) => (typeof value === "string" ? value.trim() : ""))
+      .filter((value) => value.length > 0);
+    if (sessionIds.length === 0) {
+      return {
+        status_code: 400,
+        body: { error: "sessionIds must contain non-empty strings" },
+      };
+    }
+
+    if (body.missingOnly !== undefined && typeof body.missingOnly !== "boolean") {
+      return { status_code: 400, body: { error: "missingOnly must be a boolean" } };
+    }
+    if (body.retryFailed !== undefined && typeof body.retryFailed !== "boolean") {
+      return { status_code: 400, body: { error: "retryFailed must be a boolean" } };
+    }
+    if (body.force !== undefined && typeof body.force !== "boolean") {
+      return { status_code: 400, body: { error: "force must be a boolean" } };
+    }
+
+    const textLimit = parseOptionalPositiveInt(body.textLimit);
+    if (textLimit === null) {
+      return { status_code: 400, body: { error: "textLimit must be a positive integer" } };
+    }
+    const saveLimit = parseOptionalPositiveInt(body.saveLimit);
+    if (saveLimit === null) {
+      return { status_code: 400, body: { error: "saveLimit must be a positive integer" } };
+    }
+    const chunkSize = parseOptionalPositiveInt(body.chunkSize);
+    if (chunkSize === null) {
+      return { status_code: 400, body: { error: "chunkSize must be a positive integer" } };
+    }
+    const chunkConcurrency = parseOptionalPositiveInt(body.chunkConcurrency);
+    if (chunkConcurrency === null) {
+      return {
+        status_code: 400,
+        body: { error: "chunkConcurrency must be a positive integer" },
+      };
+    }
+    const timeoutMs = parseOptionalPositiveInt(body.timeoutMs);
+    if (timeoutMs === null) {
+      return { status_code: 400, body: { error: "timeoutMs must be a positive integer" } };
+    }
+
+    const result = await sdk.trigger({
+      function_id: "mem::lessons::extract-llm",
+      payload: {
+        sessionIds,
+        ...(body.missingOnly !== undefined ? { missingOnly: body.missingOnly } : {}),
+        ...(body.retryFailed !== undefined ? { retryFailed: body.retryFailed } : {}),
+        ...(body.force !== undefined ? { force: body.force } : {}),
+        ...(textLimit !== undefined ? { textLimit } : {}),
+        ...(saveLimit !== undefined ? { saveLimit } : {}),
+        ...(chunkSize !== undefined ? { chunkSize } : {}),
+        ...(chunkConcurrency !== undefined ? { chunkConcurrency } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      },
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::lesson-extract",
+    config: { api_path: "/agentmemory/lessons/extract", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::lesson-extract-process",  async (req: ApiRequest) => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = req.body as Record<string, unknown>;
+    const limit = parseOptionalPositiveInt(body?.limit);
+    if (limit === null) {
+      return { status_code: 400, body: { error: "limit must be a positive integer" } };
+    }
+    const result = await sdk.trigger({
+      function_id: "mem::lessons::extract-process",
+      payload: limit !== undefined ? { limit } : {},
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::lesson-extract-process",
+    config: { api_path: "/agentmemory/lessons/extract/process", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::lesson-extract-runs",  async (req: ApiRequest) => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const params = req.query_params || {};
+    const limit = parseOptionalBoundedPositiveInt(params.limit, 500);
+    if (limit === null) {
+      return { status_code: 400, body: { error: "limit must be between 1 and 500" } };
+    }
+
+    const result = await sdk.trigger({
+      function_id: "mem::lessons::extract-runs",
+      payload: {
+        ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+        ...(params.status ? { status: params.status } : {}),
+        ...(limit !== undefined ? { limit } : {}),
+      },
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::lesson-extract-runs",
+    config: { api_path: "/agentmemory/lessons/extract/runs", http_method: "GET" },
+  });
+
+  sdk.registerFunction("api::lesson-extract-run-get",  async (req: ApiRequest) => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const runId = asNonEmptyString(req.query_params?.runId);
+    if (!runId) {
+      return {
+        status_code: 400,
+        body: { error: "runId query param is required" },
+      };
+    }
+    try {
+      const result = await sdk.trigger({
+        function_id: "mem::lessons::extract-run-get",
+        payload: { runId },
+      });
+      return { status_code: 200, body: result };
+    } catch (error) {
+      return {
+        status_code: 500,
+        body: { error: error instanceof Error ? error.message : "internal error" },
+      };
+    }
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::lesson-extract-run-get",
+    config: { api_path: "/agentmemory/lessons/extract/run", http_method: "GET" },
+  });
 
   sdk.registerFunction("api::lesson-list",  async (req: ApiRequest) => {
     const denied = checkAuth(req, secret);

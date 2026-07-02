@@ -21,7 +21,6 @@
 
 import { copyFile, mkdir } from "node:fs/promises";
 import { constants as fsConstants, existsSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as p from "@clack/prompts";
@@ -29,6 +28,7 @@ import { appendFileSync, readFileSync } from "node:fs";
 import { readPrefs, writePrefs } from "./preferences.js";
 import { ADAPTERS, resolveAdapter, runAdapter } from "./connect/index.js";
 import type { ConnectResult } from "./connect/types.js";
+import { agentMemoryHome } from "../paths.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -104,7 +104,7 @@ function findEnvExample(): string | null {
 }
 
 async function seedEnvFile(provider: string | null): Promise<string | null> {
-  const target = join(homedir(), ".agentmemory", ".env");
+  const target = agentMemoryHome(".env");
   const dir = dirname(target);
   await mkdir(dir, { recursive: true });
 
@@ -232,7 +232,7 @@ export async function runOnboarding(): Promise<OnboardingResult> {
     firstRunAt: new Date().toISOString(),
   });
 
-  const prefsLocation = join(homedir(), ".agentmemory", "preferences.json");
+  const prefsLocation = agentMemoryHome("preferences.json");
   const lines = [`✓ Saved preferences to ${prefsLocation}`];
   if (envPath) {
     lines.push(`✓ Wrote ${envPath} (edit to add your API key)`);

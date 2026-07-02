@@ -26,8 +26,8 @@ import {
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { agentMemoryHome } from "../paths.js";
 
 export interface Prefs {
   schemaVersion: 1;
@@ -78,7 +78,7 @@ const DEFAULTS: Prefs = {
 };
 
 export function prefsDir(): string {
-  return join(homedir(), ".agentmemory");
+  return agentMemoryHome();
 }
 
 export function prefsPath(): string {

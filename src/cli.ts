@@ -45,6 +45,7 @@ import { setBootVerbose } from "./logger.js";
 import { VERSION } from "./version.js";
 import { getAllTools, ESSENTIAL_TOOLS } from "./mcp/tools-registry.js";
 import { knownAgents } from "./cli/connect/index.js";
+import { agentMemoryHome, agentMemoryInstallHome } from "./paths.js";
 
 const ALL_TOOLS_COUNT = getAllTools().length;
 const CORE_TOOLS_COUNT = getAllTools().filter((t) => ESSENTIAL_TOOLS.has(t.name)).length;
@@ -376,7 +377,7 @@ function findIiiConfig(): string {
   const candidates = [
     ...(envPath ? [envPath] : []),
     join(process.cwd(), "iii-config.yaml"),
-    join(homedir(), ".agentmemory", "iii-config.yaml"),
+    agentMemoryHome("iii-config.yaml"),
     join(__dirname, "iii-config.yaml"),
     join(__dirname, "..", "iii-config.yaml"),
   ];
@@ -403,20 +404,14 @@ function whichBinary(name: string): string | null {
   }
 }
 
-// Private install location agentmemory manages itself. Sits under the
-// agentmemory state dir (~/.agentmemory/bin) so the pinned engine stays
-// isolated from a user-managed iii on PATH or in ~/.local/bin. #752: a
-// fresh box with iii 0.16.1 already on PATH refused to boot because the
-// hard-pin enforcer told users to overwrite their global install with
-// v0.11.2. Private install resolves the conflict without touching their
-// existing iii.
+// 这里维护单独的私有安装目录（默认 ~/.agentmemory/bin），只用于引擎二进制；
+// AGENTMEMORY_HOME 仍只负责状态（pid/state/.env/keys/偏好）。
+// 这样可避免状态目录被 pin 路径强绑定，同时不覆盖用户维护在 PATH 或 ~/.local/bin 的 iii。 #752
+// Private install location agentmemory manages itself. It must remain isolated
+// from user-managed iii on PATH / ~/.local/bin and cannot be coupled to
+// state home overrides.
 function agentmemoryBinDir(): string {
-  if (IS_WINDOWS) {
-    const userProfile = process.env["USERPROFILE"];
-    if (!userProfile) return join(homedir(), ".agentmemory", "bin");
-    return join(userProfile, ".agentmemory", "bin");
-  }
-  return join(homedir(), ".agentmemory", "bin");
+  return agentMemoryInstallHome("bin");
 }
 
 function privateIiiPath(): string {
@@ -467,7 +462,7 @@ function iiiBinVersion(binPath: string): string | null {
 // AGENTMEMORY_III_VERSION and hope it works.
 //
 // Instead: when the candidate iii on PATH is the wrong version, prefer
-// the private install under ~/.agentmemory/bin/iii. If the private copy
+// the private install under AGENTMEMORY_INSTALL_HOME/bin/iii. If the private copy
 // is missing or also mismatched, the caller installs the pinned version
 // there before retrying. AGENTMEMORY_III_VERSION still overrides
 // IIPINNED_VERSION upstream so users who knowingly want a different
@@ -493,11 +488,11 @@ function resolveCompatibleIii(iiiBinPath: string | null | undefined): string | n
 }
 
 function enginePidfilePath(): string {
-  return join(homedir(), ".agentmemory", "iii.pid");
+  return agentMemoryHome("iii.pid");
 }
 
 function engineStatePath(): string {
-  return join(homedir(), ".agentmemory", "engine-state.json");
+  return agentMemoryHome("engine-state.json");
 }
 
 type EngineState =
@@ -538,7 +533,7 @@ function clearEnginePidfile(): void {
 // engine and shows up as a duplicate registration. We write the worker
 // pid from src/index.ts on boot so stop can find and reap it.
 function workerPidfilePath(): string {
-  return join(homedir(), ".agentmemory", "worker.pid");
+  return agentMemoryHome("worker.pid");
 }
 
 function readWorkerPidfile(): number | null {
@@ -1500,7 +1495,7 @@ function buildDoctorContext(): DoctorContext {
   return {
     baseUrl: getBaseUrl(),
     viewerUrl: getViewerUrl(),
-    envPath: join(homedir(), ".agentmemory", ".env"),
+    envPath: agentMemoryHome(".env"),
     pidfilePath: enginePidfilePath(),
     enginePath: engineStatePath(),
     pinnedVersion: IIPINNED_VERSION,
@@ -1509,11 +1504,11 @@ function buildDoctorContext(): DoctorContext {
 
 function buildDoctorEffects(): DoctorEffects {
   return {
-    envFileExists: () => existsSync(join(homedir(), ".agentmemory", ".env")),
+    envFileExists: () => existsSync(agentMemoryHome(".env")),
     readEnvFile: () => {
       try {
         return parseEnvFile(
-          readFileSync(join(homedir(), ".agentmemory", ".env"), "utf-8"),
+          readFileSync(agentMemoryHome(".env"), "utf-8"),
         );
       } catch {
         return {};
@@ -2075,7 +2070,7 @@ function findEnvExample(): string | null {
 
 async function runInit() {
   p.intro("agentmemory init");
-  const target = join(homedir(), ".agentmemory", ".env");
+  const target = agentMemoryHome(".env");
   const template = findEnvExample();
   if (!template) {
     p.log.error(

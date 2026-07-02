@@ -7,8 +7,8 @@ import {
   renameSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
 import * as p from "@clack/prompts";
+import { agentMemoryHome } from "../../paths.js";
 
 // Env values use ${VAR:-default} expansion so the wired MCP entry
 // inherits AGENTMEMORY_URL / AGENTMEMORY_SECRET / AGENTMEMORY_TOOLS
@@ -55,7 +55,7 @@ export const AGENTMEMORY_COPILOT_MCP_BLOCK = {
 };
 
 export function backupsDir(): string {
-  return join(homedir(), ".agentmemory", "backups");
+  return agentMemoryHome("backups");
 }
 
 export function ensureBackupsDir(): string {

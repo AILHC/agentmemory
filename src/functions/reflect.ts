@@ -12,6 +12,7 @@ import type {
 } from "../types.js";
 import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
+import { REFLECT_OUTPUT_CONTRACT } from "../prompts/reflect.js";
 import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 
 interface ConceptCluster {
@@ -257,7 +258,7 @@ export function registerReflectFunctions(
         try {
           const prompt = buildReflectPrompt(cluster);
           const response = await provider.summarize(
-            withOutputLanguagePolicy(REFLECT_SYSTEM),
+            withOutputLanguagePolicy(REFLECT_SYSTEM, undefined, REFLECT_OUTPUT_CONTRACT),
             prompt,
           );
 

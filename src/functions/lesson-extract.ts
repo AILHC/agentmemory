@@ -4,33 +4,35 @@ import { KV, fingerprintId } from "../state/schema.js";
 import { validateOutput } from "../eval/validator.js";
 import { LessonExtractionOutputSchema } from "../eval/schemas.js";
 import { withOutputLanguagePolicy } from "../prompts/output-language.js";
+import { resolveOutputLanguage } from "../prompts/output-language.js";
 import {
   LESSON_EXTRACTION_SYSTEM,
+  LESSON_EXTRACTION_OUTPUT_CONTRACT,
   type LessonPromptItem,
   buildLessonExtractionPrompt,
   parseLessonExtractionXml,
+  truncateForLessonPrompt,
 } from "../prompts/lesson-extraction.js";
 import { stripPrivateData } from "./privacy.js";
 import { logger } from "../logger.js";
-
-export type LessonExtractionMode = "off" | "heuristic" | "llm" | "hybrid";
+import type { LlmLessonExtractionRuntimeConfig } from "./lesson-extraction-runs.js";
 
 export interface ReplayLessonExtractionConfig {
-  mode: LessonExtractionMode;
+  enabled: boolean;
   textLimit: number;
   matchLimit: number;
   saveLimit: number;
   additionalHeuristicTerms: string[];
   allowUnbounded: boolean;
-  llmChunkSize: number;
-  llmChunkConcurrency: number;
 }
 
 export interface ExtractedLessonCandidate {
   content: string;
   context: string;
   confidence: number;
+  importance: number;
   tags: string[];
+  evidence: string;
   source: "heuristic" | "llm";
 }
 
@@ -44,20 +46,44 @@ export interface HeuristicExtractionInput {
 export interface LlmExtractionInput {
   rawObservations: RawObservation[];
   compressedObservations: CompressedObservation[];
-  config: ReplayLessonExtractionConfig;
+  config: {
+    textLimit: number;
+    chunkSize?: number;
+    chunkConcurrency?: number;
+    timeoutMs?: number;
+    saveLimit?: number;
+  };
   project: string;
   firstPrompt?: string;
   sessionId: string;
   provider: MemoryProvider;
 }
 
-export interface ExtractLessonsInput {
+export interface ExtractLlmLessonsInput {
   kv: StateKV;
   provider: MemoryProvider;
   sessionId: string;
   project: string;
   rawObservations: RawObservation[];
   compressedObservations: CompressedObservation[];
+  firstPrompt?: string;
+  config: LlmLessonExtractionRuntimeConfig;
+  sourceRunId: string;
+}
+
+export interface ExtractLlmLessonsResult {
+  lessonIds: string[];
+  created: number;
+  reinforced: number;
+  skipped: number;
+  errors: string[];
+}
+
+export interface ExtractLessonsInput {
+  kv: StateKV;
+  sessionId: string;
+  project: string;
+  rawObservations: RawObservation[];
   firstPrompt?: string;
   config: ReplayLessonExtractionConfig;
 }
@@ -73,6 +99,8 @@ export interface ExtractLessonsResult {
 export const DEFAULT_REPLAY_LESSON_TEXT_LIMIT = 200;
 export const DEFAULT_REPLAY_LESSON_MATCH_LIMIT = 40;
 export const DEFAULT_REPLAY_LESSON_SAVE_LIMIT = 20;
+export const DEFAULT_REPLAY_LESSON_LLM_TEXT_LIMIT = 1200;
+export const DEFAULT_REPLAY_LESSON_LLM_SAVE_LIMIT = 50;
 export const DEFAULT_REPLAY_LESSON_LLM_CHUNK_SIZE = 120;
 export const DEFAULT_REPLAY_LESSON_LLM_CHUNK_CONCURRENCY = 3;
 
@@ -98,20 +126,75 @@ const DEFAULT_CHINESE_HEURISTIC_TERMS = [
 ];
 
 export const DEFAULT_REPLAY_LESSON_CONFIG: ReplayLessonExtractionConfig = {
-  mode: "heuristic",
+  enabled: true,
   textLimit: DEFAULT_REPLAY_LESSON_TEXT_LIMIT,
   matchLimit: DEFAULT_REPLAY_LESSON_MATCH_LIMIT,
   saveLimit: DEFAULT_REPLAY_LESSON_SAVE_LIMIT,
   additionalHeuristicTerms: [],
   allowUnbounded: false,
-  llmChunkSize: DEFAULT_REPLAY_LESSON_LLM_CHUNK_SIZE,
-  llmChunkConcurrency: DEFAULT_REPLAY_LESSON_LLM_CHUNK_CONCURRENCY,
 };
 
 const LEARNING_PATTERNS = [
   /\b(always|never|don'?t|do not|make sure|remember to|note:|caveat:|warning:)\b[^.\n]{10,200}[.!\n]/gi,
   /\b(prefer|avoid)\s[^.\n]{10,200}[.!\n]/gi,
 ];
+
+const MAX_LESSON_EVIDENCE_CHARS = 500;
+const DEFAULT_LESSON_EXTRACT_TIMEOUT_MS = 30_000;
+
+function toInt(raw: unknown): number {
+  if (typeof raw === "number" && Number.isFinite(raw)) return Math.trunc(raw);
+  if (typeof raw === "string" && raw.trim()) {
+    const parsed = Number.parseInt(raw.trim(), 10);
+    return Number.isFinite(parsed) ? Math.trunc(parsed) : Number.NaN;
+  }
+  return Number.NaN;
+}
+
+function normalizeTimeoutMs(value: unknown): number {
+  const parsed = toInt(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_LESSON_EXTRACT_TIMEOUT_MS;
+  return parsed;
+}
+
+async function callWithTimeout(
+  fn: () => Promise<string>,
+  timeoutMs: number,
+): Promise<string> {
+  const task = fn();
+  task.catch(() => {});
+  if (timeoutMs <= 0) return task;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`provider.compress timeout after ${timeoutMs}ms`));
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([task, timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function getEvidenceLabel(): string {
+  return resolveOutputLanguage() === "zh-CN" ? "证据:" : "Evidence:";
+}
+
+function sanitizeEvidence(raw?: string): string {
+  const sanitized = normalizeText(stripPrivateData(raw ?? ""));
+  if (!sanitized) return "";
+  return sanitized.slice(0, MAX_LESSON_EVIDENCE_CHARS);
+}
+
+function appendEvidenceToContext(context: string, evidence: string): string {
+  if (!evidence) return context;
+  const label = getEvidenceLabel();
+  if (context.includes("Evidence:") || context.includes("证据:")) return context;
+  return context ? `${context}\n${label} ${evidence}` : `${label} ${evidence}`;
+}
 
 function normalizeText(input: string): string {
   return input.replace(/\s+/g, " ").trim();
@@ -151,11 +234,6 @@ function parseIntFromUnknown(
 
 function resolveLimit(raw: number): number {
   return raw <= 0 ? Number.POSITIVE_INFINITY : raw;
-}
-
-function parseMode(raw: unknown, fallback: LessonExtractionMode): LessonExtractionMode {
-  if (raw === "off" || raw === "heuristic" || raw === "llm" || raw === "hybrid") return raw;
-  return fallback;
 }
 
 function parseAdditionalTerms(raw: unknown): string[] {
@@ -199,10 +277,17 @@ function sanitizePersistentTags(tags: string[]): string[] {
 function sanitizeCandidate(candidate: ExtractedLessonCandidate): ExtractedLessonCandidate | null {
   const content = sanitizePersistentText(candidate.content);
   if (!content) return null;
+  const evidence = sanitizeEvidence(candidate.evidence);
+  const context = appendEvidenceToContext(
+    sanitizePersistentText(candidate.context),
+    evidence,
+  );
+
   return {
     ...candidate,
     content,
-    context: sanitizePersistentText(candidate.context),
+    context,
+    evidence,
     tags: sanitizePersistentTags(candidate.tags),
   };
 }
@@ -218,10 +303,10 @@ export function resolveReplayLessonExtractionConfig(
   );
 
   return {
-    mode: parseMode(payload.mode ?? env.AGENTMEMORY_REPLAY_LESSON_EXTRACT_MODE, base.mode),
+    enabled: typeof payload.enabled === "boolean" ? payload.enabled : base.enabled,
     textLimit: parseIntFromUnknown(
       payload.textLimit ?? env.AGENTMEMORY_REPLAY_LESSON_TEXT_LIMIT,
-      base.textLimit,
+      DEFAULT_REPLAY_LESSON_TEXT_LIMIT,
       allowUnbounded,
       true,
     ),
@@ -233,8 +318,8 @@ export function resolveReplayLessonExtractionConfig(
     ),
     saveLimit: parseIntFromUnknown(
       payload.saveLimit ?? env.AGENTMEMORY_REPLAY_LESSON_SAVE_LIMIT,
-      base.saveLimit,
-      allowUnbounded,
+      DEFAULT_REPLAY_LESSON_SAVE_LIMIT,
+      true,
       true,
     ),
     additionalHeuristicTerms: uniqueStrings([
@@ -242,16 +327,6 @@ export function resolveReplayLessonExtractionConfig(
       ...parseAdditionalTerms(payload.additionalHeuristicTerms),
     ]),
     allowUnbounded,
-    llmChunkSize: Math.max(1, parseIntFromUnknown(payload.llmChunkSize ?? env.AGENTMEMORY_REPLAY_LESSON_LLM_CHUNK_SIZE, base.llmChunkSize, true, false)),
-    llmChunkConcurrency: Math.max(
-      1,
-      parseIntFromUnknown(
-        payload.llmChunkConcurrency ?? env.AGENTMEMORY_REPLAY_LESSON_LLM_CHUNK_CONCURRENCY,
-        base.llmChunkConcurrency,
-        true,
-        false,
-      ),
-    ),
   };
 }
 
@@ -284,9 +359,11 @@ function addCandidate(
   content: string,
   context: string,
   confidence: number,
+  importance: number,
   source: "heuristic" | "llm",
   tags: string[],
   matchLimit: number,
+  evidence = "",
 ): void {
   const sanitizedContent = sanitizePersistentText(content);
   const normalized = normalizeContent(sanitizedContent);
@@ -295,8 +372,10 @@ function addCandidate(
     content: sanitizedContent,
     context: sanitizePersistentText(context),
     confidence,
+    importance,
     tags: sanitizePersistentTags(tags),
     source,
+    evidence: sanitizeEvidence(evidence),
   });
 }
 
@@ -316,7 +395,16 @@ function extractHeuristicFromText(
     while ((match = pattern.exec(text)) !== null) {
       const snippet = normalizeText(match[0]);
       if (!snippet || snippet.length < 20 || snippet.length > 220) continue;
-      addCandidate(sourceSet, snippet, context, 0.4, "heuristic", ["auto-import", "heuristic"], matchLimit);
+      addCandidate(
+        sourceSet,
+        snippet,
+        context,
+        0.4,
+        0.4,
+        "heuristic",
+        ["auto-import", "heuristic"],
+        matchLimit,
+      );
       if (sourceSet.size >= matchLimit) return;
     }
   }
@@ -326,7 +414,16 @@ function extractHeuristicFromText(
     if (sentence.length < 8 || sentence.length > 260) continue;
     const lower = sentence.toLowerCase();
     if (!lowerTerms.some((term) => lower.includes(term))) continue;
-    addCandidate(sourceSet, sentence, context, 0.4, "heuristic", ["auto-import", "heuristic"], matchLimit);
+    addCandidate(
+      sourceSet,
+      sentence,
+      context,
+      0.4,
+      0.4,
+      "heuristic",
+      ["auto-import", "heuristic"],
+      matchLimit,
+    );
   }
 }
 
@@ -359,16 +456,23 @@ function collectLlmPromptItems(
   textLimit: number,
   firstPrompt?: string,
 ): LessonPromptItem[] {
-  const resolvedTextLimit = resolveLimit(textLimit);
+  const itemTextLimit = resolveLimit(textLimit);
+  const truncateItem = (value: string): string => {
+    const normalized = normalizeText(value);
+    if (!normalized || !Number.isFinite(itemTextLimit)) return normalized;
+    return truncateForLessonPrompt(normalized, itemTextLimit);
+  };
   const items: LessonPromptItem[] = [];
   let index = 1;
 
-  const rawItems = collectLessonTexts(rawObservations).slice(0, resolvedTextLimit);
+  const rawItems = collectLessonTexts(rawObservations);
   for (const entry of rawItems) {
+    const text = truncateItem(entry.text);
+    if (!text) continue;
     items.push({
       index,
       kind: entry.kind,
-      text: normalizeText(entry.text),
+      text,
       files: undefined,
     });
     index += 1;
@@ -377,14 +481,12 @@ function collectLlmPromptItems(
   const compressedItems = compressedObservations
     .filter((obs) =>
       obs.importance >= 5 || obs.type === "error" || obs.type === "decision" || obs.type === "discovery",
-    )
-    .slice(0, resolvedTextLimit);
+    );
 
   for (const obs of compressedItems) {
     const parts = [obs.title, obs.narrative].filter(Boolean);
-    const text = normalizeText(parts.join(" "));
+    const text = truncateItem(parts.join(" "));
     if (!text) continue;
-    if (items.length >= resolvedTextLimit * 2) break;
     items.push({
       index,
       kind: "observation",
@@ -400,11 +502,11 @@ function collectLlmPromptItems(
     items.unshift({
       index: 0,
       kind: "assistant_response",
-      text: normalizeText(firstPrompt),
+      text: truncateItem(firstPrompt),
     });
   }
 
-  return items.slice(0, resolvedTextLimit);
+  return items;
 }
 
 interface LessonChunkResult {
@@ -418,12 +520,21 @@ async function extractLlmChunkWithRetry(
   prompt: string,
   chunkIndex: number,
   sessionId: string,
+  timeoutMs: number,
 ): Promise<LessonChunkResult> {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const xml = await provider.compress(
-        withOutputLanguagePolicy(LESSON_EXTRACTION_SYSTEM),
-        stripPrivateData(prompt),
+      const xml = await callWithTimeout(
+        () =>
+          provider.compress(
+            withOutputLanguagePolicy(
+              LESSON_EXTRACTION_SYSTEM,
+              undefined,
+              LESSON_EXTRACTION_OUTPUT_CONTRACT,
+            ),
+            stripPrivateData(prompt),
+          ),
+        timeoutMs,
       );
       if (!xml || !xml.trim()) throw new Error("empty LLM response");
       const parsed = parseLessonExtractionXml(xml);
@@ -436,20 +547,22 @@ async function extractLlmChunkWithRetry(
         throw new Error(`lesson extraction invalid payload: ${validation.result.errors.join(",")}`);
       }
 
-      return {
-        chunkIndex,
-        candidates: validation.data.lessons
-          .map((lesson) =>
-            sanitizeCandidate({
-              content: lesson.content,
-              context: lesson.context || "",
-              confidence: lesson.confidence,
-              tags: lesson.tags,
-              source: "llm",
-            }),
-          )
-          .filter((candidate): candidate is ExtractedLessonCandidate => candidate !== null),
-        errors: [],
+        return {
+          chunkIndex,
+          candidates: validation.data.lessons
+            .map((lesson) =>
+              sanitizeCandidate({
+                content: lesson.content,
+                context: lesson.context || "",
+                confidence: lesson.confidence,
+                importance: lesson.importance ?? 0.4,
+                evidence: lesson.evidence ?? "",
+                tags: lesson.tags,
+                source: "llm",
+              }),
+            )
+            .filter((candidate): candidate is ExtractedLessonCandidate => candidate !== null),
+          errors: [],
       };
     } catch (err) {
       logger.warn("Lesson extraction chunk failed", {
@@ -473,8 +586,15 @@ async function extractLlmChunkWithRetry(
 export async function extractLlmLessonCandidates(
   input: LlmExtractionInput,
 ): Promise<{ candidates: ExtractedLessonCandidate[]; errors: string[] }> {
-  const { provider, rawObservations, compressedObservations, firstPrompt, project, sessionId, config } =
-    input;
+  const {
+    provider,
+    rawObservations,
+    compressedObservations,
+    firstPrompt,
+    project,
+    sessionId,
+    config,
+  } = input;
   const textLimit = resolveLimit(config.textLimit);
   const items = collectLlmPromptItems(
     rawObservations,
@@ -484,8 +604,15 @@ export async function extractLlmLessonCandidates(
   );
   if (items.length === 0) return { candidates: [], errors: [] };
 
-  const chunkSize = Math.max(1, config.llmChunkSize);
-  const concurrency = Math.max(1, config.llmChunkConcurrency);
+  const chunkSize = Math.max(
+    1,
+    config.chunkSize ?? DEFAULT_REPLAY_LESSON_LLM_CHUNK_SIZE,
+  );
+  const concurrency = Math.max(
+    1,
+    config.chunkConcurrency ?? DEFAULT_REPLAY_LESSON_LLM_CHUNK_CONCURRENCY,
+  );
+  const timeoutMs = normalizeTimeoutMs(config.timeoutMs);
   const chunks: LessonPromptItem[][] = [];
 
   for (let i = 0; i < items.length; i += chunkSize) {
@@ -511,6 +638,7 @@ export async function extractLlmLessonCandidates(
           chunkText,
           chunkIndex,
           sessionId,
+          timeoutMs,
         );
       }),
     );
@@ -530,6 +658,130 @@ export async function extractLlmLessonCandidates(
   }
 
   return { candidates, errors };
+}
+
+function sortLlmCandidates(
+  candidates: ExtractedLessonCandidate[],
+): ExtractedLessonCandidate[] {
+  return [...candidates].sort((a, b) => {
+    if (a.importance !== b.importance) return b.importance - a.importance;
+    if (a.confidence !== b.confidence) return b.confidence - a.confidence;
+    return (b.evidence || "").length - (a.evidence || "").length;
+  });
+}
+
+export async function extractLlmLessonsFromObservations(
+  input: ExtractLlmLessonsInput,
+): Promise<ExtractLlmLessonsResult> {
+  const createdAt = new Date().toISOString();
+  const {
+    kv,
+    provider,
+    sessionId,
+    project,
+    rawObservations,
+    compressedObservations,
+    firstPrompt,
+    config,
+    sourceRunId,
+  } = input;
+  const context = firstPrompt || project;
+  const fallbackContext = sanitizePersistentText(context);
+
+  const { candidates, errors: extractionErrors } = await extractLlmLessonCandidates({
+    provider,
+    rawObservations,
+    compressedObservations,
+    config,
+    firstPrompt,
+    project,
+    sessionId,
+  });
+  const errors = [...extractionErrors];
+
+  if (candidates.length === 0) {
+    return {
+      lessonIds: [],
+      created: 0,
+      reinforced: 0,
+      skipped: errors.length,
+      errors,
+    };
+  }
+
+  const sanitizedCandidates = candidates
+    .map(sanitizeCandidate)
+    .filter((candidate): candidate is ExtractedLessonCandidate => candidate !== null);
+  const merged = mergeCandidates(sanitizedCandidates).filter((candidate) =>
+    candidate.content && candidate.content.length > 0,
+  );
+  const prioritized = sortLlmCandidates(merged);
+  const limit = config.saveLimit <= 0 ? Number.POSITIVE_INFINITY : config.saveLimit;
+  const selected = applyCandidateLimit(prioritized, limit);
+
+  let created = 0;
+  let reinforced = 0;
+  const lessonIds: string[] = [];
+
+  for (const candidate of selected) {
+    const lessonId = fingerprintId("lesson", normalizeContent(candidate.content));
+    try {
+      const previous = await kv.get<Lesson>(KV.lessons, lessonId);
+      if (previous) {
+        const existing = { ...previous };
+        existing.tags = uniqueStrings([...existing.tags, ...candidate.tags]);
+        existing.confidence = Math.max(existing.confidence, candidate.confidence);
+        existing.sourceRunId = sourceRunId;
+        if (!existing.sourceIds.includes(sessionId)) {
+          existing.sourceIds.push(sessionId);
+          existing.reinforcements += 1;
+          existing.lastReinforcedAt = createdAt;
+          reinforced += 1;
+        }
+        if (!existing.context && candidate.context) {
+          existing.context = candidate.context;
+        } else if (!existing.context) {
+          existing.context = fallbackContext;
+        }
+        existing.updatedAt = createdAt;
+        await kv.set(KV.lessons, lessonId, existing);
+        lessonIds.push(lessonId);
+        continue;
+      }
+
+      const lesson: Lesson = {
+        id: lessonId,
+        content: candidate.content,
+        context: candidate.context || fallbackContext,
+        confidence: candidate.confidence,
+        reinforcements: 0,
+        source: "llm",
+        origin: "llm-session-extraction",
+        sourceIds: [sessionId],
+        sourceRunId,
+        project,
+        tags: uniqueStrings(candidate.tags),
+        createdAt,
+        updatedAt: createdAt,
+        decayRate: 0.05,
+      };
+      await kv.set(KV.lessons, lessonId, lesson);
+      lessonIds.push(lessonId);
+      created += 1;
+    } catch (err) {
+      errors.push(
+        err instanceof Error ? err.message : `failed to save lesson candidate: ${String(err)}`,
+      );
+    }
+  }
+
+  return {
+    lessonIds,
+    created,
+    reinforced,
+    skipped: errors.length,
+    errors,
+  };
 }
 
 function applyCandidateLimit<T>(items: T[], limit: number): T[] {
@@ -558,9 +810,13 @@ function mergeCandidates(
     }
 
     existing.confidence = Math.max(existing.confidence, candidate.confidence);
+    existing.importance = Math.max(existing.importance, candidate.importance);
     existing.tags = uniqueStrings([...existing.tags, ...candidate.tags]);
     if (!existing.context && candidate.context) {
       existing.context = candidate.context;
+    }
+    if (!existing.evidence && candidate.evidence) {
+      existing.evidence = candidate.evidence;
     }
     if (existing.source === "heuristic" && candidate.source === "llm") {
       existing.source = "llm";
@@ -568,7 +824,9 @@ function mergeCandidates(
   }
 
   return Array.from(merged.values()).sort((a, b) => {
-    if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+    if (b.confidence !== a.confidence) {
+      return b.confidence - a.confidence;
+    }
     return a.order - b.order;
   });
 }
@@ -583,11 +841,9 @@ export async function extractLessonsFromReplay(
   const createdAt = new Date().toISOString();
   const {
     kv,
-    provider,
     sessionId,
     project,
     rawObservations,
-    compressedObservations,
     firstPrompt,
     config,
   } = input;
@@ -598,41 +854,17 @@ export async function extractLessonsFromReplay(
     return { lessonIds: [], created: 0, reinforced: 0, skipped: 0, errors: [] };
   }
 
-  if (config.mode === "off") {
+  if (!config.enabled) {
     return { lessonIds: [], created: 0, reinforced: 0, skipped: 0, errors: [] };
   }
 
-  let allCandidates: ExtractedLessonCandidate[] = [];
+  const allCandidates = extractHeuristicLessonCandidates({
+    rawObservations,
+    config,
+    firstPrompt,
+    project,
+  });
   const errors: string[] = [];
-
-  if (config.mode === "heuristic" || config.mode === "hybrid") {
-    allCandidates = allCandidates.concat(
-      extractHeuristicLessonCandidates({
-        rawObservations,
-        config,
-        firstPrompt,
-        project,
-      }),
-    );
-  }
-
-  if (config.mode === "llm" || config.mode === "hybrid") {
-    if (isNoopProvider(provider)) {
-      errors.push("LLM lesson extraction skipped (noop provider)");
-    } else {
-      const llmResult = await extractLlmLessonCandidates({
-        provider,
-        rawObservations,
-        compressedObservations,
-        config,
-        firstPrompt,
-        project,
-        sessionId,
-      });
-      allCandidates = allCandidates.concat(llmResult.candidates);
-      errors.push(...llmResult.errors);
-    }
-  }
 
   const sanitizedCandidates = allCandidates
     .map(sanitizeCandidate)
@@ -643,8 +875,8 @@ export async function extractLessonsFromReplay(
   );
 
   const matchedCandidates = applyCandidateLimit(
-    merged,
-    config.matchLimit === 0 ? Number.POSITIVE_INFINITY : config.matchLimit,
+      merged,
+      config.matchLimit === 0 ? Number.POSITIVE_INFINITY : config.matchLimit,
   );
 
   const candidates = applyCandidateLimit(
@@ -687,7 +919,8 @@ export async function extractLessonsFromReplay(
         context: candidate.context || fallbackContext,
         confidence: candidate.confidence,
         reinforcements: 0,
-        source: "consolidation",
+        source: "heuristic",
+        origin: "replay-import-heuristic",
         sourceIds: [sessionId],
         project,
         tags: uniqueStrings([...candidate.tags, "auto-import"]),

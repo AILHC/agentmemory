@@ -16,6 +16,14 @@ Rules:
 - Skip insights that merely restate a single source item
 - Always emit confidence attribute before title attribute`;
 
+export const REFLECT_OUTPUT_CONTRACT = {
+  reflect: [
+    "<insight> 的 <title> 与正文内容使用简体中文。",
+    "sourceConceptCluster 与 concepts 可保留英文技术标识或中英双语，不要强行中文化图谱/关系名词。",
+    "sourceConceptCluster 与关系术语（source/target/type）保留可检索标识，不改写。",
+  ],
+} as const;
+
 export function buildReflectPrompt(cluster: {
   concepts: string[];
   facts: Array<{ fact: string; confidence: number }>;

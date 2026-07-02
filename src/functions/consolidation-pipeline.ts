@@ -13,6 +13,7 @@ import {
   buildSemanticMergePrompt,
   PROCEDURAL_EXTRACTION_SYSTEM,
   buildProceduralExtractionPrompt,
+  SEMANTIC_MERGE_OUTPUT_CONTRACT,
 } from "../prompts/consolidation.js";
 import {
   resolveOutputLanguage,
@@ -21,6 +22,41 @@ import {
 import { recordAudit } from "./audit.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
 import { logger } from "../logger.js";
+
+interface ParsedSemanticFact {
+  fact: string;
+  confidence: number;
+}
+
+function parseFactResponse(response: string): ParsedSemanticFact[] {
+  const facts: ParsedSemanticFact[] = [];
+  const factRegex = /<fact(\s+[^>]*)?>([\s\S]*?)<\/fact>/gi;
+  let match: RegExpExecArray | null;
+  while ((match = factRegex.exec(response)) !== null) {
+    const openTag = match[1] ?? "";
+    const matchConfidence = openTag.match(/\bconfidence\s*=\s*["']([^"']+)["']/i);
+    const parsedConf = matchConfidence ? Number.parseFloat(matchConfidence[1]) : NaN;
+    const confidence = Number.isFinite(parsedConf) ? Math.max(0, Math.min(1, parsedConf)) : 0.5;
+    const fact = match[2]?.replace(/<[^>]*>/g, " ").trim();
+    if (fact) facts.push({ fact, confidence });
+  }
+  return facts;
+}
+
+function hasChinese(input: string): boolean {
+  return /[\u4e00-\u9fff]/.test(input);
+}
+
+function collectLanguageViolations(facts: ParsedSemanticFact[]): string[] {
+  return facts.filter((entry) => !hasChinese(entry.fact)).map((entry) => entry.fact);
+}
+
+function buildSemanticRetryContractPrompt(): string {
+  return [
+    SEMANTIC_MERGE_OUTPUT_CONTRACT.semantic?.[0] ?? "每个 <fact> 内容必须使用简体中文。",
+    "若仍有非中文 fact，先保留语义与关键技术名词，再补充可读中文句子；保持 XML 与属性不变。",
+  ].join("\n");
+}
 
 function applyDecay(
   items: Array<{
@@ -58,8 +94,8 @@ export function registerConsolidationPipelineFunction(
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
       }
       const tier = data?.tier || "all";
-      const decayDays = getConsolidationDecayDays();
-      const results: Record<string, unknown> = {};
+    const decayDays = getConsolidationDecayDays();
+    const results: Record<string, unknown> = {};
 
       if (tier === "all" || tier === "semantic") {
         const summaries = await kv.list<SessionSummary>(KV.summaries);
@@ -83,21 +119,53 @@ export function registerConsolidationPipelineFunction(
           );
 
           try {
-            const response = await provider.summarize(
-              withOutputLanguagePolicy(SEMANTIC_MERGE_SYSTEM),
-              prompt,
+            const outputLanguage = resolveOutputLanguage();
+            const baseSystem = withOutputLanguagePolicy(
+              SEMANTIC_MERGE_SYSTEM,
+              undefined,
+              SEMANTIC_MERGE_OUTPUT_CONTRACT,
+            );
+            const parseResponse = (response: string) => {
+              const parsed = parseFactResponse(response);
+              const languageViolations = outputLanguage === "zh-CN"
+                ? collectLanguageViolations(parsed)
+                : [];
+              return { parsed, languageViolations };
+            };
+
+            let parsedResult = parseResponse(
+              await provider.summarize(baseSystem, prompt),
             );
 
-            const factRegex = /<fact\s+confidence="([^"]+)">([^<]+)<\/fact>/g;
-            let match;
+            if (outputLanguage === "zh-CN" && parsedResult.languageViolations.length > 0) {
+              logger.warn("Semantic merge language contract may be violated", {
+                violations: parsedResult.languageViolations.length,
+              });
+              const strictSystem = withOutputLanguagePolicy(
+                SEMANTIC_MERGE_SYSTEM,
+                undefined,
+                {
+                  semantic: [
+                    ...(SEMANTIC_MERGE_OUTPUT_CONTRACT.semantic ?? []),
+                    buildSemanticRetryContractPrompt(),
+                  ],
+                },
+              );
+              try {
+                parsedResult = parseResponse(await provider.summarize(strictSystem, prompt));
+              } catch (retryErr) {
+                logger.warn("Semantic merge retry failed; keep first extraction", {
+                  error: retryErr instanceof Error ? retryErr.message : String(retryErr),
+                });
+              }
+            }
+
+            const facts = parsedResult.parsed;
+            const languageViolations = parsedResult.languageViolations;
             let newFacts = 0;
             const now = new Date().toISOString();
 
-            while ((match = factRegex.exec(response)) !== null) {
-              const parsedConf = parseFloat(match[1]);
-              const confidence = Number.isNaN(parsedConf) ? 0.5 : parsedConf;
-              const fact = match[2].trim();
-
+            for (const { fact, confidence } of facts) {
               const existing = existingSemantic.find(
                 (s) => s.fact.toLowerCase() === fact.toLowerCase(),
               );
@@ -124,7 +192,17 @@ export function registerConsolidationPipelineFunction(
                 newFacts++;
               }
             }
-            results.semantic = { newFacts, totalSummaries: summaries.length };
+
+            results.semantic = {
+              newFacts,
+              totalSummaries: summaries.length,
+              ...(languageViolations.length > 0 ? { languageViolations } : {}),
+            };
+            if (languageViolations.length > 0) {
+              logger.warn("Semantic merge kept non-Chinese facts after retry", {
+                count: languageViolations.length,
+              });
+            }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Semantic consolidation failed", { error: msg });

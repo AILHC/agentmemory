@@ -31,12 +31,10 @@ describe("api::replay::import lessonExtraction validation", () => {
         path: "/tmp/session",
         maxFiles: 5,
         lessonExtraction: {
-          mode: "hybrid",
+          enabled: false,
           textLimit: 120,
           additionalHeuristicTerms: ["务必"],
           allowUnbounded: true,
-          llmChunkSize: 32,
-          llmChunkConcurrency: 4,
         },
       },
     } as any);
@@ -48,12 +46,10 @@ describe("api::replay::import lessonExtraction validation", () => {
       path: "/tmp/session",
       maxFiles: 5,
       lessonExtraction: {
-        mode: "hybrid",
+        enabled: false,
         textLimit: 120,
         additionalHeuristicTerms: ["务必"],
         allowUnbounded: true,
-        llmChunkSize: 32,
-        llmChunkConcurrency: 4,
       },
     });
   });
@@ -83,8 +79,8 @@ describe("api::replay::import lessonExtraction validation", () => {
       body: {
         path: "/tmp/session",
         lessonExtraction: {
-          mode: "heuristic",
           unexpected: "bad",
+          enabled: true,
         },
       },
     } as any);
@@ -125,11 +121,25 @@ describe("api::replay::import lessonExtraction validation", () => {
         lessonExtraction: { textLimit: "40" },
       },
     } as any);
+    const badLlmChunkSize = await sdk.apiReplayImport!({
+      body: {
+        lessonExtraction: { llmChunkSize: 32 },
+      },
+    } as any);
+    const badLlmChunkConcurrency = await sdk.apiReplayImport!({
+      body: {
+        lessonExtraction: { llmChunkConcurrency: 4 },
+      },
+    } as any);
 
     expect(badMode.status_code).toBe(400);
     expect(badMode.body).toMatchObject({ error: expect.stringContaining("invalid lessonExtraction") });
     expect(badType.status_code).toBe(400);
     expect(badType.body).toMatchObject({ error: expect.stringContaining("invalid lessonExtraction") });
+    expect(badLlmChunkSize.status_code).toBe(400);
+    expect(badLlmChunkSize.body).toMatchObject({ error: expect.stringContaining("invalid lessonExtraction") });
+    expect(badLlmChunkConcurrency.status_code).toBe(400);
+    expect(badLlmChunkConcurrency.body).toMatchObject({ error: expect.stringContaining("invalid lessonExtraction") });
   });
 
   it("omits lessonExtraction when it is not provided", async () => {

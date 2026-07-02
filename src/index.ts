@@ -101,7 +101,7 @@ import { VERSION } from "./version.js";
 import { bootLog } from "./logger.js";
 import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { homedir } from "node:os";
+import { agentMemoryHome } from "./paths.js";
 
 // #640 + #474: the worker process (this file) is spawned by iii-exec
 // inside the engine. When `agentmemory stop` kills only the engine pid,
@@ -110,7 +110,7 @@ import { homedir } from "node:os";
 // a duplicate worker. Write the worker pid alongside iii.pid so
 // `agentmemory stop` can reap us too.
 function workerPidfilePath(): string {
-  return join(homedir(), ".agentmemory", "worker.pid");
+  return agentMemoryHome("worker.pid");
 }
 function writeWorkerPidfile(): void {
   try {
@@ -319,7 +319,7 @@ async function main() {
   registerDiagnosticsFunction(sdk, kv);
   registerFacetsFunction(sdk, kv);
   registerVerifyFunction(sdk, kv);
-  registerLessonsFunctions(sdk, kv);
+  registerLessonsFunctions(sdk, kv, provider);
   registerObsidianExportFunction(sdk, kv);
   registerReflectFunctions(sdk, kv, provider);
   registerWorkingMemoryFunctions(sdk, kv, config.tokenBudget);
@@ -518,7 +518,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 128 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 132 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,

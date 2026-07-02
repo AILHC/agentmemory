@@ -1,8 +1,8 @@
 import type { ISdk } from "iii-sdk";
 import { resolve } from "node:path";
-import { homedir } from "node:os";
 import { KV, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
+import { agentMemoryHome } from "../paths.js";
 import type {
   Memory,
   Session,
@@ -11,7 +11,7 @@ import type {
 } from "../types.js";
 import { logger } from "../logger.js";
 
-const ALLOWED_DIRS = [resolve(homedir(), ".agentmemory")];
+const ALLOWED_DIRS = [resolve(agentMemoryHome())];
 
 function isAllowedPath(dbPath: string): boolean {
   const resolved = resolve(dbPath);

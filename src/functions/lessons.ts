@@ -1,7 +1,18 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
-import type { Lesson } from "../types.js";
+import type {
+  Lesson,
+  LessonExtractionChunkRun,
+  LessonExtractionRun,
+  MemoryProvider,
+} from "../types.js";
+import {
+  enqueueLlmLessonExtractionRun,
+  listRunnableRuns,
+  processLlmLessonExtractionRun,
+  resolveLlmLessonExtractionRuntimeConfig,
+} from "./lesson-extraction-runs.js";
 import { recordAudit } from "./audit.js";
 
 function reinforceLesson(lesson: Lesson): void {
@@ -15,7 +26,56 @@ function reinforceLesson(lesson: Lesson): void {
   lesson.updatedAt = now;
 }
 
-export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
+function parseBoolean(value: unknown): boolean | undefined {
+  if (typeof value === "boolean") return value;
+  return undefined;
+}
+
+function parsePositiveInteger(value: unknown): number | undefined {
+  if (typeof value !== "number") return undefined;
+  if (!Number.isInteger(value) || value < 1) return undefined;
+  return value;
+}
+
+function parseLessonExtractionStatus(status: unknown): string | undefined {
+  if (typeof status !== "string") return undefined;
+  const trimmed = status.trim();
+  if (trimmed.length === 0) return undefined;
+
+  const allowed = new Set([
+    "pending",
+    "running",
+    "succeeded",
+    "failed",
+    "retryable",
+    "skipped",
+  ]);
+  return allowed.has(trimmed) ? trimmed : undefined;
+}
+
+function parseStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") return undefined;
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    out.push(trimmed);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function isExpiredRunningRun(run: LessonExtractionRun, now = new Date()): boolean {
+  if (run.status !== "running") return false;
+  if (!run.runningLeaseUntil) return false;
+  return new Date(run.runningLeaseUntil).getTime() <= now.getTime();
+}
+
+export function registerLessonsFunctions(
+  sdk: ISdk,
+  kv: StateKV,
+  provider?: MemoryProvider,
+): void {
   sdk.registerFunction("mem::lesson-save", 
     async (data: {
       content: string;
@@ -23,8 +83,10 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
       confidence?: number;
       project?: string;
       tags?: string[];
-      source?: "crystal" | "manual" | "consolidation";
+      source?: "crystal" | "manual" | "consolidation" | "heuristic" | "llm";
+      origin?: Lesson["origin"];
       sourceIds?: string[];
+      sourceRunId?: string;
     }) => {
       if (!data.content?.trim()) {
         return { success: false, error: "content is required" };
@@ -68,6 +130,8 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
         confidence,
         reinforcements: 0,
         source: data.source || "manual",
+        origin: data.origin,
+        sourceRunId: data.sourceRunId,
         sourceIds: data.sourceIds || [],
         project: data.project,
         tags: data.tags || [],
@@ -83,6 +147,136 @@ export function registerLessonsFunctions(sdk: ISdk, kv: StateKV): void {
       } catch {}
 
       return { success: true, action: "created", lesson };
+    },
+  );
+
+  sdk.registerFunction("mem::lessons::extract-llm",
+    async (data: {
+      sessionIds?: string[];
+      missingOnly?: unknown;
+      retryFailed?: unknown;
+      force?: unknown;
+      textLimit?: unknown;
+      saveLimit?: unknown;
+      chunkSize?: unknown;
+      chunkConcurrency?: unknown;
+      timeoutMs?: unknown;
+    }) => {
+      if (!provider) {
+        return { success: false, error: "provider is required for lesson extraction" };
+      }
+
+      const sessionIds = parseStringArray(data.sessionIds);
+      if (!sessionIds || sessionIds.length === 0) {
+        return { success: false, error: "sessionIds is required and must be a non-empty string array" };
+      }
+
+      const missingOnly = parseBoolean(data.missingOnly);
+      const retryFailed = parseBoolean(data.retryFailed);
+      const force = parseBoolean(data.force);
+      const config = resolveLlmLessonExtractionRuntimeConfig(provider, {
+        textLimit: data.textLimit,
+        saveLimit: data.saveLimit,
+        chunkSize: data.chunkSize,
+        chunkConcurrency: data.chunkConcurrency,
+        timeoutMs: data.timeoutMs,
+      });
+
+      const runs: LessonExtractionRun[] = [];
+      const now = new Date();
+
+      for (const sessionId of sessionIds) {
+        const baseRun = await enqueueLlmLessonExtractionRun({
+          kv,
+          sessionId,
+          missingOnly: missingOnly ?? true,
+          retryFailed: retryFailed ?? true,
+          force: force ?? false,
+          config,
+        });
+
+        if (
+          baseRun.status === "pending" ||
+          baseRun.status === "retryable" ||
+          isExpiredRunningRun(baseRun, now)
+        ) {
+          runs.push(await processLlmLessonExtractionRun({ kv, provider, runId: baseRun.id }));
+        } else {
+          runs.push(baseRun);
+        }
+      }
+
+      return { success: true, runs };
+    },
+  );
+
+  sdk.registerFunction("mem::lessons::extract-process",
+    async (data: { limit?: unknown }) => {
+      if (!provider) {
+        return { success: false, error: "provider is required for lesson extraction" };
+      }
+
+      const rawLimit = parsePositiveInteger(data.limit);
+      if (typeof data.limit !== "undefined" && rawLimit === undefined) {
+        return { success: false, error: "limit must be a positive integer" };
+      }
+      const limit = rawLimit ?? 1;
+      const runs = await listRunnableRuns(kv, limit);
+      const out: LessonExtractionRun[] = [];
+
+      for (const run of runs) {
+        out.push(await processLlmLessonExtractionRun({ kv, provider, runId: run.id }));
+      }
+
+      return { success: true, runs };
+    },
+  );
+
+  sdk.registerFunction("mem::lessons::extract-runs",
+    async (data: { sessionId?: unknown; status?: unknown; limit?: unknown }) => {
+      const rawLimit = parsePositiveInteger(data.limit);
+      if (typeof data.limit !== "undefined" && (rawLimit === undefined || rawLimit > 500)) {
+        return { success: false, error: "limit must be between 1 and 500" };
+      }
+      const limit = rawLimit ?? 50;
+
+      const status = parseLessonExtractionStatus(data.status);
+      if (typeof data.status === "string" && !status) {
+        return { success: false, error: "invalid status" };
+      }
+
+      const sessionId =
+        typeof data.sessionId === "string" && data.sessionId.trim().length > 0
+          ? data.sessionId.trim()
+          : undefined;
+
+      const runs = await kv.list<LessonExtractionRun>(KV.lessonExtractionRuns);
+      const filtered = runs
+        .filter((run) => (sessionId ? run.sessionId === sessionId : true))
+        .filter((run) => (status ? run.status === status : true))
+        .sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""))
+        .slice(0, limit);
+      return { success: true, runs: filtered };
+    },
+  );
+
+  sdk.registerFunction("mem::lessons::extract-run-get",
+    async (data: { runId?: unknown }) => {
+      if (typeof data.runId !== "string" || !data.runId.trim()) {
+        return { success: false, error: "runId is required" };
+      }
+
+      const runId = data.runId.trim();
+      const run = await kv.get<LessonExtractionRun>(KV.lessonExtractionRuns, runId);
+      if (!run) {
+        return { success: false, error: "run not found" };
+      }
+
+      const chunks = await kv.list<LessonExtractionChunkRun>(
+        KV.lessonExtractionChunks(run.id),
+      );
+      const sortedChunks = chunks.sort((a, b) => a.chunkIndex - b.chunkIndex);
+      return { success: true, run, chunks: sortedChunks };
     },
   );
 

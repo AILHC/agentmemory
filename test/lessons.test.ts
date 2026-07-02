@@ -5,7 +5,8 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerLessonsFunctions } from "../src/functions/lessons.js";
-import type { Lesson } from "../src/types.js";
+import type { Lesson, MemoryProvider } from "../src/types.js";
+import { KV } from "../src/state/schema.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -347,6 +348,61 @@ describe("Lessons", () => {
       const after = await kv.get<Lesson>("mem:lessons", saved.lesson.id);
       expect(after!.confidence).toBeCloseTo(0.55, 2);
       expect(after!.confidence).toBeGreaterThan(0.4);
+    });
+  });
+
+  describe("mem::lessons::extract-llm", () => {
+    it("fails when provider is missing", async () => {
+      const result = (await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-1"],
+      })) as { success: boolean; error?: string };
+
+      expect(result.success).toBe(false);
+      expect(result.error).toMatch(/provider is required/);
+    });
+
+    it("supports extract-runs and extract-run-get with active provider", async () => {
+      const provider: MemoryProvider = {
+        name: "mock-llm",
+        compress: vi.fn(async () => ""),
+        summarize: vi.fn(async () => ""),
+      };
+      registerLessonsFunctions(sdk as never, kv as never, provider);
+
+      await kv.set(KV.sessions, "session-1", {
+        id: "session-1",
+        project: "project",
+        cwd: "/tmp/project",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        status: "active",
+        observationCount: 0,
+      });
+
+      const extractResult = (await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-1"],
+      })) as { success: boolean; runs: Array<{ id: string }> };
+      expect(extractResult.success).toBe(true);
+      expect(extractResult.runs).toHaveLength(1);
+
+      const runsResult = (await sdk.trigger("mem::lessons::extract-runs", {})) as {
+        success: boolean;
+        runs: Array<{ id: string; status: string }>;
+      };
+      expect(runsResult.success).toBe(true);
+      expect(runsResult.runs.length).toBe(1);
+      expect(runsResult.runs[0].id).toBe(extractResult.runs[0].id);
+
+      const runResult = (await sdk.trigger("mem::lessons::extract-run-get", {
+        runId: extractResult.runs[0].id,
+      })) as {
+        success: boolean;
+        run: { id: string };
+        chunks: unknown[];
+      };
+      expect(runResult.success).toBe(true);
+      expect(runResult.run.id).toBe(extractResult.runs[0].id);
+      expect(Array.isArray(runResult.chunks)).toBe(true);
+      expect(runResult.chunks).toHaveLength(0);
     });
   });
 });

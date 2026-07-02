@@ -1,10 +1,10 @@
-import { homedir } from "node:os";
 import { join, resolve, sep } from "node:path";
 import { existsSync } from "node:fs";
 import { mkdir, writeFile, unlink, utimes, stat } from "node:fs/promises";
 import { createHash } from "node:crypto";
+import { agentMemoryHome } from "../paths.js";
 
-export const IMAGES_DIR = join(homedir(), ".agentmemory", "images");
+export const IMAGES_DIR = agentMemoryHome("images");
 
 const DEFAULT_MAX_BYTES = 500 * 1024 * 1024;
 

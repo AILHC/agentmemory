@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { agentMemoryHome } from "./paths.js";
 import type {
   AgentMemoryConfig,
   ProviderConfig,
@@ -16,7 +17,7 @@ function safeParseInt(value: string | undefined, fallback: number): number {
   return Number.isNaN(parsed) ? fallback : parsed;
 }
 
-const DATA_DIR = join(homedir(), ".agentmemory");
+const DATA_DIR = agentMemoryHome();
 const ENV_FILE = join(DATA_DIR, ".env");
 
 let warnPremiumModelShown = false;
@@ -430,7 +431,7 @@ export function loadSnapshotConfig(): {
   return {
     enabled: env["SNAPSHOT_ENABLED"] === "true",
     interval: safeParseInt(env["SNAPSHOT_INTERVAL"], 3600),
-    dir: env["SNAPSHOT_DIR"] || join(homedir(), ".agentmemory", "snapshots"),
+    dir: env["SNAPSHOT_DIR"] || agentMemoryHome("snapshots"),
   };
 }
 
@@ -520,7 +521,7 @@ export function getStandalonePersistPath(): string {
   const env = getMergedEnv();
   return (
     env["STANDALONE_PERSIST_PATH"] ||
-    join(homedir(), ".agentmemory", "standalone.json")
+    agentMemoryHome("standalone.json")
   );
 }
 
