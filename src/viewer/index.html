@@ -1285,6 +1285,9 @@
         body: JSON.stringify(body || {})
       });
     }
+    function delay(ms) {
+      return new Promise(function(resolve) { setTimeout(resolve, ms); });
+    }
 
     function normalizeTab(tab) {
       var normalized = String(tab || '').replace(/^#/, '').toLowerCase();
@@ -1722,8 +1725,8 @@
       if (state.graph.nodes.length === 0 && (state.graph.stats.totalNodes || state.graph.stats.nodes || 0) === 0) {
         var sb = document.getElementById('graph-sidebar');
         if (sb) sb.innerHTML = '<h3>Graph</h3><p style="font-size:12px;color:var(--ink-faint);margin:8px 0;font-style:italic;">No graph data yet. Building from observations and memories...</p>';
-        var buildResult = await apiPost('graph/build', {});
-        if (buildResult && buildResult.success && buildResult.nodes > 0) {
+        var buildTask = await runGraphBuildTask();
+        if (buildTask && buildTask.status === 'succeeded' && buildTask.resultVisibility !== 'none') {
           var freshResults = await Promise.all([
             apiPost('graph/query', { limit: GRAPH_INITIAL_LIMIT }),
             apiGet('graph/stats')
@@ -1754,6 +1757,47 @@
       decision: 'diamond', pattern: 'circle', library: 'hexagon', person: 'circle'
     };
     var graphSearchTerm = '';
+
+    function renderGraphBuildProgress(message, task) {
+      var sb = document.getElementById('graph-sidebar');
+      if (!sb) return;
+      var progress = task && task.progress ? task.progress : {};
+      var sessions = typeof progress.sessionTotal === 'number'
+        ? progress.sessionProcessed + '/' + progress.sessionTotal + ' sessions'
+        : progress.sessionProcessed + ' sessions';
+      sb.innerHTML =
+        '<h3>Graph</h3>' +
+        '<p style="font-size:12px;color:var(--ink-faint);font-style:italic;">' + esc(message) + '</p>' +
+        '<div style="font-size:11px;color:var(--ink-muted);line-height:1.5;margin-top:8px;">' +
+        '<div>Status: ' + esc((task && (task.viewStatus || task.status)) || 'queued') + '</div>' +
+        '<div>Progress: ' + esc(sessions) + ', ' + (progress.batchProcessed || 0) + ' batches</div>' +
+        '</div>';
+    }
+
+    async function runGraphBuildTask() {
+      var created = await apiPost('graph/build', {});
+      if (!created || !created.success || !created.taskId) return null;
+      var taskId = created.taskId;
+      var task = created.task || { status: created.status || 'queued', progress: {} };
+      renderGraphBuildProgress('Building graph from observations...', task);
+
+      for (var i = 0; i < 200; i++) {
+        var processed = await apiPost('graph/build/process', { taskId: taskId, maxBatches: 1 });
+        if (!processed || !processed.success) return null;
+        task = processed.task || task;
+        renderGraphBuildProgress('Building graph from observations...', task);
+        if (task.status === 'succeeded' || task.status === 'failed') return task;
+        await delay(250);
+      }
+
+      var status = await apiGet('graph/build/task?taskId=' + encodeURIComponent(taskId));
+      if (status && status.success) {
+        task = status.task || task;
+        task.viewStatus = status.viewStatus;
+        renderGraphBuildProgress('Graph build is still running. Refreshing current graph view...', task);
+      }
+      return task;
+    }
 
     function renderGraphSidebar() {
       var sb = document.getElementById('graph-sidebar');
@@ -2138,7 +2182,7 @@
     async function rebuildGraph() {
       var sb = document.getElementById('graph-sidebar');
       if (sb) sb.innerHTML = '<h3>Graph</h3><p style="font-size:12px;color:var(--ink-faint);font-style:italic;">Rebuilding graph from observations...</p>';
-      await apiPost('graph/build', {});
+      await runGraphBuildTask();
       state.graph.loaded = false;
       loadGraph();
     }

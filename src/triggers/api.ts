@@ -227,6 +227,13 @@ function parseOptionalBoundedPositiveInt(
   return parsed <= max ? parsed : null;
 }
 
+const allowedGraphBuildCreateKeys = new Set(["batchSize", "maxSessions"]);
+const allowedGraphBuildProcessKeys = new Set(["taskId", "maxBatches"]);
+
+function hasOnlyKeys(body: Record<string, unknown>, allowed: Set<string>): boolean {
+  return Object.keys(body).every((key) => allowed.has(key));
+}
+
 export function registerApiTriggers(
   sdk: ISdk,
   kv: StateKV,
@@ -1664,59 +1671,39 @@ export function registerApiTriggers(
   });
 
   // Backfill the knowledge graph from existing compressed observations.
-  // Viewer calls this when the graph is empty (#666). Iterates every
-  // session, collects observations that have a `title` (compressed only),
-  // and feeds them through `mem::graph-extract` in batches.
+  // The POST endpoint is intentionally short: it creates a durable task
+  // and returns immediately. /graph/build/process advances the cursor in
+  // bounded batches so callers can observe accurate task state after
+  // HTTP or invocation timeouts.
   sdk.registerFunction("api::graph-build",
-    async (req: ApiRequest<{ batchSize?: number }>): Promise<Response> => {
+    async (req: ApiRequest<{ batchSize?: number; maxSessions?: number }>): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const batchSize = Math.max(
-        1,
-        Math.min(100, Number((req.body as { batchSize?: number })?.batchSize) || 25),
-      );
-      try {
-        const sessions = await kv.list<Session>(KV.sessions);
-        let totalNodes = 0;
-        let totalEdges = 0;
-        let batchesRun = 0;
-        for (const session of sessions) {
-          const sid = session?.id;
-          if (typeof sid !== "string" || sid.length === 0) continue;
-          const observations = await kv.list<CompressedObservation>(KV.observations(sid));
-          const compressed = observations.filter((o) => o && typeof o.title === "string" && o.title.length > 0);
-          if (compressed.length === 0) continue;
-          for (let i = 0; i < compressed.length; i += batchSize) {
-            const batch = compressed.slice(i, i + batchSize);
-            try {
-              const result = (await sdk.trigger({
-                function_id: "mem::graph-extract",
-                payload: { observations: batch },
-              })) as { success?: boolean; nodesAdded?: number; edgesAdded?: number };
-              if (result?.success) {
-                totalNodes += Number(result.nodesAdded) || 0;
-                totalEdges += Number(result.edgesAdded) || 0;
-              }
-              batchesRun++;
-            } catch (err) {
-              logger.warn("graph-build batch failed", {
-                sessionId: sid,
-                batchIndex: Math.floor(i / batchSize),
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
-          }
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      if (!hasOnlyKeys(body, allowedGraphBuildCreateKeys)) {
+        return { status_code: 400, body: { error: "unsupported graph build field" } };
+      }
+      const payload: { batchSize?: number; maxSessions?: number } = {};
+      if (body.batchSize !== undefined) {
+        const parsed = Number(body.batchSize);
+        if (!Number.isInteger(parsed) || parsed < 1) {
+          return { status_code: 400, body: { error: "batchSize must be a positive integer" } };
         }
-        return {
-          status_code: 200,
-          body: {
-            success: true,
-            sessions: sessions.length,
-            batches: batchesRun,
-            nodes: totalNodes,
-            edges: totalEdges,
-          },
-        };
+        payload.batchSize = Math.max(1, Math.min(100, Number(body.batchSize)));
+      }
+      if (body.maxSessions !== undefined) {
+        const parsed = Number(body.maxSessions);
+        if (!Number.isInteger(parsed) || parsed < 1) {
+          return { status_code: 400, body: { error: "maxSessions must be a positive integer" } };
+        }
+        payload.maxSessions = Math.max(1, Math.min(100000, Number(body.maxSessions)));
+      }
+      try {
+        const result = await sdk.trigger({
+          function_id: "mem::graph-build-task-create",
+          payload,
+        });
+        return { status_code: 200, body: result };
       } catch {
         return graphDisabledResponse();
       }
@@ -1726,6 +1713,76 @@ export function registerApiTriggers(
     type: "http",
     function_id: "api::graph-build",
     config: { api_path: "/agentmemory/graph/build", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::graph-build-process",
+    async (req: ApiRequest<{ taskId?: string; maxBatches?: number }>): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const body = (req.body ?? {}) as Record<string, unknown>;
+      if (!hasOnlyKeys(body, allowedGraphBuildProcessKeys)) {
+        return { status_code: 400, body: { error: "unsupported graph build process field" } };
+      }
+      const taskId = typeof body.taskId === "string" ? body.taskId.trim() : "";
+      if (!taskId) {
+        return { status_code: 400, body: { error: "taskId is required" } };
+      }
+      const payload: { taskId: string; maxBatches?: number } = { taskId };
+      if (body.maxBatches !== undefined) {
+        const parsed = Number(body.maxBatches);
+        if (!Number.isInteger(parsed) || parsed < 1) {
+          return { status_code: 400, body: { error: "maxBatches must be a positive integer" } };
+        }
+        payload.maxBatches = Math.max(1, Math.min(20, Number(body.maxBatches)));
+      }
+      try {
+        const result = await sdk.trigger({
+          function_id: "mem::graph-build-task-process",
+          payload,
+        });
+        const response = result as { success?: boolean; statusCode?: number };
+        return {
+          status_code: response?.success === false ? response.statusCode ?? 400 : 200,
+          body: result,
+        };
+      } catch {
+        return graphDisabledResponse();
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-build-process",
+    config: { api_path: "/agentmemory/graph/build/process", http_method: "POST" },
+  });
+
+  sdk.registerFunction("api::graph-build-task",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const taskId = asNonEmptyString(req.query_params?.["taskId"]);
+      if (!taskId) {
+        return { status_code: 400, body: { error: "taskId query param required" } };
+      }
+      try {
+        const result = await sdk.trigger({
+          function_id: "mem::graph-build-task-get",
+          payload: { taskId },
+        });
+        const response = result as { success?: boolean };
+        return {
+          status_code: response?.success === false ? 404 : 200,
+          body: result,
+        };
+      } catch {
+        return graphDisabledResponse();
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::graph-build-task",
+    config: { api_path: "/agentmemory/graph/build/task", http_method: "GET" },
   });
 
   sdk.registerFunction("api::consolidate-pipeline",

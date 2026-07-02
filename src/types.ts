@@ -499,6 +499,43 @@ export interface GraphSnapshot {
   resetAt?: string;
 }
 
+export type GraphBuildTaskStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "failed";
+
+export type GraphBuildResultVisibility = "none" | "partial" | "published";
+
+export interface GraphBuildTask {
+  id: string;
+  status: GraphBuildTaskStatus;
+  step: string;
+  createdAt: string;
+  updatedAt: string;
+  startedAt?: string;
+  finishedAt?: string;
+  leaseUntil?: string;
+  leaseToken?: string;
+  cursor?: {
+    sessionIndex: number;
+    batchIndex: number;
+  };
+  progress: {
+    sessionTotal?: number;
+    sessionProcessed: number;
+    batchProcessed: number;
+    batchFailed: number;
+    nodeCount: number;
+    edgeCount: number;
+  };
+  resultVisibility: GraphBuildResultVisibility;
+  lastError?: string;
+  errorClass?: string;
+  batchSize: number;
+  maxSessions?: number;
+}
+
 export type ConsolidationTier =
   | "working"
   | "episodic"

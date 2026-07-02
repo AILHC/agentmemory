@@ -1556,7 +1556,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-132 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+134 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1576,8 +1576,32 @@ Create `~/.agentmemory/.env`:
 | `GET` | `/agentmemory/export` | Export all data |
 | `POST` | `/agentmemory/import` | Import from JSON |
 | `POST` | `/agentmemory/graph/query` | Knowledge graph query |
+| `POST` | `/agentmemory/graph/build` | Create a queued graph build task |
+| `POST` | `/agentmemory/graph/build/process` | Process a bounded number of graph build batches |
+| `GET` | `/agentmemory/graph/build/task?taskId=...` | Read graph build task status |
 | `POST` | `/agentmemory/team/share` | Share with team |
 | `GET` | `/agentmemory/audit` | Audit trail |
+
+Graph build backfill is task-based. Start with `POST /agentmemory/graph/build`
+and an optional `{ "batchSize": 25 }` body. The response includes `taskId`
+and `status: "queued"`. Call `POST /agentmemory/graph/build/process` with
+`{ "taskId": "...", "maxBatches": 1 }` until the task reaches `succeeded` or
+`failed`. Query `GET /agentmemory/graph/build/task?taskId=...` at any time;
+if a persisted `running` task has an expired lease, the response reports
+`viewStatus: "stale"` without mutating the stored task. `resultVisibility`
+is `none` before any graph write, `partial` while processed batches have
+published incremental graph rows, and `published` after a fully successful
+build.
+
+Lesson extraction already uses durable run state. Query
+`GET /agentmemory/lessons/extract/runs` to list runs and
+`GET /agentmemory/lessons/extract/run?runId=...` for a specific run.
+If a run has `runningLeaseUntil` in the past, treat it as stale and
+recoverable, not as failed.
+
+Session summarize is still synchronous best-effort in this phase. After an
+HTTP 504, hook abort, or iii invocation timeout, there is no guaranteed final
+summarize status to query.
 
 Full endpoint list: [`src/triggers/api.ts`](src/triggers/api.ts)
 

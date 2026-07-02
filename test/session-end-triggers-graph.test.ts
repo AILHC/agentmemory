@@ -32,11 +32,12 @@ describe("api::session::end → event::session::stopped (#666)", () => {
 });
 
 // #666: viewer's "Build Graph" button used to POST /agentmemory/graph/build
-// which returned 404 because the endpoint was never registered. Backfill
-// the knowledge graph from existing compressed observations across every
-// session in batches.
+// which returned 404 because the endpoint was never registered. The
+// endpoint now creates a persistent task; a separate process endpoint
+// advances the backfill in bounded batches.
 describe("api::graph-build endpoint (#666)", () => {
   const api = readFileSync("src/triggers/api.ts", "utf-8");
+  const viewer = readFileSync("src/viewer/index.html", "utf-8");
 
   it("registers api::graph-build function", () => {
     expect(api).toMatch(/registerFunction\("api::graph-build"/);
@@ -48,24 +49,40 @@ describe("api::graph-build endpoint (#666)", () => {
     );
   });
 
-  it("iterates sessions and calls mem::graph-extract", () => {
-    expect(api).toMatch(/kv\.list<Session>\(KV\.sessions\)/);
-    expect(api).toMatch(/kv\.list<CompressedObservation>\(KV\.observations\(sid\)\)/);
+  it("creates a graph build task instead of doing the full build in the REST handler", () => {
     expect(api).toMatch(
-      /sdk\.trigger\(\{\s*function_id:\s*"mem::graph-extract"/,
+      /sdk\.trigger\(\{\s*function_id:\s*"mem::graph-build-task-create"/,
     );
+    const graphBuildHandler = api.match(
+      /sdk\.registerFunction\("api::graph-build"[\s\S]*?sdk\.registerTrigger\(\{\s*type:\s*"http",\s*function_id:\s*"api::graph-build"/,
+    )?.[0] ?? "";
+    expect(graphBuildHandler).not.toMatch(/KV\.observations/);
+    expect(graphBuildHandler).not.toMatch(/mem::graph-extract/);
   });
 
-  it("filters observations that have a title (compressed only)", () => {
-    expect(api).toMatch(/typeof o\.title === "string" && o\.title\.length > 0/);
+  it("registers process and task status endpoints", () => {
+    expect(api).toMatch(
+      /api_path:\s*"\/agentmemory\/graph\/build\/process",\s*http_method:\s*"POST"/,
+    );
+    expect(api).toMatch(
+      /api_path:\s*"\/agentmemory\/graph\/build\/task",\s*http_method:\s*"GET"/,
+    );
   });
 
   it("respects batchSize override with a 100-item upper bound", () => {
     expect(api).toMatch(/Math\.min\(100,\s*Number\(.*batchSize/);
   });
 
-  it("response shape matches what the viewer expects (success + nodes)", () => {
-    expect(api).toMatch(/success:\s*true,\s*sessions:[\s\S]*?nodes:\s*totalNodes/);
+  it("whitelists task API payload fields", () => {
+    expect(api).toMatch(/allowedGraphBuildCreateKeys/);
+    expect(api).toMatch(/allowedGraphBuildProcessKeys/);
+  });
+
+  it("viewer advances graph build tasks instead of only creating them", () => {
+    expect(viewer).toMatch(/async function runGraphBuildTask/);
+    expect(viewer).toMatch(/apiPost\('graph\/build',\s*\{\}\)/);
+    expect(viewer).toMatch(/apiPost\('graph\/build\/process',\s*\{\s*taskId:\s*taskId,\s*maxBatches:\s*1\s*\}\)/);
+    expect(viewer).not.toMatch(/buildResult\.nodes/);
   });
 });
 
