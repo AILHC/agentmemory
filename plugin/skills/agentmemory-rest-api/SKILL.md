@@ -33,6 +33,25 @@ By default localhost is open and no auth is needed. When `AGENTMEMORY_SECRET` is
 - Handlers whitelist body fields and drop unknown ones, so passing extra keys is safe but ignored.
 - The port is configurable with `--port` or `--instance`; streams, viewer, and engine derive from it.
 
+## Task-style APIs
+
+Some extraction and build operations are durable tasks: create the task, process bounded work, then poll status.
+
+Graph build task:
+
+1. `POST /agentmemory/graph/build` creates a graph build task and returns a task id.
+2. `POST /agentmemory/graph/build/process` advances queued or running graph build work.
+3. `GET /agentmemory/graph/build/task?taskId=...` reads task status, progress, lease, cursor, and visibility.
+
+The lessons extraction flow:
+
+1. `POST /agentmemory/lessons/extract` creates one extraction run per explicit `sessionIds` entry.
+2. `POST /agentmemory/lessons/extract/process` advances bounded extraction work.
+3. `GET /agentmemory/lessons/extract/runs` lists extraction runs.
+4. `GET /agentmemory/lessons/extract/run?runId=...` reads one run status.
+
+These flows are REST-only unless an MCP tool in agentmemory-mcp-tools explicitly documents an equivalent.
+
 ## See also
 
 - agentmemory-mcp-tools for the MCP equivalents.

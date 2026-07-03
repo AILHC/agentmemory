@@ -4,7 +4,7 @@ description: Map of every agentmemory MCP tool, what each does, and its paramete
 user-invocable: false
 ---
 
-agentmemory exposes its full capability set as MCP tools. This skill is the index: it tells you which tool to reach for and where to find exact parameters.
+agentmemory exposes most agent-facing memory operations as MCP tools. This skill is the index: it tells you which tool to reach for, where to find exact parameters, and when to fall back to REST.
 
 ## Quick start
 
@@ -27,6 +27,18 @@ Save then recall:
 1. Pick the narrowest tool for the task. Prefer `memory_smart_search` for open recall, `memory_recall` when you already have a focused query, `memory_sessions` for session listings.
 2. Look up exact parameter names and which are required in REFERENCE.md before calling.
 3. Pass only documented fields. REST handlers whitelist fields and drop unknown ones.
+
+## REST-only gaps
+
+Some durable task flows do not currently have MCP tool equivalents. Use agentmemory-rest-api for:
+
+- `POST /agentmemory/graph/build`
+- `POST /agentmemory/graph/build/process`
+- `GET /agentmemory/graph/build/task`
+- `POST /agentmemory/lessons/extract`
+- `POST /agentmemory/lessons/extract/process`
+- `GET /agentmemory/lessons/extract/runs`
+- `GET /agentmemory/lessons/extract/run`
 
 ## See also
 

@@ -20,6 +20,22 @@ function countRestApiEndpoints(): number {
   return Array.from(src.matchAll(/api_path:\s*["`]/g)).length;
 }
 
+function listRestApiEndpoints(): string[] {
+  const src = readText("src/triggers/api.ts");
+  const endpoints: string[] = [];
+  for (const match of src.matchAll(/api_path:\s*["`]([^"`]+)["`]/g)) {
+    const index = match.index ?? 0;
+    const window = src.slice(Math.max(0, index - 140), index + 140);
+    const method = /http_method:\s*["`]([A-Z]+)["`]/.exec(window)?.[1] ?? "POST";
+    endpoints.push(`${method} ${match[1]}`);
+  }
+  return [...new Set(endpoints)].sort((a, b) => {
+    const [, pathA] = a.split(" ");
+    const [, pathB] = b.split(" ");
+    return pathA === pathB ? a.localeCompare(b) : pathA.localeCompare(pathB);
+  });
+}
+
 describe("Consistency checks", () => {
   const toolCount = getAllTools().length;
   const restEndpointCount = countRestApiEndpoints();
@@ -57,6 +73,44 @@ describe("Consistency checks", () => {
     expect(readme).toContain(`${restEndpointCount} endpoints on port`);
     expect(agents).toContain(`${restEndpointCount} REST endpoints`);
     expect(index).toContain(`REST API: ${restEndpointCount} endpoints`);
+  });
+
+  it("REST skill reference matches registered method/path API endpoints", () => {
+    const reference = readText("plugin/skills/agentmemory-rest-api/REFERENCE.md");
+    const endpoints = listRestApiEndpoints();
+
+    expect(reference).toContain(`${endpoints.length} registered endpoints`);
+    for (const endpoint of endpoints) {
+      const [method, path] = endpoint.split(" ");
+      expect(reference).toContain(`| ${method} | \`${path}\` |`);
+    }
+
+    expect(reference).toContain("| GET | `/agentmemory/slot` |");
+    expect(reference).toContain("| POST | `/agentmemory/slot` |");
+    expect(reference).toContain("| DELETE | `/agentmemory/slot` |");
+  });
+
+  it("REST and MCP skills document task-style REST-only flows", () => {
+    const restSkill = readText("plugin/skills/agentmemory-rest-api/SKILL.md");
+    const mcpSkill = readText("plugin/skills/agentmemory-mcp-tools/SKILL.md");
+    const taskFlowEndpoints = [
+      "/agentmemory/graph/build",
+      "/agentmemory/graph/build/process",
+      "/agentmemory/graph/build/task",
+      "/agentmemory/lessons/extract",
+      "/agentmemory/lessons/extract/process",
+      "/agentmemory/lessons/extract/runs",
+      "/agentmemory/lessons/extract/run",
+    ];
+
+    for (const text of ["graph build task", "lessons extraction", ...taskFlowEndpoints]) {
+      expect(restSkill).toContain(text);
+    }
+
+    expect(mcpSkill).toContain("REST-only");
+    for (const endpoint of taskFlowEndpoints) {
+      expect(mcpSkill).toContain(endpoint);
+    }
   });
 
   it("all tool names are unique", () => {
