@@ -9,13 +9,15 @@ import {
 import { VERSION } from "../version.js";
 
 const VIEWER_VERSION_PLACEHOLDER = "__AGENTMEMORY_VERSION__";
+type ViewerDocumentName = "index" | "review";
 
-function loadViewerTemplate(): string | null {
+function loadViewerTemplate(name: ViewerDocumentName = "index"): string | null {
   const base = dirname(fileURLToPath(import.meta.url));
+  const filename = name === "review" ? "review.html" : "index.html";
   const candidates = [
-    join(base, "..", "src", "viewer", "index.html"),
-    join(base, "..", "viewer", "index.html"),
-    join(base, "viewer", "index.html"),
+    join(base, "..", "src", "viewer", filename),
+    join(base, "..", "viewer", filename),
+    join(base, "viewer", filename),
   ];
   for (const path of candidates) {
     try {
@@ -25,10 +27,12 @@ function loadViewerTemplate(): string | null {
   return null;
 }
 
-export function renderViewerDocument():
+export function renderViewerDocument(
+  name: ViewerDocumentName = "index",
+):
   | { found: true; html: string; csp: string }
   | { found: false } {
-  const template = loadViewerTemplate();
+  const template = loadViewerTemplate(name);
   if (!template) {
     return { found: false };
   }

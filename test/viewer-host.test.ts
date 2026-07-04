@@ -282,6 +282,21 @@ describe("startViewerServer host binding", () => {
     expect(res.status).not.toBe(401);
   });
 
+  it("serves standalone review HTML on non-loopback bind without requiring a Bearer", async () => {
+    process.env.AGENTMEMORY_VIEWER_HOST = "0.0.0.0";
+    process.env.VIEWER_ALLOWED_HOSTS = "placeholder";
+    server = startViewerServer(0, null, null, "test-secret-xyz");
+    await waitForListening(server);
+    const addr = server.address() as AddressInfo;
+    process.env.VIEWER_ALLOWED_HOSTS = `127.0.0.1:${addr.port}`;
+
+    const res = await fetch(
+      `http://127.0.0.1:${addr.port}/agentmemory/viewer/review`,
+    );
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain("AgentMemory Data Viewer");
+  });
+
   it("logs non-loopback bind mode and inbound auth requirements", async () => {
     process.env.AGENTMEMORY_VIEWER_HOST = "0.0.0.0";
     process.env.VIEWER_ALLOWED_HOSTS = "localhost:3113,[::1]:3113";

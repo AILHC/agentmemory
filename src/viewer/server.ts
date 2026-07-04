@@ -284,6 +284,27 @@ export function startViewerServer(
       return;
     }
 
+    if (
+      method === "GET" &&
+      (pathname === "/review" ||
+        pathname === "/viewer/review" ||
+        pathname === "/agentmemory/viewer/review")
+    ) {
+      const rendered = renderViewerDocument("review");
+      if (rendered.found) {
+        res.writeHead(200, {
+          "Content-Type": "text/html; charset=utf-8",
+          "Content-Security-Policy": rendered.csp,
+          "Cache-Control": "no-cache",
+        });
+        res.end(rendered.html);
+        return;
+      }
+      res.writeHead(404, { "Content-Type": "text/plain" });
+      res.end("review viewer not found");
+      return;
+    }
+
     if (method === "GET" && pathname === "/favicon.svg") {
       if (VIEWER_FAVICON) {
         res.writeHead(200, {

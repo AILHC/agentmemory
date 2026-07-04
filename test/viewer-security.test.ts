@@ -52,6 +52,35 @@ describe("viewer document security", () => {
     expect(rendered.html).not.toContain("onmouseover=");
     expect(rendered.html).not.toContain("onmouseout=");
   });
+
+  it("renders the standalone review viewer with nonce-backed script and no inline handlers", () => {
+    const rendered = renderViewerDocument("review");
+    expect(rendered.found).toBe(true);
+    if (!rendered.found) return;
+
+    expect(rendered.csp).toContain("script-src 'nonce-");
+    expect(rendered.html).toContain("AgentMemory Data Viewer");
+    expect(rendered.html).toContain("'sessions'");
+    expect(rendered.html).toContain("'lessons'");
+    expect(rendered.html).toContain("FULL_LIST_LIMIT = 10000");
+    expect(rendered.html).toContain("lessons?limit=");
+    expect(rendered.html).toContain("'observations'");
+    expect(rendered.html).toContain("<script nonce=\"");
+    expect(rendered.html).not.toContain("__AGENTMEMORY_VIEWER_NONCE__");
+    expect(rendered.html).not.toContain("onclick=");
+    expect(rendered.html).not.toContain("apiPost");
+    expect(rendered.html).not.toContain("apiDelete");
+    expect(rendered.html).not.toContain("data-action");
+    expect(rendered.html).not.toContain("method: \"POST\"");
+    expect(rendered.html).not.toContain("method: 'POST'");
+    expect(rendered.html).not.toContain("method: \"DELETE\"");
+    expect(rendered.html).not.toContain("method: 'DELETE'");
+    expect(rendered.html).not.toContain("/agentmemory/summaries");
+    expect(rendered.html).not.toContain("smart-search");
+    expect(rendered.html).not.toContain("graph/search");
+    expect(rendered.html).toContain("apiGet(");
+    expect(rendered.html).toContain("loadObservationsForSession");
+  });
 });
 
 describe("viewer host allowlist (DNS rebinding defence)", () => {
@@ -207,6 +236,17 @@ describe("viewer request handler DNS rebinding defence (e2e)", () => {
     expect(res.status === 200 || res.status === 404).toBe(true);
     if (res.status === 200) {
       expect(res.body).toContain("agentmemory viewer");
+    }
+  });
+
+  it("serves the standalone review viewer HTML on the viewer route", async () => {
+    const { port } = await spinUpViewer();
+    const res = await request(port, `localhost:${port}`, "/agentmemory/viewer/review");
+    expect(res.status === 200 || res.status === 404).toBe(true);
+    if (res.status === 200) {
+      expect(res.body).toContain("AgentMemory Data Viewer");
+      expect(res.body).toContain("'sessions'");
+      expect(res.body).toContain("'insights'");
     }
   });
 

@@ -17,7 +17,7 @@
     "agentmemory": "dist/cli.mjs"
   },
   "scripts": {
-    "build": "tsdown && (cp iii-config.yaml dist/ 2>/dev/null || true) && (cp iii-config.docker.yaml dist/ 2>/dev/null || true) && (cp docker-compose.yml dist/ 2>/dev/null || true) && (cp .env.example dist/ 2>/dev/null || true) && mkdir -p dist/viewer && cp src/viewer/index.html dist/viewer/ && cp src/viewer/favicon.svg dist/viewer/",
+    "build": "tsdown && node -e \"const fs=require('fs'),path=require('path');fs.mkdirSync('dist/viewer',{recursive:true});for(const f of ['iii-config.yaml','iii-config.docker.yaml','docker-compose.yml','.env.example'])if(fs.existsSync(f))fs.copyFileSync(f,path.join('dist',f));for(const f of ['index.html','review.html','favicon.svg'])fs.copyFileSync(path.join('src','viewer',f),path.join('dist','viewer',f));\"",
     "dev": "tsx src/index.ts",
     "start": "node dist/cli.mjs",
     "migrate": "node dist/functions/migrate.js",
