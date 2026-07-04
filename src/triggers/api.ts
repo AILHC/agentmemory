@@ -15,6 +15,12 @@ import { MAX_FILES_UPPER_BOUND } from "../functions/replay.js";
 import type { ReplayLessonExtractionConfig } from "../functions/lesson-extract.js";
 import { logger } from "../logger.js";
 import {
+  isViewerStoreType,
+  listViewerStore,
+  listViewerStores,
+  MAX_VIEWER_STORE_LIMIT,
+} from "../functions/viewer-store-reader.js";
+import {
   isGraphExtractionEnabled,
   isConsolidationEnabled,
   isAutoCompressEnabled,
@@ -225,6 +231,18 @@ function parseOptionalBoundedPositiveInt(
   const parsed = parseOptionalPositiveInt(value);
   if (parsed === undefined || parsed === null) return parsed;
   return parsed <= max ? parsed : null;
+}
+
+function parseOptionalBoolean(value: unknown): boolean | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === "boolean") return value;
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return undefined;
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+  return null;
 }
 
 const allowedGraphBuildCreateKeys = new Set(["batchSize", "maxSessions"]);
@@ -2965,6 +2983,67 @@ export function registerApiTriggers(
     type: "http",
     function_id: "api::branch-sessions",
     config: { api_path: "/agentmemory/branch/sessions", http_method: "GET" },
+  });
+
+  sdk.registerFunction("api::viewer-stores",
+    async (req: ApiRequest): Promise<Response> => {
+      const denied = checkAuth(req, secret);
+      if (denied) return denied;
+      const includeDeleted = parseOptionalBoolean(req.query_params?.["includeDeleted"]);
+      if (includeDeleted === null) {
+        return { status_code: 400, body: { error: "includeDeleted must be true or false" } };
+      }
+      const result = await listViewerStores(kv, { includeDeleted });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::viewer-stores",
+    config: { api_path: "/agentmemory/viewer/stores", http_method: "GET" },
+  });
+
+  sdk.registerFunction("api::viewer-store",
+    async (req: ApiRequest): Promise<Response> => {
+      const denied = checkAuth(req, secret);
+      if (denied) return denied;
+      const params = req.query_params || {};
+      const type = asNonEmptyString(params.type);
+      if (!isViewerStoreType(type)) {
+        return { status_code: 400, body: { error: "type must be a supported viewer store" } };
+      }
+      const limit = parseOptionalBoundedPositiveInt(params.limit, MAX_VIEWER_STORE_LIMIT);
+      if (limit === null) {
+        return {
+          status_code: 400,
+          body: { error: `limit must be between 1 and ${MAX_VIEWER_STORE_LIMIT}` },
+        };
+      }
+      const includeDeleted = parseOptionalBoolean(params.includeDeleted);
+      if (includeDeleted === null) {
+        return { status_code: 400, body: { error: "includeDeleted must be true or false" } };
+      }
+      try {
+        const result = await listViewerStore(kv, {
+          type,
+          ...(limit !== undefined ? { limit } : {}),
+          cursor: asNonEmptyString(params.cursor),
+          sessionId: asNonEmptyString(params.sessionId) ?? undefined,
+          includeDeleted,
+        });
+        return { status_code: 200, body: result };
+      } catch (error) {
+        return {
+          status_code: 400,
+          body: { error: error instanceof Error ? error.message : "invalid viewer store request" },
+        };
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::viewer-store",
+    config: { api_path: "/agentmemory/viewer/store", http_method: "GET" },
   });
 
   sdk.registerFunction("api::viewer", 

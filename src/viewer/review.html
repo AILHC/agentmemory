@@ -234,18 +234,18 @@
       'use strict';
 
       var PAGE_SIZE = 50;
-      var FULL_LIST_LIMIT = 10000;
+      var API_PAGE_SIZE = 500;
       var REST = window.location.origin;
       var TAB_IDS = ['sessions', 'lessons', 'summaries', 'observations', 'semantic', 'procedural', 'crystals', 'insights'];
       var TAB_CONFIG = {
         sessions: { label: 'Sessions' },
-        lessons: { label: 'Lessons', path: 'lessons?limit=' + FULL_LIST_LIMIT, key: 'lessons' },
+        lessons: { label: 'Lessons' },
         summaries: { label: 'Summaries' },
         observations: { label: 'Observations' },
-        semantic: { label: 'Semantic', path: 'semantic', key: 'semantic', fallbackKey: 'facts' },
-        procedural: { label: 'Procedural', path: 'procedural', key: 'procedural', fallbackKey: 'procedures' },
-        crystals: { label: 'Crystals', path: 'crystals?limit=500', key: 'crystals' },
-        insights: { label: 'Insights', path: 'insights?limit=500', key: 'insights' }
+        semantic: { label: 'Semantic' },
+        procedural: { label: 'Procedural' },
+        crystals: { label: 'Crystals' },
+        insights: { label: 'Insights' }
       };
       var store = {
         activeTab: 'sessions',
@@ -253,6 +253,7 @@
         loading: false,
         error: '',
         sessions: [],
+        meta: {},
         cache: {},
         observationsBySession: {},
         selected: {
@@ -328,6 +329,13 @@
         var h = window.location.hash.replace(/^#review-/, '').replace(/^#/, '');
         return TAB_IDS.indexOf(h) >= 0 ? h : 'sessions';
       }
+      function query(params) {
+        return Object.keys(params).filter(function(k) {
+          return params[k] !== undefined && params[k] !== null && params[k] !== '';
+        }).map(function(k) {
+          return encodeURIComponent(k) + '=' + encodeURIComponent(String(params[k]));
+        }).join('&');
+      }
 
       async function init() {
         store.activeTab = tabFromHash();
@@ -343,14 +351,17 @@
         store.error = '';
         render();
         try {
-          var sessionsRes = await apiGet('sessions?agentId=*');
-          store.sessions = asArray(sessionsRes.sessions);
+          var storesRes = await apiGet('viewer/stores');
+          asArray(storesRes.stores).forEach(function(meta) {
+            if (meta && meta.type) store.meta[meta.type] = meta;
+          });
+          var sessionsPage = await fetchStoreAll('sessions');
+          store.sessions = asArray(sessionsPage.items);
+          store.cache.sessions = sessionsPage;
+          store.cache.summaries = await fetchStoreAll('summaries');
           if (!store.selected.sessionId && store.sessions.length) {
             store.selected.sessionId = idOf(sortedSessions()[0]);
           }
-          await Promise.all(['lessons', 'semantic', 'procedural', 'crystals', 'insights'].map(function(tab) {
-            return ensureTabData(tab).catch(function() {});
-          }));
           store.loaded = true;
         } catch (err) {
           store.error = err instanceof Error ? err.message : String(err);
@@ -360,18 +371,12 @@
       }
 
       async function ensureTabData(tab) {
-        if (tab === 'sessions' || tab === 'summaries' || tab === 'observations') return;
+        if (tab === 'sessions' || tab === 'observations') return;
         if (store.cache[tab]) return;
-        var cfg = TAB_CONFIG[tab];
-        if (!cfg || !cfg.path) {
-          store.cache[tab] = [];
-          return;
-        }
         store.cache[tab] = { loading: true, items: [] };
         render();
         try {
-          var res = await apiGet(cfg.path);
-          store.cache[tab] = asArray(res[cfg.key] || (cfg.fallbackKey && res[cfg.fallbackKey]) || []);
+          store.cache[tab] = await fetchStoreAll(tab);
         } catch (err) {
           store.cache[tab] = { error: err instanceof Error ? err.message : String(err), items: [] };
         }
@@ -382,11 +387,24 @@
         store.observationsBySession[sessionId] = { loading: true, items: [] };
         render();
         try {
-          var res = await apiGet('observations?sessionId=' + encodeURIComponent(sessionId) + '&agentId=*');
-          store.observationsBySession[sessionId] = { items: asArray(res.observations) };
+          store.observationsBySession[sessionId] = await fetchStoreAll('observations', { sessionId: sessionId });
         } catch (err) {
           store.observationsBySession[sessionId] = { error: err instanceof Error ? err.message : String(err), items: [] };
         }
+      }
+
+      async function fetchStoreAll(type, extra) {
+        var cursor = '';
+        var items = [];
+        var last = null;
+        do {
+          var params = Object.assign({ type: type, limit: API_PAGE_SIZE }, extra || {});
+          if (cursor) params.cursor = cursor;
+          last = await apiGet('viewer/store?' + query(params));
+          items = items.concat(asArray(last.items));
+          cursor = last.nextCursor || '';
+        } while (last && last.hasMore && cursor);
+        return Object.assign({}, last || {}, { items: items, returned: items.length, hasMore: false, completeness: 'complete' });
       }
 
       function renderTabs() {
@@ -412,7 +430,7 @@
         if (store.activeTab === 'sessions') {
           app.innerHTML = renderSessionsTab();
         } else if (store.activeTab === 'summaries') {
-          app.innerHTML = renderTwoColumnTab('summaries', summaryItems());
+          app.innerHTML = renderTwoColumnTab('summaries', tabItems('summaries'));
         } else if (store.activeTab === 'observations') {
           app.innerHTML = renderObservationsTab();
         } else {
@@ -421,16 +439,17 @@
       }
 
       function statusHtml() {
-        var obsTotal = store.sessions.reduce(function(sum, s) { return sum + (Number(s.observationCount) || 0); }, 0);
+        var sessionTotal = store.meta.sessions ? store.meta.sessions.total : store.sessions.length;
+        var obsTotal = store.meta.observations ? store.meta.observations.total : store.sessions.reduce(function(sum, s) { return sum + (Number(s.observationCount) || 0); }, 0);
         var pieces = [
-          '<strong>' + esc(store.sessions.length) + '</strong> sessions',
+          '<strong>' + esc(sessionTotal) + '</strong> sessions',
           '<strong>' + esc(obsTotal) + '</strong> observations'
         ];
         ['lessons', 'semantic', 'procedural', 'crystals', 'insights'].forEach(function(tab) {
-          var data = store.cache[tab];
-          if (Array.isArray(data)) pieces.push('<strong>' + data.length + '</strong> ' + esc(tab));
+          var meta = store.meta[tab];
+          if (meta) pieces.push('<strong>' + esc(meta.total) + '</strong> ' + esc(tab));
         });
-        return pieces.join('<span>·</span>') + '<span>read-only GET API</span>';
+        return pieces.join('<span>·</span>') + '<span>viewer-store paged GET API</span>';
       }
 
       function sortedSessions() {
@@ -442,16 +461,15 @@
         return store.sessions.find(function(s) { return idOf(s) === store.selected.sessionId; }) || sortedSessions()[0] || null;
       }
       function summaryItems() {
+        var summaries = tabItems('summaries');
+        var bySession = new Map(summaries.map(function(summary) { return [String(summary.sessionId || summary.id || ''), summary]; }));
         return store.sessions.map(function(s) {
-          var summary = s.summary;
-          if (summary && typeof summary === 'object') {
-            return Object.assign({ id: idOf(s), sessionId: idOf(s) }, summary);
-          }
-          return {
+          var summary = bySession.get(idOf(s));
+          return summary ? Object.assign({ id: idOf(s), sessionId: idOf(s) }, summary) : {
             id: idOf(s),
             sessionId: idOf(s),
             title: firstText(s, ['firstPrompt']) || idOf(s),
-            narrative: typeof summary === 'string' ? summary : '',
+            narrative: '',
             observationCount: s.observationCount,
             project: s.project,
             startedAt: s.startedAt
@@ -517,8 +535,8 @@
         var sid = session ? idOf(session) : '';
         var obs = observationState(sid).items || [];
         return [
-          { id: 'summary', label: 'Summary', count: session ? 1 : 0, meta: 'session summary from sessions API' },
-          { id: 'observations', label: 'Observations', count: session ? (session.observationCount || obs.length || 0) : 0, meta: 'lazy loaded by sessionId' },
+          { id: 'summary', label: 'Summary', count: session ? 1 : 0, meta: 'summary joined by sessionId' },
+          { id: 'observations', label: 'Observations', count: session ? (session.observationCount || obs.length || 0) : 0, meta: 'paged viewer-store by sessionId' },
           { id: 'lessons', label: 'Lessons', count: relatedLessons(sid).length, meta: 'sourceIds when resolvable' },
           { id: 'semantic', label: 'Semantic', count: relatedBySession('semantic', sid, 'sourceSessionIds').length, meta: 'sourceSessionIds match' },
           { id: 'procedural', label: 'Procedural', count: relatedBySession('procedural', sid, 'sourceSessionIds').length, meta: 'sourceSessionIds match' },
