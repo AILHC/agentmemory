@@ -139,6 +139,14 @@
       align-items: center;
       gap: 12px;
     }
+    .data-viewer-link {
+      font-size: 10px;
+      padding: 5px 12px;
+      letter-spacing: 0.08em;
+      text-decoration: none;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
     .ws-status {
       font-size: 10px;
       padding: 3px 10px;
@@ -981,6 +989,7 @@
       <span class="version">v__AGENTMEMORY_VERSION__</span>
     </a>
     <div class="header-right">
+      <a class="btn data-viewer-link" href="/agentmemory/viewer/review">Data Viewer</a>
       <span class="dateline" id="dateline"></span>
       <button id="theme-toggle" class="btn" style="font-size:9px;padding:3px 10px;letter-spacing:0.1em;margin-right:8px;" data-action="toggle-theme">DARK</button>
       <span id="ws-status" class="ws-status disconnected">live updates off</span>
@@ -989,7 +998,6 @@
 
   <div class="tab-bar" id="tab-bar">
     <button class="active" data-tab="dashboard" aria-current="page">Dashboard</button>
-    <a class="btn" href="/agentmemory/viewer/review" style="align-self:center;font-size:10px;padding:7px 12px;text-decoration:none;">Data Viewer</a>
     <button data-tab="graph">Graph</button>
     <button data-tab="memories">Memories</button>
     <button data-tab="timeline">Timeline</button>

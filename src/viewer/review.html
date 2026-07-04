@@ -25,6 +25,10 @@
       --ui: Inter, "Segoe UI", Arial, sans-serif;
     }
     * { box-sizing: border-box; }
+    html, body {
+      height: 100%;
+      overflow: hidden;
+    }
     body {
       margin: 0;
       background: var(--bg);
@@ -32,22 +36,39 @@
       font-family: var(--ui);
       font-size: 14px;
     }
-    .shell { min-height: 100vh; display: flex; flex-direction: column; }
+    .shell { height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
     .topbar {
       height: 64px;
       display: flex;
       align-items: center;
-      gap: 22px;
+      gap: 16px;
       padding: 0 24px;
       background: #111827;
       color: #fff;
       flex-shrink: 0;
     }
+    .back-link {
+      height: 34px;
+      border: 1px solid #374151;
+      border-radius: 5px;
+      background: #1f2937;
+      color: #fff;
+      padding: 0 12px;
+      font: 700 13px var(--ui);
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    .back-link:hover { border-color: #93c5fd; background: #263244; }
+    .back-arrow { font-size: 18px; line-height: 1; }
     .brand { display: flex; flex-direction: column; min-width: 230px; }
     .brand strong { font-size: 18px; letter-spacing: 0; }
     .brand span { color: #cbd5e1; font-size: 11px; margin-top: 2px; }
     .top-tabs { display: flex; align-items: center; gap: 8px; overflow-x: auto; min-width: 0; flex: 1; }
-    .top-tabs button, .top-tabs a {
+    .top-tabs button {
       height: 34px;
       border: 1px solid #374151;
       border-radius: 5px;
@@ -62,7 +83,6 @@
       align-items: center;
     }
     .top-tabs button.active { background: var(--active); border-color: var(--active); }
-    .top-tabs a { margin-left: auto; background: transparent; }
     .status-line {
       height: 42px;
       display: flex;
@@ -75,8 +95,8 @@
       flex-shrink: 0;
     }
     .status-line strong { color: var(--ink); }
-    .viewer-body { padding: 24px; min-height: 0; flex: 1; }
-    .grid { display: grid; gap: 18px; min-height: calc(100vh - 154px); }
+    .viewer-body { padding: 24px; min-height: 0; flex: 1; overflow: hidden; }
+    .grid { display: grid; gap: 18px; height: 100%; min-height: 0; overflow: hidden; }
     .grid.sessions { grid-template-columns: minmax(270px, 330px) minmax(260px, 330px) minmax(420px, 1fr); }
     .grid.two-col { grid-template-columns: minmax(330px, 420px) minmax(520px, 1fr); }
     .pane {
@@ -84,6 +104,7 @@
       border: 1px solid var(--border);
       border-radius: 7px;
       min-width: 0;
+      min-height: 0;
       overflow: hidden;
       display: flex;
       flex-direction: column;
@@ -200,11 +221,11 @@
     .pager button:disabled { opacity: 0.45; cursor: default; }
     @media (max-width: 1050px) {
       .grid.sessions, .grid.two-col { grid-template-columns: 1fr; }
-      .pane { min-height: 300px; }
+      .grid { overflow: auto; }
+      .pane { min-height: 300px; max-height: none; }
       .topbar { height: auto; padding: 16px; align-items: flex-start; flex-direction: column; }
       .brand { min-width: 0; }
       .top-tabs { width: 100%; flex-wrap: wrap; overflow-x: visible; }
-      .top-tabs a { margin-left: 0; }
       .status-line {
         height: auto;
         min-height: 42px;
@@ -219,6 +240,7 @@
 <body>
   <div class="shell">
     <header class="topbar">
+      <a class="back-link" href="/agentmemory/viewer" aria-label="Return to classic viewer"><span class="back-arrow" aria-hidden="true">←</span><span>Classic Viewer</span></a>
       <div class="brand">
         <strong>AgentMemory Data Viewer</strong>
         <span>v__AGENTMEMORY_VERSION__ · read-only raw data browser</span>
@@ -412,7 +434,7 @@
         tabs.innerHTML = TAB_IDS.map(function(tab) {
           var active = store.activeTab === tab ? ' active' : '';
           return '<button class="' + active + '" type="button" data-ui="tab" data-tab="' + attr(tab) + '">' + esc(TAB_CONFIG[tab].label) + '</button>';
-        }).join('') + '<a href="/agentmemory/viewer">Classic Viewer</a>';
+        }).join('');
       }
 
       function render() {
