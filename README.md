@@ -1556,7 +1556,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-136 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+139 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1579,6 +1579,9 @@ Create `~/.agentmemory/.env`:
 | `POST` | `/agentmemory/graph/build` | Create a queued graph build task |
 | `POST` | `/agentmemory/graph/build/process` | Process a bounded number of graph build batches |
 | `GET` | `/agentmemory/graph/build/task?taskId=...` | Read graph build task status |
+| `GET` | `/agentmemory/runtime-config` | Read redacted extraction runtime limits |
+| `POST` | `/agentmemory/semantic-rollup` | Create run-tagged semantic rollups for session windows or corpus windows |
+| `POST` | `/agentmemory/extraction-runs/record` | Record full extraction run progress in the internal run index |
 | `POST` | `/agentmemory/team/share` | Share with team |
 | `GET` | `/agentmemory/audit` | Audit trail |
 
@@ -1602,6 +1605,26 @@ recoverable, not as failed.
 Session summarize is still synchronous best-effort in this phase. After an
 HTTP 504, hook abort, or iii invocation timeout, there is no guaranteed final
 summarize status to query.
+
+Full extraction orchestration uses three narrow REST endpoints:
+
+- `GET /agentmemory/runtime-config` returns only redacted runtime facts:
+  `summarizeChunkConcurrency`, `summarizeChunkSize`, and `providerName`.
+- `POST /agentmemory/semantic-rollup` accepts
+  `{ runId, windowId, mark, kind, sessionIds? , semanticMemoryIds? }`.
+  `kind: "window"` requires `sessionIds`; `kind: "corpus"` requires
+  `semanticMemoryIds`. Responses include `success`, `inputHash`, source
+  provenance, and `semanticMemoryIds` on success. Failure responses include
+  `runId`, `windowId`, `mark`, `kind`, and `inputHash` so external
+  orchestrators can persist deterministic failed units.
+- `POST /agentmemory/extraction-runs/record` accepts
+  `{ runId, mark, status?, summarySessionId?, lessonRunId?, semanticWindowId?, corpusWindowId? }`
+  and idempotently updates the internal extraction run index.
+
+`semantic-rollup` rejects missing sources, empty fact output, oversized source
+lists, and oversized prompts instead of silently succeeding. Repeating the same
+`runId` / `windowId` / `mark` / `kind` / `inputHash` returns the existing
+semantic memories without another provider call.
 
 Full endpoint list: [`src/triggers/api.ts`](src/triggers/api.ts)
 

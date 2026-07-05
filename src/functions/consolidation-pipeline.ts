@@ -19,29 +19,13 @@ import {
   resolveOutputLanguage,
   withOutputLanguagePolicy,
 } from "../prompts/output-language.js";
+import {
+  parseFactResponse,
+  type ParsedSemanticFact,
+} from "../prompts/facts.js";
 import { recordAudit } from "./audit.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
 import { logger } from "../logger.js";
-
-interface ParsedSemanticFact {
-  fact: string;
-  confidence: number;
-}
-
-function parseFactResponse(response: string): ParsedSemanticFact[] {
-  const facts: ParsedSemanticFact[] = [];
-  const factRegex = /<fact(\s+[^>]*)?>([\s\S]*?)<\/fact>/gi;
-  let match: RegExpExecArray | null;
-  while ((match = factRegex.exec(response)) !== null) {
-    const openTag = match[1] ?? "";
-    const matchConfidence = openTag.match(/\bconfidence\s*=\s*["']([^"']+)["']/i);
-    const parsedConf = matchConfidence ? Number.parseFloat(matchConfidence[1]) : NaN;
-    const confidence = Number.isFinite(parsedConf) ? Math.max(0, Math.min(1, parsedConf)) : 0.5;
-    const fact = match[2]?.replace(/<[^>]*>/g, " ").trim();
-    if (fact) facts.push({ fact, confidence });
-  }
-  return facts;
-}
 
 function hasChinese(input: string): boolean {
   return /[\u4e00-\u9fff]/.test(input);

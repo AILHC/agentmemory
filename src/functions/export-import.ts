@@ -23,6 +23,7 @@ import type {
   Insight,
   ExportPagination,
   AccessLogExport,
+  ExtractionRunIndex,
 } from "../types.js";
 import { normalizeAccessLog } from "./access-tracker.js";
 import { KV } from "../state/schema.js";
@@ -88,6 +89,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         routines,
         signals,
         checkpoints,
+        extractionRuns,
         accessLogs,
       ] = await Promise.all([
         kv.list<GraphNode>(KV.graphNodes).catch(() => []),
@@ -105,6 +107,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         kv.list<Routine>(KV.routines).catch(() => []),
         kv.list<Signal>(KV.signals).catch(() => []),
         kv.list<Checkpoint>(KV.checkpoints).catch(() => []),
+        kv.list<ExtractionRunIndex>(KV.extractionRuns).catch(() => []),
         kv.list<AccessLogExport>(KV.accessLog).catch(() => []),
       ]);
 
@@ -133,6 +136,7 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         routines: routines.length > 0 ? routines : undefined,
         signals: signals.length > 0 ? signals : undefined,
         checkpoints: checkpoints.length > 0 ? checkpoints : undefined,
+        extractionRuns: extractionRuns.length > 0 ? extractionRuns : undefined,
         accessLogs: accessLogs.length > 0 ? accessLogs : undefined,
       };
 
@@ -296,6 +300,9 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
         }
         for (const c of await kv.list<Checkpoint>(KV.checkpoints).catch(() => [])) {
           await kv.delete(KV.checkpoints, c.id);
+        }
+        for (const run of await kv.list<ExtractionRunIndex>(KV.extractionRuns).catch(() => [])) {
+          await kv.delete(KV.extractionRuns, run.id);
         }
         for (const s of await kv.list<Sentinel>(KV.sentinels).catch(() => [])) {
           await kv.delete(KV.sentinels, s.id);
@@ -491,6 +498,15 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
             if (existing) { stats.skipped++; continue; }
           }
           await kv.set(KV.checkpoints, checkpoint.id, checkpoint);
+        }
+      }
+      if (importData.extractionRuns) {
+        for (const run of importData.extractionRuns) {
+          if (strategy === "skip") {
+            const existing = await kv.get(KV.extractionRuns, run.id).catch(() => null);
+            if (existing) { stats.skipped++; continue; }
+          }
+          await kv.set(KV.extractionRuns, run.id, run);
         }
       }
       if (importData.sentinels) {

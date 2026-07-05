@@ -337,6 +337,7 @@ export interface ExportData {
   facets?: Facet[];
   lessons?: Lesson[];
   insights?: Insight[];
+  extractionRuns?: ExtractionRunIndex[];
   accessLogs?: AccessLogExport[];
   pagination?: ExportPagination;
 }
@@ -548,9 +549,28 @@ export interface SemanticMemory {
   confidence: number;
   sourceSessionIds: string[];
   sourceMemoryIds: string[];
+  extractionRunId?: string;
+  extractionWindowId?: string;
+  extractionMark?: string;
+  extractionInputHash?: string;
+  extractionKind?: "window" | "corpus";
   accessCount: number;
   lastAccessedAt: string;
   strength: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ExtractionRunStatus = "running" | "succeeded" | "failed" | "partial";
+
+export interface ExtractionRunIndex {
+  id: string;
+  mark: string;
+  status: ExtractionRunStatus;
+  summarySessionIds: string[];
+  lessonRunIds: string[];
+  semanticWindowIds: string[];
+  corpusWindowIds: string[];
   createdAt: string;
   updatedAt: string;
 }
@@ -653,7 +673,9 @@ export interface AuditEntry {
     | "slot_replace"
     | "slot_create"
     | "slot_delete"
-    | "slot_reflect";
+    | "slot_reflect"
+    | "semantic_rollup"
+    | "extraction_run_record";
   userId?: string;
   functionId: string;
   targetIds: string[];

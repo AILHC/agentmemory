@@ -59,6 +59,8 @@ import { registerClaudeBridgeFunction } from "./functions/claude-bridge.js";
 import { registerGraphFunction } from "./functions/graph.js";
 import { registerGraphBuildTaskFunctions } from "./functions/graph-build-tasks.js";
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
+import { registerSemanticRollupFunction } from "./functions/semantic-rollup.js";
+import { registerExtractionRunIndexFunction } from "./functions/extraction-run-index.js";
 import { registerTeamFunction } from "./functions/team.js";
 import { registerGovernanceFunction } from "./functions/governance.js";
 import { registerSnapshotFunction } from "./functions/snapshot.js";
@@ -274,6 +276,8 @@ async function main() {
   }
 
   registerConsolidationPipelineFunction(sdk, kv, provider);
+  registerSemanticRollupFunction(sdk, kv, provider);
+  registerExtractionRunIndexFunction(sdk, kv);
   bootLog(`Consolidation pipeline: registered (CONSOLIDATION_ENABLED=${isConsolidationEnabled() ? "true" : "false"})`);
 
   if (isAutoCompressEnabled()) {
@@ -520,7 +524,7 @@ async function main() {
     `Ready. ${embeddingProvider ? "Triple-stream (BM25+Vector+Graph)" : "BM25+Graph"} search active.`,
   );
   bootLog(
-    `REST API: 136 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
+    `REST API: 139 endpoints at http://localhost:${config.restPort}/agentmemory/*`,
   );
   bootLog(
     `MCP surface (opt-in via \`npx @agentmemory/mcp\`): ${getAllTools().length} tools · 6 resources · 3 prompts`,

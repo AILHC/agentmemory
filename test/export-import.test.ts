@@ -11,7 +11,9 @@ import type {
   Memory,
   SessionSummary,
   ExportData,
+  ExtractionRunIndex,
 } from "../src/types.js";
+import { KV } from "../src/state/schema.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -99,6 +101,18 @@ const testSummary: SessionSummary = {
   filesModified: ["src/auth.ts"],
   concepts: ["auth"],
   observationCount: 1,
+};
+
+const testExtractionRun: ExtractionRunIndex = {
+  id: "run_1",
+  mark: "full-2026-07",
+  status: "succeeded",
+  summarySessionIds: ["ses_1"],
+  lessonRunIds: ["lesson_1"],
+  semanticWindowIds: ["win_1"],
+  corpusWindowIds: ["corpus_1"],
+  createdAt: "2026-02-01T00:00:00Z",
+  updatedAt: "2026-02-01T01:00:00Z",
 };
 
 describe("Export/Import Functions", () => {
@@ -229,6 +243,52 @@ describe("Export/Import Functions", () => {
     )) as ExportData;
     expect(reExported.sessions.length).toBe(exported.sessions.length);
     expect(reExported.memories.length).toBe(exported.memories.length);
+  });
+
+  it("exports and imports extraction run indexes", async () => {
+    await kv.set(KV.extractionRuns, testExtractionRun.id, testExtractionRun);
+
+    const exported = (await sdk.trigger("mem::export", {})) as ExportData;
+
+    expect(exported.extractionRuns).toEqual([testExtractionRun]);
+
+    const freshKv = mockKV();
+    const freshSdk = mockSdk();
+    registerExportImportFunction(freshSdk as never, freshKv as never);
+
+    const importResult = (await freshSdk.trigger("mem::import", {
+      exportData: exported,
+      strategy: "merge",
+    })) as { success: boolean };
+
+    expect(importResult.success).toBe(true);
+    expect(await freshKv.get(KV.extractionRuns, testExtractionRun.id)).toEqual(testExtractionRun);
+  });
+
+  it("replace import clears existing extraction run indexes", async () => {
+    await kv.set(KV.extractionRuns, "old-run", {
+      ...testExtractionRun,
+      id: "old-run",
+    });
+    const newRun = { ...testExtractionRun, id: "new-run" };
+    const exportData: ExportData = {
+      version: "0.9.27",
+      exportedAt: new Date().toISOString(),
+      sessions: [],
+      observations: {},
+      memories: [],
+      summaries: [],
+      extractionRuns: [newRun],
+    };
+
+    const result = (await sdk.trigger("mem::import", {
+      exportData,
+      strategy: "replace",
+    })) as { success: boolean };
+
+    expect(result.success).toBe(true);
+    expect(await kv.get(KV.extractionRuns, "old-run")).toBeNull();
+    expect(await kv.get(KV.extractionRuns, "new-run")).toEqual(newRun);
   });
 
   it("import rejects unsupported version", async () => {

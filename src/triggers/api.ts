@@ -205,6 +205,14 @@ function asNonEmptyString(value: unknown): string | null {
   return trimmed ? trimmed : null;
 }
 
+function optionalNonEmptyString(
+  body: Record<string, unknown>,
+  key: string,
+): string | undefined | null {
+  if (!Object.prototype.hasOwnProperty.call(body, key)) return undefined;
+  return asNonEmptyString(body[key]);
+}
+
 function parseOptionalFiniteNumber(value: unknown): number | undefined | null {
   if (value === undefined || value === null) return undefined;
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
@@ -247,9 +255,62 @@ function parseOptionalBoolean(value: unknown): boolean | undefined | null {
 
 const allowedGraphBuildCreateKeys = new Set(["batchSize", "maxSessions"]);
 const allowedGraphBuildProcessKeys = new Set(["taskId", "maxBatches"]);
+const allowedSemanticRollupKeys = new Set([
+  "runId",
+  "windowId",
+  "mark",
+  "kind",
+  "sessionIds",
+  "semanticMemoryIds",
+]);
+const allowedExtractionRunRecordKeys = new Set([
+  "runId",
+  "mark",
+  "status",
+  "summarySessionId",
+  "lessonRunId",
+  "semanticWindowId",
+  "corpusWindowId",
+]);
+const extractionRunStatuses = new Set(["running", "succeeded", "failed", "partial"]);
 
 function hasOnlyKeys(body: Record<string, unknown>, allowed: Set<string>): boolean {
   return Object.keys(body).every((key) => allowed.has(key));
+}
+
+function requirePlainBody(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return raw as Record<string, unknown>;
+}
+
+function parseStringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== "string") return null;
+    const trimmed = item.trim();
+    if (trimmed && !out.includes(trimmed)) out.push(trimmed);
+  }
+  return out;
+}
+
+function parsePositiveEnvInt(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function providerNameFrom(provider: unknown): string {
+  if (
+    provider &&
+    typeof provider === "object" &&
+    "name" in provider &&
+    typeof (provider as { name?: unknown }).name === "string"
+  ) {
+    return (provider as { name: string }).name;
+  }
+  return detectLlmProviderKind();
 }
 
 export function registerApiTriggers(
@@ -361,6 +422,176 @@ export function registerApiTriggers(
     config: {
       api_path: "/agentmemory/config/flags",
       http_method: "GET",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::runtime-config",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      return {
+        status_code: 200,
+        body: {
+          success: true,
+          runtime: {
+            summarizeChunkConcurrency: parsePositiveEnvInt("SUMMARIZE_CHUNK_CONCURRENCY", 6),
+            summarizeChunkSize: parsePositiveEnvInt("SUMMARIZE_CHUNK_SIZE", 400),
+            providerName: providerNameFrom(provider),
+          },
+        },
+      };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::runtime-config",
+    config: {
+      api_path: "/agentmemory/runtime-config",
+      http_method: "GET",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::semantic-rollup",
+    async (req: ApiRequest): Promise<Response> => {
+      const denied = checkAuth(req, secret);
+      if (denied) return denied;
+      const body = requirePlainBody(req.body);
+      if (!body) {
+        return { status_code: 400, body: { error: "request body is required" } };
+      }
+      if (!hasOnlyKeys(body, allowedSemanticRollupKeys)) {
+        return {
+          status_code: 400,
+          body: {
+            error:
+              "invalid semantic rollup payload: only runId, windowId, mark, kind, sessionIds, semanticMemoryIds are allowed",
+          },
+        };
+      }
+
+      const runId = asNonEmptyString(body.runId);
+      const windowId = asNonEmptyString(body.windowId);
+      const mark = asNonEmptyString(body.mark);
+      const kind = body.kind === "window" || body.kind === "corpus" ? body.kind : null;
+      if (!runId || !windowId || !mark || !kind) {
+        return {
+          status_code: 400,
+          body: { error: "runId, windowId, mark, and kind are required" },
+        };
+      }
+
+      const sessionIds = body.sessionIds === undefined
+        ? undefined
+        : parseStringArray(body.sessionIds);
+      const semanticMemoryIds = body.semanticMemoryIds === undefined
+        ? undefined
+        : parseStringArray(body.semanticMemoryIds);
+      if (sessionIds === null || semanticMemoryIds === null) {
+        return {
+          status_code: 400,
+          body: { error: "sessionIds and semanticMemoryIds must be string arrays" },
+        };
+      }
+      if (kind === "window" && (!sessionIds || sessionIds.length === 0)) {
+        return {
+          status_code: 400,
+          body: { error: "sessionIds is required for window rollup" },
+        };
+      }
+      if (kind === "corpus" && (!semanticMemoryIds || semanticMemoryIds.length === 0)) {
+        return {
+          status_code: 400,
+          body: { error: "semanticMemoryIds is required for corpus rollup" },
+        };
+      }
+
+      const payload: Record<string, unknown> = { runId, windowId, mark, kind };
+      if (sessionIds) payload.sessionIds = sessionIds;
+      if (semanticMemoryIds) payload.semanticMemoryIds = semanticMemoryIds;
+      const result = await sdk.trigger({
+        function_id: "mem::semantic-rollup",
+        payload,
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::semantic-rollup",
+    config: {
+      api_path: "/agentmemory/semantic-rollup",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::extraction-run-record",
+    async (req: ApiRequest): Promise<Response> => {
+      const denied = checkAuth(req, secret);
+      if (denied) return denied;
+      const body = requirePlainBody(req.body);
+      if (!body) {
+        return { status_code: 400, body: { error: "request body is required" } };
+      }
+      if (!hasOnlyKeys(body, allowedExtractionRunRecordKeys)) {
+        return {
+          status_code: 400,
+          body: {
+            error:
+              "invalid extraction run record payload: only runId, mark, status, summarySessionId, lessonRunId, semanticWindowId, corpusWindowId are allowed",
+          },
+        };
+      }
+
+      const runId = asNonEmptyString(body.runId);
+      const mark = asNonEmptyString(body.mark);
+      const status = optionalNonEmptyString(body, "status");
+      if (!runId || !mark) {
+        return { status_code: 400, body: { error: "runId and mark are required" } };
+      }
+      if (status === null) {
+        return { status_code: 400, body: { error: "status must be a non-empty string" } };
+      }
+      if (status !== undefined && !extractionRunStatuses.has(status)) {
+        return {
+          status_code: 400,
+          body: { error: "status must be running, succeeded, failed, or partial" },
+        };
+      }
+
+      const payload: Record<string, unknown> = { runId, mark };
+      if (status !== undefined) payload.status = status;
+      const optionalIds = {
+        summarySessionId: optionalNonEmptyString(body, "summarySessionId"),
+        lessonRunId: optionalNonEmptyString(body, "lessonRunId"),
+        semanticWindowId: optionalNonEmptyString(body, "semanticWindowId"),
+        corpusWindowId: optionalNonEmptyString(body, "corpusWindowId"),
+      };
+      for (const [key, value] of Object.entries(optionalIds)) {
+        if (value === null) {
+          return {
+            status_code: 400,
+            body: { error: `${key} must be a non-empty string` },
+          };
+        }
+        if (value !== undefined) payload[key] = value;
+      }
+
+      const result = await sdk.trigger({
+        function_id: "mem::extraction-run-record",
+        payload,
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::extraction-run-record",
+    config: {
+      api_path: "/agentmemory/extraction-runs/record",
+      http_method: "POST",
       middleware_function_ids: ["middleware::api-auth"],
     },
   });
