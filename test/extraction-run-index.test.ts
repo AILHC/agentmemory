@@ -53,7 +53,7 @@ describe("mem::extraction-run-record", () => {
     registerExtractionRunIndexFunction(sdk as never, kv as never);
   });
 
-  it("upserts extraction run records idempotently with deduplicated ids", async () => {
+  it("keeps legacy summary lesson and semantic fields while writing stage records", async () => {
     await sdk.trigger("mem::extraction-run-record", {
       runId: "run-1",
       mark: "full-2026-07",
@@ -61,7 +61,6 @@ describe("mem::extraction-run-record", () => {
       summarySessionId: "ses-a",
       lessonRunId: "lesson-a",
       semanticWindowId: "win-a",
-      corpusWindowId: "corpus-a",
     });
     const result = (await sdk.trigger("mem::extraction-run-record", {
       runId: "run-1",
@@ -70,7 +69,6 @@ describe("mem::extraction-run-record", () => {
       summarySessionId: "ses-a",
       lessonRunId: "lesson-a",
       semanticWindowId: "win-a",
-      corpusWindowId: "corpus-a",
     })) as { success: boolean; run: ExtractionRunIndex };
 
     expect(result.success).toBe(true);
@@ -81,8 +79,31 @@ describe("mem::extraction-run-record", () => {
       summarySessionIds: ["ses-a"],
       lessonRunIds: ["lesson-a"],
       semanticWindowIds: ["win-a"],
-      corpusWindowIds: ["corpus-a"],
     });
+    expect(result.run).not.toHaveProperty("corpusWindowIds");
+    expect(result.run.stageRecords).toMatchObject([
+      {
+        stage: "summary",
+        unitId: "ses-a",
+        sourceIds: ["ses-a"],
+        resultIds: ["ses-a"],
+        resultType: "summary",
+      },
+      {
+        stage: "lessons",
+        unitId: "lesson-a",
+        sourceIds: [],
+        resultIds: ["lesson-a"],
+        resultType: "lesson",
+      },
+      {
+        stage: "semantic_rollup",
+        unitId: "win-a",
+        sourceIds: [],
+        resultIds: ["win-a"],
+        resultType: "semantic",
+      },
+    ]);
 
     const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-1");
     expect(stored).toEqual(result.run);
@@ -94,7 +115,7 @@ describe("mem::extraction-run-record", () => {
     expect(audits[1].targetIds).toEqual(["run-1"]);
   });
 
-  it("serializes concurrent updates for the same run id", async () => {
+  it("serializes concurrent legacy updates for the same run id without corpus fields", async () => {
     await Promise.all([
       sdk.trigger("mem::extraction-run-record", {
         runId: "run-concurrent",
@@ -111,11 +132,6 @@ describe("mem::extraction-run-record", () => {
         mark: "full-2026-07",
         semanticWindowId: "win-a",
       }),
-      sdk.trigger("mem::extraction-run-record", {
-        runId: "run-concurrent",
-        mark: "full-2026-07",
-        corpusWindowId: "corpus-a",
-      }),
     ]);
 
     const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-concurrent");
@@ -124,7 +140,79 @@ describe("mem::extraction-run-record", () => {
       summarySessionIds: ["ses-a"],
       lessonRunIds: ["lesson-a"],
       semanticWindowIds: ["win-a"],
-      corpusWindowIds: ["corpus-a"],
     });
+    expect(stored).not.toHaveProperty("corpusWindowIds");
+    expect(stored?.stageRecords.map((record) => record.stage).sort()).toEqual([
+      "lessons",
+      "semantic_rollup",
+      "summary",
+    ]);
+  });
+
+  it("rejects legacy corpusWindowId", async () => {
+    await expect(
+      sdk.trigger("mem::extraction-run-record", {
+        runId: "run-corpus",
+        mark: "full-v1",
+        corpusWindowId: "corpus-a",
+      }),
+    ).resolves.toEqual({
+      success: false,
+      error: "unsupported extraction run record field: corpusWindowId",
+    });
+
+    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-corpus");
+    expect(stored).toBeNull();
+  });
+
+  it("accumulates generic stage records with deduplicated source and result ids", async () => {
+    await sdk.trigger("mem::extraction-run-record", {
+      runId: "run-stages",
+      mark: "full-v1",
+      stage: "memory_consolidate",
+      unitId: "mem-unit-1",
+      sourceIds: ["obs-a", "obs-b", "obs-a", ""],
+      resultIds: ["mem-a"],
+      resultType: "memory",
+    });
+
+    const result = (await sdk.trigger("mem::extraction-run-record", {
+      runId: "run-stages",
+      mark: "full-v1",
+      stage: "memory_consolidate",
+      unitId: "mem-unit-1",
+      sourceIds: ["obs-b", "obs-c"],
+      resultIds: ["mem-a", "mem-b"],
+      resultType: "memory",
+    })) as { success: boolean; run: ExtractionRunIndex };
+
+    expect(result.success).toBe(true);
+    expect(result.run.stageRecords).toHaveLength(1);
+    expect(result.run.stageRecords[0]).toMatchObject({
+      stage: "memory_consolidate",
+      unitId: "mem-unit-1",
+      sourceIds: ["obs-a", "obs-b", "obs-c"],
+      resultIds: ["mem-a", "mem-b"],
+      resultType: "memory",
+    });
+  });
+
+  it("rejects invalid generic stage fields", async () => {
+    await expect(
+      sdk.trigger("mem::extraction-run-record", {
+        runId: "run-invalid",
+        mark: "full-v1",
+        stage: "corpus_rollup",
+      }),
+    ).resolves.toEqual({ success: false, error: "stage is invalid" });
+
+    await expect(
+      sdk.trigger("mem::extraction-run-record", {
+        runId: "run-invalid",
+        mark: "full-v1",
+        stage: "summary",
+        resultType: "corpus",
+      }),
+    ).resolves.toEqual({ success: false, error: "resultType is invalid" });
   });
 });

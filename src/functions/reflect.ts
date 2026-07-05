@@ -25,6 +25,27 @@ interface ConceptCluster {
   crystalIds: string[];
 }
 
+export interface ReflectInsightWindow {
+  windowId: string;
+  semanticMemoryIds: string[];
+  lessonIds: string[];
+  crystalIds: string[];
+  itemCount: number;
+  charSize: number;
+}
+
+export interface ReflectInsightWindowOptions {
+  kv: StateKV;
+  provider: MemoryProvider;
+  semanticMemoryIds?: string[];
+  lessonIds?: string[];
+  crystalIds?: string[];
+  maxItemsPerWindow?: number;
+  charBudget?: number;
+  project?: string;
+  useGraph?: boolean;
+}
+
 function reinforceInsight(insight: Insight): void {
   const now = new Date().toISOString();
   insight.reinforcements++;
@@ -162,11 +183,263 @@ function buildJaccardClusters(
   return clusters;
 }
 
+function itemSize(value: { fact?: string; content?: string; narrative?: string }): number {
+  return (value.fact ?? value.content ?? value.narrative ?? "").length;
+}
+
+export async function planReflectInsightWindows(options: {
+  kv: StateKV;
+  maxItemsPerWindow?: number;
+  charBudget?: number;
+  project?: string;
+  useGraph?: boolean;
+}): Promise<Record<string, unknown>> {
+  if (options.useGraph === true) {
+    return { success: false, error: "useGraph:true is not supported for full reflect insight windows" };
+  }
+  const maxItems = Math.max(3, options.maxItemsPerWindow ?? 30);
+  const charBudget = Math.max(1, options.charBudget ?? 24_000);
+  const [semanticMemories, lessons, crystals] = await Promise.all([
+    options.kv.list<SemanticMemory>(KV.semantic).catch(() => []),
+    options.kv.list<Lesson>(KV.lessons).catch(() => []),
+    options.kv.list<Crystal>(KV.crystals).catch(() => []),
+  ]);
+  const activeLessons = lessons.filter((l) => !l.deleted && (!options.project || l.project === options.project));
+  const scopedCrystals = crystals.filter((c) => !options.project || c.project === options.project);
+  const items: Array<
+    | { kind: "semantic"; id: string; size: number }
+    | { kind: "lesson"; id: string; size: number }
+    | { kind: "crystal"; id: string; size: number }
+  > = [
+    ...semanticMemories.map((memory) => ({ kind: "semantic" as const, id: memory.id, size: itemSize(memory) })),
+    ...activeLessons.map((lesson) => ({ kind: "lesson" as const, id: lesson.id, size: itemSize(lesson) })),
+    ...scopedCrystals.map((crystal) => ({ kind: "crystal" as const, id: crystal.id, size: itemSize(crystal) })),
+  ];
+
+  const windows: ReflectInsightWindow[] = [];
+  let current: ReflectInsightWindow = {
+    windowId: "reflect:1",
+    semanticMemoryIds: [],
+    lessonIds: [],
+    crystalIds: [],
+    itemCount: 0,
+    charSize: 0,
+  };
+
+  const flush = () => {
+    if (current.itemCount > 0) {
+      windows.push(current);
+      current = {
+        windowId: `reflect:${windows.length + 1}`,
+        semanticMemoryIds: [],
+        lessonIds: [],
+        crystalIds: [],
+        itemCount: 0,
+        charSize: 0,
+      };
+    }
+  };
+
+  for (const item of items) {
+    const wouldExceedItems = current.itemCount >= maxItems;
+    const wouldExceedChars = current.itemCount > 0 && current.charSize + item.size > charBudget;
+    if (wouldExceedItems || wouldExceedChars) flush();
+    if (item.kind === "semantic") current.semanticMemoryIds.push(item.id);
+    if (item.kind === "lesson") current.lessonIds.push(item.id);
+    if (item.kind === "crystal") current.crystalIds.push(item.id);
+    current.itemCount++;
+    current.charSize += item.size;
+  }
+  flush();
+
+  return { success: true, windows, totalItems: items.length };
+}
+
+async function loadReflectWindowCluster(
+  options: ReflectInsightWindowOptions,
+): Promise<ConceptCluster> {
+  const [semanticMemories, lessons, crystals] = await Promise.all([
+    Promise.all(
+      (options.semanticMemoryIds ?? []).map((id) =>
+        options.kv.get<SemanticMemory>(KV.semantic, id).catch(() => null),
+      ),
+    ),
+    Promise.all(
+      (options.lessonIds ?? []).map((id) =>
+        options.kv.get<Lesson>(KV.lessons, id).catch(() => null),
+      ),
+    ),
+    Promise.all(
+      (options.crystalIds ?? []).map((id) =>
+        options.kv.get<Crystal>(KV.crystals, id).catch(() => null),
+      ),
+    ),
+  ]);
+  const facts = semanticMemories.filter((item): item is SemanticMemory => item !== null);
+  const activeLessons = lessons
+    .filter((item): item is Lesson => item !== null)
+    .filter((lesson) => !lesson.deleted && (!options.project || lesson.project === options.project));
+  const activeCrystals = crystals
+    .filter((item): item is Crystal => item !== null)
+    .filter((crystal) => !options.project || crystal.project === options.project);
+  const concepts = [
+    ...new Set([
+      ...activeLessons.flatMap((lesson) => lesson.tags),
+      ...facts.flatMap((fact) => fact.fact.toLowerCase().split(/\s+/).filter((term) => term.length > 3).slice(0, 3)),
+    ]),
+  ].slice(0, 12);
+  return {
+    concepts: concepts.length > 0 ? concepts : ["reflect-full-window"],
+    facts: facts.map((f) => ({ fact: f.fact, confidence: f.confidence })),
+    lessons: activeLessons.map((l) => ({ content: l.content, confidence: l.confidence })),
+    crystalNarratives: activeCrystals.map((c) => c.narrative),
+    factIds: facts.map((f) => f.id),
+    lessonIds: activeLessons.map((l) => l.id),
+    crystalIds: activeCrystals.map((c) => c.id),
+  };
+}
+
+async function persistReflectInsights(options: {
+  kv: StateKV;
+  response: string;
+  cluster: ConceptCluster;
+  project?: string;
+  maxInsights?: number;
+}): Promise<{ newInsights: number; reinforced: number; totalInsights: number; insightIds: string[] }> {
+  const insightRegex =
+    /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;
+  let match;
+  let newInsights = 0;
+  let reinforced = 0;
+  let totalInsights = 0;
+  const insightIds: string[] = [];
+  const maxInsights = options.maxInsights ?? 50;
+
+  while ((match = insightRegex.exec(options.response)) !== null && totalInsights < maxInsights) {
+    const parsedConf = parseFloat(match[1]);
+    const confidence = Number.isNaN(parsedConf)
+      ? 0.5
+      : Math.max(0, Math.min(1, parsedConf));
+    const title = match[2].trim();
+    const content = match[3].trim();
+    if (!content) continue;
+
+    const fp = fingerprintId("ins", content.trim().toLowerCase());
+    const existing = await options.kv.get<Insight>(KV.insights, fp);
+    if (existing && !existing.deleted) {
+      reinforceInsight(existing);
+      await options.kv.set(KV.insights, existing.id, existing);
+      if (!insightIds.includes(existing.id)) insightIds.push(existing.id);
+      reinforced++;
+    } else {
+      const now = new Date().toISOString();
+      const insight: Insight = {
+        id: fp,
+        title,
+        content,
+        confidence,
+        reinforcements: 0,
+        sourceConceptCluster: options.cluster.concepts,
+        sourceMemoryIds: options.cluster.factIds,
+        sourceLessonIds: options.cluster.lessonIds,
+        sourceCrystalIds: options.cluster.crystalIds,
+        project: options.project,
+        tags: options.cluster.concepts,
+        createdAt: now,
+        updatedAt: now,
+        decayRate: 0.05,
+      };
+      await options.kv.set(KV.insights, insight.id, insight);
+      insightIds.push(insight.id);
+      newInsights++;
+    }
+    totalInsights++;
+  }
+
+  return { newInsights, reinforced, totalInsights, insightIds };
+}
+
+export async function runReflectInsightWindow(
+  options: ReflectInsightWindowOptions,
+): Promise<Record<string, unknown>> {
+  if (options.useGraph === true) {
+    return { success: false, error: "useGraph:true is not supported for full reflect insight windows" };
+  }
+  try {
+    if (!options.provider?.summarize) {
+      return { success: false, error: "provider.summarize is required" };
+    }
+    const cluster = await loadReflectWindowCluster(options);
+    const totalItems = cluster.facts.length + cluster.lessons.length + cluster.crystalNarratives.length;
+    if (totalItems < 3) {
+      return {
+        success: true,
+        skipped: true,
+        reason: "fewer than 3 supporting items",
+        totalItems,
+      };
+    }
+
+    const prompt = buildReflectPrompt(cluster);
+    if (options.charBudget !== undefined && prompt.length > options.charBudget) {
+      return {
+        success: false,
+        error: "input_too_large",
+        promptChars: prompt.length,
+        charBudget: options.charBudget,
+      };
+    }
+    const response = await options.provider.summarize(
+      withOutputLanguagePolicy(REFLECT_SYSTEM, undefined, REFLECT_OUTPUT_CONTRACT),
+      prompt,
+    );
+    const persisted = await persistReflectInsights({
+      kv: options.kv,
+      response,
+      cluster,
+      project: options.project,
+      maxInsights: options.maxItemsPerWindow,
+    });
+    await recordAudit(options.kv, "reflect", "mem::reflect-insight-window", [], {
+      newInsights: persisted.newInsights,
+      reinforced: persisted.reinforced,
+      totalItems,
+      useGraph: false,
+    });
+    return { success: true, ...persisted, totalItems, usedFallback: true };
+  } catch (err) {
+    return { success: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export function registerReflectFunctions(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
 ): void {
+  sdk.registerFunction(
+    "mem::full-reflect-insight-windows-plan",
+    async (data: {
+      project?: string;
+      useGraph?: boolean;
+      maxItemsPerWindow?: number;
+      charBudget?: number;
+    }) => planReflectInsightWindows({ kv, ...data }),
+  );
+
+  sdk.registerFunction(
+    "mem::full-reflect-insight-window",
+    async (data: {
+      project?: string;
+      useGraph?: boolean;
+      maxItemsPerWindow?: number;
+      charBudget?: number;
+      semanticMemoryIds?: string[];
+      lessonIds?: string[];
+      crystalIds?: string[];
+    }) => runReflectInsightWindow({ kv, provider, ...data }),
+  );
+
   sdk.registerFunction("mem::reflect", 
     async (data: { maxClusters?: number; project?: string }) => {
       const maxClusters = Math.min(data?.maxClusters ?? 10, 20);

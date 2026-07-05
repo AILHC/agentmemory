@@ -27,6 +27,20 @@ import { recordAudit } from "./audit.js";
 import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
 import { logger } from "../logger.js";
 
+export interface ConsolidationProceduralWindow {
+  windowId: string;
+  memoryIds: string[];
+  patternCount: number;
+}
+
+export interface ConsolidationProceduralWindowOptions {
+  kv: StateKV;
+  provider: MemoryProvider;
+  memoryIds?: string[];
+  project?: string;
+  maxItemsPerWindow?: number;
+}
+
 function hasChinese(input: string): boolean {
   return /[\u4e00-\u9fff]/.test(input);
 }
@@ -66,11 +80,162 @@ function applyDecay(
   }
 }
 
+function eligibleProceduralPatterns(memories: Memory[], project?: string): Memory[] {
+  return memories
+    .filter((m) => m.isLatest && m.type === "pattern")
+    .filter((m) => !project || !m.project || m.project === project)
+    .filter((m) => (m.sessionIds.length || 1) >= 2);
+}
+
+export async function planConsolidationProceduralWindows(options: {
+  kv: StateKV;
+  project?: string;
+  maxItemsPerWindow?: number;
+}): Promise<{ success: boolean; windows: ConsolidationProceduralWindow[]; totalPatterns: number; reason?: string }> {
+  const memories = await options.kv.list<Memory>(KV.memories);
+  const patterns = eligibleProceduralPatterns(memories, options.project);
+  if (patterns.length < 2) {
+    return {
+      success: true,
+      windows: [],
+      totalPatterns: patterns.length,
+      reason: "fewer than 2 recurring patterns",
+    };
+  }
+
+  const chunkSize = Math.max(2, options.maxItemsPerWindow ?? patterns.length);
+  const windows: ConsolidationProceduralWindow[] = [];
+  for (let i = 0; i < patterns.length; i += chunkSize) {
+    const chunk = patterns.slice(i, i + chunkSize);
+    if (chunk.length < 2) continue;
+    windows.push({
+      windowId: `procedural:${windows.length + 1}`,
+      memoryIds: chunk.map((memory) => memory.id),
+      patternCount: chunk.length,
+    });
+  }
+
+  return { success: true, windows, totalPatterns: patterns.length };
+}
+
+async function extractProceduralMemories(
+  kv: StateKV,
+  provider: MemoryProvider,
+  patterns: Array<{ content: string; frequency: number }>,
+): Promise<{ newProcedures: number; patternsAnalyzed: number; proceduralMemoryIds: string[] }> {
+  const prompt = buildProceduralExtractionPrompt(patterns);
+  const response = await provider.summarize(
+    withOutputLanguagePolicy(PROCEDURAL_EXTRACTION_SYSTEM),
+    prompt,
+  );
+
+  const procRegex =
+    /<procedure\s+name="([^"]+)"\s+trigger="([^"]+)">([\s\S]*?)<\/procedure>/g;
+  let match;
+  let newProcs = 0;
+  const now = new Date().toISOString();
+  const existingProcs = await kv.list<ProceduralMemory>(KV.procedural);
+  const proceduralMemoryIds: string[] = [];
+
+  while ((match = procRegex.exec(response)) !== null) {
+    const name = match[1];
+    const trigger = match[2];
+    const stepsBlock = match[3];
+    const steps: string[] = [];
+
+    const stepRegex = /<step>([^<]+)<\/step>/g;
+    let stepMatch;
+    while ((stepMatch = stepRegex.exec(stepsBlock)) !== null) {
+      steps.push(stepMatch[1].trim());
+    }
+
+    const existing = existingProcs.find(
+      (p) => p.name.toLowerCase() === name.toLowerCase(),
+    );
+    if (existing) {
+      existing.frequency++;
+      existing.updatedAt = now;
+      existing.strength = Math.min(1, existing.strength + 0.1);
+      await kv.set(KV.procedural, existing.id, existing);
+      if (!proceduralMemoryIds.includes(existing.id)) proceduralMemoryIds.push(existing.id);
+    } else {
+      const proc: ProceduralMemory = {
+        id: generateId("proc"),
+        name,
+        steps,
+        triggerCondition: trigger,
+        frequency: 1,
+        sourceSessionIds: [],
+        strength: 0.5,
+        createdAt: now,
+        updatedAt: now,
+      };
+      await kv.set(KV.procedural, proc.id, proc);
+      proceduralMemoryIds.push(proc.id);
+      newProcs++;
+    }
+  }
+
+  return { newProcedures: newProcs, patternsAnalyzed: patterns.length, proceduralMemoryIds };
+}
+
+export async function runConsolidationProceduralWindow(
+  options: ConsolidationProceduralWindowOptions,
+): Promise<Record<string, unknown>> {
+  try {
+    resolveOutputLanguage();
+    if (!options.provider?.summarize) {
+      return { success: false, error: "provider.summarize is required" };
+    }
+    const allMemories = await options.kv.list<Memory>(KV.memories);
+    const selectedIds = new Set(options.memoryIds ?? []);
+    const sourceMemories = selectedIds.size > 0
+      ? allMemories.filter((memory) => selectedIds.has(memory.id))
+      : allMemories;
+    const eligible = eligibleProceduralPatterns(sourceMemories, options.project);
+    const maxItems = options.maxItemsPerWindow ?? eligible.length;
+    const patterns = eligible
+      .slice(0, maxItems)
+      .map((m) => ({
+        content: m.content,
+        frequency: m.sessionIds.length || 1,
+      }));
+
+    if (patterns.length < 2) {
+      return {
+        success: true,
+        skipped: true,
+        reason: "fewer than 2 recurring patterns",
+        patternsAnalyzed: patterns.length,
+      };
+    }
+
+    const result = await extractProceduralMemories(options.kv, options.provider, patterns);
+    return { success: true, ...result };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error("Full procedural extraction failed", { error: msg });
+    return { success: false, error: msg };
+  }
+}
+
 export function registerConsolidationPipelineFunction(
   sdk: ISdk,
   kv: StateKV,
   provider: MemoryProvider,
 ): void {
+  sdk.registerFunction(
+    "mem::full-consolidation-procedural-windows-plan",
+    async (data: { project?: string; maxItemsPerWindow?: number }) =>
+      planConsolidationProceduralWindows({ kv, ...data }),
+  );
+
+  sdk.registerFunction(
+    "mem::full-consolidation-procedural-window",
+    async (data: { project?: string; memoryIds?: string[]; maxItemsPerWindow?: number }) =>
+      runConsolidationProceduralWindow({ kv, provider, ...data }),
+  );
+
   sdk.registerFunction("mem::consolidate-pipeline", 
     async (data?: { tier?: string; force?: boolean; project?: string }) => {
       resolveOutputLanguage();
@@ -216,72 +381,14 @@ export function registerConsolidationPipelineFunction(
 
       if (tier === "all" || tier === "procedural") {
         const memories = await kv.list<Memory>(KV.memories);
-        const patterns = memories
-          .filter((m) => m.isLatest && m.type === "pattern")
-          .map((m) => ({
-            content: m.content,
-            frequency: m.sessionIds.length || 1,
-          }))
-          .filter((p) => p.frequency >= 2);
+        const patterns = eligibleProceduralPatterns(memories, data?.project).map((m) => ({
+          content: m.content,
+          frequency: m.sessionIds.length || 1,
+        }));
 
         if (patterns.length >= 2) {
-          const prompt = buildProceduralExtractionPrompt(patterns);
-
           try {
-            const response = await provider.summarize(
-              withOutputLanguagePolicy(PROCEDURAL_EXTRACTION_SYSTEM),
-              prompt,
-            );
-
-            const procRegex =
-              /<procedure\s+name="([^"]+)"\s+trigger="([^"]+)">([\s\S]*?)<\/procedure>/g;
-            let match;
-            let newProcs = 0;
-            const now = new Date().toISOString();
-            const existingProcs = await kv.list<ProceduralMemory>(
-              KV.procedural,
-            );
-
-            while ((match = procRegex.exec(response)) !== null) {
-              const name = match[1];
-              const trigger = match[2];
-              const stepsBlock = match[3];
-              const steps: string[] = [];
-
-              const stepRegex = /<step>([^<]+)<\/step>/g;
-              let stepMatch;
-              while ((stepMatch = stepRegex.exec(stepsBlock)) !== null) {
-                steps.push(stepMatch[1].trim());
-              }
-
-              const existing = existingProcs.find(
-                (p) => p.name.toLowerCase() === name.toLowerCase(),
-              );
-              if (existing) {
-                existing.frequency++;
-                existing.updatedAt = now;
-                existing.strength = Math.min(1, existing.strength + 0.1);
-                await kv.set(KV.procedural, existing.id, existing);
-              } else {
-                const proc: ProceduralMemory = {
-                  id: generateId("proc"),
-                  name,
-                  steps,
-                  triggerCondition: trigger,
-                  frequency: 1,
-                  sourceSessionIds: [],
-                  strength: 0.5,
-                  createdAt: now,
-                  updatedAt: now,
-                };
-                await kv.set(KV.procedural, proc.id, proc);
-                newProcs++;
-              }
-            }
-            results.procedural = {
-              newProcedures: newProcs,
-              patternsAnalyzed: patterns.length,
-            };
+            results.procedural = await extractProceduralMemories(kv, provider, patterns);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Procedural extraction failed", { error: msg });

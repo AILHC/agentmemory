@@ -9,7 +9,10 @@ vi.mock("../src/config.js", () => ({
   isConsolidationEnabled: vi.fn(() => true),
 }));
 
-import { registerConsolidationPipelineFunction } from "../src/functions/consolidation-pipeline.js";
+import {
+  registerConsolidationPipelineFunction,
+  runConsolidationProceduralWindow,
+} from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled } from "../src/config.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
 import { logger } from "../src/logger.js";
@@ -279,6 +282,38 @@ describe("Consolidation Pipeline", () => {
       expect.stringContaining("AgentMemory Output Language Policy"),
       expect.any(String),
     );
+  });
+
+  it("full procedural window only uses latest recurring pattern memories", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<procedures><procedure name="Full Procedure" trigger="when patterns recur"><step>Read pattern</step><step>Apply pattern</step></procedure></procedures>`,
+      ),
+    };
+    await kv.set("mem:memories", "eligible-1", { ...makePattern(1), id: "eligible-1" });
+    await kv.set("mem:memories", "eligible-2", { ...makePattern(2), id: "eligible-2" });
+    await kv.set("mem:memories", "old", { ...makePattern(3), id: "old", isLatest: false });
+    await kv.set("mem:memories", "fact", { ...makePattern(4), id: "fact", type: "fact" });
+    await kv.set("mem:memories", "rare", { ...makePattern(5), id: "rare", sessionIds: ["ses_1"] });
+
+    const result = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["eligible-1", "eligible-2", "old", "fact", "rare"],
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.patternsAnalyzed).toBe(2);
+    expect(result.proceduralMemoryIds).toEqual([expect.stringMatching(/^proc_/)]);
+    expect(provider.summarize).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.not.stringContaining("Always do thing 3"),
+    );
+    const stored = await kv.list<ProceduralMemory>("mem:procedural");
+    expect(stored).toHaveLength(1);
+    expect(stored[0].name).toBe("Full Procedure");
   });
 
   it("consolidation records an audit entry", async () => {

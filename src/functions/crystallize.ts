@@ -11,10 +11,140 @@ interface CrystalDigest {
   lessons: string[];
 }
 
+export interface EligibleCrystalActionGroup {
+  groupId: string;
+  groupKey: string;
+  actionIds: string[];
+  actionUpdatedAts: string[];
+  actionCount: number;
+  project?: string;
+}
+
+export interface BuildEligibleCrystalActionGroupsOptions {
+  kv: StateKV;
+  olderThanDays?: number;
+  project?: string;
+}
+
 const CRYSTALLIZE_SYSTEM = `You are summarizing a completed chain of agent actions into a compact digest.
 Extract: (1) what was accomplished in 1-2 sentences, (2) key decisions as bullet points,
 (3) files affected, (4) any lessons or patterns worth remembering.
 Return as JSON: { "narrative": "...", "keyOutcomes": ["..."], "filesAffected": ["..."], "lessons": ["..."] }`;
+
+export async function buildEligibleCrystalActionGroups(
+  options: BuildEligibleCrystalActionGroupsOptions,
+): Promise<EligibleCrystalActionGroup[]> {
+  const olderThanDays = options.olderThanDays ?? 7;
+  const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
+
+  let allActions = await options.kv.list<Action>(KV.actions);
+  allActions = allActions.filter(
+    (a) =>
+      a.status === "done" &&
+      !a.crystallizedInto &&
+      new Date(a.updatedAt).getTime() < cutoff,
+  );
+
+  if (options.project) {
+    allActions = allActions.filter((a) => a.project === options.project);
+  }
+
+  const groups = new Map<string, Action[]>();
+  for (const action of allActions) {
+    const key = action.parentId ?? action.project ?? "_ungrouped";
+    const group = groups.get(key);
+    if (group) {
+      group.push(action);
+    } else {
+      groups.set(key, [action]);
+    }
+  }
+
+  return Array.from(groups.entries()).map(([key, actions], index) => ({
+    groupId: `crystal-group:${index + 1}:${key}`,
+    groupKey: key,
+    actionIds: actions.map((a) => a.id),
+    actionUpdatedAts: actions.map((a) => a.updatedAt),
+    actionCount: actions.length,
+    project: actions[0]?.project,
+  }));
+}
+
+async function runAutoCrystallize(
+  sdk: ISdk,
+  kv: StateKV,
+  data: {
+    olderThanDays?: number;
+    project?: string;
+    dryRun?: boolean;
+  },
+  failedGroupsMakeRunFail: boolean,
+): Promise<Record<string, unknown>> {
+  const dryRun = data.dryRun ?? false;
+  const groups = await buildEligibleCrystalActionGroups({
+    kv,
+    olderThanDays: data.olderThanDays,
+    project: data.project,
+  });
+
+  if (dryRun) {
+    return {
+      success: true,
+      dryRun: true,
+      groupCount: groups.length,
+      groups: groups.map((group) => ({ ...group, status: "planned" })),
+      crystalIds: [],
+    };
+  }
+
+  const crystalIds: string[] = [];
+  const groupResults: Array<EligibleCrystalActionGroup & {
+    status: "succeeded" | "failed";
+    crystalIds: string[];
+    error?: string;
+  }> = [];
+  for (const group of groups) {
+    const actionIds = group.actionIds;
+
+    try {
+      const result = (await sdk.trigger({ function_id: "mem::crystallize", payload: {
+        actionIds,
+        project: group.project,
+      } })) as { success: boolean; crystal?: Crystal; error?: string };
+
+      if (result.success && result.crystal) {
+        crystalIds.push(result.crystal.id);
+        groupResults.push({
+          ...group,
+          status: "succeeded",
+          crystalIds: [result.crystal.id],
+        });
+      } else {
+        groupResults.push({
+          ...group,
+          status: "failed",
+          crystalIds: [],
+          error: result.error ?? "crystallize returned no crystal",
+        });
+      }
+    } catch (err) {
+      groupResults.push({
+        ...group,
+        status: "failed",
+        crystalIds: [],
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  const hasFailedGroups = groupResults.some((group) => group.status === "failed");
+  return {
+    success: failedGroupsMakeRunFail ? !hasFailedGroups : true,
+    groupCount: groups.length,
+    groups: groupResults,
+    crystalIds,
+  };
+}
 
 export function registerCrystallizeFunction(
   sdk: ISdk,
@@ -149,86 +279,16 @@ export function registerCrystallizeFunction(
     },
   );
 
-  sdk.registerFunction("mem::auto-crystallize", 
-    async (data: {
-      olderThanDays?: number;
-      project?: string;
-      dryRun?: boolean;
-    }) => {
-      const olderThanDays = data.olderThanDays ?? 7;
-      const dryRun = data.dryRun ?? false;
-      const cutoff = Date.now() - olderThanDays * 24 * 60 * 60 * 1000;
+  sdk.registerFunction(
+    "mem::auto-crystallize",
+    async (data: { olderThanDays?: number; project?: string; dryRun?: boolean }) =>
+      runAutoCrystallize(sdk, kv, data, false),
+  );
 
-      let allActions = await kv.list<Action>(KV.actions);
-
-      allActions = allActions.filter(
-        (a) =>
-          a.status === "done" &&
-          !a.crystallizedInto &&
-          new Date(a.createdAt).getTime() < cutoff,
-      );
-
-      if (data.project) {
-        allActions = allActions.filter((a) => a.project === data.project);
-      }
-
-      if (allActions.length === 0) {
-        return { success: true, groupCount: 0, crystalIds: [] };
-      }
-
-      const groups = new Map<string, Action[]>();
-      for (const action of allActions) {
-        const key = action.parentId ?? action.project ?? "_ungrouped";
-        const group = groups.get(key);
-        if (group) {
-          group.push(action);
-        } else {
-          groups.set(key, [action]);
-        }
-      }
-
-      if (dryRun) {
-        const groupSummaries = Array.from(groups.entries()).map(
-          ([key, actions]) => ({
-            groupKey: key,
-            actionCount: actions.length,
-            actionIds: actions.map((a) => a.id),
-          }),
-        );
-        return {
-          success: true,
-          dryRun: true,
-          groupCount: groups.size,
-          groups: groupSummaries,
-          crystalIds: [],
-        };
-      }
-
-      const crystalIds: string[] = [];
-      for (const [, groupActions] of groups) {
-        const actionIds = groupActions.map((a) => a.id);
-        const project = groupActions[0].project;
-
-        try {
-          const result = (await sdk.trigger({ function_id: "mem::crystallize", payload: {
-            actionIds,
-            project,
-          } })) as { success: boolean; crystal?: Crystal };
-
-          if (result.success && result.crystal) {
-            crystalIds.push(result.crystal.id);
-          }
-        } catch {
-          continue;
-        }
-      }
-
-      return {
-        success: true,
-        groupCount: groups.size,
-        crystalIds,
-      };
-    },
+  sdk.registerFunction(
+    "mem::full-crystals-auto",
+    async (data: { olderThanDays?: number; project?: string; dryRun?: boolean }) =>
+      runAutoCrystallize(sdk, kv, data, true),
   );
 }
 

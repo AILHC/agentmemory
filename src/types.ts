@@ -561,7 +561,35 @@ export interface SemanticMemory {
   updatedAt: string;
 }
 
-export type ExtractionRunStatus = "running" | "succeeded" | "failed" | "partial";
+export type ExtractionRunStatus = "running" | "succeeded" | "skipped" | "failed" | "partial";
+
+export type ExtractionRunStage =
+  | "summary"
+  | "lessons"
+  | "memory_consolidate"
+  | "semantic_rollup"
+  | "skill_extract"
+  | "crystal"
+  | "consolidation_procedural"
+  | "reflect_insight";
+
+export type ExtractionRunResultType =
+  | "summary"
+  | "lesson"
+  | "memory"
+  | "semantic"
+  | "procedural"
+  | "crystal"
+  | "insight";
+
+export interface ExtractionRunStageRecord {
+  stage: ExtractionRunStage;
+  unitId?: string;
+  sourceIds: string[];
+  resultIds: string[];
+  resultType?: ExtractionRunResultType;
+  updatedAt: string;
+}
 
 export interface ExtractionRunIndex {
   id: string;
@@ -570,7 +598,7 @@ export interface ExtractionRunIndex {
   summarySessionIds: string[];
   lessonRunIds: string[];
   semanticWindowIds: string[];
-  corpusWindowIds: string[];
+  stageRecords: ExtractionRunStageRecord[];
   createdAt: string;
   updatedAt: string;
 }

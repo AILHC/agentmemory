@@ -170,7 +170,7 @@ describe("mem::semantic-rollup", () => {
     expect(provider.summarize).not.toHaveBeenCalled();
   });
 
-  it("fails when corpus source semantic memories are missing", async () => {
+  it("rejects corpus rollups before reading semantic memory sources", async () => {
     await kv.set(KV.semantic, "sem-a", semantic("sem-a", "Fact A"));
 
     const result = (await sdk.trigger("mem::semantic-rollup", {
@@ -187,18 +187,16 @@ describe("mem::semantic-rollup", () => {
       mark: string;
       kind: string;
       inputHash: string;
-      missingSemanticMemoryIds: string[];
+      missingSemanticMemoryIds?: string[];
     };
 
     expect(result).toMatchObject({
       success: false,
-      error: "missing_sources",
+      error: "kind corpus is not supported; use kind window",
       runId: "run-1",
       windowId: "corpus-1",
       mark: "full",
       kind: "corpus",
-      missingSessionIds: [],
-      missingSemanticMemoryIds: ["missing-sem"],
     });
     expect(result.inputHash).toMatch(/^[0-9a-f]{64}$/);
     expect(provider.summarize).not.toHaveBeenCalled();
@@ -345,7 +343,7 @@ describe("mem::semantic-rollup", () => {
     expect(provider.summarize).not.toHaveBeenCalled();
   });
 
-  it("writes corpus rollups with source memory provenance", async () => {
+  it("does not accept corpus rollups as a success path", async () => {
     await kv.set(KV.semantic, "sem-a", semantic("sem-a", "Fact A", ["ses-a"]));
     await kv.set(KV.semantic, "sem-b", semantic("sem-b", "Fact B", ["ses-b"]));
 
@@ -355,15 +353,11 @@ describe("mem::semantic-rollup", () => {
       mark: "full",
       kind: "corpus",
       semanticMemoryIds: ["sem-a", "sem-b"],
-    })) as { success: boolean; semanticMemoryIds: string[]; inputHash: string };
+    })) as { success: boolean; error: string; inputHash: string };
 
-    expect(result.success).toBe(true);
-    const stored = await kv.get<SemanticMemory>(KV.semantic, result.semanticMemoryIds[0]);
-    expect(stored).toMatchObject({
-      sourceSessionIds: ["ses-a", "ses-b"],
-      sourceMemoryIds: ["sem-a", "sem-b"],
-      extractionKind: "corpus",
-    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("corpus");
+    expect(provider.summarize).not.toHaveBeenCalled();
   });
 
   it("uses run-aware semantic ids while keeping the input hash source-only", async () => {

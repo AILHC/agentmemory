@@ -2,8 +2,8 @@ import type { ISdk } from "iii-sdk";
 import { createHash } from "node:crypto";
 import type {
   MemoryProvider,
-  SemanticMemory,
   SessionSummary,
+  SemanticMemory,
 } from "../types.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
@@ -78,25 +78,6 @@ function buildWindowPrompt(summaries: SessionSummary[]): string {
   return `Extract durable semantic facts from these session summaries:\n\n${input}`;
 }
 
-function buildCorpusPrompt(memories: SemanticMemory[]): string {
-  const input = memories
-    .map((memory, index) =>
-      [
-        `[Semantic memory ${index + 1}]`,
-        `ID: ${memory.id}`,
-        `Fact: ${memory.fact}`,
-        `Confidence: ${memory.confidence}`,
-        `Source sessions: ${memory.sourceSessionIds.join(", ")}`,
-      ].join("\n"),
-    )
-    .join("\n\n");
-  return `Consolidate these semantic memories into higher-level durable facts:\n\n${input}`;
-}
-
-function unique(values: string[]): string[] {
-  return Array.from(new Set(values.filter((value) => value.length > 0)));
-}
-
 function failureDetails(
   error: string,
   runId: string,
@@ -134,6 +115,17 @@ export function registerSemanticRollupFunction(
         error: "runId, windowId, mark, and kind are required",
       };
     }
+    if (kind === "corpus") {
+      return {
+        success: false,
+        error: "kind corpus is not supported; use kind window",
+        runId,
+        windowId,
+        mark,
+        kind,
+        inputHash: stableHash({ kind, mark, windowId, semanticMemoryIds: data.semanticMemoryIds }),
+      };
+    }
 
     const sessionIds = parseStringArray(data.sessionIds);
     const semanticMemoryIds = parseStringArray(data.semanticMemoryIds);
@@ -157,10 +149,7 @@ export function registerSemanticRollupFunction(
     if (kind === "window" && (!sessionIds || sessionIds.length === 0)) {
       return failureDetails("sessionIds is required for window rollup", runId, windowId, mark, kind, requestHash);
     }
-    if (kind === "corpus" && (!semanticMemoryIds || semanticMemoryIds.length === 0)) {
-      return failureDetails("semanticMemoryIds is required for corpus rollup", runId, windowId, mark, kind, requestHash);
-    }
-    const sourceIds = kind === "window" ? sessionIds! : semanticMemoryIds!;
+    const sourceIds = sessionIds!;
     if (sourceIds.length > MAX_ROLLUP_SOURCE_IDS) {
       return failureDetails("input_too_large", runId, windowId, mark, kind, requestHash, {
         sourceIds: sourceIds.length,
@@ -171,25 +160,14 @@ export function registerSemanticRollupFunction(
     const missingSessionIds: string[] = [];
     const missingSemanticMemoryIds: string[] = [];
     let summaries: SessionSummary[] = [];
-    let semanticSources: SemanticMemory[] = [];
 
-    if (kind === "window") {
-      summaries = await Promise.all(
-        sessionIds!.map(async (sessionId) => {
-          const summary = await kv.get<SessionSummary>(KV.summaries, sessionId);
-          if (!summary) missingSessionIds.push(sessionId);
-          return summary;
-        }),
-      ).then((items) => items.filter((item): item is SessionSummary => item !== null));
-    } else {
-      semanticSources = await Promise.all(
-        semanticMemoryIds!.map(async (memoryId) => {
-          const memory = await kv.get<SemanticMemory>(KV.semantic, memoryId);
-          if (!memory) missingSemanticMemoryIds.push(memoryId);
-          return memory;
-        }),
-      ).then((items) => items.filter((item): item is SemanticMemory => item !== null));
-    }
+    summaries = await Promise.all(
+      sessionIds!.map(async (sessionId) => {
+        const summary = await kv.get<SessionSummary>(KV.summaries, sessionId);
+        if (!summary) missingSessionIds.push(sessionId);
+        return summary;
+      }),
+    ).then((items) => items.filter((item): item is SessionSummary => item !== null));
 
     if (missingSessionIds.length > 0 || missingSemanticMemoryIds.length > 0) {
       return failureDetails("missing_sources", runId, windowId, mark, kind, requestHash, {
@@ -203,7 +181,7 @@ export function registerSemanticRollupFunction(
       mark,
       windowId,
       sessionIds: kind === "window" ? sessionIds : undefined,
-      semanticMemoryIds: kind === "corpus" ? semanticMemoryIds : undefined,
+      semanticMemoryIds: undefined,
       summaries: summaries.map((summary) => ({
         sessionId: summary.sessionId,
         title: summary.title,
@@ -211,17 +189,10 @@ export function registerSemanticRollupFunction(
         keyDecisions: summary.keyDecisions,
         concepts: summary.concepts,
       })),
-      semanticSources: semanticSources.map((memory) => ({
-        id: memory.id,
-        fact: memory.fact,
-        confidence: memory.confidence,
-        sourceSessionIds: memory.sourceSessionIds,
-      })),
+      semanticSources: [],
     });
 
-    const prompt = kind === "window"
-      ? buildWindowPrompt(summaries)
-      : buildCorpusPrompt(semanticSources);
+    const prompt = buildWindowPrompt(summaries);
     if (prompt.length > MAX_ROLLUP_PROMPT_CHARS) {
       return failureDetails("input_too_large", runId, windowId, mark, kind, inputHash, {
         promptChars: prompt.length,
@@ -272,10 +243,8 @@ export function registerSemanticRollupFunction(
     }
 
     const now = new Date().toISOString();
-    const sourceSessionIds = kind === "window"
-      ? sessionIds!
-      : unique(semanticSources.flatMap((memory) => memory.sourceSessionIds));
-    const sourceMemoryIds = kind === "corpus" ? semanticMemoryIds! : [];
+    const sourceSessionIds = sessionIds!;
+    const sourceMemoryIds: string[] = [];
     const memories: SemanticMemory[] = await Promise.all(
       facts.map(async ({ fact, confidence }) => {
         const id = fingerprintId("sem", stableStringify({

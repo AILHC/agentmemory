@@ -4,7 +4,10 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerCrystallizeFunction } from "../src/functions/crystallize.js";
+import {
+  buildEligibleCrystalActionGroups,
+  registerCrystallizeFunction,
+} from "../src/functions/crystallize.js";
 import type { Action, Crystal, MemoryProvider } from "../src/types.js";
 
 function mockKV() {
@@ -57,13 +60,14 @@ function mockProvider(): MemoryProvider {
 }
 
 function makeAction(overrides: Partial<Action> & { id: string }): Action {
+  const stablePast = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   return {
     title: "Test action",
     description: "A test action",
     status: "done",
     priority: 5,
-    createdAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString(),
-    updatedAt: new Date().toISOString(),
+    createdAt: stablePast,
+    updatedAt: stablePast,
     createdBy: "agent-1",
     tags: [],
     sourceObservationIds: [],
@@ -363,6 +367,48 @@ describe("Crystallize Functions", () => {
   });
 
   describe("mem::auto-crystallize", () => {
+    it("buildEligibleCrystalActionGroups exposes stable group ids and action ids", async () => {
+      const action = makeAction({
+        id: "act_group",
+        status: "done",
+        project: "proj",
+        updatedAt: "2026-06-01T00:00:00.000Z",
+      });
+      await kv.set("mem:actions", action.id, action);
+
+      const groups = await buildEligibleCrystalActionGroups({
+        kv: kv as never,
+        olderThanDays: 7,
+      });
+
+      expect(groups).toHaveLength(1);
+      expect(groups[0]).toMatchObject({
+        groupId: "crystal-group:1:proj",
+        groupKey: "proj",
+        actionIds: ["act_group"],
+        actionUpdatedAts: ["2026-06-01T00:00:00.000Z"],
+        actionCount: 1,
+      });
+    });
+
+    it("does not include recently updated done actions even when created long ago", async () => {
+      const action = makeAction({
+        id: "act_recent_update",
+        status: "done",
+        project: "proj",
+        createdAt: "2020-01-01T00:00:00.000Z",
+        updatedAt: new Date().toISOString(),
+      });
+      await kv.set("mem:actions", action.id, action);
+
+      const groups = await buildEligibleCrystalActionGroups({
+        kv: kv as never,
+        olderThanDays: 7,
+      });
+
+      expect(groups).toHaveLength(0);
+    });
+
     it("returns group summaries in dryRun mode", async () => {
       const action = makeAction({
         id: "act_dry",
@@ -377,7 +423,7 @@ describe("Crystallize Functions", () => {
         success: boolean;
         dryRun: boolean;
         groupCount: number;
-        groups: { groupKey: string; actionCount: number; actionIds: string[] }[];
+        groups: { groupKey: string; actionCount: number; actionIds: string[]; actionUpdatedAts: string[] }[];
         crystalIds: string[];
       };
 
@@ -385,6 +431,7 @@ describe("Crystallize Functions", () => {
       expect(result.dryRun).toBe(true);
       expect(result.groupCount).toBe(1);
       expect(result.groups[0].actionIds).toContain("act_dry");
+      expect(result.groups[0].actionUpdatedAts).toHaveLength(1);
       expect(result.crystalIds).toEqual([]);
     });
 
@@ -466,6 +513,7 @@ describe("Crystallize Functions", () => {
         id: "act_recent",
         status: "done",
         createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
       });
       await kv.set("mem:actions", recentAction.id, recentAction);
 
@@ -495,6 +543,52 @@ describe("Crystallize Functions", () => {
       expect(result.crystalIds.length).toBe(2);
       expect(result.crystalIds[0]).toMatch(/^crys_/);
       expect(result.crystalIds[1]).toMatch(/^crys_/);
+    });
+
+    it("full auto-crystallize exposes failed groups and marks overall failure", async () => {
+      (provider.summarize as ReturnType<typeof vi.fn>)
+        .mockResolvedValueOnce(
+          '{"narrative":"ok","keyOutcomes":[],"filesAffected":[],"lessons":[]}',
+        )
+        .mockRejectedValueOnce(new Error("provider failed"));
+      const ok = makeAction({ id: "act_full_ok", status: "done", project: "ok" });
+      const fail = makeAction({ id: "act_full_fail", status: "done", project: "fail" });
+      await kv.set("mem:actions", ok.id, ok);
+      await kv.set("mem:actions", fail.id, fail);
+
+      const result = (await sdk.trigger("mem::full-crystals-auto", {})) as {
+        success: boolean;
+        groupCount: number;
+        crystalIds: string[];
+        groups: Array<{
+          groupId: string;
+          actionIds: string[];
+          actionUpdatedAts: string[];
+          status: "succeeded" | "failed";
+          crystalIds: string[];
+          error?: string;
+        }>;
+      };
+
+      expect(result.success).toBe(false);
+      expect(result.groupCount).toBe(2);
+      expect(result.crystalIds).toHaveLength(1);
+      expect(result.groups).toEqual([
+        expect.objectContaining({
+          groupId: "crystal-group:1:ok",
+          actionIds: ["act_full_ok"],
+          actionUpdatedAts: [ok.updatedAt],
+          status: "succeeded",
+        }),
+        expect.objectContaining({
+          groupId: "crystal-group:2:fail",
+          actionIds: ["act_full_fail"],
+          actionUpdatedAts: [fail.updatedAt],
+          status: "failed",
+          crystalIds: [],
+          error: expect.stringContaining("provider failed"),
+        }),
+      ]);
     });
 
     it("filters by project when specified", async () => {

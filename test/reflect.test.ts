@@ -4,7 +4,7 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerReflectFunctions } from "../src/functions/reflect.js";
+import { registerReflectFunctions, runReflectInsightWindow } from "../src/functions/reflect.js";
 import type { Insight, GraphNode, GraphEdge, SemanticMemory, Lesson, Crystal } from "../src/types.js";
 
 function mockKV() {
@@ -260,6 +260,42 @@ describe("Reflect", () => {
 
       expect(result.success).toBe(true);
       expect(result.newInsights).toBe(0);
+    });
+
+    it("full insight window rejects useGraph true", async () => {
+      const result = await runReflectInsightWindow({
+        kv: kv as never,
+        provider: provider as never,
+        useGraph: true,
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain("useGraph:true");
+      expect(provider.summarize).not.toHaveBeenCalled();
+    });
+
+    it("full insight window builds prompts from semantic, lesson, and crystal ids without graph reads", async () => {
+      await kv.set("mem:semantic", "sem_1", makeSemantic("security validation is important", "sem_1"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use security headers", ["security"]));
+      await kv.set("mem:crystals", "crys_1", makeCrystal("Completed security validation cleanup", ["security"]));
+      const originalList = kv.list;
+      const listSpy = vi.fn(originalList);
+      kv.list = listSpy as typeof kv.list;
+
+      const result = await runReflectInsightWindow({
+        kv: kv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: ["sem_1"],
+        lessonIds: ["lsn_1"],
+        crystalIds: ["crys_1"],
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.insightIds).toHaveLength(2);
+      expect(provider.summarize).toHaveBeenCalled();
+      expect(listSpy).not.toHaveBeenCalledWith("mem:graph:nodes");
+      expect(listSpy).not.toHaveBeenCalledWith("mem:graph:edges");
     });
   });
 

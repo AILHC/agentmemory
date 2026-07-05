@@ -264,16 +264,66 @@ const allowedSemanticRollupKeys = new Set([
   "sessionIds",
   "semanticMemoryIds",
 ]);
+const allowedFullSkillExtractKeys = new Set(["sessionId"]);
+const allowedFullConsolidatePlanKeys = new Set([
+  "project",
+  "minImportance",
+  "minObservationsPerConcept",
+  "maxObservationsPerWindow",
+  "charBudget",
+  "minObservations",
+]);
+const allowedFullConsolidateWindowKeys = new Set([
+  "windowId",
+  "project",
+  "concept",
+  "sourceObservationIds",
+  "observationIds",
+  "charBudget",
+  "minObservations",
+]);
+const allowedFullProceduralPlanKeys = new Set(["project", "maxItemsPerWindow"]);
+const allowedFullProceduralWindowKeys = new Set([
+  "windowId",
+  "project",
+  "memoryIds",
+  "maxItemsPerWindow",
+]);
+const allowedFullReflectPlanKeys = new Set([
+  "project",
+  "useGraph",
+  "maxItemsPerWindow",
+  "charBudget",
+]);
+const allowedFullReflectWindowKeys = new Set([
+  "windowId",
+  "project",
+  "useGraph",
+  "maxItemsPerWindow",
+  "charBudget",
+  "semanticMemoryIds",
+  "lessonIds",
+  "crystalIds",
+]);
+const allowedFullCrystalAutoKeys = new Set([
+  "olderThanDays",
+  "project",
+  "dryRun",
+]);
 const allowedExtractionRunRecordKeys = new Set([
   "runId",
   "mark",
   "status",
+  "stage",
+  "unitId",
+  "sourceIds",
+  "resultIds",
+  "resultType",
   "summarySessionId",
   "lessonRunId",
   "semanticWindowId",
-  "corpusWindowId",
 ]);
-const extractionRunStatuses = new Set(["running", "succeeded", "failed", "partial"]);
+const extractionRunStatuses = new Set(["running", "succeeded", "skipped", "failed", "partial"]);
 
 function hasOnlyKeys(body: Record<string, unknown>, allowed: Set<string>): boolean {
   return Object.keys(body).every((key) => allowed.has(key));
@@ -476,6 +526,12 @@ export function registerApiTriggers(
           body: { error: "runId, windowId, mark, and kind are required" },
         };
       }
+      if (kind === "corpus") {
+        return {
+          status_code: 400,
+          body: { success: false, error: "kind corpus is not supported; use kind window" },
+        };
+      }
 
       const sessionIds = body.sessionIds === undefined
         ? undefined
@@ -493,12 +549,6 @@ export function registerApiTriggers(
         return {
           status_code: 400,
           body: { error: "sessionIds is required for window rollup" },
-        };
-      }
-      if (kind === "corpus" && (!semanticMemoryIds || semanticMemoryIds.length === 0)) {
-        return {
-          status_code: 400,
-          body: { error: "semanticMemoryIds is required for corpus rollup" },
         };
       }
 
@@ -522,6 +572,337 @@ export function registerApiTriggers(
     },
   });
 
+  sdk.registerFunction("api::full-skill-extract", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body) return { status_code: 400, body: { error: "request body is required" } };
+    if (!hasOnlyKeys(body, allowedFullSkillExtractKeys)) {
+      return { status_code: 400, body: { error: "invalid full skill extraction payload: only sessionId is allowed" } };
+    }
+    const sessionId = asNonEmptyString(body.sessionId);
+    if (!sessionId) return { status_code: 400, body: { error: "sessionId is required" } };
+    const result = await sdk.trigger({
+      function_id: "mem::skill-extract",
+      payload: { sessionId },
+    });
+    const bodyResult = result && typeof result === "object"
+      ? (result as Record<string, unknown>)
+      : {};
+    const skillId = bodyResult.skill
+      && typeof bodyResult.skill === "object"
+      && typeof (bodyResult.skill as { id?: unknown }).id === "string"
+      ? (bodyResult.skill as { id: string }).id
+      : undefined;
+    return {
+      status_code: 200,
+      body: {
+        ...bodyResult,
+        proceduralMemoryIds: skillId ? [skillId] : [],
+      },
+    };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-skill-extract",
+    config: {
+      api_path: "/agentmemory/full/skill-extract",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::full-memory-consolidate-windows-plan", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body) return { status_code: 400, body: { error: "request body is required" } };
+    if (!hasOnlyKeys(body, allowedFullConsolidatePlanKeys)) {
+      return { status_code: 400, body: { error: "invalid full memory consolidate plan payload" } };
+    }
+    const minImportance = parseOptionalPositiveInt(body.minImportance);
+    const minObservationsPerConcept = parseOptionalPositiveInt(
+      body.minObservationsPerConcept ?? body.minObservations,
+    );
+    const maxObservationsPerWindow = parseOptionalPositiveInt(body.maxObservationsPerWindow);
+    const charBudget = parseOptionalPositiveInt(body.charBudget);
+    if (
+      minImportance === null
+      || minObservationsPerConcept === null
+      || maxObservationsPerWindow === null
+      || charBudget === null
+    ) {
+      return {
+        status_code: 400,
+        body: {
+          error: "minImportance, minObservationsPerConcept, maxObservationsPerWindow, and charBudget must be positive integers",
+        },
+      };
+    }
+    const project = optionalNonEmptyString(body, "project");
+    if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
+    const payload: Record<string, unknown> = {};
+    if (project !== undefined) payload.project = project;
+    if (minImportance !== undefined) payload.minImportance = minImportance;
+    if (minObservationsPerConcept !== undefined) payload.minObservationsPerConcept = minObservationsPerConcept;
+    if (maxObservationsPerWindow !== undefined) payload.maxObservationsPerWindow = maxObservationsPerWindow;
+    if (charBudget !== undefined) payload.charBudget = charBudget;
+    const result = await sdk.trigger({
+      function_id: "mem::full-memory-consolidate-windows-plan",
+      payload,
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-memory-consolidate-windows-plan",
+    config: {
+      api_path: "/agentmemory/full/memory-consolidate-windows/plan",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::full-memory-consolidate-window", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body) return { status_code: 400, body: { error: "request body is required" } };
+    if (!hasOnlyKeys(body, allowedFullConsolidateWindowKeys)) {
+      return { status_code: 400, body: { error: "invalid full memory consolidate window payload" } };
+    }
+    const minObservations = parseOptionalPositiveInt(body.minObservations);
+    const charBudget = parseOptionalPositiveInt(body.charBudget);
+    if (minObservations === null || charBudget === null) {
+      return { status_code: 400, body: { error: "minObservations and charBudget must be positive integers" } };
+    }
+    const project = optionalNonEmptyString(body, "project");
+    const concept = optionalNonEmptyString(body, "concept");
+    const observationIds = body.sourceObservationIds === undefined
+      ? (body.observationIds === undefined ? undefined : parseStringArray(body.observationIds))
+      : parseStringArray(body.sourceObservationIds);
+    if (project === null || concept === null) {
+      return { status_code: 400, body: { error: "project and concept must be non-empty strings when present" } };
+    }
+    if (observationIds === null) {
+      return { status_code: 400, body: { error: "observationIds must be a string array" } };
+    }
+    const payload: Record<string, unknown> = {};
+    if (project !== undefined) payload.project = project;
+    if (concept !== undefined) payload.concept = concept;
+    if (observationIds !== undefined) payload.observationIds = observationIds;
+    if (minObservations !== undefined) payload.minObservations = minObservations;
+    if (charBudget !== undefined) payload.charBudget = charBudget;
+    const result = await sdk.trigger({
+      function_id: "mem::full-memory-consolidate-window",
+      payload,
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-memory-consolidate-window",
+    config: {
+      api_path: "/agentmemory/full/memory-consolidate-window",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::full-consolidation-procedural-windows-plan", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body) return { status_code: 400, body: { error: "request body is required" } };
+    if (!hasOnlyKeys(body, allowedFullProceduralPlanKeys)) {
+      return { status_code: 400, body: { error: "invalid full procedural plan payload" } };
+    }
+    const maxItemsPerWindow = parseOptionalPositiveInt(body.maxItemsPerWindow);
+    if (maxItemsPerWindow === null) {
+      return { status_code: 400, body: { error: "maxItemsPerWindow must be a positive integer" } };
+    }
+    const project = optionalNonEmptyString(body, "project");
+    if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
+    const payload: Record<string, unknown> = {};
+    if (project !== undefined) payload.project = project;
+    if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
+    const result = await sdk.trigger({
+      function_id: "mem::full-consolidation-procedural-windows-plan",
+      payload,
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-consolidation-procedural-windows-plan",
+    config: {
+      api_path: "/agentmemory/full/consolidation-procedural-windows/plan",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::full-consolidation-procedural-window", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body) return { status_code: 400, body: { error: "request body is required" } };
+    if (!hasOnlyKeys(body, allowedFullProceduralWindowKeys)) {
+      return { status_code: 400, body: { error: "invalid full procedural window payload" } };
+    }
+    const maxItemsPerWindow = parseOptionalPositiveInt(body.maxItemsPerWindow);
+    if (maxItemsPerWindow === null) {
+      return { status_code: 400, body: { error: "maxItemsPerWindow must be a positive integer" } };
+    }
+    const project = optionalNonEmptyString(body, "project");
+    const memoryIds = body.memoryIds === undefined ? undefined : parseStringArray(body.memoryIds);
+    if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
+    if (memoryIds === null) return { status_code: 400, body: { error: "memoryIds must be a string array" } };
+    const payload: Record<string, unknown> = {};
+    if (project !== undefined) payload.project = project;
+    if (memoryIds !== undefined) payload.memoryIds = memoryIds;
+    if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
+    const result = await sdk.trigger({
+      function_id: "mem::full-consolidation-procedural-window",
+      payload,
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-consolidation-procedural-window",
+    config: {
+      api_path: "/agentmemory/full/consolidation-procedural-window",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::full-reflect-insight-windows-plan", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body) return { status_code: 400, body: { error: "request body is required" } };
+    if (!hasOnlyKeys(body, allowedFullReflectPlanKeys)) {
+      return { status_code: 400, body: { error: "invalid full reflect insight plan payload" } };
+    }
+    const useGraph = parseOptionalBoolean(body.useGraph);
+    if (useGraph === null) return { status_code: 400, body: { error: "useGraph must be a boolean" } };
+    if (useGraph === true) {
+      return { status_code: 400, body: { success: false, error: "useGraph:true is not supported for full reflect insight windows" } };
+    }
+    const maxItemsPerWindow = parseOptionalPositiveInt(body.maxItemsPerWindow);
+    const charBudget = parseOptionalPositiveInt(body.charBudget);
+    if (maxItemsPerWindow === null || charBudget === null) {
+      return { status_code: 400, body: { error: "maxItemsPerWindow and charBudget must be positive integers" } };
+    }
+    const project = optionalNonEmptyString(body, "project");
+    if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
+    const payload: Record<string, unknown> = { useGraph: false };
+    if (project !== undefined) payload.project = project;
+    if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
+    if (charBudget !== undefined) payload.charBudget = charBudget;
+    const result = await sdk.trigger({
+      function_id: "mem::full-reflect-insight-windows-plan",
+      payload,
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-reflect-insight-windows-plan",
+    config: {
+      api_path: "/agentmemory/full/reflect-insight-windows/plan",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::full-reflect-insight-window", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body) return { status_code: 400, body: { error: "request body is required" } };
+    if (!hasOnlyKeys(body, allowedFullReflectWindowKeys)) {
+      return { status_code: 400, body: { error: "invalid full reflect insight window payload" } };
+    }
+    const useGraph = parseOptionalBoolean(body.useGraph);
+    if (useGraph === null) return { status_code: 400, body: { error: "useGraph must be a boolean" } };
+    if (useGraph === true) {
+      return { status_code: 400, body: { success: false, error: "useGraph:true is not supported for full reflect insight windows" } };
+    }
+    const maxItemsPerWindow = parseOptionalPositiveInt(body.maxItemsPerWindow);
+    const charBudget = parseOptionalPositiveInt(body.charBudget);
+    if (maxItemsPerWindow === null || charBudget === null) {
+      return { status_code: 400, body: { error: "maxItemsPerWindow and charBudget must be positive integers" } };
+    }
+    const project = optionalNonEmptyString(body, "project");
+    const semanticMemoryIds = body.semanticMemoryIds === undefined ? undefined : parseStringArray(body.semanticMemoryIds);
+    const lessonIds = body.lessonIds === undefined ? undefined : parseStringArray(body.lessonIds);
+    const crystalIds = body.crystalIds === undefined ? undefined : parseStringArray(body.crystalIds);
+    if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
+    if (semanticMemoryIds === null || lessonIds === null || crystalIds === null) {
+      return { status_code: 400, body: { error: "semanticMemoryIds, lessonIds, and crystalIds must be string arrays" } };
+    }
+    const payload: Record<string, unknown> = { useGraph: false };
+    if (project !== undefined) payload.project = project;
+    if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
+    if (charBudget !== undefined) payload.charBudget = charBudget;
+    if (semanticMemoryIds !== undefined) payload.semanticMemoryIds = semanticMemoryIds;
+    if (lessonIds !== undefined) payload.lessonIds = lessonIds;
+    if (crystalIds !== undefined) payload.crystalIds = crystalIds;
+    const result = await sdk.trigger({
+      function_id: "mem::full-reflect-insight-window",
+      payload,
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-reflect-insight-window",
+    config: {
+      api_path: "/agentmemory/full/reflect-insight-window",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::full-crystals-auto", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body) return { status_code: 400, body: { error: "request body is required" } };
+    if (!hasOnlyKeys(body, allowedFullCrystalAutoKeys)) {
+      return { status_code: 400, body: { error: "invalid full crystal auto payload" } };
+    }
+    const olderThanDays = parseOptionalPositiveInt(body.olderThanDays);
+    if (olderThanDays === null) {
+      return { status_code: 400, body: { error: "olderThanDays must be a positive integer" } };
+    }
+    const dryRun = parseOptionalBoolean(body.dryRun);
+    if (dryRun === null) return { status_code: 400, body: { error: "dryRun must be a boolean" } };
+    const project = optionalNonEmptyString(body, "project");
+    if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
+    const payload: Record<string, unknown> = {};
+    if (olderThanDays !== undefined) payload.olderThanDays = olderThanDays;
+    if (project !== undefined) payload.project = project;
+    if (dryRun !== undefined) payload.dryRun = dryRun;
+    const result = await sdk.trigger({
+      function_id: "mem::full-crystals-auto",
+      payload,
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-crystals-auto",
+    config: {
+      api_path: "/agentmemory/full/crystals/auto",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
   sdk.registerFunction("api::extraction-run-record",
     async (req: ApiRequest): Promise<Response> => {
       const denied = checkAuth(req, secret);
@@ -535,7 +916,7 @@ export function registerApiTriggers(
           status_code: 400,
           body: {
             error:
-              "invalid extraction run record payload: only runId, mark, status, summarySessionId, lessonRunId, semanticWindowId, corpusWindowId are allowed",
+              "invalid extraction run record payload: only runId, mark, status, stage, unitId, sourceIds, resultIds, resultType, summarySessionId, lessonRunId, semanticWindowId are allowed",
           },
         };
       }
@@ -552,17 +933,19 @@ export function registerApiTriggers(
       if (status !== undefined && !extractionRunStatuses.has(status)) {
         return {
           status_code: 400,
-          body: { error: "status must be running, succeeded, failed, or partial" },
+          body: { error: "status must be running, succeeded, skipped, failed, or partial" },
         };
       }
 
       const payload: Record<string, unknown> = { runId, mark };
       if (status !== undefined) payload.status = status;
+      for (const key of ["stage", "unitId", "sourceIds", "resultIds", "resultType"]) {
+        if (Object.prototype.hasOwnProperty.call(body, key)) payload[key] = body[key];
+      }
       const optionalIds = {
         summarySessionId: optionalNonEmptyString(body, "summarySessionId"),
         lessonRunId: optionalNonEmptyString(body, "lessonRunId"),
         semanticWindowId: optionalNonEmptyString(body, "semanticWindowId"),
-        corpusWindowId: optionalNonEmptyString(body, "corpusWindowId"),
       };
       for (const [key, value] of Object.entries(optionalIds)) {
         if (value === null) {

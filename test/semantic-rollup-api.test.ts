@@ -74,6 +74,30 @@ describe("semantic rollup REST wrappers", () => {
     });
   });
 
+  it("rejects corpus semantic-rollup requests", async () => {
+    const sdk = mockSdk();
+    registerApiTriggers(sdk as never, {} as never, "");
+    const handler = sdk.getFunction("api::semantic-rollup");
+
+    const response = await handler({
+      headers: {},
+      body: {
+        runId: "run-1",
+        windowId: "corpus-1",
+        mark: "full",
+        kind: "corpus",
+        semanticMemoryIds: ["sem-a"],
+      },
+    });
+
+    expect(response.status_code).toBe(400);
+    expect(response.body).toMatchObject({
+      success: false,
+      error: expect.stringContaining("corpus"),
+    });
+    expect(sdk.trigger).not.toHaveBeenCalled();
+  });
+
   it("rejects unsupported extraction-run-record fields", async () => {
     const sdk = mockSdk();
     registerApiTriggers(sdk as never, {} as never, "");
@@ -108,7 +132,6 @@ describe("semantic rollup REST wrappers", () => {
         summarySessionId: " ses-a ",
         lessonRunId: " lesson-a ",
         semanticWindowId: " win-a ",
-        corpusWindowId: " corpus-a ",
       },
     });
 
@@ -122,9 +145,26 @@ describe("semantic rollup REST wrappers", () => {
         summarySessionId: "ses-a",
         lessonRunId: "lesson-a",
         semanticWindowId: "win-a",
+      },
+    });
+  });
+
+  it("rejects extraction-run-record corpusWindowId", async () => {
+    const sdk = mockSdk();
+    registerApiTriggers(sdk as never, {} as never, "");
+    const handler = sdk.getFunction("api::extraction-run-record");
+
+    const response = await handler({
+      headers: {},
+      body: {
+        runId: "run-1",
+        mark: "full",
         corpusWindowId: "corpus-a",
       },
     });
+
+    expect(response.status_code).toBe(400);
+    expect(sdk.trigger).not.toHaveBeenCalled();
   });
 
   it("rejects extraction-run-record optional fields that are present but not non-empty strings", async () => {
@@ -134,7 +174,6 @@ describe("semantic rollup REST wrappers", () => {
       { runId: "run-1", mark: "full", summarySessionId: "" },
       { runId: "run-1", mark: "full", lessonRunId: 1 },
       { runId: "run-1", mark: "full", semanticWindowId: null },
-      { runId: "run-1", mark: "full", corpusWindowId: [] },
     ]) {
       const sdk = mockSdk();
       registerApiTriggers(sdk as never, {} as never, "");
