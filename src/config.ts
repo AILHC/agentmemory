@@ -287,6 +287,50 @@ export function getEnvVar(key: string): string | undefined {
   return getMergedEnv()[key];
 }
 
+export const SUMMARIZE_CHUNK_SIZE_DEFAULT = 400;
+export const SUMMARIZE_CHUNK_CONCURRENCY_DEFAULT = 6;
+export const SUMMARIZE_CHUNK_CONCURRENCY_MAX = 256;
+
+function parsePositiveIntValue(
+  raw: string | undefined,
+  fallback: number,
+  max?: number,
+): number {
+  if (!raw) return fallback;
+  const trimmed = raw.trim();
+  if (!/^[1-9]\d*$/.test(trimmed)) return fallback;
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed)) return fallback;
+  if (max !== undefined && parsed > max) return fallback;
+  return parsed;
+}
+
+export function getPositiveEnvInt(
+  key: string,
+  fallback: number,
+  max?: number,
+): number {
+  return parsePositiveIntValue(getEnvVar(key), fallback, max);
+}
+
+export function getSummarizeRuntimeConfig(): {
+  chunkSize: number;
+  chunkConcurrency: number;
+} {
+  const env = getMergedEnv();
+  return {
+    chunkSize: parsePositiveIntValue(
+      env["SUMMARIZE_CHUNK_SIZE"],
+      SUMMARIZE_CHUNK_SIZE_DEFAULT,
+    ),
+    chunkConcurrency: parsePositiveIntValue(
+      env["SUMMARIZE_CHUNK_CONCURRENCY"],
+      SUMMARIZE_CHUNK_CONCURRENCY_DEFAULT,
+      SUMMARIZE_CHUNK_CONCURRENCY_MAX,
+    ),
+  };
+}
+
 export function isDropStaleIndexEnabled(): boolean {
   return getMergedEnv()["AGENTMEMORY_DROP_STALE_INDEX"] === "true";
 }

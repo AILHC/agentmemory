@@ -29,6 +29,7 @@ import {
   detectLlmProviderKind,
   getAgentId,
   isAgentScopeIsolated,
+  getSummarizeRuntimeConfig,
 } from "../config.js";
 
 type Response = {
@@ -294,13 +295,6 @@ function parseStringArray(value: unknown): string[] | null {
   return out;
 }
 
-function parsePositiveEnvInt(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-}
-
 function providerNameFrom(provider: unknown): string {
   if (
     provider &&
@@ -430,13 +424,14 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
+      const summarizeRuntimeConfig = getSummarizeRuntimeConfig();
       return {
         status_code: 200,
         body: {
           success: true,
           runtime: {
-            summarizeChunkConcurrency: parsePositiveEnvInt("SUMMARIZE_CHUNK_CONCURRENCY", 6),
-            summarizeChunkSize: parsePositiveEnvInt("SUMMARIZE_CHUNK_SIZE", 400),
+            summarizeChunkConcurrency: summarizeRuntimeConfig.chunkConcurrency,
+            summarizeChunkSize: summarizeRuntimeConfig.chunkSize,
             providerName: providerNameFrom(provider),
           },
         },

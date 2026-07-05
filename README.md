@@ -1392,6 +1392,8 @@ Put agentmemory runtime configuration in `~/.agentmemory/.env` instead of export
 
 Process environment variables still work and take precedence over values in the file.
 
+Managed deployments can set `AGENTMEMORY_HOME` to place the runtime state and `.env` file outside the user profile. `AGENTMEMORY_HOME` must come from the service manager or shell before the process starts; a migrated `.env` file cannot bootstrap a different state directory because the `.env` path is resolved from `AGENTMEMORY_HOME` first. In that mode, AgentMemory business runtime settings belong in `AGENTMEMORY_HOME/.env`; service managers such as WinSW and process supervisors should not define duplicate `SUMMARIZE_CHUNK_*` keys.
+
 On Windows, the same file lives at `%USERPROFILE%\.agentmemory\.env`:
 
 ```powershell
@@ -1610,6 +1612,11 @@ Full extraction orchestration uses three narrow REST endpoints:
 
 - `GET /agentmemory/runtime-config` returns only redacted runtime facts:
   `summarizeChunkConcurrency`, `summarizeChunkSize`, and `providerName`.
+  `summarizeChunkConcurrency` and `summarizeChunkSize` are resolved through
+  the same merged config path used by `mem::summarize`:
+  `AGENTMEMORY_HOME/.env` plus `process.env`, with `process.env` taking
+  precedence. The endpoint is safe to call for deployment verification
+  because it returns only redacted runtime facts.
 - `POST /agentmemory/semantic-rollup` accepts
   `{ runId, windowId, mark, kind, sessionIds? , semanticMemoryIds? }`.
   `kind: "window"` requires `sessionIds`; `kind: "corpus"` requires

@@ -22,35 +22,11 @@ import { scoreSummary } from "../eval/quality.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
+import { getSummarizeRuntimeConfig } from "../config.js";
 
-// Per-chunk observation budget when a session is too large to fit in one
-// LLM call. Default ≈ 50k input tokens per chunk at ~110 tok/obs — fits
-// comfortably in 128k-window models. Override via SUMMARIZE_CHUNK_SIZE.
-const CHUNK_SIZE_DEFAULT = 400;
-// Concurrent in-flight chunk calls. 6 keeps a 100-chunk session under
-// iii's 180s function-invocation timeout at ~8s/call while staying
-// inside generous-but-not-unlimited provider rate limits (well below
-// OpenAI free tier's 500 RPM). High-throughput providers
-// (Novita / DeepInfra / DeepSeek) typically allow 100+ concurrent — set
-// SUMMARIZE_CHUNK_CONCURRENCY higher to cover ~1000+ chunk sessions.
-const CHUNK_CONCURRENCY_DEFAULT = 6;
 // Bail on the merged summary if more than this fraction of chunks fail
 // to parse — a half-blind narrative is worse than a clean error.
 const MAX_SKIP_RATIO = 0.5;
-
-function getChunkSize(): number {
-  const raw = process.env.SUMMARIZE_CHUNK_SIZE;
-  if (!raw) return CHUNK_SIZE_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CHUNK_SIZE_DEFAULT;
-}
-
-function getChunkConcurrency(): number {
-  const raw = process.env.SUMMARIZE_CHUNK_CONCURRENCY;
-  if (!raw) return CHUNK_CONCURRENCY_DEFAULT;
-  const n = parseInt(raw, 10);
-  return Number.isFinite(n) && n > 0 ? n : CHUNK_CONCURRENCY_DEFAULT;
-}
 
 // One chunk call with retry-once. Returns null when both attempts fail —
 // whether by parse failure, provider 4xx (content rejected by upstream
@@ -108,7 +84,8 @@ async function produceSummaryXml(
   chunks: number;
   skipped?: number;
 }> {
-  const chunkSize = getChunkSize();
+  const runtimeConfig = getSummarizeRuntimeConfig();
+  const chunkSize = runtimeConfig.chunkSize;
   if (compressed.length <= chunkSize) {
     const response = await provider.summarize(
       withOutputLanguagePolicy(SUMMARY_SYSTEM, undefined, SUMMARY_OUTPUT_CONTRACT),
@@ -121,7 +98,7 @@ async function produceSummaryXml(
   for (let i = 0; i < compressed.length; i += chunkSize) {
     chunks.push(compressed.slice(i, i + chunkSize));
   }
-  const concurrency = getChunkConcurrency();
+  const concurrency = runtimeConfig.chunkConcurrency;
   logger.info("Summarize chunking session", {
     sessionId,
     chunks: chunks.length,
