@@ -157,10 +157,16 @@ export interface ProviderConfig {
 
 export type ProviderType = "agent-sdk" | "pi-agent-sdk" | "anthropic" | "gemini" | "openrouter" | "minimax" | "openai" | "noop";
 
+export interface MemoryProviderCallOptions {
+  model?: string;
+  maxTokens?: number;
+  modelSource?: string;
+}
+
 export interface MemoryProvider {
   name: string;
-  compress(systemPrompt: string, userPrompt: string): Promise<string>;
-  summarize(systemPrompt: string, userPrompt: string): Promise<string>;
+  compress(systemPrompt: string, userPrompt: string, options?: MemoryProviderCallOptions): Promise<string>;
+  summarize(systemPrompt: string, userPrompt: string, options?: MemoryProviderCallOptions): Promise<string>;
   describeImage?(imageData: string, mimeType: string, prompt: string): Promise<string>;
 }
 
@@ -936,12 +942,22 @@ export interface LessonExtractionRun {
     chunkSize: number;
     chunkConcurrency: number;
     timeoutMs: number;
+    model?: string;
+    modelSource?: string;
   };
   attempts: number;
   createdLessonIds: string[];
   replacedLessonIds: string[];
   skippedReason?: string;
   lastError?: string;
+  provider?: string;
+  model?: string;
+  modelSource?: string;
+  promptChars?: number;
+  parseFailures?: number;
+  durationMs?: number;
+  modelApplied?: boolean;
+  providerModelOverride?: "unsupported";
   startedAt?: string;
   runningLeaseUntil?: string;
   finishedAt?: string;

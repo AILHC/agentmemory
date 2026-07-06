@@ -1,5 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk'
-import type { MemoryProvider } from '../types.js'
+import type { MemoryProvider, MemoryProviderCallOptions } from '../types.js'
 
 export class AnthropicProvider implements MemoryProvider {
   name = 'anthropic'
@@ -13,11 +13,19 @@ export class AnthropicProvider implements MemoryProvider {
     this.maxTokens = maxTokens
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
+  async compress(
+    systemPrompt: string,
+    userPrompt: string,
+    _options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     return this.call(systemPrompt, userPrompt)
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
+  async summarize(
+    systemPrompt: string,
+    userPrompt: string,
+    _options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     return this.call(systemPrompt, userPrompt)
   }
 

@@ -11,6 +11,10 @@ import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import { withOutputLanguagePolicy } from "../prompts/output-language.js";
+import {
+  resolveStageModelCallOptions,
+  resolveStageModelMetadata,
+} from "../config.js";
 
 const SKILL_EXTRACT_SYSTEM = `You are a skill extraction engine. Given a completed multi-step task session, extract a reusable procedural skill document.
 
@@ -107,21 +111,30 @@ export function registerSkillExtractFunctions(
   provider: MemoryProvider,
 ): void {
   sdk.registerFunction("mem::skill-extract", 
-    async (data: { sessionId: string }) => {
+    async (data: { sessionId: string; model?: string }) => {
+      const startMs = Date.now();
+      const stageMetadata = resolveStageModelMetadata("skill_extract", provider, data?.model);
+      const responseMetadata = (status: string, extra: Record<string, unknown> = {}) => ({
+        status,
+        ...stageMetadata,
+        durationMs: Date.now() - startMs,
+        ...extra,
+      });
       if (!data?.sessionId) {
-        return { success: false, error: "sessionId is required" };
+        return { success: false, error: "sessionId is required", ...responseMetadata("failed") };
       }
 
       const session = await kv
         .get<Session>(KV.sessions, data.sessionId)
         .catch(() => null);
       if (!session) {
-        return { success: false, error: "session not found" };
+        return { success: false, error: "session not found", ...responseMetadata("failed") };
       }
       if (session.status !== "completed") {
         return {
           success: false,
           error: "session must be completed before skill extraction",
+          ...responseMetadata("failed"),
         };
       }
 
@@ -133,25 +146,35 @@ export function registerSkillExtractFunctions(
         return {
           success: false,
           error: "no summary — run mem::summarize first",
+          ...responseMetadata("failed"),
         };
       }
       if (observations.length < 3) {
-        return { success: false, error: "too few observations for skill extraction" };
+        return { success: false, error: "too few observations for skill extraction", ...responseMetadata("failed") };
       }
 
       try {
         const prompt = buildSkillPrompt(summary, observations);
-        const response = await provider.summarize(
-          withOutputLanguagePolicy(SKILL_EXTRACT_SYSTEM),
-          prompt,
-        );
+        const systemPrompt = withOutputLanguagePolicy(SKILL_EXTRACT_SYSTEM);
+        const callOptions = resolveStageModelCallOptions("skill_extract", data.model);
+        const response = callOptions
+          ? await provider.summarize(systemPrompt, prompt, callOptions)
+          : await provider.summarize(systemPrompt, prompt);
         const parsed = parseSkillXml(response);
 
         if (!parsed) {
           logger.info("No skill extracted — session was exploratory", {
             sessionId: data.sessionId,
           });
-          return { success: true, extracted: false, reason: "no clear procedure found" };
+          return {
+            success: true,
+            extracted: false,
+            reason: "no clear procedure found",
+            ...responseMetadata("skipped", {
+              promptChars: prompt.length,
+              parseFailures: 1,
+            }),
+          };
         }
 
         const fp = fingerprintId(
@@ -193,6 +216,10 @@ export function registerSkillExtractFunctions(
             extracted: true,
             reinforced: true,
             skill: existing,
+            ...responseMetadata("succeeded", {
+              promptChars: prompt.length,
+              parseFailures: 0,
+            }),
           };
         }
 
@@ -232,11 +259,20 @@ export function registerSkillExtractFunctions(
           steps: parsed.steps.length,
         });
 
-        return { success: true, extracted: true, reinforced: false, skill };
+        return {
+          success: true,
+          extracted: true,
+          reinforced: false,
+          skill,
+          ...responseMetadata("succeeded", {
+            promptChars: prompt.length,
+            parseFailures: 0,
+          }),
+        };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         logger.error("Skill extraction failed", { error: msg });
-        return { success: false, error: msg };
+        return { success: false, error: msg, ...responseMetadata("failed") };
       }
     },
   );

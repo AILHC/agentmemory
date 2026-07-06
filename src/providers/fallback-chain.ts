@@ -1,4 +1,4 @@
-import type { MemoryProvider } from "../types.js";
+import type { MemoryProvider, MemoryProviderCallOptions } from "../types.js";
 
 export class FallbackChainProvider implements MemoryProvider {
   name: string;
@@ -7,12 +7,20 @@ export class FallbackChainProvider implements MemoryProvider {
     this.name = `fallback(${providers.map((p) => p.name).join(" -> ")})`;
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.tryAll((p) => p.compress(systemPrompt, userPrompt));
+  async compress(
+    systemPrompt: string,
+    userPrompt: string,
+    options?: MemoryProviderCallOptions,
+  ): Promise<string> {
+    return this.tryAll((p) => p.compress(systemPrompt, userPrompt, options));
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.tryAll((p) => p.summarize(systemPrompt, userPrompt));
+  async summarize(
+    systemPrompt: string,
+    userPrompt: string,
+    options?: MemoryProviderCallOptions,
+  ): Promise<string> {
+    return this.tryAll((p) => p.summarize(systemPrompt, userPrompt, options));
   }
 
   private async tryAll(

@@ -10,6 +10,7 @@ import type {
 } from "../types.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import { resolveStageModel, resolveStageModelMetadata } from "../config.js";
 
 export interface LlmLessonExtractionRuntimeConfig {
   providerName: string;
@@ -18,6 +19,8 @@ export interface LlmLessonExtractionRuntimeConfig {
   chunkSize: number;
   chunkConcurrency: number;
   timeoutMs: number;
+  model?: string;
+  modelSource?: string;
 }
 
 export interface EnqueueLlmLessonExtractionRunInput {
@@ -103,6 +106,10 @@ function parsePositiveInt(value: unknown, fallback: number): number {
   return fallback;
 }
 
+function supportsStageModelOverride(providerName: string): boolean {
+  return providerName === "pi-agent-sdk" || providerName === "resilient(pi-agent-sdk)";
+}
+
 export function resolveLlmLessonExtractionRuntimeConfig(
   provider: MemoryProvider,
   rawConfig: Record<string, unknown> = {},
@@ -111,6 +118,12 @@ export function resolveLlmLessonExtractionRuntimeConfig(
   const defaultConcurrency = providerName === "pi-agent-sdk" || providerName === "resilient(pi-agent-sdk)"
     ? 1
     : 3;
+  const stageModel = supportsStageModelOverride(providerName)
+    ? resolveStageModel(
+        "lesson",
+        typeof rawConfig.model === "string" ? rawConfig.model : undefined,
+      )
+    : undefined;
 
   return {
     providerName,
@@ -119,6 +132,9 @@ export function resolveLlmLessonExtractionRuntimeConfig(
     chunkSize: parsePositiveInt(rawConfig.chunkSize, 20),
     chunkConcurrency: parsePositiveInt(rawConfig.chunkConcurrency, defaultConcurrency),
     timeoutMs: parsePositiveInt(rawConfig.timeoutMs, 60000),
+    ...(stageModel?.model
+      ? { model: stageModel.model, modelSource: stageModel.source }
+      : {}),
   };
 }
 
@@ -316,6 +332,7 @@ export async function processLlmLessonExtractionRun(
   input: ProcessLlmLessonExtractionRunInput,
 ): Promise<LessonExtractionRun> {
   const { kv, provider, runId } = input;
+  const startedMs = Date.now();
   const run = await kv.get<LessonExtractionRun>(KV.lessonExtractionRuns, runId);
   if (!run) {
     throw new Error(`run ${runId} not found`);
@@ -354,12 +371,34 @@ export async function processLlmLessonExtractionRun(
     config: { ...run.config, providerName: run.providerName },
     sourceRunId: run.id,
   });
+  const stageMetadata = resolveStageModelMetadata(
+    "lesson",
+    provider,
+    run.config.model,
+  );
+  const extractionMetadata = {
+    provider: stageMetadata.provider,
+    ...(stageMetadata.modelApplied && (run.config.model ?? stageMetadata.model)
+      ? { model: run.config.model ?? stageMetadata.model }
+      : {}),
+    ...(stageMetadata.modelApplied && (run.config.modelSource ?? stageMetadata.modelSource)
+      ? { modelSource: run.config.modelSource ?? stageMetadata.modelSource }
+      : {}),
+    promptChars: extraction.promptChars,
+    parseFailures: extraction.parseFailures,
+    durationMs: Date.now() - startedMs,
+    modelApplied: stageMetadata.modelApplied,
+    ...(stageMetadata.providerModelOverride
+      ? { providerModelOverride: stageMetadata.providerModelOverride }
+      : {}),
+  };
 
   if (extraction.errors.length > 0) {
     return saveRunStatus(kv, runningPatch, "retryable", {
       lastError: extraction.errors.join("\n"),
       createdLessonIds: extraction.lessonIds,
       replacedLessonIds: [],
+      ...extractionMetadata,
     });
   }
 
@@ -371,5 +410,6 @@ export async function processLlmLessonExtractionRun(
   return saveRunStatus(kv, runningPatch, "succeeded", {
     createdLessonIds: extraction.lessonIds,
     replacedLessonIds,
+    ...extractionMetadata,
   });
 }

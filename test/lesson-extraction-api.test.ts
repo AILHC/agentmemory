@@ -37,6 +37,7 @@ describe("api::lesson-extract", () => {
         chunkSize: 9,
         chunkConcurrency: 3,
         timeoutMs: 30000,
+        model: " lesson-model ",
       },
       headers: {},
     });
@@ -53,7 +54,45 @@ describe("api::lesson-extract", () => {
       chunkSize: 9,
       chunkConcurrency: 3,
       timeoutMs: 30000,
+      model: "lesson-model",
     });
+  });
+
+  it("rejects empty or non-string model", async () => {
+    for (const invalidModel of ["", "   ", 123]) {
+      const kv = {} as never;
+      const sdk = {
+        registerFunction: (id: string, handler: unknown) => {
+          if (id === "api::lesson-extract") {
+            sdk.apiLessonExtract = handler;
+          }
+        },
+        registerTrigger: vi.fn(),
+        trigger: vi.fn(async () => ({ success: true, runs: [] })),
+        apiLessonExtract: undefined as undefined | Function,
+      } as {
+        registerFunction: (id: string, handler: unknown) => void;
+        registerTrigger: () => void;
+        trigger: () => Promise<unknown>;
+        apiLessonExtract?: Function;
+      };
+
+      registerApiTriggers(sdk as never, kv, "");
+
+      const response = await sdk.apiLessonExtract!({
+        body: {
+          sessionIds: ["session-a"],
+          model: invalidModel,
+        },
+        headers: {},
+      });
+
+      expect(response).toMatchObject({
+        status_code: 400,
+        body: { error: "model must be a non-empty string" },
+      });
+      expect(sdk.trigger).not.toHaveBeenCalled();
+    }
   });
 
   it("rejects unknown lesson extract fields", async () => {

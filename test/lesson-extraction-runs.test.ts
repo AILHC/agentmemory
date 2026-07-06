@@ -414,4 +414,34 @@ describe("lesson extraction run helpers", () => {
     expect(resilientCfg.chunkConcurrency).toBe(1);
     expect(otherCfg.chunkConcurrency).toBe(3);
   });
+
+  it("does not record ignored stage model overrides for unsupported providers", () => {
+    const provider: MemoryProvider = {
+      name: "openai",
+      compress: vi.fn(),
+      summarize: vi.fn(),
+    };
+
+    const config = resolveLlmLessonExtractionRuntimeConfig(provider, {
+      model: "lesson-model",
+      textLimit: 1200,
+      saveLimit: 50,
+      chunkSize: 20,
+      chunkConcurrency: 3,
+      timeoutMs: 60000,
+    });
+
+    expect(config.model).toBeUndefined();
+    expect(config.modelSource).toBeUndefined();
+    expect(computeLessonExtractionConfigHash(config)).toBe(
+      computeLessonExtractionConfigHash({
+        providerName: "openai",
+        textLimit: 1200,
+        saveLimit: 50,
+        chunkSize: 20,
+        chunkConcurrency: 3,
+        timeoutMs: 60000,
+      }),
+    );
+  });
 });

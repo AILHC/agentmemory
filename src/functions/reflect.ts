@@ -14,6 +14,10 @@ import { recordAudit } from "./audit.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 import { REFLECT_OUTPUT_CONTRACT } from "../prompts/reflect.js";
 import { withOutputLanguagePolicy } from "../prompts/output-language.js";
+import {
+  resolveStageModelCallOptions,
+  resolveStageModelMetadata,
+} from "../config.js";
 
 interface ConceptCluster {
   concepts: string[];
@@ -44,6 +48,7 @@ export interface ReflectInsightWindowOptions {
   charBudget?: number;
   project?: string;
   useGraph?: boolean;
+  model?: string;
 }
 
 function reinforceInsight(insight: Insight): void {
@@ -185,6 +190,18 @@ function buildJaccardClusters(
 
 function itemSize(value: { fact?: string; content?: string; narrative?: string }): number {
   return (value.fact ?? value.content ?? value.narrative ?? "").length;
+}
+
+function summarizeWithOptions(
+  provider: MemoryProvider,
+  systemPrompt: string,
+  userPrompt: string,
+  model?: string,
+): Promise<string> {
+  const callOptions = resolveStageModelCallOptions("reflect_insight", model);
+  return callOptions
+    ? provider.summarize(systemPrompt, userPrompt, callOptions)
+    : provider.summarize(systemPrompt, userPrompt);
 }
 
 export async function planReflectInsightWindows(options: {
@@ -362,12 +379,24 @@ async function persistReflectInsights(options: {
 export async function runReflectInsightWindow(
   options: ReflectInsightWindowOptions,
 ): Promise<Record<string, unknown>> {
+  const startMs = Date.now();
+  const stageMetadata = resolveStageModelMetadata("reflect_insight", options.provider, options.model);
+  const responseMetadata = (status: string, extra: Record<string, unknown> = {}) => ({
+    status,
+    ...stageMetadata,
+    durationMs: Date.now() - startMs,
+    ...extra,
+  });
   if (options.useGraph === true) {
-    return { success: false, error: "useGraph:true is not supported for full reflect insight windows" };
+    return {
+      success: false,
+      error: "useGraph:true is not supported for full reflect insight windows",
+      ...responseMetadata("failed"),
+    };
   }
   try {
     if (!options.provider?.summarize) {
-      return { success: false, error: "provider.summarize is required" };
+      return { success: false, error: "provider.summarize is required", ...responseMetadata("failed") };
     }
     const cluster = await loadReflectWindowCluster(options);
     const totalItems = cluster.facts.length + cluster.lessons.length + cluster.crystalNarratives.length;
@@ -377,6 +406,7 @@ export async function runReflectInsightWindow(
         skipped: true,
         reason: "fewer than 3 supporting items",
         totalItems,
+        ...responseMetadata("skipped", { parseFailures: 0 }),
       };
     }
 
@@ -387,11 +417,18 @@ export async function runReflectInsightWindow(
         error: "input_too_large",
         promptChars: prompt.length,
         charBudget: options.charBudget,
+        ...responseMetadata("failed", {
+          promptChars: prompt.length,
+          charBudget: options.charBudget,
+          parseFailures: 0,
+        }),
       };
     }
-    const response = await options.provider.summarize(
+    const response = await summarizeWithOptions(
+      options.provider,
       withOutputLanguagePolicy(REFLECT_SYSTEM, undefined, REFLECT_OUTPUT_CONTRACT),
       prompt,
+      options.model,
     );
     const persisted = await persistReflectInsights({
       kv: options.kv,
@@ -406,9 +443,19 @@ export async function runReflectInsightWindow(
       totalItems,
       useGraph: false,
     });
-    return { success: true, ...persisted, totalItems, usedFallback: true };
+    return {
+      success: true,
+      ...persisted,
+      totalItems,
+      usedFallback: true,
+      ...responseMetadata("succeeded", {
+        promptChars: prompt.length,
+        charBudget: options.charBudget,
+        parseFailures: persisted.insightIds.length > 0 ? 0 : 1,
+      }),
+    };
   } catch (err) {
-    return { success: false, error: err instanceof Error ? err.message : String(err) };
+    return { success: false, error: err instanceof Error ? err.message : String(err), ...responseMetadata("failed") };
   }
 }
 
@@ -437,11 +484,12 @@ export function registerReflectFunctions(
       semanticMemoryIds?: string[];
       lessonIds?: string[];
       crystalIds?: string[];
+      model?: string;
     }) => runReflectInsightWindow({ kv, provider, ...data }),
   );
 
   sdk.registerFunction("mem::reflect", 
-    async (data: { maxClusters?: number; project?: string }) => {
+    async (data: { maxClusters?: number; project?: string; model?: string }) => {
       const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;
@@ -530,9 +578,11 @@ export function registerReflectFunctions(
 
         try {
           const prompt = buildReflectPrompt(cluster);
-          const response = await provider.summarize(
+          const response = await summarizeWithOptions(
+            provider,
             withOutputLanguagePolicy(REFLECT_SYSTEM, undefined, REFLECT_OUTPUT_CONTRACT),
             prompt,
+            data?.model,
           );
 
           const insightRegex =

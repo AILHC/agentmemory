@@ -33,7 +33,7 @@ function requireEnvVar(key: string): string {
 // must resolve its OWN env-driven default model. Mirrors the resolution
 // in detectProvider() so primary + fallback agree on what each
 // provider's default model is.
-function defaultModelFor(providerType: ProviderConfig["provider"]): string {
+export function defaultModelFor(providerType: ProviderConfig["provider"]): string {
   switch (providerType) {
     case "openai":
       return getEnvVar("OPENAI_MODEL") || "gpt-4o-mini";

@@ -33,6 +33,7 @@ describe("skill-extract", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+    mockProvider.name = "test";
     mockKv.get.mockResolvedValue(null);
     mockKv.set.mockResolvedValue(undefined);
     mockKv.list.mockResolvedValue([]);
@@ -130,6 +131,71 @@ describe("skill-extract", () => {
       expect.stringContaining("AgentMemory Output Language Policy"),
       expect.any(String),
     );
+  });
+
+  it("skill-extract returns effective model and prompt metrics metadata", async () => {
+    mockProvider.name = "pi-agent-sdk";
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
+    mockKv.get.mockImplementation((scope: string) => {
+      if (scope === "mem:sessions")
+        return Promise.resolve({ id: "s1", project: "test", status: "completed" });
+      if (scope === "mem:summaries")
+        return Promise.resolve({
+          sessionId: "s1",
+          project: "test",
+          title: "Fix auth bug",
+          narrative: "Debugged and fixed JWT expiration",
+          keyDecisions: ["Switch to RS256"],
+          filesModified: ["auth.ts"],
+          concepts: ["authentication", "JWT"],
+          createdAt: new Date().toISOString(),
+          observationCount: 10,
+        });
+      return Promise.resolve(null);
+    });
+    mockKv.list.mockReturnValue(
+      Promise.resolve(Array.from({ length: 5 }, (_, i) => ({
+        id: `obs${i}`,
+        sessionId: "s1",
+        timestamp: new Date().toISOString(),
+        type: "file_edit",
+        title: `Edit auth.ts step ${i}`,
+        narrative: `Modified JWT validation logic step ${i}`,
+        importance: 7,
+        concepts: ["JWT"],
+        files: ["auth.ts"],
+        facts: [],
+      }))),
+    );
+    mockProvider.summarize.mockResolvedValue(`
+<skill>
+<trigger>When the agent encounters JWT authentication failures</trigger>
+<title>Fix JWT Token Expiration</title>
+<steps>
+<step>Check the JWT library configuration</step>
+<step>Verify the signing algorithm</step>
+</steps>
+<expected_outcome>JWT auth works reliably</expected_outcome>
+<tags>jwt,authentication</tags>
+</skill>
+    `);
+
+    const result = await handlers["mem::skill-extract"]({
+      sessionId: "s1",
+      model: "skill-model",
+    });
+
+    expect(result).toMatchObject({
+      success: true,
+      stage: "skill_extract",
+      model: "skill-model",
+      modelSource: "explicitModel",
+      provider: "pi-agent-sdk",
+      modelApplied: true,
+      parseFailures: 0,
+    });
+    expect(result.promptChars).toBeGreaterThan(0);
+    expect(result.durationMs).toBeGreaterThanOrEqual(0);
   });
 
   it("skill-extract returns no-skill for exploratory sessions", async () => {

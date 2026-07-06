@@ -26,6 +26,7 @@ describe("REST endpoint count", () => {
     expect(apiPaths).toContain("/agentmemory/semantic-rollup");
     expect(apiPaths).toContain("/agentmemory/extraction-runs/record");
     expect(apiPaths).toContain("/agentmemory/runtime-config");
+    expect(apiPaths).toContain("/agentmemory/runtime-config/diagnostics");
     expect(apiCount).toBeGreaterThan(0);
     expect(indexCount).toBe(apiCount);
     expect(readmeCount).toBe(apiCount);

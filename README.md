@@ -1558,7 +1558,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-147 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+148 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1582,6 +1582,7 @@ Create `~/.agentmemory/.env`:
 | `POST` | `/agentmemory/graph/build/process` | Process a bounded number of graph build batches |
 | `GET` | `/agentmemory/graph/build/task?taskId=...` | Read graph build task status |
 | `GET` | `/agentmemory/runtime-config` | Read redacted extraction runtime limits |
+| `GET` | `/agentmemory/runtime-config/diagnostics` | Read non-secret runtime diagnostics without API secret |
 | `POST` | `/agentmemory/semantic-rollup` | Create run-tagged semantic rollups for session windows |
 | `POST` | `/agentmemory/extraction-runs/record` | Record full extraction run progress in the internal run index |
 | `POST` | `/agentmemory/team/share` | Share with team |
@@ -1611,12 +1612,14 @@ summarize status to query.
 Full extraction orchestration uses narrow REST endpoints:
 
 - `GET /agentmemory/runtime-config` returns only redacted runtime facts:
-  `summarizeChunkConcurrency`, `summarizeChunkSize`, and `providerName`.
+  `summarizeChunkConcurrency`, `summarizeChunkSize`, `providerName`,
+  `outputLanguageConfigured`, `outputLanguage`, and `modelRouting`.
   `summarizeChunkConcurrency` and `summarizeChunkSize` are resolved through
   the same merged config path used by `mem::summarize`:
   `AGENTMEMORY_HOME/.env` plus `process.env`, with `process.env` taking
-  precedence. The endpoint is safe to call for deployment verification
-  because it returns only redacted runtime facts.
+  precedence. The authenticated endpoint is used by the full extraction
+  orchestrator. `GET /agentmemory/runtime-config/diagnostics` returns the same
+  non-secret body for local doctor scripts that must not read or print secrets.
 - `POST /agentmemory/semantic-rollup` accepts
   `{ runId, windowId, mark, kind, sessionIds? , semanticMemoryIds? }`.
   Window rollups require `kind` set to `window` with `sessionIds`; the former

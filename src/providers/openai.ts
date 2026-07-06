@@ -1,4 +1,4 @@
-import type { MemoryProvider } from "../types.js";
+import type { MemoryProvider, MemoryProviderCallOptions } from "../types.js";
 import { getEnvVar } from "../config.js";
 import { fetchWithTimeout } from "./_fetch.js";
 import {
@@ -67,11 +67,19 @@ export class OpenAIProvider implements MemoryProvider {
     this.isAzure = detectAzure(this.baseUrl);
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
+  async compress(
+    systemPrompt: string,
+    userPrompt: string,
+    _options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     return this.call(systemPrompt, userPrompt);
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
+  async summarize(
+    systemPrompt: string,
+    userPrompt: string,
+    _options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     return this.call(systemPrompt, userPrompt);
   }
 
@@ -179,4 +187,3 @@ function parsePositiveInt(raw: string | null | undefined): number | undefined {
   const n = Number(trimmed);
   return Number.isFinite(n) && n > 0 ? n : undefined;
 }
-

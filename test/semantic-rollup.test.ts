@@ -1,10 +1,11 @@
-import { describe, expect, it, beforeEach, vi } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
 import { registerSemanticRollupFunction } from "../src/functions/semantic-rollup.js";
+import { getSemanticRollupMaxPromptChars } from "../src/config.js";
 import { KV } from "../src/state/schema.js";
 import type { MemoryProvider, SemanticMemory, SessionSummary } from "../src/types.js";
 
@@ -78,6 +79,8 @@ describe("mem::semantic-rollup", () => {
   let provider: MemoryProvider;
 
   beforeEach(() => {
+    delete process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MODEL;
+    delete process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS;
     sdk = mockSdk();
     kv = mockKV();
     provider = {
@@ -86,6 +89,11 @@ describe("mem::semantic-rollup", () => {
       summarize: vi.fn().mockResolvedValue('<facts><fact confidence="0.92">提炼事实</fact></facts>'),
     };
     registerSemanticRollupFunction(sdk as never, kv as never, provider);
+  });
+
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MODEL;
+    delete process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS;
   });
 
   it("writes window rollup semantic memories with provenance and audit", async () => {
@@ -133,6 +141,56 @@ describe("mem::semantic-rollup", () => {
       operation: "semantic_rollup",
       targetIds: result.semanticMemoryIds,
     });
+  });
+
+  it("bounds AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS config", () => {
+    expect(getSemanticRollupMaxPromptChars({
+      AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS: "not-a-number",
+    })).toBe(24_000);
+    expect(getSemanticRollupMaxPromptChars({
+      AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS: "0",
+    })).toBe(24_000);
+    expect(getSemanticRollupMaxPromptChars({
+      AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS: "999999",
+    })).toBe(120_000);
+  });
+
+  it("returns effective model metadata for applied pi-agent-sdk model routing", async () => {
+    provider.name = "pi-agent-sdk";
+    process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MODEL = "semantic-env-model";
+    await kv.set(KV.summaries, "ses-a", summary("ses-a"));
+
+    const result = (await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-1",
+      windowId: "win-model",
+      mark: "full",
+      kind: "window",
+      sessionIds: ["ses-a"],
+    })) as {
+      success: boolean;
+      stage: string;
+      model: string;
+      modelSource: string;
+      provider: string;
+      modelApplied: boolean;
+      promptChars: number;
+      charBudget: number;
+      durationMs: number;
+      parseFailures: number;
+    };
+
+    expect(result.success).toBe(true);
+    expect(result).toMatchObject({
+      stage: "semantic_rollup",
+      model: "semantic-env-model",
+      modelSource: "AGENTMEMORY_SEMANTIC_ROLLUP_MODEL",
+      provider: "pi-agent-sdk",
+      modelApplied: true,
+      parseFailures: 0,
+    });
+    expect(result.promptChars).toBeGreaterThan(0);
+    expect(result.charBudget).toBeGreaterThanOrEqual(result.promptChars);
+    expect(result.durationMs).toBeGreaterThanOrEqual(0);
   });
 
   it("fails when window session summaries are missing", async () => {
@@ -341,6 +399,31 @@ describe("mem::semantic-rollup", () => {
     expect(result.inputHash).toMatch(/^[0-9a-f]{64}$/);
     expect(result.promptChars).toBeGreaterThan(24000);
     expect(provider.summarize).not.toHaveBeenCalled();
+  });
+
+  it("uses AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS for the service prompt cap", async () => {
+    process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS = "30000";
+    await kv.set(KV.summaries, "ses-a", {
+      ...summary("ses-a"),
+      narrative: "x".repeat(25_000),
+    });
+
+    const result = (await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-1",
+      windowId: "win-env-cap",
+      mark: "full",
+      kind: "window",
+      sessionIds: ["ses-a"],
+    })) as {
+      success: boolean;
+      charBudget: number;
+      promptChars: number;
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.charBudget).toBe(30000);
+    expect(result.promptChars).toBeGreaterThan(24000);
+    expect(provider.summarize).toHaveBeenCalled();
   });
 
   it("does not accept corpus rollups as a success path", async () => {

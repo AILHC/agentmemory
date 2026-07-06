@@ -275,6 +275,7 @@ describe("Reflect", () => {
     });
 
     it("full insight window builds prompts from semantic, lesson, and crystal ids without graph reads", async () => {
+      provider.name = "pi-agent-sdk";
       await kv.set("mem:semantic", "sem_1", makeSemantic("security validation is important", "sem_1"));
       await kv.set("mem:lessons", "lsn_1", makeLesson("Use security headers", ["security"]));
       await kv.set("mem:crystals", "crys_1", makeCrystal("Completed security validation cleanup", ["security"]));
@@ -289,10 +290,23 @@ describe("Reflect", () => {
         semanticMemoryIds: ["sem_1"],
         lessonIds: ["lsn_1"],
         crystalIds: ["crys_1"],
+        charBudget: 12000,
+        model: "reflect-model",
       });
 
       expect(result.success).toBe(true);
       expect(result.insightIds).toHaveLength(2);
+      expect(result).toMatchObject({
+        stage: "reflect_insight",
+        model: "reflect-model",
+        modelSource: "explicitModel",
+        provider: "pi-agent-sdk",
+        modelApplied: true,
+        charBudget: 12000,
+        parseFailures: 0,
+      });
+      expect(result.promptChars).toBeGreaterThan(0);
+      expect(result.durationMs).toBeGreaterThanOrEqual(0);
       expect(provider.summarize).toHaveBeenCalled();
       expect(listSpy).not.toHaveBeenCalledWith("mem:graph:nodes");
       expect(listSpy).not.toHaveBeenCalledWith("mem:graph:edges");

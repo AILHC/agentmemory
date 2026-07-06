@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -8,6 +8,7 @@ import {
   planConsolidateObservationWindows,
   runConsolidateObservationWindow,
 } from "../src/functions/consolidate.js";
+import { getMemoryConsolidateCompressTimeoutMs } from "../src/config.js";
 import { KV } from "../src/state/schema.js";
 import type { CompressedObservation, MemoryProvider, Session } from "../src/types.js";
 
@@ -56,6 +57,11 @@ function observation(id: string, importance: number): CompressedObservation {
 }
 
 describe("consolidate full window helpers", () => {
+  afterEach(() => {
+    delete process.env.AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS;
+    vi.useRealTimers();
+  });
+
   it("plans all eligible concept windows", async () => {
     const kv = mockKV();
     await kv.set(KV.sessions, "ses-a", session("ses-a"));
@@ -75,6 +81,18 @@ describe("consolidate full window helpers", () => {
       concept: "windows",
       observationCount: 4,
     });
+  });
+
+  it("bounds AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS config", () => {
+    expect(getMemoryConsolidateCompressTimeoutMs({
+      AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS: "not-a-number",
+    })).toBe(30_000);
+    expect(getMemoryConsolidateCompressTimeoutMs({
+      AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS: "0",
+    })).toBe(30_000);
+    expect(getMemoryConsolidateCompressTimeoutMs({
+      AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS: "999999",
+    })).toBe(300_000);
   });
 
   it("splits concept observations into stable windows without dropping eligible observations", async () => {
@@ -144,7 +162,7 @@ describe("consolidate full window helpers", () => {
       await kv.set(KV.observations("ses-a"), obs.id, obs);
     }
     const provider: MemoryProvider = {
-      name: "test",
+      name: "pi-agent-sdk",
       summarize: vi.fn(),
       compress: vi.fn().mockResolvedValue(`
 <memory>
@@ -162,16 +180,62 @@ describe("consolidate full window helpers", () => {
       provider,
       concept: "windows",
       minObservations: 3,
+      model: "memory-model",
     });
 
     expect(result.success).toBe(true);
     expect(result.consolidated).toBe(1);
     expect(result.memoryIds).toEqual([expect.stringMatching(/^mem_/)]);
+    expect(result).toMatchObject({
+      stage: "memory_consolidate",
+      model: "memory-model",
+      modelSource: "explicitModel",
+      provider: "pi-agent-sdk",
+      modelApplied: true,
+      parseFailures: 0,
+    });
+    expect(result.promptChars).toBeGreaterThan(0);
+    expect(result.durationMs).toBeGreaterThanOrEqual(0);
     expect(provider.compress).toHaveBeenCalledWith(
       expect.any(String),
       expect.stringContaining("Observation obs-11"),
+      expect.objectContaining({ model: "memory-model" }),
     );
     const stored = await kv.list(KV.memories);
     expect(stored).toHaveLength(1);
+  });
+
+  it("uses AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS for full window compress timeout", async () => {
+    vi.useFakeTimers();
+    process.env.AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS = "1";
+    const kv = mockKV();
+    await kv.set(KV.sessions, "ses-a", session("ses-a"));
+    for (let i = 0; i < 3; i++) {
+      const obs = observation(`obs-${i}`, 20 - i);
+      await kv.set(KV.observations("ses-a"), obs.id, obs);
+    }
+    const provider: MemoryProvider = {
+      name: "test",
+      summarize: vi.fn(),
+      compress: vi.fn(() => new Promise<string>(() => {})),
+    };
+
+    const pending = runConsolidateObservationWindow({
+      kv: kv as never,
+      provider,
+      concept: "windows",
+      minObservations: 3,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await Promise.race([
+      pending,
+      Promise.resolve(null),
+    ]);
+
+    expect(result).toMatchObject({
+      success: false,
+      error: expect.stringContaining("compress timeout"),
+    });
+    expect((result as Record<string, unknown>).durationMs).toBeGreaterThanOrEqual(0);
   });
 });

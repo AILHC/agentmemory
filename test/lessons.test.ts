@@ -404,5 +404,70 @@ describe("Lessons", () => {
       expect(Array.isArray(runResult.chunks)).toBe(true);
       expect(runResult.chunks).toHaveLength(0);
     });
+
+    it("uses explicit model in lesson runtime config and provider call options", async () => {
+      const xml = `
+<lessons>
+  <lesson confidence=\"0.72\">
+    <content>Always validate stage model routing before recording extraction state.</content>
+    <context>full extraction lesson model override</context>
+    <tags><tag>agentmemory</tag></tags>
+  </lesson>
+</lessons>`;
+      const provider: MemoryProvider = {
+        name: "pi-agent-sdk",
+        compress: vi.fn(async () => xml),
+        summarize: vi.fn(async () => ""),
+      };
+      registerLessonsFunctions(sdk as never, kv as never, provider);
+
+      await kv.set(KV.sessions, "session-model", {
+        id: "session-model",
+        project: "project",
+        cwd: "/tmp/project",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        status: "active",
+        observationCount: 1,
+      });
+      await kv.set(KV.observations("session-model"), "obs-1", {
+        id: "obs-1",
+        sessionId: "session-model",
+        timestamp: "2026-01-01T00:00:01.000Z",
+        hookType: "user",
+        userPrompt: "Remember to verify the actual lesson provider call, not only state metadata.",
+        raw: {},
+        sourceEventIndex: 1,
+      });
+
+      const result = (await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-model"],
+        force: true,
+        model: " lesson-model ",
+        textLimit: 1200,
+        saveLimit: 10,
+        chunkSize: 20,
+        chunkConcurrency: 1,
+        timeoutMs: 1000,
+      })) as {
+        success: boolean;
+        runs: Array<{
+          status: string;
+          config: { model?: string; modelSource?: string };
+        }>;
+      };
+
+      expect(result.success).toBe(true);
+      expect(result.runs[0].status).toBe("succeeded");
+      expect(result.runs[0].config.model).toBe("lesson-model");
+      expect(result.runs[0].config.modelSource).toBe("explicitModel");
+      expect(provider.compress).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        expect.objectContaining({
+          model: "lesson-model",
+          modelSource: "explicitModel",
+        }),
+      );
+    });
   });
 });

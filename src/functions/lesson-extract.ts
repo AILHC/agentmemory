@@ -1,4 +1,10 @@
-import type { CompressedObservation, Lesson, MemoryProvider, RawObservation } from "../types.js";
+import type {
+  CompressedObservation,
+  Lesson,
+  MemoryProvider,
+  MemoryProviderCallOptions,
+  RawObservation,
+} from "../types.js";
 import { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import { validateOutput } from "../eval/validator.js";
@@ -16,6 +22,7 @@ import {
 import { stripPrivateData } from "./privacy.js";
 import { logger } from "../logger.js";
 import type { LlmLessonExtractionRuntimeConfig } from "./lesson-extraction-runs.js";
+import { resolveStageModelCallOptions } from "../config.js";
 
 export interface ReplayLessonExtractionConfig {
   enabled: boolean;
@@ -52,6 +59,8 @@ export interface LlmExtractionInput {
     chunkConcurrency?: number;
     timeoutMs?: number;
     saveLimit?: number;
+    model?: string;
+    modelSource?: string;
   };
   project: string;
   firstPrompt?: string;
@@ -77,6 +86,8 @@ export interface ExtractLlmLessonsResult {
   reinforced: number;
   skipped: number;
   errors: string[];
+  promptChars?: number;
+  parseFailures?: number;
 }
 
 export interface ExtractLessonsInput {
@@ -177,6 +188,17 @@ async function callWithTimeout(
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+function compressWithOptions(
+  provider: MemoryProvider,
+  systemPrompt: string,
+  userPrompt: string,
+  callOptions?: MemoryProviderCallOptions,
+): Promise<string> {
+  return callOptions
+    ? provider.compress(systemPrompt, userPrompt, callOptions)
+    : provider.compress(systemPrompt, userPrompt);
 }
 
 function getEvidenceLabel(): string {
@@ -513,6 +535,8 @@ interface LessonChunkResult {
   chunkIndex: number;
   candidates: ExtractedLessonCandidate[];
   errors: string[];
+  promptChars: number;
+  parseFailures: number;
 }
 
 async function extractLlmChunkWithRetry(
@@ -521,18 +545,22 @@ async function extractLlmChunkWithRetry(
   chunkIndex: number,
   sessionId: string,
   timeoutMs: number,
+  callOptions?: MemoryProviderCallOptions,
 ): Promise<LessonChunkResult> {
+  let parseFailures = 0;
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const xml = await callWithTimeout(
         () =>
-          provider.compress(
+          compressWithOptions(
+            provider,
             withOutputLanguagePolicy(
               LESSON_EXTRACTION_SYSTEM,
               undefined,
               LESSON_EXTRACTION_OUTPUT_CONTRACT,
             ),
             stripPrivateData(prompt),
+            callOptions,
           ),
         timeoutMs,
       );
@@ -549,6 +577,8 @@ async function extractLlmChunkWithRetry(
 
         return {
           chunkIndex,
+          promptChars: prompt.length,
+          parseFailures,
           candidates: validation.data.lessons
             .map((lesson) =>
               sanitizeCandidate({
@@ -571,21 +601,24 @@ async function extractLlmChunkWithRetry(
         attempt,
         error: err instanceof Error ? err.message : String(err),
       });
+      parseFailures++;
       if (attempt === 2) {
         return {
           chunkIndex,
           candidates: [],
           errors: [err instanceof Error ? err.message : String(err)],
+          promptChars: prompt.length,
+          parseFailures,
         };
       }
     }
   }
-  return { chunkIndex, candidates: [], errors: [] };
+  return { chunkIndex, candidates: [], errors: [], promptChars: prompt.length, parseFailures };
 }
 
 export async function extractLlmLessonCandidates(
   input: LlmExtractionInput,
-): Promise<{ candidates: ExtractedLessonCandidate[]; errors: string[] }> {
+): Promise<{ candidates: ExtractedLessonCandidate[]; errors: string[]; promptChars: number; parseFailures: number }> {
   const {
     provider,
     rawObservations,
@@ -602,7 +635,7 @@ export async function extractLlmLessonCandidates(
     textLimit,
     firstPrompt,
   );
-  if (items.length === 0) return { candidates: [], errors: [] };
+  if (items.length === 0) return { candidates: [], errors: [], promptChars: 0, parseFailures: 0 };
 
   const chunkSize = Math.max(
     1,
@@ -613,6 +646,9 @@ export async function extractLlmLessonCandidates(
     config.chunkConcurrency ?? DEFAULT_REPLAY_LESSON_LLM_CHUNK_CONCURRENCY,
   );
   const timeoutMs = normalizeTimeoutMs(config.timeoutMs);
+  const callOptions = config.model
+    ? { model: config.model, modelSource: config.modelSource }
+    : resolveStageModelCallOptions("lesson");
   const chunks: LessonPromptItem[][] = [];
 
   for (let i = 0; i < items.length; i += chunkSize) {
@@ -621,6 +657,8 @@ export async function extractLlmLessonCandidates(
 
   const chunkResults: Array<LessonChunkResult | null> = new Array(chunks.length).fill(null);
   const errors: string[] = [];
+  let promptChars = 0;
+  let parseFailures = 0;
 
   for (let batchStart = 0; batchStart < chunks.length; batchStart += concurrency) {
     const batch = chunks.slice(batchStart, batchStart + concurrency);
@@ -633,12 +671,14 @@ export async function extractLlmLessonCandidates(
           firstPrompt,
           items: chunks[chunkIndex],
         });
+        promptChars += chunkText.length;
         chunkResults[chunkIndex] = await extractLlmChunkWithRetry(
           provider,
           chunkText,
           chunkIndex,
           sessionId,
           timeoutMs,
+          callOptions,
         );
       }),
     );
@@ -650,6 +690,7 @@ export async function extractLlmLessonCandidates(
   const candidates: ExtractedLessonCandidate[] = [];
 
   for (const result of ordered) {
+    parseFailures += result.parseFailures;
     if (result.errors.length > 0) {
       errors.push(...result.errors);
       continue;
@@ -657,7 +698,7 @@ export async function extractLlmLessonCandidates(
     candidates.push(...result.candidates);
   }
 
-  return { candidates, errors };
+  return { candidates, errors, promptChars, parseFailures };
 }
 
 function sortLlmCandidates(
@@ -688,7 +729,12 @@ export async function extractLlmLessonsFromObservations(
   const context = firstPrompt || project;
   const fallbackContext = sanitizePersistentText(context);
 
-  const { candidates, errors: extractionErrors } = await extractLlmLessonCandidates({
+  const {
+    candidates,
+    errors: extractionErrors,
+    promptChars,
+    parseFailures,
+  } = await extractLlmLessonCandidates({
     provider,
     rawObservations,
     compressedObservations,
@@ -706,6 +752,8 @@ export async function extractLlmLessonsFromObservations(
       reinforced: 0,
       skipped: errors.length,
       errors,
+      promptChars,
+      parseFailures,
     };
   }
 
@@ -781,6 +829,8 @@ export async function extractLlmLessonsFromObservations(
     reinforced,
     skipped: errors.length,
     errors,
+    promptChars,
+    parseFailures,
   };
 }
 

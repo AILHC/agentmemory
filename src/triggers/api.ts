@@ -6,6 +6,7 @@ import { StateKV } from "../state/kv.js";
 import { getLatestHealth } from "../health/monitor.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import type { ResilientProvider } from "../providers/resilient.js";
+import { defaultModelFor } from "../providers/index.js";
 import { VERSION } from "../version.js";
 import { timingSafeCompare } from "../auth.js";
 import { isSlotsEnabled, isReflectEnabled } from "../functions/slots.js";
@@ -30,7 +31,11 @@ import {
   getAgentId,
   isAgentScopeIsolated,
   getSummarizeRuntimeConfig,
+  resolveStageModel,
+  STAGE_MODEL_KEYS,
+  type StageModelKey,
 } from "../config.js";
+import { resolveOutputLanguage } from "../prompts/output-language.js";
 
 type Response = {
   status_code: number;
@@ -214,6 +219,14 @@ function optionalNonEmptyString(
   return asNonEmptyString(body[key]);
 }
 
+function optionalModelString(body: Record<string, unknown>): string | undefined | null {
+  return optionalNonEmptyString(body, "model");
+}
+
+function invalidModelResponse(): Response {
+  return { status_code: 400, body: { error: "model must be a non-empty string" } };
+}
+
 function parseOptionalFiniteNumber(value: unknown): number | undefined | null {
   if (value === undefined || value === null) return undefined;
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
@@ -263,8 +276,9 @@ const allowedSemanticRollupKeys = new Set([
   "kind",
   "sessionIds",
   "semanticMemoryIds",
+  "model",
 ]);
-const allowedFullSkillExtractKeys = new Set(["sessionId"]);
+const allowedFullSkillExtractKeys = new Set(["sessionId", "model"]);
 const allowedFullConsolidatePlanKeys = new Set([
   "project",
   "minImportance",
@@ -281,6 +295,7 @@ const allowedFullConsolidateWindowKeys = new Set([
   "observationIds",
   "charBudget",
   "minObservations",
+  "model",
 ]);
 const allowedFullProceduralPlanKeys = new Set(["project", "maxItemsPerWindow"]);
 const allowedFullProceduralWindowKeys = new Set([
@@ -288,6 +303,7 @@ const allowedFullProceduralWindowKeys = new Set([
   "project",
   "memoryIds",
   "maxItemsPerWindow",
+  "model",
 ]);
 const allowedFullReflectPlanKeys = new Set([
   "project",
@@ -304,6 +320,7 @@ const allowedFullReflectWindowKeys = new Set([
   "semanticMemoryIds",
   "lessonIds",
   "crystalIds",
+  "model",
 ]);
 const allowedFullCrystalAutoKeys = new Set([
   "olderThanDays",
@@ -355,6 +372,79 @@ function providerNameFrom(provider: unknown): string {
     return (provider as { name: string }).name;
   }
   return detectLlmProviderKind();
+}
+
+function unwrapProviderName(name: string): string {
+  const resilient = name.match(/^resilient\((.*)\)$/);
+  const inner = resilient?.[1] ?? name;
+  if (inner.startsWith("fallback(")) return "fallback";
+  return inner;
+}
+
+type ModelRouting = Record<
+  StageModelKey,
+  {
+    model: string | null;
+    source: string;
+    provider: string;
+    modelApplied: boolean;
+    providerModelOverride?: "unsupported";
+  }
+>;
+
+function buildModelRouting(provider: unknown): ModelRouting {
+  const providerName = unwrapProviderName(providerNameFrom(provider));
+  const modelApplied = providerName === "pi-agent-sdk";
+  const providerDefaultModel = isProviderConfigName(providerName)
+    ? defaultModelFor(providerName)
+    : null;
+  return Object.fromEntries(
+    STAGE_MODEL_KEYS.map((stage) => {
+      const resolved = resolveStageModel(stage);
+      return [
+        stage,
+        {
+          model: modelApplied ? resolved.model ?? providerDefaultModel : providerDefaultModel,
+          source: modelApplied ? resolved.source : "provider_default",
+          provider: providerName,
+          modelApplied,
+          ...(!modelApplied ? { providerModelOverride: "unsupported" as const } : {}),
+        },
+      ];
+    }),
+  ) as ModelRouting;
+}
+
+function buildRuntimeConfigResponse(provider: unknown): Response {
+  const summarizeRuntimeConfig = getSummarizeRuntimeConfig();
+  const outputLanguage = resolveOutputLanguage();
+  return {
+    status_code: 200,
+    body: {
+      success: true,
+      runtime: {
+        summarizeChunkConcurrency: summarizeRuntimeConfig.chunkConcurrency,
+        summarizeChunkSize: summarizeRuntimeConfig.chunkSize,
+        providerName: providerNameFrom(provider),
+        outputLanguageConfigured: outputLanguage === "zh-CN",
+        outputLanguage,
+        modelRouting: buildModelRouting(provider),
+      },
+    },
+  };
+}
+
+function isProviderConfigName(name: string): name is Parameters<typeof defaultModelFor>[0] {
+  return (
+    name === "openai" ||
+    name === "pi-agent-sdk" ||
+    name === "anthropic" ||
+    name === "gemini" ||
+    name === "openrouter" ||
+    name === "minimax" ||
+    name === "agent-sdk" ||
+    name === "noop"
+  );
 }
 
 export function registerApiTriggers(
@@ -474,18 +564,7 @@ export function registerApiTriggers(
     async (req: ApiRequest): Promise<Response> => {
       const authErr = checkAuth(req, secret);
       if (authErr) return authErr;
-      const summarizeRuntimeConfig = getSummarizeRuntimeConfig();
-      return {
-        status_code: 200,
-        body: {
-          success: true,
-          runtime: {
-            summarizeChunkConcurrency: summarizeRuntimeConfig.chunkConcurrency,
-            summarizeChunkSize: summarizeRuntimeConfig.chunkSize,
-            providerName: providerNameFrom(provider),
-          },
-        },
-      };
+      return buildRuntimeConfigResponse(provider);
     },
   );
   sdk.registerTrigger({
@@ -495,6 +574,18 @@ export function registerApiTriggers(
       api_path: "/agentmemory/runtime-config",
       http_method: "GET",
       middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::runtime-config-diagnostics",
+    async (): Promise<Response> => buildRuntimeConfigResponse(provider),
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::runtime-config-diagnostics",
+    config: {
+      api_path: "/agentmemory/runtime-config/diagnostics",
+      http_method: "GET",
     },
   });
 
@@ -511,7 +602,7 @@ export function registerApiTriggers(
           status_code: 400,
           body: {
             error:
-              "invalid semantic rollup payload: only runId, windowId, mark, kind, sessionIds, semanticMemoryIds are allowed",
+              "invalid semantic rollup payload: only runId, windowId, mark, kind, sessionIds, semanticMemoryIds, model are allowed",
           },
         };
       }
@@ -539,6 +630,8 @@ export function registerApiTriggers(
       const semanticMemoryIds = body.semanticMemoryIds === undefined
         ? undefined
         : parseStringArray(body.semanticMemoryIds);
+      const model = optionalModelString(body);
+      if (model === null) return invalidModelResponse();
       if (sessionIds === null || semanticMemoryIds === null) {
         return {
           status_code: 400,
@@ -555,6 +648,7 @@ export function registerApiTriggers(
       const payload: Record<string, unknown> = { runId, windowId, mark, kind };
       if (sessionIds) payload.sessionIds = sessionIds;
       if (semanticMemoryIds) payload.semanticMemoryIds = semanticMemoryIds;
+      if (model) payload.model = model;
       const result = await sdk.trigger({
         function_id: "mem::semantic-rollup",
         payload,
@@ -578,13 +672,15 @@ export function registerApiTriggers(
     const body = requirePlainBody(req.body);
     if (!body) return { status_code: 400, body: { error: "request body is required" } };
     if (!hasOnlyKeys(body, allowedFullSkillExtractKeys)) {
-      return { status_code: 400, body: { error: "invalid full skill extraction payload: only sessionId is allowed" } };
+      return { status_code: 400, body: { error: "invalid full skill extraction payload: only sessionId, model are allowed" } };
     }
     const sessionId = asNonEmptyString(body.sessionId);
     if (!sessionId) return { status_code: 400, body: { error: "sessionId is required" } };
+    const model = optionalModelString(body);
+    if (model === null) return invalidModelResponse();
     const result = await sdk.trigger({
       function_id: "mem::skill-extract",
-      payload: { sessionId },
+      payload: { sessionId, ...(model ? { model } : {}) },
     });
     const bodyResult = result && typeof result === "object"
       ? (result as Record<string, unknown>)
@@ -687,12 +783,15 @@ export function registerApiTriggers(
     if (observationIds === null) {
       return { status_code: 400, body: { error: "observationIds must be a string array" } };
     }
+    const model = optionalModelString(body);
+    if (model === null) return invalidModelResponse();
     const payload: Record<string, unknown> = {};
     if (project !== undefined) payload.project = project;
     if (concept !== undefined) payload.concept = concept;
     if (observationIds !== undefined) payload.observationIds = observationIds;
     if (minObservations !== undefined) payload.minObservations = minObservations;
     if (charBudget !== undefined) payload.charBudget = charBudget;
+    if (model) payload.model = model;
     const result = await sdk.trigger({
       function_id: "mem::full-memory-consolidate-window",
       payload,
@@ -756,12 +855,15 @@ export function registerApiTriggers(
     }
     const project = optionalNonEmptyString(body, "project");
     const memoryIds = body.memoryIds === undefined ? undefined : parseStringArray(body.memoryIds);
+    const model = optionalModelString(body);
+    if (model === null) return invalidModelResponse();
     if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
     if (memoryIds === null) return { status_code: 400, body: { error: "memoryIds must be a string array" } };
     const payload: Record<string, unknown> = {};
     if (project !== undefined) payload.project = project;
     if (memoryIds !== undefined) payload.memoryIds = memoryIds;
     if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
+    if (model) payload.model = model;
     const result = await sdk.trigger({
       function_id: "mem::full-consolidation-procedural-window",
       payload,
@@ -844,6 +946,8 @@ export function registerApiTriggers(
     if (semanticMemoryIds === null || lessonIds === null || crystalIds === null) {
       return { status_code: 400, body: { error: "semanticMemoryIds, lessonIds, and crystalIds must be string arrays" } };
     }
+    const model = optionalModelString(body);
+    if (model === null) return invalidModelResponse();
     const payload: Record<string, unknown> = { useGraph: false };
     if (project !== undefined) payload.project = project;
     if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
@@ -851,6 +955,7 @@ export function registerApiTriggers(
     if (semanticMemoryIds !== undefined) payload.semanticMemoryIds = semanticMemoryIds;
     if (lessonIds !== undefined) payload.lessonIds = lessonIds;
     if (crystalIds !== undefined) payload.crystalIds = crystalIds;
+    if (model) payload.model = model;
     const result = await sdk.trigger({
       function_id: "mem::full-reflect-insight-window",
       payload,
@@ -1403,14 +1508,17 @@ export function registerApiTriggers(
   });
 
   sdk.registerFunction("api::summarize", 
-    async (req: ApiRequest<{ sessionId: string }>): Promise<Response> => {
-      const sessionId = asNonEmptyString((req.body as Record<string, unknown>)?.sessionId);
+    async (req: ApiRequest<{ sessionId: string; model?: string }>): Promise<Response> => {
+      const body = (req.body as Record<string, unknown>) || {};
+      const sessionId = asNonEmptyString(body.sessionId);
       if (!sessionId) {
         return { status_code: 400, body: { error: "sessionId is required" } };
       }
+      const model = optionalModelString(body);
+      if (model === null) return invalidModelResponse();
       const result = await sdk.trigger({
         function_id: "mem::summarize",
-        payload: { sessionId },
+        payload: { sessionId, ...(model ? { model } : {}) },
       });
       return { status_code: 200, body: result };
     },
@@ -3953,6 +4061,7 @@ export function registerApiTriggers(
       "chunkSize",
       "chunkConcurrency",
       "timeoutMs",
+      "model",
     ]);
     const unknown = Object.keys(body).filter((key) => !allowed.has(key));
     if (unknown.length > 0) {
@@ -3960,7 +4069,7 @@ export function registerApiTriggers(
         status_code: 400,
         body: {
           error:
-            "invalid lesson extraction payload: only sessionIds, missingOnly, retryFailed, force, textLimit, saveLimit, chunkSize, chunkConcurrency, timeoutMs are allowed",
+            "invalid lesson extraction payload: only sessionIds, missingOnly, retryFailed, force, textLimit, saveLimit, chunkSize, chunkConcurrency, timeoutMs, model are allowed",
         },
       };
     }
@@ -4015,6 +4124,8 @@ export function registerApiTriggers(
     if (timeoutMs === null) {
       return { status_code: 400, body: { error: "timeoutMs must be a positive integer" } };
     }
+    const model = optionalModelString(body);
+    if (model === null) return invalidModelResponse();
 
     const result = await sdk.trigger({
       function_id: "mem::lessons::extract-llm",
@@ -4028,6 +4139,7 @@ export function registerApiTriggers(
         ...(chunkSize !== undefined ? { chunkSize } : {}),
         ...(chunkConcurrency !== undefined ? { chunkConcurrency } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(model ? { model } : {}),
       },
     });
     return { status_code: 200, body: result };

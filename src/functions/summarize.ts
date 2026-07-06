@@ -4,6 +4,7 @@ import type {
   SessionSummary,
   MemoryProvider,
   Session,
+  MemoryProviderCallOptions,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -22,11 +23,26 @@ import { scoreSummary } from "../eval/quality.js";
 import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
-import { getSummarizeRuntimeConfig } from "../config.js";
+import {
+  getSummarizeRuntimeConfig,
+  resolveStageModelCallOptions,
+  resolveStageModelMetadata,
+} from "../config.js";
 
 // Bail on the merged summary if more than this fraction of chunks fail
 // to parse — a half-blind narrative is worse than a clean error.
 const MAX_SKIP_RATIO = 0.5;
+
+function summarizeWithOptions(
+  provider: MemoryProvider,
+  systemPrompt: string,
+  userPrompt: string,
+  callOptions?: MemoryProviderCallOptions,
+): Promise<string> {
+  return callOptions
+    ? provider.summarize(systemPrompt, userPrompt, callOptions)
+    : provider.summarize(systemPrompt, userPrompt);
+}
 
 // One chunk call with retry-once. Returns null when both attempts fail —
 // whether by parse failure, provider 4xx (content rejected by upstream
@@ -42,12 +58,15 @@ async function summarizeChunkWithRetry(
   project: string,
   idx: number,
   total: number,
+  callOptions?: MemoryProviderCallOptions,
 ): Promise<SessionSummary | null> {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const xml = await provider.summarize(
+      const xml = await summarizeWithOptions(
+        provider,
         withOutputLanguagePolicy(SUMMARY_SYSTEM, undefined, SUMMARY_OUTPUT_CONTRACT),
         buildSummaryPrompt(chunk),
+        callOptions,
       );
       const parsed = parseSummaryXml(xml, sessionId, project, chunk.length);
       if (parsed) return parsed;
@@ -78,20 +97,25 @@ async function produceSummaryXml(
   compressed: CompressedObservation[],
   sessionId: string,
   project: string,
+  callOptions?: MemoryProviderCallOptions,
 ): Promise<{
   response: string;
   mode: "single" | "chunked";
   chunks: number;
   skipped?: number;
+  promptChars: number;
 }> {
   const runtimeConfig = getSummarizeRuntimeConfig();
   const chunkSize = runtimeConfig.chunkSize;
   if (compressed.length <= chunkSize) {
-    const response = await provider.summarize(
+    const userPrompt = buildSummaryPrompt(compressed);
+    const response = await summarizeWithOptions(
+      provider,
       withOutputLanguagePolicy(SUMMARY_SYSTEM, undefined, SUMMARY_OUTPUT_CONTRACT),
-      buildSummaryPrompt(compressed),
+      userPrompt,
+      callOptions,
     );
-    return { response, mode: "single", chunks: 1 };
+    return { response, mode: "single", chunks: 1, promptChars: userPrompt.length };
   }
 
   const chunks: CompressedObservation[][] = [];
@@ -123,6 +147,7 @@ async function produceSummaryXml(
           project,
           idx,
           chunks.length,
+          callOptions,
         );
       }),
     );
@@ -156,11 +181,15 @@ async function produceSummaryXml(
       obsRangeEnd: Math.min((originalIdx + 1) * chunkSize, compressed.length),
     };
   });
-  const response = await provider.summarize(
+  const reducePrompt = buildReducePrompt(reduceInput);
+  const response = await summarizeWithOptions(
+    provider,
     withOutputLanguagePolicy(REDUCE_SYSTEM, undefined, SUMMARY_OUTPUT_CONTRACT),
-    buildReducePrompt(reduceInput),
+    reducePrompt,
+    callOptions,
   );
-  return { response, mode: "chunked", chunks: chunks.length, skipped };
+  const chunkPromptChars = chunks.reduce((sum, chunk) => sum + buildSummaryPrompt(chunk).length, 0);
+  return { response, mode: "chunked", chunks: chunks.length, skipped, promptChars: chunkPromptChars + reducePrompt.length };
 }
 
 // #783: many LLMs (DeepSeek, GPT variants, some Anthropic responses)
@@ -212,7 +241,7 @@ export function registerSummarizeFunction(
   metricsStore?: MetricsStore,
 ): void {
   sdk.registerFunction("mem::summarize", 
-    async (data: { sessionId: string } | undefined) => {
+    async (data: { sessionId: string; model?: string } | undefined) => {
       const startMs = Date.now();
       if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
         return { success: false, error: "sessionId is required" };
@@ -252,6 +281,8 @@ export function registerSummarizeFunction(
       }
 
       try {
+        const callOptions = resolveStageModelCallOptions("summary", data.model);
+        const stageMetadata = resolveStageModelMetadata("summary", provider, data.model);
         // #783: chunk-level produceSummaryXml retries internally, but
         // the final merge used to parse once and bail. Wrap the
         // produce-and-parse pair in the same 2-attempt loop so a
@@ -261,16 +292,20 @@ export function registerSummarizeFunction(
         let response = "";
         let mode = "single";
         let chunks = 1;
+        let promptChars = 0;
+        let parseFailures = 0;
         for (let attempt = 1; attempt <= 2; attempt++) {
           const produced = await produceSummaryXml(
             provider,
             compressed,
             sessionId,
             session.project,
+            callOptions,
           );
           response = produced.response;
           mode = produced.mode;
           chunks = produced.chunks;
+          promptChars = produced.promptChars;
           if (!response || !response.trim()) {
             logger.warn("Empty provider response on summarize", {
               sessionId,
@@ -289,6 +324,7 @@ export function registerSummarizeFunction(
             compressed.length,
           );
           if (summary) break;
+          parseFailures++;
           logger.warn("Failed to parse summary XML", { sessionId, attempt });
         }
 
@@ -297,7 +333,15 @@ export function registerSummarizeFunction(
           if (metricsStore) {
             await metricsStore.record("mem::summarize", latencyMs, false);
           }
-          return { success: false, error: "empty_provider_response" };
+          return {
+            success: false,
+            error: "empty_provider_response",
+            status: "failed",
+            ...stageMetadata,
+            promptChars,
+            durationMs: latencyMs,
+            parseFailures,
+          };
         }
 
         if (!summary) {
@@ -305,7 +349,15 @@ export function registerSummarizeFunction(
           if (metricsStore) {
             await metricsStore.record("mem::summarize", latencyMs, false);
           }
-          return { success: false, error: "parse_failed" };
+          return {
+            success: false,
+            error: "parse_failed",
+            status: "failed",
+            ...stageMetadata,
+            promptChars,
+            durationMs: latencyMs,
+            parseFailures,
+          };
         }
 
         const summaryForValidation = {
@@ -330,7 +382,15 @@ export function registerSummarizeFunction(
             sessionId,
             errors: validation.result.errors,
           });
-          return { success: false, error: "validation_failed" };
+          return {
+            success: false,
+            error: "validation_failed",
+            status: "failed",
+            ...stageMetadata,
+            promptChars,
+            durationMs: latencyMs,
+            parseFailures,
+          };
         }
 
         const qualityScore = scoreSummary(summaryForValidation);
@@ -359,7 +419,16 @@ export function registerSummarizeFunction(
           valid: validation.valid,
         });
 
-        return { success: true, summary, qualityScore };
+        return {
+          success: true,
+          summary,
+          qualityScore,
+          status: "succeeded",
+          ...stageMetadata,
+          promptChars,
+          durationMs: latencyMs,
+          parseFailures,
+        };
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         const latencyMs = Date.now() - startMs;

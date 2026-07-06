@@ -100,9 +100,9 @@ describe("full extraction REST wrappers", () => {
       },
       {
         api: "api::full-consolidation-procedural-window",
-        body: { project: " repo ", memoryIds: [" mem-a ", ""] },
+        body: { project: " repo ", memoryIds: [" mem-a ", ""], model: " memory-model " },
         function_id: "mem::full-consolidation-procedural-window",
-        payload: { project: "repo", memoryIds: ["mem-a"] },
+        payload: { project: "repo", memoryIds: ["mem-a"], model: "memory-model" },
       },
       {
         api: "api::full-reflect-insight-windows-plan",

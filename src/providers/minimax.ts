@@ -1,4 +1,4 @@
-import type { MemoryProvider } from '../types.js'
+import type { MemoryProvider, MemoryProviderCallOptions } from '../types.js'
 import { getEnvVar } from '../config.js'
 import { fetchWithTimeout } from './_fetch.js'
 
@@ -31,11 +31,19 @@ export class MinimaxProvider implements MemoryProvider {
       getEnvVar('MINIMAX_BASE_URL') || 'https://api.minimax.io/anthropic'
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
+  async compress(
+    systemPrompt: string,
+    userPrompt: string,
+    _options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     return this.call(systemPrompt, userPrompt)
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
+  async summarize(
+    systemPrompt: string,
+    userPrompt: string,
+    _options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     return this.call(systemPrompt, userPrompt)
   }
 

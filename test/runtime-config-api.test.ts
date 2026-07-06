@@ -51,12 +51,14 @@ describe("api::runtime-config", () => {
     const response = await handler({ headers: {}, query_params: {} });
 
     expect(response.status_code).toBe(200);
-    expect(response.body).toEqual({
+    expect(response.body).toMatchObject({
       success: true,
       runtime: {
         summarizeChunkConcurrency: 2,
         summarizeChunkSize: 25,
         providerName: "safe-provider",
+        outputLanguageConfigured: false,
+        outputLanguage: "default",
       },
     });
     const serialized = JSON.stringify(response.body);
@@ -132,6 +134,60 @@ describe("api::runtime-config", () => {
     }
   });
 
+  it("returns the non-secret output language state", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
+    vi.resetModules();
+
+    const registerApiTriggers = await loadRegisterApiTriggers();
+    const sdk = mockSdk();
+    registerApiTriggers(sdk as never, {} as never, "", undefined, undefined);
+    const handler = sdk.getFunction("api::runtime-config");
+
+    const response = await handler({ headers: {}, query_params: {} });
+
+    expect(response.status_code).toBe(200);
+    expect(response.body.runtime.outputLanguageConfigured).toBe(true);
+    expect(response.body.runtime.outputLanguage).toBe("zh-CN");
+    expect(JSON.stringify(response.body)).not.toMatch(/apiKey|token|secret|prompt|response/i);
+  });
+
+  it("keeps runtime-config protected while diagnostics stays secret-free", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
+    process.env.AGENTMEMORY_DEFAULT_STAGE_MODEL = "default-stage-model";
+    process.env.OPENAI_API_KEY = "do-not-return";
+    vi.resetModules();
+
+    const registerApiTriggers = await loadRegisterApiTriggers();
+    const sdk = mockSdk();
+    registerApiTriggers(
+      sdk as never,
+      {} as never,
+      "configured-secret",
+      undefined,
+      { name: "resilient(pi-agent-sdk)" } as never,
+    );
+    const protectedHandler = sdk.getFunction("api::runtime-config");
+    const diagnosticsHandler = sdk.getFunction("api::runtime-config-diagnostics");
+
+    const protectedResponse = await protectedHandler({ headers: {}, query_params: {} });
+    const diagnosticsResponse = await diagnosticsHandler({ headers: {}, query_params: {} });
+
+    expect(protectedResponse.status_code).toBe(401);
+    expect(diagnosticsResponse.status_code).toBe(200);
+    expect(diagnosticsResponse.body.runtime.outputLanguageConfigured).toBe(true);
+    expect(diagnosticsResponse.body.runtime.outputLanguage).toBe("zh-CN");
+    expect(diagnosticsResponse.body.runtime.modelRouting.summary).toMatchObject({
+      model: "default-stage-model",
+      source: "AGENTMEMORY_DEFAULT_STAGE_MODEL",
+      provider: "pi-agent-sdk",
+      modelApplied: true,
+    });
+    const serialized = JSON.stringify(diagnosticsResponse.body);
+    expect(serialized).not.toContain("configured-secret");
+    expect(serialized).not.toContain("do-not-return");
+    expect(serialized).not.toMatch(/apiKey|token|secret|prompt|response/i);
+  });
+
   it("falls back to defaults for invalid summarize runtime limit values", async () => {
     process.env.SUMMARIZE_CHUNK_SIZE = "400.5";
     process.env.SUMMARIZE_CHUNK_CONCURRENCY = "0";
@@ -181,5 +237,99 @@ describe("api::runtime-config", () => {
     expect(response.status_code).toBe(200);
     expect(response.body.runtime.summarizeChunkConcurrency).toBe(6);
     expect(response.body.runtime.summarizeChunkSize).toBe(401);
+  });
+
+  it("returns redacted model routing diagnostics for every stage", async () => {
+    process.env.AGENTMEMORY_SUMMARY_MODEL = "summary-model";
+    process.env.AGENTMEMORY_DEFAULT_STAGE_MODEL = "default-stage-model";
+    process.env.PI_AGENT_MODEL = "pi-model";
+    process.env.OPENAI_API_KEY = "do-not-return";
+    vi.resetModules();
+
+    const registerApiTriggers = await loadRegisterApiTriggers();
+    const sdk = mockSdk();
+    registerApiTriggers(
+      sdk as never,
+      {} as never,
+      "",
+      undefined,
+      { name: "resilient(pi-agent-sdk)" } as never,
+    );
+    const handler = sdk.getFunction("api::runtime-config");
+
+    const response = await handler({ headers: {}, query_params: {} });
+
+    expect(response.status_code).toBe(200);
+    expect(response.body.runtime.modelRouting).toMatchObject({
+      summary: {
+        model: "summary-model",
+        source: "AGENTMEMORY_SUMMARY_MODEL",
+        provider: "pi-agent-sdk",
+        modelApplied: true,
+      },
+      lesson: {
+        model: "default-stage-model",
+        source: "AGENTMEMORY_DEFAULT_STAGE_MODEL",
+        provider: "pi-agent-sdk",
+        modelApplied: true,
+      },
+      skill_extract: {
+        model: "default-stage-model",
+        source: "AGENTMEMORY_DEFAULT_STAGE_MODEL",
+        provider: "pi-agent-sdk",
+        modelApplied: true,
+      },
+      semantic_rollup: {
+        model: "default-stage-model",
+        source: "AGENTMEMORY_DEFAULT_STAGE_MODEL",
+        provider: "pi-agent-sdk",
+        modelApplied: true,
+      },
+      memory_consolidate: {
+        model: "default-stage-model",
+        source: "AGENTMEMORY_DEFAULT_STAGE_MODEL",
+        provider: "pi-agent-sdk",
+        modelApplied: true,
+      },
+      reflect_insight: {
+        model: "default-stage-model",
+        source: "AGENTMEMORY_DEFAULT_STAGE_MODEL",
+        provider: "pi-agent-sdk",
+        modelApplied: true,
+      },
+    });
+    const serialized = JSON.stringify(response.body);
+    expect(serialized).not.toContain("do-not-return");
+    expect(serialized).not.toMatch(/apiKey|token|secret|prompt|response/i);
+  });
+
+  it("does not report modelApplied=true for unsupported providers", async () => {
+    process.env.AGENTMEMORY_DEFAULT_STAGE_MODEL = "default-stage-model";
+    process.env.OPENAI_MODEL = "openai-env-model";
+    vi.resetModules();
+
+    const registerApiTriggers = await loadRegisterApiTriggers();
+    const sdk = mockSdk();
+    registerApiTriggers(
+      sdk as never,
+      {} as never,
+      "",
+      undefined,
+      { name: "resilient(openai)" } as never,
+    );
+    const handler = sdk.getFunction("api::runtime-config");
+
+    const response = await handler({ headers: {}, query_params: {} });
+
+    expect(response.status_code).toBe(200);
+    for (const route of Object.values(response.body.runtime.modelRouting)) {
+      expect(route).toMatchObject({
+        provider: "openai",
+        model: "openai-env-model",
+        source: "provider_default",
+        modelApplied: false,
+        providerModelOverride: "unsupported",
+      });
+    }
   });
 });

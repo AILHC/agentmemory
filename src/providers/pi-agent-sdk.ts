@@ -1,5 +1,5 @@
 import { ProxyAgent, setGlobalDispatcher } from "undici";
-import type { MemoryProvider } from "../types.js";
+import type { MemoryProvider, MemoryProviderCallOptions } from "../types.js";
 import { getEnvVar } from "../config.js";
 
 type OpenAICodexResponsesModule = typeof import("@earendil-works/pi-ai/openai-codex-responses");
@@ -94,13 +94,21 @@ export class PiAgentSDKProvider implements MemoryProvider {
     this.maxTokens = maxTokens;
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
-    return this.summarize(systemPrompt, userPrompt);
+  async compress(
+    systemPrompt: string,
+    userPrompt: string,
+    options?: MemoryProviderCallOptions,
+  ): Promise<string> {
+    return this.summarize(systemPrompt, userPrompt, options);
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
+  async summarize(
+    systemPrompt: string,
+    userPrompt: string,
+    options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     try {
-      return await this.call(systemPrompt, userPrompt);
+      return await this.call(systemPrompt, userPrompt, options);
     } catch (err) {
       if (err instanceof Error) {
         const message = err.message;
@@ -119,16 +127,22 @@ export class PiAgentSDKProvider implements MemoryProvider {
     }
   }
 
-  private async call(systemPrompt: string, userPrompt: string): Promise<string> {
+  private async call(
+    systemPrompt: string,
+    userPrompt: string,
+    options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     const modules = await this.loadModules();
     const { AuthStorage, ModelRegistry } = modules.codingAgent as {
       AuthStorage: { create: () => unknown };
       ModelRegistry: { create: (auth: unknown) => { find: (provider: string, modelName: string) => unknown; getApiKeyAndHeaders: (model: unknown) => Credentials | Promise<Credentials> }; };
     };
     const registry = ModelRegistry.create(AuthStorage.create());
+    const modelName = options?.model?.trim() || this.model;
+    const maxTokens = options?.maxTokens ?? this.maxTokens;
     const model =
-      registry.find("openai-codex", this.model) ??
-      modules.ai.getModel("openai-codex", this.model);
+      registry.find("openai-codex", modelName) ??
+      modules.ai.getModel("openai-codex", modelName);
     if (!model) {
       throw new Error("pi_model_not_found");
     }
@@ -141,18 +155,22 @@ export class PiAgentSDKProvider implements MemoryProvider {
       messages: [{ role: "user", content: userPrompt }],
       tools: [],
     };
-    const options: StreamOptions = {
+    const streamOptions: StreamOptions = {
       apiKey: credentials.apiKey,
       headers: credentials.headers,
       env: process.env,
-      maxTokens: this.maxTokens,
+      maxTokens,
       transport: "sse",
       timeoutMs: getTimeoutMs(),
     };
 
     let output = "";
     try {
-      const stream = await modules.codex.streamSimpleOpenAICodexResponses(model, context, options);
+      const stream = await modules.codex.streamSimpleOpenAICodexResponses(
+        model,
+        context,
+        streamOptions,
+      );
       for await (const rawEvent of stream as AsyncIterable<unknown>) {
         if (!isObject(rawEvent)) continue;
         if (rawEvent["type"] === "error") {

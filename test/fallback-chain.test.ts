@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { FallbackChainProvider } from "../src/providers/fallback-chain.js";
+import { ResilientProvider } from "../src/providers/resilient.js";
 import type { MemoryProvider } from "../src/types.js";
 
 function makeProvider(
@@ -89,5 +90,59 @@ describe("FallbackChainProvider", () => {
     ]);
     const result = await chain.summarize("sys", "user");
     expect(result).toBe("summarized by backup");
+  });
+
+  it("passes provider call options through fallback attempts", async () => {
+    const seen: unknown[] = [];
+    const failing: MemoryProvider = {
+      name: "failing",
+      compress: async (_system, _user, options) => {
+        seen.push(options);
+        throw new Error("down");
+      },
+      summarize: async (_system, _user, options) => {
+        seen.push(options);
+        throw new Error("down");
+      },
+    };
+    const backup: MemoryProvider = {
+      name: "backup",
+      compress: async (_system, _user, options) => {
+        seen.push(options);
+        return "ok";
+      },
+      summarize: async (_system, _user, options) => {
+        seen.push(options);
+        return "ok";
+      },
+    };
+    const options = { model: "stage-model", maxTokens: 123, modelSource: "explicitModel" };
+    const chain = new FallbackChainProvider([failing, backup]);
+
+    await expect(chain.compress("sys", "user", options)).resolves.toBe("ok");
+    await expect(chain.summarize("sys", "user", options)).resolves.toBe("ok");
+
+    expect(seen).toEqual([options, options, options, options]);
+  });
+
+  it("passes provider call options through resilient wrapper", async () => {
+    const seen: unknown[] = [];
+    const provider = new ResilientProvider({
+      name: "inner",
+      compress: async (_system, _user, options) => {
+        seen.push(options);
+        return "ok";
+      },
+      summarize: async (_system, _user, options) => {
+        seen.push(options);
+        return "ok";
+      },
+    });
+    const options = { model: "stage-model", maxTokens: 123, modelSource: "explicitModel" };
+
+    await expect(provider.compress("sys", "user", options)).resolves.toBe("ok");
+    await expect(provider.summarize("sys", "user", options)).resolves.toBe("ok");
+
+    expect(seen).toEqual([options, options]);
   });
 });

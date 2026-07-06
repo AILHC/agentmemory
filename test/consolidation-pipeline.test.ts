@@ -7,6 +7,15 @@ vi.mock("../src/logger.js", () => ({
 vi.mock("../src/config.js", () => ({
   getConsolidationDecayDays: () => 30,
   isConsolidationEnabled: vi.fn(() => true),
+  resolveStageModelCallOptions: vi.fn(() => undefined),
+  resolveStageModelMetadata: vi.fn((stage: string, provider?: { name?: string }) => ({
+    stage,
+    provider: provider?.name ?? "test",
+    modelApplied: provider?.name === "pi-agent-sdk",
+    ...(provider?.name === "pi-agent-sdk"
+      ? { model: "test-model", modelSource: "provider_default" }
+      : { providerModelOverride: "unsupported" }),
+  })),
 }));
 
 import {

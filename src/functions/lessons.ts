@@ -161,6 +161,7 @@ export function registerLessonsFunctions(
       chunkSize?: unknown;
       chunkConcurrency?: unknown;
       timeoutMs?: unknown;
+      model?: unknown;
     }) => {
       if (!provider) {
         return { success: false, error: "provider is required for lesson extraction" };
@@ -180,6 +181,7 @@ export function registerLessonsFunctions(
         chunkSize: data.chunkSize,
         chunkConcurrency: data.chunkConcurrency,
         timeoutMs: data.timeoutMs,
+        model: data.model,
       });
 
       const runs: LessonExtractionRun[] = [];

@@ -9,6 +9,7 @@ import type {
   FallbackConfig,
   ClaudeBridgeConfig,
   TeamConfig,
+  MemoryProviderCallOptions,
 } from "./types.js";
 
 function safeParseInt(value: string | undefined, fallback: number): number {
@@ -48,6 +49,194 @@ function loadEnvFile(): Record<string, string> {
 
 function hasRealValue(v: string | undefined): v is string {
   return typeof v === "string" && v.trim().length > 0;
+}
+
+export const STAGE_MODEL_KEYS = [
+  "summary",
+  "lesson",
+  "skill_extract",
+  "semantic_rollup",
+  "memory_consolidate",
+  "reflect_insight",
+] as const;
+
+export type StageModelKey = (typeof STAGE_MODEL_KEYS)[number];
+
+export type StageModelSource =
+  | "explicitModel"
+  | "AGENTMEMORY_SUMMARY_MODEL"
+  | "AGENTMEMORY_LESSON_MODEL"
+  | "AGENTMEMORY_SKILL_EXTRACT_MODEL"
+  | "AGENTMEMORY_SEMANTIC_ROLLUP_MODEL"
+  | "AGENTMEMORY_MEMORY_CONSOLIDATE_MODEL"
+  | "AGENTMEMORY_REFLECT_INSIGHT_MODEL"
+  | "AGENTMEMORY_DEFAULT_STAGE_MODEL"
+  | "PI_AGENT_MODEL"
+  | "provider_default";
+
+export interface ResolvedStageModel {
+  stage: StageModelKey;
+  model?: string;
+  source: StageModelSource;
+}
+
+export interface StageModelRuntimeMetadata {
+  stage: StageModelKey;
+  provider: string;
+  modelApplied: boolean;
+  model?: string;
+  modelSource?: StageModelSource;
+  providerModelOverride?: "unsupported";
+}
+
+const STAGE_MODEL_ENV: Record<StageModelKey, StageModelSource> = {
+  summary: "AGENTMEMORY_SUMMARY_MODEL",
+  lesson: "AGENTMEMORY_LESSON_MODEL",
+  skill_extract: "AGENTMEMORY_SKILL_EXTRACT_MODEL",
+  semantic_rollup: "AGENTMEMORY_SEMANTIC_ROLLUP_MODEL",
+  memory_consolidate: "AGENTMEMORY_MEMORY_CONSOLIDATE_MODEL",
+  reflect_insight: "AGENTMEMORY_REFLECT_INSIGHT_MODEL",
+};
+
+function normalizeModelValue(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+export function resolveStageModel(
+  stage: StageModelKey,
+  explicitModel?: string,
+): ResolvedStageModel {
+  const explicit = normalizeModelValue(explicitModel);
+  if (explicit) return { stage, model: explicit, source: "explicitModel" };
+
+  const env = getMergedEnv();
+  const stageEnv = STAGE_MODEL_ENV[stage];
+  const stageModel = normalizeModelValue(env[stageEnv]);
+  if (stageModel) return { stage, model: stageModel, source: stageEnv };
+
+  const defaultStageModel = normalizeModelValue(
+    env["AGENTMEMORY_DEFAULT_STAGE_MODEL"],
+  );
+  if (defaultStageModel) {
+    return {
+      stage,
+      model: defaultStageModel,
+      source: "AGENTMEMORY_DEFAULT_STAGE_MODEL",
+    };
+  }
+
+  const piAgentModel = normalizeModelValue(env["PI_AGENT_MODEL"]);
+  if (piAgentModel) return { stage, model: piAgentModel, source: "PI_AGENT_MODEL" };
+
+  return { stage, source: "provider_default" };
+}
+
+export function resolveStageModelCallOptions(
+  stage: StageModelKey,
+  explicitModel?: string,
+): MemoryProviderCallOptions | undefined {
+  const resolved = resolveStageModel(stage, explicitModel);
+  if (!resolved.model) return undefined;
+  return {
+    model: resolved.model,
+    modelSource: resolved.source,
+  };
+}
+
+export function unwrapStageModelProviderName(name: string): string {
+  const resilient = name.match(/^resilient\((.*)\)$/);
+  const inner = resilient?.[1] ?? name;
+  if (inner.startsWith("fallback(")) return "fallback";
+  return inner;
+}
+
+export function defaultModelForProviderName(providerName: string): string | undefined {
+  switch (providerName) {
+    case "pi-agent-sdk":
+      return "gpt-5.4";
+    case "agent-sdk":
+      return "claude-sonnet-4-20250514";
+    case "openai":
+      return normalizeModelValue(getMergedEnv().OPENAI_MODEL) ?? "gpt-4o-mini";
+    case "anthropic":
+      return normalizeModelValue(getMergedEnv().ANTHROPIC_MODEL) ?? "claude-sonnet-4-20250514";
+    case "gemini":
+      return normalizeModelValue(getMergedEnv().GEMINI_MODEL) ?? "gemini-2.5-flash";
+    case "openrouter":
+      return normalizeModelValue(getMergedEnv().OPENROUTER_MODEL) ?? "anthropic/claude-sonnet-4-20250514";
+    case "minimax":
+      return normalizeModelValue(getMergedEnv().MINIMAX_MODEL) ?? "MiniMax-M2.7";
+    case "noop":
+      return "noop";
+    default:
+      return undefined;
+  }
+}
+
+function providerNameFromRuntimeInput(provider: string | { name?: string } | undefined): string {
+  if (typeof provider === "string") return unwrapStageModelProviderName(provider);
+  return unwrapStageModelProviderName(provider?.name ?? "unknown");
+}
+
+export function providerSupportsStageModelOverride(provider: string | { name?: string } | undefined): boolean {
+  return providerNameFromRuntimeInput(provider) === "pi-agent-sdk";
+}
+
+export function resolveStageModelMetadata(
+  stage: StageModelKey,
+  provider: string | { name?: string } | undefined,
+  explicitModel?: string,
+): StageModelRuntimeMetadata {
+  const providerName = providerNameFromRuntimeInput(provider);
+  if (!providerSupportsStageModelOverride(providerName)) {
+    return {
+      stage,
+      provider: providerName,
+      modelApplied: false,
+      providerModelOverride: "unsupported",
+    };
+  }
+
+  const resolved = resolveStageModel(stage, explicitModel);
+  const providerDefault = defaultModelForProviderName(providerName);
+  return {
+    stage,
+    provider: providerName,
+    model: resolved.model ?? providerDefault,
+    modelSource: resolved.model ? resolved.source : "provider_default",
+    modelApplied: true,
+  };
+}
+
+function parseBoundedPositiveInt(
+  value: string | undefined,
+  fallback: number,
+  max: number,
+): number {
+  const parsed = safeParseInt(value, fallback);
+  if (!Number.isFinite(parsed) || parsed < 1) return fallback;
+  return Math.min(parsed, max);
+}
+
+export function getSemanticRollupMaxPromptChars(
+  env: Record<string, string | undefined> = getMergedEnv(),
+): number {
+  return parseBoundedPositiveInt(
+    env.AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS,
+    24_000,
+    120_000,
+  );
+}
+
+export function getMemoryConsolidateCompressTimeoutMs(
+  env: Record<string, string | undefined> = getMergedEnv(),
+): number {
+  return parseBoundedPositiveInt(
+    env.AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS,
+    30_000,
+    300_000,
+  );
 }
 
 function detectProvider(env: Record<string, string>): ProviderConfig {

@@ -5,6 +5,7 @@ import type {
   Memory,
   Session,
   MemoryProvider,
+  MemoryProviderCallOptions,
 } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -32,6 +33,11 @@ Output XML:
 
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
 import { logger } from "../logger.js";
+import {
+  getMemoryConsolidateCompressTimeoutMs,
+  resolveStageModelCallOptions,
+  resolveStageModelMetadata,
+} from "../config.js";
 
 export interface ConsolidateObservationWindow {
   windowId: string;
@@ -56,10 +62,26 @@ export interface ConsolidateObservationWindowOptions {
   minObservationsPerConcept?: number;
   maxObservationsPerWindow?: number;
   charBudget?: number;
+  model?: string;
 }
 
 function stableHash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function modelOptionsFromMemoryConsolidate(model?: string): MemoryProviderCallOptions | undefined {
+  return resolveStageModelCallOptions("memory_consolidate", model);
+}
+
+function compressWithOptions(
+  provider: MemoryProvider,
+  systemPrompt: string,
+  userPrompt: string,
+  callOptions?: MemoryProviderCallOptions,
+): Promise<string> {
+  return callOptions
+    ? provider.compress(systemPrompt, userPrompt, callOptions)
+    : provider.compress(systemPrompt, userPrompt);
 }
 
 function parseMemoryXml(
@@ -300,10 +322,18 @@ async function persistConsolidatedMemory(
 export async function runConsolidateObservationWindow(
   options: ConsolidateObservationWindowOptions,
 ): Promise<Record<string, unknown>> {
+  const startMs = Date.now();
+  const stageMetadata = resolveStageModelMetadata("memory_consolidate", options.provider, options.model);
+  const responseMetadata = (status: string, extra: Record<string, unknown> = {}) => ({
+    status,
+    ...stageMetadata,
+    durationMs: Date.now() - startMs,
+    ...extra,
+  });
   try {
     resolveOutputLanguage();
     if (!options.provider?.compress) {
-      return { success: false, error: "provider.compress is required" };
+      return { success: false, error: "provider.compress is required", ...responseMetadata("failed") };
     }
 
     const hasExplicitObservationIds = (options.observationIds?.length ?? 0) > 0;
@@ -330,6 +360,7 @@ export async function runConsolidateObservationWindow(
         consolidated: 0,
         reason: "insufficient_observations",
         totalObservations: obsGroup.length,
+        ...responseMetadata("skipped"),
       };
     }
 
@@ -347,15 +378,24 @@ export async function runConsolidateObservationWindow(
         error: "input_too_large",
         promptChars: prompt.length,
         charBudget: options.charBudget,
+        ...responseMetadata("failed", {
+          promptChars: prompt.length,
+          charBudget: options.charBudget,
+          parseFailures: 0,
+        }),
       };
     }
+    const callOptions = modelOptionsFromMemoryConsolidate(options.model);
+    const timeoutMs = getMemoryConsolidateCompressTimeoutMs();
     const response = await Promise.race([
-      options.provider.compress(
+      compressWithOptions(
+        options.provider,
         withOutputLanguagePolicy(CONSOLIDATION_SYSTEM),
         `Concept: "${concept ?? "observation-window"}"\n\nObservations:\n${prompt}`,
+        callOptions,
       ),
       new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("compress timeout")), 30_000),
+        setTimeout(() => reject(new Error(`compress timeout after ${timeoutMs}ms`)), timeoutMs),
       ),
     ]);
     const parsed = parseMemoryXml(response, sessionIds);
@@ -364,6 +404,11 @@ export async function runConsolidateObservationWindow(
         success: false,
         error: "failed to parse memory XML",
         totalObservations: sorted.length,
+        ...responseMetadata("failed", {
+          promptChars: prompt.length,
+          charBudget: options.charBudget,
+          parseFailures: 1,
+        }),
       };
     }
 
@@ -382,11 +427,16 @@ export async function runConsolidateObservationWindow(
       totalObservations: sorted.length,
       memoryIds: [persisted.memoryId],
       ...persisted,
+      ...responseMetadata("succeeded", {
+        promptChars: prompt.length,
+        charBudget: options.charBudget,
+        parseFailures: 0,
+      }),
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn("Full consolidation window failed", { error: msg });
-    return { success: false, error: msg };
+    return { success: false, error: msg, ...responseMetadata("failed") };
   }
 }
 
@@ -414,11 +464,12 @@ export function registerConsolidateFunction(
       observationIds?: string[];
       minObservations?: number;
       charBudget?: number;
+      model?: string;
     }) => runConsolidateObservationWindow({ kv, provider, ...data }),
   );
 
   sdk.registerFunction("mem::consolidate", 
-    async (data: { project?: string; minObservations?: number }) => {
+    async (data: { project?: string; minObservations?: number; model?: string }) => {
       resolveOutputLanguage();
       const minObs = data.minObservations ?? 10;
 
@@ -434,6 +485,7 @@ export function registerConsolidateFunction(
       const existingMemories = await kv.list<Memory>(KV.memories);
       const MAX_LLM_CALLS = 10;
       let llmCallCount = 0;
+      const callOptions = modelOptionsFromMemoryConsolidate(data.model);
 
       const sortedGroups = [...conceptGroups.entries()]
         .filter(([, g]) => g.length >= 3)
@@ -456,12 +508,17 @@ export function registerConsolidateFunction(
 
         try {
           const response = await Promise.race([
-            provider.compress(
+            compressWithOptions(
+              provider,
               withOutputLanguagePolicy(CONSOLIDATION_SYSTEM),
               `Concept: "${concept}"\n\nObservations:\n${prompt}`,
+              callOptions,
             ),
             new Promise<never>((_, reject) =>
-              setTimeout(() => reject(new Error("compress timeout")), 30_000),
+              setTimeout(
+                () => reject(new Error(`compress timeout after ${getMemoryConsolidateCompressTimeoutMs()}ms`)),
+                getMemoryConsolidateCompressTimeoutMs(),
+              ),
             ),
           ]);
           llmCallCount++;

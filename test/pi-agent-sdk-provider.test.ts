@@ -88,10 +88,20 @@ import { PiAgentSDKProvider } from "../src/providers/pi-agent-sdk.js";
 
 import { setGlobalDispatcher, ProxyAgent } from "undici";
 
+function restoreEnv(name: string, value: string | undefined): void {
+  if (value === undefined) {
+    delete process.env[name];
+  } else {
+    process.env[name] = value;
+  }
+}
+
 describe("PiAgentSDKProvider", () => {
   const originalHttpsProxy = process.env.HTTPS_PROXY;
   const originalHttpProxy = process.env.HTTP_PROXY;
   const originalAllProxy = process.env.ALL_PROXY;
+  const originalNodeUseEnvProxy = process.env.NODE_USE_ENV_PROXY;
+  const originalPiAgentModel = process.env.PI_AGENT_MODEL;
 
   beforeEach(() => {
     state.authCalls = 0;
@@ -116,9 +126,11 @@ describe("PiAgentSDKProvider", () => {
   });
 
   afterEach(() => {
-    process.env.HTTPS_PROXY = originalHttpsProxy;
-    process.env.HTTP_PROXY = originalHttpProxy;
-    process.env.ALL_PROXY = originalAllProxy;
+    restoreEnv("HTTPS_PROXY", originalHttpsProxy);
+    restoreEnv("HTTP_PROXY", originalHttpProxy);
+    restoreEnv("ALL_PROXY", originalAllProxy);
+    restoreEnv("NODE_USE_ENV_PROXY", originalNodeUseEnvProxy);
+    restoreEnv("PI_AGENT_MODEL", originalPiAgentModel);
   });
 
   it("forwards caller system/user prompts and keeps context payload clean", async () => {
@@ -154,7 +166,7 @@ describe("PiAgentSDKProvider", () => {
     expect(state.codexCalls).toHaveLength(2);
   });
 
-  it("uses the proxy dispatcher when proxy env is set and forces NODE_USE_ENV_PROXY", async () => {
+  it("uses the proxy dispatcher and forces env proxy when proxy env is set", async () => {
     process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
     const provider = new PiAgentSDKProvider();
     const out = await provider.summarize("sys", "prompt");
@@ -162,6 +174,34 @@ describe("PiAgentSDKProvider", () => {
     expect(process.env.NODE_USE_ENV_PROXY).toBe("1");
     expect(setGlobalDispatcher).toHaveBeenCalledWith(expect.objectContaining({ url: process.env.HTTPS_PROXY }));
     expect(ProxyAgent).toHaveBeenCalledWith(process.env.HTTPS_PROXY);
+  });
+
+  it("uses per-call model and maxTokens options without changing defaults or model env", async () => {
+    process.env.PI_AGENT_MODEL = "env-model";
+    const provider = new PiAgentSDKProvider("gpt-5.4", 512);
+    const modelEnvBefore = process.env.PI_AGENT_MODEL;
+
+    await provider.summarize("sys", "override prompt", {
+      model: "gpt-5.5-stage",
+      maxTokens: 777,
+      modelSource: "explicitModel",
+    });
+    state.textEvents = [{ type: "text_delta", text_delta: "default result" }];
+    await provider.summarize("sys", "default prompt");
+
+    expect(state.modelFindCalls[0]).toEqual(["openai-codex", "gpt-5.5-stage"]);
+    expect(state.modelFindCalls[1]).toEqual(["openai-codex", "gpt-5.4"]);
+    expect(state.codexCalls[0].model).toEqual({
+      provider: "openai-codex",
+      model: "gpt-5.5-stage",
+    });
+    expect(state.codexCalls[0].options).toMatchObject({ maxTokens: 777 });
+    expect(state.codexCalls[1].model).toEqual({
+      provider: "openai-codex",
+      model: "gpt-5.4",
+    });
+    expect(state.codexCalls[1].options).toMatchObject({ maxTokens: 512 });
+    expect(process.env.PI_AGENT_MODEL).toBe(modelEnvBefore);
   });
 
   it("maps model fallback from ModelRegistry.find to pi_model_not_found", async () => {

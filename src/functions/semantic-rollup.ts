@@ -14,9 +14,13 @@ import {
   SEMANTIC_MERGE_SYSTEM,
 } from "../prompts/consolidation.js";
 import { withOutputLanguagePolicy } from "../prompts/output-language.js";
+import {
+  getSemanticRollupMaxPromptChars,
+  resolveStageModelCallOptions,
+  resolveStageModelMetadata,
+} from "../config.js";
 
 const MAX_ROLLUP_SOURCE_IDS = 100;
-const MAX_ROLLUP_PROMPT_CHARS = 24_000;
 
 interface SemanticRollupInput {
   runId?: unknown;
@@ -25,6 +29,7 @@ interface SemanticRollupInput {
   kind?: unknown;
   sessionIds?: unknown;
   semanticMemoryIds?: unknown;
+  model?: unknown;
 }
 
 function asTrimmedString(value: unknown): string | null {
@@ -105,6 +110,7 @@ export function registerSemanticRollupFunction(
   provider: MemoryProvider,
 ): void {
   sdk.registerFunction("mem::semantic-rollup", async (data: SemanticRollupInput) => {
+    const startMs = Date.now();
     const runId = asTrimmedString(data?.runId);
     const windowId = asTrimmedString(data?.windowId);
     const mark = asTrimmedString(data?.mark);
@@ -193,10 +199,27 @@ export function registerSemanticRollupFunction(
     });
 
     const prompt = buildWindowPrompt(summaries);
-    if (prompt.length > MAX_ROLLUP_PROMPT_CHARS) {
+    const charBudget = getSemanticRollupMaxPromptChars();
+    const stageMetadata = resolveStageModelMetadata(
+      "semantic_rollup",
+      provider,
+      asTrimmedString(data.model) ?? undefined,
+    );
+    const responseMetadata = (status: string, extra: Record<string, unknown> = {}) => ({
+      status,
+      ...stageMetadata,
+      promptChars: prompt.length,
+      charBudget,
+      durationMs: Date.now() - startMs,
+      parseFailures: 0,
+      ...extra,
+    });
+    if (prompt.length > charBudget) {
       return failureDetails("input_too_large", runId, windowId, mark, kind, inputHash, {
         promptChars: prompt.length,
-        maxPromptChars: MAX_ROLLUP_PROMPT_CHARS,
+        maxPromptChars: charBudget,
+        charBudget,
+        ...responseMetadata("failed"),
       });
     }
 
@@ -216,30 +239,34 @@ export function registerSemanticRollupFunction(
           existingMemories.map((memory) => [memory.id, memory.fact.length]),
         ),
         inputHash,
+        ...responseMetadata("succeeded", { reused: true }),
         facts: existingMemories.map((memory) => ({
           fact: memory.fact,
           confidence: memory.confidence,
         })),
-        reused: true,
       };
     }
 
     let response: string;
     try {
-      response = await provider.summarize(
-        withOutputLanguagePolicy(
-          SEMANTIC_MERGE_SYSTEM,
-          undefined,
-          { semantic: [...(SEMANTIC_MERGE_OUTPUT_CONTRACT.semantic ?? [])] },
-        ),
-        prompt,
+      const systemPrompt = withOutputLanguagePolicy(
+        SEMANTIC_MERGE_SYSTEM,
+        undefined,
+        { semantic: [...(SEMANTIC_MERGE_OUTPUT_CONTRACT.semantic ?? [])] },
       );
+      const callOptions = resolveStageModelCallOptions(
+        "semantic_rollup",
+        asTrimmedString(data.model) ?? undefined,
+      );
+      response = callOptions
+        ? await provider.summarize(systemPrompt, prompt, callOptions)
+        : await provider.summarize(systemPrompt, prompt);
     } catch {
-      return failureDetails("provider_error", runId, windowId, mark, kind, inputHash);
+      return failureDetails("provider_error", runId, windowId, mark, kind, inputHash, responseMetadata("failed"));
     }
     const facts = parseFactResponse(response);
     if (facts.length === 0) {
-      return failureDetails("empty_facts", runId, windowId, mark, kind, inputHash);
+      return failureDetails("empty_facts", runId, windowId, mark, kind, inputHash, responseMetadata("failed", { parseFailures: 1 }));
     }
 
     const now = new Date().toISOString();
@@ -301,6 +328,7 @@ export function registerSemanticRollupFunction(
         memories.map((memory) => [memory.id, memory.fact.length]),
       ),
       inputHash,
+      ...responseMetadata("succeeded"),
       facts,
     };
   });

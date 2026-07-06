@@ -85,16 +85,16 @@ function makeObs(i: number, sessionId: string): CompressedObservation {
 }
 
 function makeProvider(responses: string[]): MemoryProvider & {
-  calls: Array<{ system: string; user: string }>;
+  calls: Array<{ system: string; user: string; options: unknown }>;
 } {
-  const calls: Array<{ system: string; user: string }> = [];
+  const calls: Array<{ system: string; user: string; options: unknown }> = [];
   let i = 0;
   return {
     name: "test",
     calls,
     compress: async () => "",
-    summarize: async (system: string, user: string) => {
-      calls.push({ system, user });
+    summarize: async (system: string, user: string, options?: unknown) => {
+      calls.push({ system, user, options });
       const r = responses[i] ?? responses[responses.length - 1];
       i += 1;
       return r;
@@ -153,6 +153,7 @@ describe("mem::summarize chunking", () => {
     delete process.env.SUMMARIZE_CHUNK_SIZE;
     delete process.env.SUMMARIZE_CHUNK_CONCURRENCY;
     delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+    delete process.env.AGENTMEMORY_SUMMARY_MODEL;
   });
 
   afterEach(() => {
@@ -181,6 +182,42 @@ describe("mem::summarize chunking", () => {
     expect(provider.calls[0].user).toContain("Session observations (10 total)");
     const stored: any = await kv.get("summaries", "ses_small");
     expect(stored?.title).toBe("Small session");
+  });
+
+  it("passes resolved summary stage model options to provider calls", async () => {
+    process.env.AGENTMEMORY_SUMMARY_MODEL = "summary-stage-model";
+    const provider = makeProvider([
+      summaryXml({
+        title: "Routed session",
+        decisions: ["decision A"],
+        files: ["src/a.ts"],
+        concepts: ["concept-a"],
+      }),
+    ]);
+    provider.name = "pi-agent-sdk";
+    const { handler } = await setupHandler({
+      sessionId: "ses_model",
+      obsCount: 10,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_model" });
+
+    expect(result.success).toBe(true);
+    expect(provider.calls[0].options).toEqual({
+      model: "summary-stage-model",
+      modelSource: "AGENTMEMORY_SUMMARY_MODEL",
+    });
+    expect(result).toMatchObject({
+      stage: "summary",
+      model: "summary-stage-model",
+      modelSource: "AGENTMEMORY_SUMMARY_MODEL",
+      provider: "pi-agent-sdk",
+      modelApplied: true,
+      parseFailures: 0,
+    });
+    expect(result.promptChars).toBeGreaterThan(0);
+    expect(result.durationMs).toBeGreaterThanOrEqual(0);
   });
 
   it("large session map-reduces: N chunk calls + 1 reduce call", async () => {

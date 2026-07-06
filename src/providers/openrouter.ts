@@ -1,4 +1,4 @@
-import type { MemoryProvider } from "../types.js";
+import type { MemoryProvider, MemoryProviderCallOptions } from "../types.js";
 import { fetchWithTimeout } from "./_fetch.js";
 
 export class OpenRouterProvider implements MemoryProvider {
@@ -21,11 +21,19 @@ export class OpenRouterProvider implements MemoryProvider {
     this.name = baseUrl.includes("openrouter") ? "openrouter" : "gemini";
   }
 
-  async compress(systemPrompt: string, userPrompt: string): Promise<string> {
+  async compress(
+    systemPrompt: string,
+    userPrompt: string,
+    _options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     return this.call(systemPrompt, userPrompt);
   }
 
-  async summarize(systemPrompt: string, userPrompt: string): Promise<string> {
+  async summarize(
+    systemPrompt: string,
+    userPrompt: string,
+    _options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     return this.call(systemPrompt, userPrompt);
   }
 

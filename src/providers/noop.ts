@@ -1,4 +1,4 @@
-import type { MemoryProvider } from "../types.js";
+import type { MemoryProvider, MemoryProviderCallOptions } from "../types.js";
 
 /**
  * Returns empty strings for every call. Used when no LLM API key is set
@@ -10,11 +10,19 @@ import type { MemoryProvider } from "../types.js";
 export class NoopProvider implements MemoryProvider {
   name = "noop";
 
-  async compress(): Promise<string> {
+  async compress(
+    _systemPrompt?: string,
+    _userPrompt?: string,
+    _options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     return "";
   }
 
-  async summarize(): Promise<string> {
+  async summarize(
+    _systemPrompt?: string,
+    _userPrompt?: string,
+    _options?: MemoryProviderCallOptions,
+  ): Promise<string> {
     return "";
   }
 }

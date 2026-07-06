@@ -5,6 +5,7 @@ import type {
   SessionSummary,
   Memory,
   MemoryProvider,
+  MemoryProviderCallOptions,
 } from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
@@ -24,7 +25,12 @@ import {
   type ParsedSemanticFact,
 } from "../prompts/facts.js";
 import { recordAudit } from "./audit.js";
-import { getConsolidationDecayDays, isConsolidationEnabled } from "../config.js";
+import {
+  getConsolidationDecayDays,
+  isConsolidationEnabled,
+  resolveStageModelCallOptions,
+  resolveStageModelMetadata,
+} from "../config.js";
 import { logger } from "../logger.js";
 
 export interface ConsolidationProceduralWindow {
@@ -39,6 +45,7 @@ export interface ConsolidationProceduralWindowOptions {
   memoryIds?: string[];
   project?: string;
   maxItemsPerWindow?: number;
+  model?: string;
 }
 
 function hasChinese(input: string): boolean {
@@ -54,6 +61,17 @@ function buildSemanticRetryContractPrompt(): string {
     SEMANTIC_MERGE_OUTPUT_CONTRACT.semantic?.[0] ?? "每个 <fact> 内容必须使用简体中文。",
     "若仍有非中文 fact，先保留语义与关键技术名词，再补充可读中文句子；保持 XML 与属性不变。",
   ].join("\n");
+}
+
+function summarizeWithOptions(
+  provider: MemoryProvider,
+  systemPrompt: string,
+  userPrompt: string,
+  callOptions?: MemoryProviderCallOptions,
+): Promise<string> {
+  return callOptions
+    ? provider.summarize(systemPrompt, userPrompt, callOptions)
+    : provider.summarize(systemPrompt, userPrompt);
 }
 
 function applyDecay(
@@ -122,11 +140,14 @@ async function extractProceduralMemories(
   kv: StateKV,
   provider: MemoryProvider,
   patterns: Array<{ content: string; frequency: number }>,
+  callOptions?: MemoryProviderCallOptions,
 ): Promise<{ newProcedures: number; patternsAnalyzed: number; proceduralMemoryIds: string[] }> {
   const prompt = buildProceduralExtractionPrompt(patterns);
-  const response = await provider.summarize(
+  const response = await summarizeWithOptions(
+    provider,
     withOutputLanguagePolicy(PROCEDURAL_EXTRACTION_SYSTEM),
     prompt,
+    callOptions,
   );
 
   const procRegex =
@@ -182,10 +203,18 @@ async function extractProceduralMemories(
 export async function runConsolidationProceduralWindow(
   options: ConsolidationProceduralWindowOptions,
 ): Promise<Record<string, unknown>> {
+  const startMs = Date.now();
+  const stageMetadata = resolveStageModelMetadata("memory_consolidate", options.provider, options.model);
+  const responseMetadata = (status: string, extra: Record<string, unknown> = {}) => ({
+    status,
+    ...stageMetadata,
+    durationMs: Date.now() - startMs,
+    ...extra,
+  });
   try {
     resolveOutputLanguage();
     if (!options.provider?.summarize) {
-      return { success: false, error: "provider.summarize is required" };
+      return { success: false, error: "provider.summarize is required", ...responseMetadata("failed") };
     }
     const allMemories = await options.kv.list<Memory>(KV.memories);
     const selectedIds = new Set(options.memoryIds ?? []);
@@ -207,15 +236,29 @@ export async function runConsolidationProceduralWindow(
         skipped: true,
         reason: "fewer than 2 recurring patterns",
         patternsAnalyzed: patterns.length,
+        ...responseMetadata("skipped", { parseFailures: 0 }),
       };
     }
 
-    const result = await extractProceduralMemories(options.kv, options.provider, patterns);
-    return { success: true, ...result };
+    const promptChars = buildProceduralExtractionPrompt(patterns).length;
+    const result = await extractProceduralMemories(
+      options.kv,
+      options.provider,
+      patterns,
+      resolveStageModelCallOptions("memory_consolidate", options.model),
+    );
+    return {
+      success: true,
+      ...result,
+      ...responseMetadata("succeeded", {
+        promptChars,
+        parseFailures: result.proceduralMemoryIds.length > 0 ? 0 : 1,
+      }),
+    };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error("Full procedural extraction failed", { error: msg });
-    return { success: false, error: msg };
+    return { success: false, error: msg, ...responseMetadata("failed") };
   }
 }
 
@@ -232,19 +275,28 @@ export function registerConsolidationPipelineFunction(
 
   sdk.registerFunction(
     "mem::full-consolidation-procedural-window",
-    async (data: { project?: string; memoryIds?: string[]; maxItemsPerWindow?: number }) =>
+    async (data: {
+      project?: string;
+      memoryIds?: string[];
+      maxItemsPerWindow?: number;
+      model?: string;
+    }) =>
       runConsolidationProceduralWindow({ kv, provider, ...data }),
   );
 
   sdk.registerFunction("mem::consolidate-pipeline", 
-    async (data?: { tier?: string; force?: boolean; project?: string }) => {
+    async (data?: { tier?: string; force?: boolean; project?: string; model?: string }) => {
       resolveOutputLanguage();
       if (!data?.force && !isConsolidationEnabled()) {
         return { success: false, skipped: true, reason: "Consolidation disabled: set CONSOLIDATION_ENABLED=true or configure an LLM provider (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY / MINIMAX_API_KEY / OPENAI_BASE_URL / AGENTMEMORY_PROVIDER=agent-sdk)" };
       }
       const tier = data?.tier || "all";
-    const decayDays = getConsolidationDecayDays();
-    const results: Record<string, unknown> = {};
+      const decayDays = getConsolidationDecayDays();
+      const results: Record<string, unknown> = {};
+      const callOptions = resolveStageModelCallOptions(
+        "memory_consolidate",
+        data?.model,
+      );
 
       if (tier === "all" || tier === "semantic") {
         const summaries = await kv.list<SessionSummary>(KV.summaries);
@@ -283,7 +335,7 @@ export function registerConsolidationPipelineFunction(
             };
 
             let parsedResult = parseResponse(
-              await provider.summarize(baseSystem, prompt),
+              await summarizeWithOptions(provider, baseSystem, prompt, callOptions),
             );
 
             if (outputLanguage === "zh-CN" && parsedResult.languageViolations.length > 0) {
@@ -301,7 +353,9 @@ export function registerConsolidationPipelineFunction(
                 },
               );
               try {
-                parsedResult = parseResponse(await provider.summarize(strictSystem, prompt));
+                parsedResult = parseResponse(
+                  await summarizeWithOptions(provider, strictSystem, prompt, callOptions),
+                );
               } catch (retryErr) {
                 logger.warn("Semantic merge retry failed; keep first extraction", {
                   error: retryErr instanceof Error ? retryErr.message : String(retryErr),
@@ -388,7 +442,12 @@ export function registerConsolidationPipelineFunction(
 
         if (patterns.length >= 2) {
           try {
-            results.procedural = await extractProceduralMemories(kv, provider, patterns);
+            results.procedural = await extractProceduralMemories(
+              kv,
+              provider,
+              patterns,
+              callOptions,
+            );
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Procedural extraction failed", { error: msg });
