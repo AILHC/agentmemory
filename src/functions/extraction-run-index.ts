@@ -186,6 +186,7 @@ export function registerExtractionRunIndexFunction(
   sdk.registerFunction("mem::extraction-run-record", async (data: ExtractionRunRecordInput) => {
     const rawData = (data ?? {}) as Record<string, unknown>;
     for (const key of Object.keys(rawData)) {
+      if (key.startsWith("_")) continue;
       if (!allowedRecordInputKeys.has(key)) {
         return { success: false, error: `unsupported extraction run record field: ${key}` };
       }

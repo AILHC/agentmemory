@@ -165,6 +165,20 @@ describe("mem::extraction-run-record", () => {
     expect(stored).toBeNull();
   });
 
+  it("ignores iii runtime metadata fields injected into trigger payloads", async () => {
+    const result = (await sdk.trigger("mem::extraction-run-record", {
+      runId: "run-runtime-meta",
+      mark: "full-v1",
+      summarySessionId: "ses-a",
+      _caller_worker_id: "worker-a",
+    })) as { success: boolean; run: ExtractionRunIndex };
+
+    expect(result.success).toBe(true);
+    expect(result.run.summarySessionIds).toEqual(["ses-a"]);
+    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-runtime-meta");
+    expect(stored?.summarySessionIds).toEqual(["ses-a"]);
+  });
+
   it("accumulates generic stage records with deduplicated source and result ids", async () => {
     await sdk.trigger("mem::extraction-run-record", {
       runId: "run-stages",
