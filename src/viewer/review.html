@@ -377,6 +377,7 @@
           observations: 'filters',
           tabById: {},
         },
+        composingFilterKey: '',
         filters: {},
         pages: {},
       };
@@ -1063,6 +1064,37 @@
       function renderSearch(key, placeholder) {
         return '<div class="pane-tools"><input class="search" data-ui="filter" data-key="' + attr(key) + '" type="search" placeholder="' + attr(placeholder) + '" value="' + attr(store.filters[key] || '') + '"></div>';
       }
+      function restoreFilterFocus(key, start, end) {
+        var inputs = document.querySelectorAll('input[data-ui="filter"]');
+        for (var i = 0; i < inputs.length; i++) {
+          var input = inputs[i];
+          if (input.getAttribute('data-key') !== key) continue;
+          if (typeof input.focus === 'function') input.focus();
+          if (typeof input.setSelectionRange === 'function' && start != null && end != null) {
+            input.setSelectionRange(start, end);
+          }
+          return;
+        }
+      }
+      function renderAfterFilterChange(key, selectionStart, selectionEnd) {
+        store.pages[key] = 0;
+        if (key === 'sessions') {
+          renderSessionListPaneOnly();
+        } else if (key === 'observations' || key.indexOf('session-content:') === 0) {
+          if (store.activeTab === 'sessions') {
+            renderSessionContentPaneOnly();
+            renderSessionDetailPaneOnly();
+          }
+          if (store.activeTab === 'observations') renderObservationListPaneOnly();
+        } else if (store.activeTab === 'sessions') {
+          renderSessionContentPaneOnly();
+          renderSessionDetailPaneOnly();
+        } else {
+          renderTabListPaneOnly(store.activeTab);
+          renderTabDetailPaneOnly(store.activeTab);
+        }
+        restoreFilterFocus(key, selectionStart, selectionEnd);
+      }
       function renderSessionRow(s) {
         var id = idOf(s);
         return '<button type="button" class="row ' + (id === store.selected.sessionId ? 'active' : '') + '" data-ui="select-session" data-id="' + attr(id) + '">' +
@@ -1597,23 +1629,25 @@
         var target = e.target instanceof Element ? e.target.closest('[data-ui="filter"]') : null;
         if (!target) return;
         var key = target.getAttribute('data-key') || '';
+        var selectionStart = target.selectionStart;
+        var selectionEnd = target.selectionEnd;
         store.filters[key] = target.value || '';
-        store.pages[key] = 0;
-        if (key === 'sessions') {
-          renderSessionListPaneOnly();
-        } else if (key === 'observations' || key.indexOf('session-content:') === 0) {
-          if (store.activeTab === 'sessions') {
-            renderSessionContentPaneOnly();
-            renderSessionDetailPaneOnly();
-          }
-          if (store.activeTab === 'observations') renderObservationListPaneOnly();
-        } else if (store.activeTab === 'sessions') {
-          renderSessionContentPaneOnly();
-          renderSessionDetailPaneOnly();
-        } else {
-          renderTabListPaneOnly(store.activeTab);
-          renderTabDetailPaneOnly(store.activeTab);
-        }
+        if (store.composingFilterKey === key || e.isComposing) return;
+        renderAfterFilterChange(key, selectionStart, selectionEnd);
+      });
+      document.addEventListener('compositionstart', function(e) {
+        var target = e.target instanceof Element ? e.target.closest('[data-ui="filter"]') : null;
+        if (!target) return;
+        store.composingFilterKey = target.getAttribute('data-key') || '';
+      });
+      document.addEventListener('compositionend', function(e) {
+        var target = e.target instanceof Element ? e.target.closest('[data-ui="filter"]') : null;
+        if (!target) return;
+        var key = target.getAttribute('data-key') || '';
+        store.composingFilterKey = '';
+        store.filters[key] = target.value || '';
+        var position = target.value ? target.value.length : 0;
+        renderAfterFilterChange(key, position, position);
       });
       window.addEventListener('resize', function() {
         clearTimeout(store.resizeTimer);

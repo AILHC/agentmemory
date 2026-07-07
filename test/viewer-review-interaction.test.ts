@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import * as vm from "node:vm";
 import { renderViewerDocument } from "../src/viewer/document.js";
 
-type Listener = (event: { type: string; target: MockElement }) => void;
+type Listener = (event: { type: string; target: MockElement; isComposing?: boolean }) => void;
 
 type ParsedTag = {
   tag: string;
@@ -46,19 +46,23 @@ function escapeRegExp(value: string): string {
 
 class MockElement {
   id = "";
+  tagName = "";
   textContent = "";
   value = "";
   className = "";
   scrollTop = 0;
+  selectionStart: number | null = null;
+  selectionEnd: number | null = null;
   parent: MockElement | null = null;
   private attrs = new Map<string, string>();
   private listeners = new Map<string, Listener[]>();
   private html = "";
   private readonly document: MockDocument;
 
-  constructor(document: MockDocument, id = "") {
+  constructor(document: MockDocument, id = "", tagName = "") {
     this.document = document;
     this.id = id;
+    this.tagName = tagName;
   }
 
   set _rawHtml(value: string) {
@@ -119,6 +123,9 @@ class MockElement {
   }
 
   matches(selector: string): boolean {
+    if (selector === 'input[data-ui="filter"]') {
+      return this.tagName.toLowerCase() === "input" && this.attrs.get("data-ui") === "filter";
+    }
     if (selector === "[data-ui]") {
       return this.attrs.has("data-ui");
     }
@@ -135,9 +142,12 @@ class MockElement {
 
   querySelectorAll(selector: string): MockElement[] {
     const all = parseTags(this.html).map((node) => {
-      const element = new MockElement(this.document);
+      const element = new MockElement(this.document, "", node.tag);
       element.parent = this;
       element.setParsedAttributes(node.attrs);
+      element.value = node.attrs.get("value") || "";
+      element.selectionStart = element.value.length;
+      element.selectionEnd = element.value.length;
       return element;
     }).filter((node) => node.matches(selector));
     return all;
@@ -146,9 +156,19 @@ class MockElement {
   querySelector(selector: string): MockElement | null {
     return this.querySelectorAll(selector)[0] || null;
   }
+
+  focus(): void {
+    this.document.activeElement = this;
+  }
+
+  setSelectionRange(start: number, end: number): void {
+    this.selectionStart = start;
+    this.selectionEnd = end;
+  }
 }
 
 class MockDocument {
+  activeElement: MockElement | null = null;
   private readonly nodes = new Map<string, MockElement>();
   private readonly listeners = new Map<string, Listener[]>();
 
@@ -168,9 +188,17 @@ class MockDocument {
     this.listeners.set(type, list);
   }
 
-  dispatchEvent(type: string, target: MockElement): void {
+  dispatchEvent(type: string, target: MockElement, extra: { isComposing?: boolean } = {}): void {
     const list = this.listeners.get(type) || [];
-    list.forEach((listener) => listener({ type, target }));
+    list.forEach((listener) => listener({ type, target, ...extra }));
+  }
+
+  querySelectorAll(selector: string): MockElement[] {
+    const all: MockElement[] = [];
+    this.nodes.forEach((node) => {
+      all.push(...node.querySelectorAll(selector));
+    });
+    return all;
   }
 
   syncIdsFromHtml(container: MockElement, html: string): void {
@@ -179,6 +207,7 @@ class MockDocument {
       if (!id) return;
       const current = this.nodes.get(id);
       const next = current || new MockElement(this, id);
+      next.tagName = node.tag;
       next.parent = container;
       next.setParsedAttributes(node.attrs);
       const escapedId = escapeRegExp(id);
@@ -416,6 +445,37 @@ async function waitFor(predicate: () => boolean, attempts = 20): Promise<void> {
 }
 
 describe("review viewer interaction", () => {
+  it("keeps search inputs stable while composing IME text", async () => {
+    const { document } = createReviewSandbox();
+
+    await flushPromises();
+    await waitFor(() => !String(document.getElementById("app")?.innerHTML).includes("Loading sessions..."));
+    const beforeRows = document.getElementById("session-list-rows")?.innerHTML || "";
+    expect(beforeRows).toContain("first prompt");
+
+    const sessionSearch = document.querySelectorAll('input[data-ui="filter"]')
+      .find((input) => input.getAttribute("data-key") === "sessions");
+    expect(sessionSearch).toBeTruthy();
+    if (!sessionSearch) throw new Error("session search input missing");
+
+    sessionSearch.value = "中文";
+    sessionSearch.selectionStart = 2;
+    sessionSearch.selectionEnd = 2;
+
+    document.dispatchEvent("compositionstart", sessionSearch);
+    document.dispatchEvent("input", sessionSearch, { isComposing: true });
+
+    expect(document.getElementById("session-list-rows")?.innerHTML).toBe(beforeRows);
+
+    document.dispatchEvent("compositionend", sessionSearch);
+
+    const focusedSearch = document.activeElement;
+    expect(focusedSearch?.getAttribute("data-key")).toBe("sessions");
+    expect(focusedSearch?.value).toBe("中文");
+    expect(focusedSearch?.selectionStart).toBe(2);
+    expect(document.getElementById("session-list-rows")?.innerHTML).toContain("No sessions");
+  });
+
   it("uses backend session-stats and keeps interactions pane-local without re-rendering unrelated panes", async () => {
     const { document, renderEvents, api, sandbox } = createReviewSandbox();
 
