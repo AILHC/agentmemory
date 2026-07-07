@@ -172,6 +172,64 @@
     .detail h3 { margin: 0 0 10px; font-size: 16px; }
     .section { margin-top: 14px; }
     .section-title { font-weight: 700; font-size: 12px; text-transform: uppercase; color: var(--ink-muted); letter-spacing: 0.05em; margin-bottom: 7px; }
+    .detail-primary {
+      margin-top: 14px;
+      border: 1px solid #bae6fd;
+      background: #f0f9ff;
+      border-radius: 6px;
+      padding: 14px;
+    }
+    .detail-primary .section-title { color: #075985; }
+    .detail-secondary {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(220px, 0.8fr);
+      gap: 14px;
+      align-items: start;
+    }
+    .detail-drawer-root:empty { display: none; }
+    .detail-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      background: rgba(15, 23, 42, 0.24);
+      display: flex;
+      justify-content: flex-end;
+    }
+    .detail-drawer {
+      width: min(760px, 56vw);
+      height: 100%;
+      background: #fff;
+      border-left: 1px solid var(--border);
+      box-shadow: -18px 0 40px rgba(15, 23, 42, 0.18);
+      display: flex;
+      flex-direction: column;
+      min-width: 520px;
+    }
+    .detail-drawer-head {
+      min-height: 64px;
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border-light);
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 14px;
+      background: var(--panel-soft);
+      flex-shrink: 0;
+    }
+    .detail-drawer-title { margin: 0; font-size: 18px; line-height: 1.25; }
+    .detail-drawer-sub { margin-top: 5px; color: var(--ink-muted); font-size: 12px; }
+    .icon-button {
+      width: 34px;
+      height: 34px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: #fff;
+      color: var(--ink);
+      cursor: pointer;
+      font: 700 18px/1 var(--ui);
+      flex-shrink: 0;
+    }
+    .detail-drawer-body { padding: 18px; overflow: auto; min-height: 0; }
     .text-block {
       white-space: pre-wrap;
       overflow-wrap: anywhere;
@@ -223,6 +281,8 @@
       .grid.sessions, .grid.two-col { grid-template-columns: 1fr; }
       .grid { overflow: auto; }
       .pane { min-height: 300px; max-height: none; }
+      .detail-drawer { width: 100vw; min-width: 0; }
+      .detail-secondary { grid-template-columns: 1fr; }
       .topbar { height: auto; padding: 16px; align-items: flex-start; flex-direction: column; }
       .brand { min-width: 0; }
       .top-tabs { width: 100%; flex-wrap: wrap; overflow-x: visible; }
@@ -249,6 +309,7 @@
     </header>
     <div class="status-line" id="status-line">Loading data...</div>
     <main class="viewer-body" id="app"></main>
+    <div class="detail-drawer-root" id="detail-drawer-root"></div>
   </div>
 
   <script nonce="__AGENTMEMORY_VIEWER_NONCE__">
@@ -698,7 +759,9 @@
 
         if (category === 'summary') {
           var summary = sessionSummaryForSession(session);
-          pane.innerHTML += '<div class="list" id="session-content-list">' + renderSummaryDetail(summary) + '</div>';
+          var summaryKey = 'session-content:' + sid + ':summary';
+          pane.innerHTML += '<div class="list" id="session-content-list"><div class="pane-sub">Count: 1</div>' +
+            renderItemList(summaryKey, [summary], 'summaries', true) + '</div>';
           return;
         }
 
@@ -731,14 +794,12 @@
           selectedId = idOf(filtered[0]);
           store.selected.itemByTab[category] = selectedId;
         }
-        var selected = filtered.find(function(item) { return idOf(item) === selectedId; }) || filtered[0] || null;
         var countForTotal = sessionCategoryCount(session, category);
         var countText = countForTotal === null ? '...' : countForTotal < 0 ? '!' : String(countForTotal);
         var total = countForTotal != null && countForTotal >= 0 ? countForTotal : filtered.length;
         pane.innerHTML += '<div class="list" id="session-content-list"><div class="pane-sub">Count: ' + esc(countText) + '</div>' + renderSearch(key, 'Filter current category') +
           (filtered.length ? renderItemList(key, listItems, category, true) : renderEmpty('No items')) + '</div>' +
-          pagerHtml(key, total) +
-          '<div class="detail">' + (selected ? renderDetail(selected, category) : renderEmpty('No item selected')) + '</div>';
+          pagerHtml(key, total);
       }
 
       function renderTabListPaneOnly(tab) {
@@ -1001,6 +1062,13 @@
         if (item.observationCount != null) badges.push(countBadge('observations', item.observationCount, ''));
         return badges.length ? '<div class="badge-row">' + badges.join('') + '</div>' : '';
       }
+      function renderPrimarySection(label, content) {
+        return '<div class="detail-primary"><div class="section-title">' + esc(label || 'Primary') + '</div>' +
+          renderTextBlock(content, 'No primary content') + '</div>';
+      }
+      function renderMetaSection(rows) {
+        return '<div class="section"><div class="section-title">Metadata</div>' + renderFieldRows(rows) + '</div>';
+      }
       function renderDetail(item, type) {
         if (!item) return renderEmpty('No detail');
         if (type === 'summaries') return renderSummaryDetail(item);
@@ -1014,103 +1082,124 @@
       }
       function renderSummaryDetail(item) {
         return '<article class="detail"><h3>' + esc(itemTitle(item, 'summaries')) + '</h3>' +
-          '<div class="section"><div class="section-title">Summary</div>' +
-          renderFieldRows([
+          renderPrimarySection('Summary', item.narrative || item.summary || item.title || '') +
+          '<div class="detail-secondary"><div>' +
+          renderMetaSection([
             ['title', item.title],
-            ['narrative', item.narrative],
+            ['createdAt', item.createdAt],
+            ['updatedAt', item.updatedAt],
+            ['observationCount', item.observationCount],
+          ]) +
+          '</div><div>' +
+          '<div class="section"><div class="section-title">Supporting Fields</div>' +
+          renderFieldRows([
             ['keyDecisions', item.keyDecisions, true],
             ['filesModified', item.filesModified, true],
             ['concepts', item.concepts, true],
-          ]) + '</div>' +
+          ]) + '</div></div></div>' +
           renderSourceSection(item) +
           renderRaw(item) + '</article>';
       }
       function renderObservationDetail(item) {
         return '<article class="detail"><h3>' + esc(itemTitle(item, 'observations')) + '</h3>' +
-          '<div class="section"><div class="section-title">Observation</div>' +
-          renderFieldRows([
+          renderPrimarySection('Observation Narrative', item.narrative || item.title || item.subtitle || '') +
+          '<div class="detail-secondary"><div>' +
+          renderMetaSection([
             ['title', item.title],
             ['subtitle', item.subtitle],
             ['type', item.type],
-            ['narrative', item.narrative],
-            ['facts', item.facts, true],
-            ['concepts', item.concepts, true],
-            ['files', item.files, true],
             ['importance', item.importance],
             ['confidence', item.confidence],
             ['timestamp', item.timestamp],
-          ]) + '</div>' +
+          ]) +
+          '</div><div>' +
+          '<div class="section"><div class="section-title">Extracted Signals</div>' +
+          renderFieldRows([
+            ['facts', item.facts, true],
+            ['concepts', item.concepts, true],
+            ['files', item.files, true],
+          ]) + '</div></div></div>' +
           renderSourceSection(item) +
           renderRaw(item) + '</article>';
       }
       function renderSemanticDetail(item) {
         return '<article class="detail"><h3>' + esc(itemTitle(item, 'semantic')) + '</h3>' +
-          '<div class="section"><div class="section-title">Semantic Memory</div>' +
-          renderFieldRows([
-            ['fact', item.fact],
+          renderPrimarySection('Semantic Fact', item.fact || '') +
+          renderMetaSection([
             ['confidence', item.confidence],
-            ['sourceSessionIds', item.sourceSessionIds, true],
-            ['sourceMemoryIds', item.sourceMemoryIds, true],
-            ['extractionRunId', item.extractionRunId],
-            ['extractionWindowId', item.extractionWindowId],
             ['strength', item.strength],
             ['accessCount', item.accessCount],
             ['createdAt', item.createdAt],
             ['updatedAt', item.updatedAt],
+          ]) +
+          '<div class="section"><div class="section-title">Extraction</div>' +
+          renderFieldRows([
+            ['sourceSessionIds', item.sourceSessionIds, true],
+            ['sourceMemoryIds', item.sourceMemoryIds, true],
+            ['extractionRunId', item.extractionRunId],
+            ['extractionWindowId', item.extractionWindowId],
           ]) + '</div>' +
           renderSourceSection(item) +
           renderRaw(item) + '</article>';
       }
       function renderLessonDetail(item) {
         return '<article class="detail"><h3>' + esc(itemTitle(item, 'lessons')) + '</h3>' +
-          '<div class="section"><div class="section-title">Lesson</div>' +
-          renderFieldRows([
-            ['content', item.content],
+          renderPrimarySection('Lesson', item.content || '') +
+          renderMetaSection([
+            ['name', item.name],
             ['context', item.context],
             ['confidence', item.confidence],
             ['reinforcements', item.reinforcements],
             ['source', item.source],
             ['origin', item.origin],
-            ['sourceIds', item.sourceIds, true],
-            ['sourceRunId', item.sourceRunId],
             ['tags', item.tags, true],
             ['createdAt', item.createdAt],
             ['updatedAt', item.updatedAt],
+          ]) +
+          '<div class="section"><div class="section-title">Source Links</div>' +
+          renderFieldRows([
+            ['sourceIds', item.sourceIds, true],
+            ['sourceRunId', item.sourceRunId],
           ]) + '</div>' +
           renderSourceSection(item) +
           renderRaw(item) + '</article>';
       }
       function renderCrystalDetail(item) {
         return '<article class="detail"><h3>' + esc(itemTitle(item, 'crystals')) + '</h3>' +
-          '<div class="section"><div class="section-title">Crystal</div>' +
+          renderPrimarySection('Crystal Narrative', item.narrative || '') +
+          '<div class="detail-secondary"><div>' +
+          renderMetaSection([
+            ['sessionId', item.sessionId],
+            ['project', item.project],
+            ['createdAt', item.createdAt],
+          ]) +
+          '</div><div>' +
+          '<div class="section"><div class="section-title">Outcomes</div>' +
           renderFieldRows([
-            ['narrative', item.narrative],
             ['keyOutcomes', item.keyOutcomes, true],
             ['filesAffected', item.filesAffected, true],
             ['lessons', item.lessons, true],
             ['sourceActionIds', item.sourceActionIds, true],
-            ['sessionId', item.sessionId],
-            ['project', item.project],
-            ['createdAt', item.createdAt],
-          ]) + '</div>' +
+          ]) + '</div></div></div>' +
           renderSourceSection(item) +
           renderRaw(item) + '</article>';
       }
       function renderInsightDetail(item) {
         return '<article class="detail"><h3>' + esc(itemTitle(item, 'insights')) + '</h3>' +
-          '<div class="section"><div class="section-title">Insight</div>' +
-          renderFieldRows([
-            ['title', item.title],
-            ['content', item.content],
+          renderPrimarySection('Insight', item.content || item.title || '') +
+          renderMetaSection([
             ['confidence', item.confidence],
             ['reinforcements', item.reinforcements],
-            ['sourceConceptCluster', item.sourceConceptCluster],
-            ['sourceMemoryIds', item.sourceMemoryIds, true],
-            ['sourceLessonIds', item.sourceLessonIds, true],
-            ['sourceCrystalIds', item.sourceCrystalIds, true],
+            ['sourceConceptCluster', item.sourceConceptCluster, true],
             ['tags', item.tags, true],
             ['createdAt', item.createdAt],
             ['updatedAt', item.updatedAt],
+          ]) +
+          '<div class="section"><div class="section-title">Source Links</div>' +
+          renderFieldRows([
+            ['sourceMemoryIds', item.sourceMemoryIds, true],
+            ['sourceLessonIds', item.sourceLessonIds, true],
+            ['sourceCrystalIds', item.sourceCrystalIds, true],
           ]) + '</div>' +
           renderSourceSection(item) +
           renderRaw(item) + '</article>';
@@ -1120,21 +1209,23 @@
           return '<li>' + esc(String(step || '')) + '</li>';
         }).join('');
         return '<article class="detail"><h3>' + esc(itemTitle(item, 'procedural')) + '</h3>' +
-          '<div class="section"><div class="section-title">Procedural Memory</div>' +
-          renderFieldRows([
+          renderPrimarySection('Trigger And Outcome', [item.triggerCondition, item.expectedOutcome].filter(Boolean).join('\n\n')) +
+          renderMetaSection([
             ['name', item.name],
-            ['triggerCondition', item.triggerCondition],
-            ['expectedOutcome', item.expectedOutcome],
             ['frequency', item.frequency],
             ['strength', item.strength],
             ['tags', item.tags, true],
             ['concepts', item.concepts, true],
-            ['sourceObservationIds', item.sourceObservationIds, true],
             ['createdAt', item.createdAt],
             ['updatedAt', item.updatedAt],
           ]) +
-          (steps ? '<h4>steps</h4><ol>' + steps + '</ol>' : '') +
+          '<div class="section"><div class="section-title">Steps</div>' +
+          (steps ? '<ol>' + steps + '</ol>' : renderEmpty('No steps')) +
           '</div>' +
+          '<div class="section"><div class="section-title">Source Links</div>' +
+          renderFieldRows([
+            ['sourceObservationIds', item.sourceObservationIds, true],
+          ]) + '</div>' +
           renderSourceSection(item) +
           renderRaw(item) + '</article>';
       }
@@ -1189,6 +1280,46 @@
       }
       function renderEmpty(message) {
         return '<div class="empty">' + esc(message) + '</div>';
+      }
+
+      function selectedSessionItemFor(type, id) {
+        var session = selectedSession();
+        if (type === 'summaries') {
+          var summary = sessionSummaryForSession(session);
+          return idOf(summary) === id ? summary : null;
+        }
+        var category = store.selected.sessionCategory || type;
+        return sessionCategoryItems(category, session).find(function(item) { return idOf(item) === id; }) || null;
+      }
+      function selectedItemFor(type, id, key) {
+        if (!type || !id) return null;
+        if (store.activeTab === 'sessions' || (key && key.indexOf('session-content:') === 0)) {
+          return selectedSessionItemFor(type, id);
+        }
+        if (type === 'observations') {
+          var sid = store.selected.observationSessionId || store.selected.sessionId;
+          return (observationState(sid).items || []).find(function(item) { return idOf(item) === id; }) || null;
+        }
+        return tabItems(type).find(function(item) { return idOf(item) === id; }) || null;
+      }
+      function openDetailDrawer(item, type) {
+        if (!item) return;
+        var root = getElementById('detail-drawer-root');
+        if (!root) return;
+        root.innerHTML =
+          '<div class="detail-backdrop" data-ui="close-detail">' +
+            '<aside class="detail-drawer" role="dialog" aria-modal="true" aria-label="' + attr(itemTitle(item, type)) + '">' +
+              '<div class="detail-drawer-head">' +
+                '<div><h2 class="detail-drawer-title">' + esc(itemTitle(item, type)) + '</h2><div class="detail-drawer-sub">' + esc(TAB_CONFIG[type] ? TAB_CONFIG[type].label : type) + ' detail</div></div>' +
+                '<button type="button" class="icon-button" data-ui="close-detail" aria-label="Close detail">x</button>' +
+              '</div>' +
+              '<div class="detail-drawer-body">' + renderDetail(item, type) + '</div>' +
+            '</aside>' +
+          '</div>';
+      }
+      function closeDetailDrawer() {
+        var root = getElementById('detail-drawer-root');
+        if (root) root.innerHTML = '';
       }
 
       function listContainerFromKey(key) {
@@ -1298,9 +1429,12 @@
           } else {
             renderTabDetailPaneOnly(itemType);
           }
+          openDetailDrawer(selectedItemFor(itemType, selectedId, selectedKey), itemType);
         } else if (ui === 'expand-item') {
           var exKey = target.getAttribute('data-key') || '';
           var exId = target.getAttribute('data-id') || '';
+          var exType = target.getAttribute('data-type') || '';
+          var willExpand = store.selected.expandedByTab[exKey] !== exId;
           store.selected.expandedByTab[exKey] = store.selected.expandedByTab[exKey] === exId ? '' : exId;
           var container = listContainerFromKey(exKey);
           updateRowActive(container, '[data-ui="expand-item"]', exId);
@@ -1309,6 +1443,9 @@
           } else {
             renderTabListPaneOnly(store.activeTab);
             renderTabDetailPaneOnly(store.activeTab);
+          }
+          if (willExpand) {
+            openDetailDrawer(selectedItemFor(exType, exId, exKey), exType);
           }
         } else if (ui === 'page') {
           var pageKey = target.getAttribute('data-tab') || '';
@@ -1323,7 +1460,14 @@
             renderTabListPaneOnly(store.activeTab);
             renderTabDetailPaneOnly(store.activeTab);
           }
+        } else if (ui === 'close-detail') {
+          if (target === e.target || target.tagName === 'BUTTON') {
+            closeDetailDrawer();
+          }
         }
+      });
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') closeDetailDrawer();
       });
       document.addEventListener('input', function(e) {
         var target = e.target instanceof Element ? e.target.closest('[data-ui="filter"]') : null;

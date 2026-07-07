@@ -301,10 +301,12 @@ function createReviewSandbox() {
   const rootStatus = document.createRoot("status-line");
   const rootApp = document.createRoot("app");
   const rootShell = document.createRoot("shell");
+  const rootDetailDrawer = document.createRoot("detail-drawer-root");
   rootShell._rawHtml = "";
   rootTabs._rawHtml = "";
   rootStatus._rawHtml = "";
   rootApp._rawHtml = "";
+  rootDetailDrawer._rawHtml = "";
 
   const api = buildMockFetch({
     sessions: [
@@ -495,7 +497,7 @@ describe("review viewer interaction", () => {
     expect(lessonCategory).toBeTruthy();
 
     click(sandbox, lessonCategory as MockElement);
-    await waitFor(() => (document.getElementById("session-content-list")?.querySelectorAll('[data-ui="select-item"]') || []).length > 0);
+    await waitFor(() => String(document.getElementById("session-content-list")?.innerHTML || "").includes("lesson-a"));
 
     expect(document.getElementById("session-list")).toBe(sessionList);
     expect(document.getElementById("session-list")?.scrollTop).toBe(77);
@@ -509,5 +511,9 @@ describe("review viewer interaction", () => {
     expect(document.getElementById("session-list")).toBe(sessionList);
     expect(document.getElementById("session-category-pane")).toBe(sessionCategory);
     expect(renderEvents).toHaveLength(baselineRenderCount);
+    const detailDrawer = document.getElementById("detail-drawer-root");
+    expect(detailDrawer?.innerHTML).toContain("first lesson");
+    expect(detailDrawer?.innerHTML).toContain("Lesson");
+    expect(detailDrawer?.innerHTML).toContain("lesson-a");
   });
 });
