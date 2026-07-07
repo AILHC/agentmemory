@@ -224,7 +224,7 @@ export function getSemanticRollupMaxPromptChars(
 ): number {
   return parseBoundedPositiveInt(
     env.AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS,
-    24_000,
+    64_000,
     120_000,
   );
 }

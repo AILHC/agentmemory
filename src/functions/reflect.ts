@@ -215,7 +215,7 @@ export async function planReflectInsightWindows(options: {
     return { success: false, error: "useGraph:true is not supported for full reflect insight windows" };
   }
   const maxItems = Math.max(3, options.maxItemsPerWindow ?? 30);
-  const charBudget = Math.max(1, options.charBudget ?? 24_000);
+  const charBudget = Math.max(1, options.charBudget ?? 64_000);
   const [semanticMemories, lessons, crystals] = await Promise.all([
     options.kv.list<SemanticMemory>(KV.semantic).catch(() => []),
     options.kv.list<Lesson>(KV.lessons).catch(() => []),

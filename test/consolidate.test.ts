@@ -127,6 +127,64 @@ describe("consolidate full window helpers", () => {
     ]);
   });
 
+  it("applies charBudget when planning concept windows", async () => {
+    const kv = mockKV();
+    await kv.set(KV.sessions, "ses-a", session("ses-a"));
+    for (let i = 0; i < 5; i++) {
+      const obs = {
+        ...observation(`obs-${i}`, 20 - i),
+        narrative: `Narrative ${i} ${"x".repeat(90)}`,
+      };
+      await kv.set(KV.observations("ses-a"), obs.id, obs);
+    }
+
+    const result = await planConsolidateObservationWindows({
+      kv: kv as never,
+      minObservations: 3,
+      charBudget: 250,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.charBudget).toBe(250);
+    expect(result.budgetApplied).toBe(true);
+    expect(result.windows.length).toBeGreaterThan(1);
+    for (const window of result.windows) {
+      expect(window.observationEstimatedChars).toBeTruthy();
+      if (window.observationCount > 1) {
+        expect(window.estimatedChars).toBeLessThanOrEqual(250);
+      }
+    }
+    expect(result.maxWindowEstimatedChars).toBeLessThanOrEqual(250);
+    expect(result.overBudgetWindowCount).toBe(0);
+  });
+
+  it("marks a single oversized observation without recursively splitting it", async () => {
+    const kv = mockKV();
+    await kv.set(KV.sessions, "ses-a", session("ses-a"));
+    const huge = {
+      ...observation("huge", 10),
+      narrative: "x".repeat(400),
+    };
+    await kv.set(KV.observations("ses-a"), huge.id, huge);
+
+    const result = await planConsolidateObservationWindows({
+      kv: kv as never,
+      minObservations: 1,
+      charBudget: 120,
+    });
+
+    expect(result.success).toBe(true);
+    expect(result.windows).toHaveLength(1);
+    expect(result.windows[0]).toMatchObject({
+      observationIds: ["huge"],
+      overBudget: true,
+      overBudgetReason: "single_observation",
+      charBudget: 120,
+      budgetApplied: true,
+    });
+    expect(result.overBudgetWindowCount).toBe(1);
+  });
+
   it("plans remaining eligible observations that do not meet concept frequency", async () => {
     const kv = mockKV();
     await kv.set(KV.sessions, "ses-a", session("ses-a"));

@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { registerConsolidateFunction } from "../src/functions/consolidate.js";
+import { KV } from "../src/state/schema.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 
 function mockKV() {
@@ -180,5 +182,61 @@ describe("full extraction REST wrappers", () => {
       function_id: "mem::full-crystals-auto",
       payload: { dryRun: true },
     });
+  });
+
+  it("full memory consolidate plan endpoint applies charBudget through the service planner", async () => {
+    let sdk: ReturnType<typeof mockSdk>;
+    sdk = mockSdk(async (input) => sdk.getFunction(input.function_id)(input.payload));
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    registerConsolidateFunction(sdk as never, kv as never, {
+      name: "test",
+      summarize: vi.fn(),
+      compress: vi.fn(),
+    });
+
+    await kv.set(KV.sessions, "ses-a", {
+      id: "ses-a",
+      project: "repo",
+      cwd: "/repo",
+      startedAt: "2026-07-01T00:00:00.000Z",
+      status: "completed",
+      observationCount: 4,
+    });
+    for (let i = 0; i < 4; i++) {
+      await kv.set(KV.observations("ses-a"), `obs-${i}`, {
+        id: `obs-${i}`,
+        sessionId: "ses-a",
+        timestamp: "2026-07-01T00:00:00.000Z",
+        type: "decision",
+        title: `Observation ${i}`,
+        facts: [],
+        narrative: `Narrative ${i} ${"x".repeat(90)}`,
+        concepts: ["windows"],
+        files: [`file-${i}.ts`],
+        importance: 6,
+      });
+    }
+
+    const handler = sdk.getFunction("api::full-memory-consolidate-windows-plan");
+    const response = await handler({
+      headers: {},
+      body: { project: " repo ", minObservations: 3, charBudget: 250 },
+    });
+
+    expect(response.status_code).toBe(200);
+    expect(response.body).toMatchObject({
+      success: true,
+      charBudget: 250,
+      budgetApplied: true,
+      overBudgetWindowCount: 0,
+    });
+    expect(response.body.windows.length).toBeGreaterThan(1);
+    expect(response.body.maxWindowEstimatedChars).toBeLessThanOrEqual(250);
+    for (const window of response.body.windows) {
+      if (window.observationCount > 1) {
+        expect(window.estimatedChars).toBeLessThanOrEqual(250);
+      }
+    }
   });
 });

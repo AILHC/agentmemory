@@ -146,10 +146,10 @@ describe("mem::semantic-rollup", () => {
   it("bounds AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS config", () => {
     expect(getSemanticRollupMaxPromptChars({
       AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS: "not-a-number",
-    })).toBe(24_000);
+    })).toBe(64_000);
     expect(getSemanticRollupMaxPromptChars({
       AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS: "0",
-    })).toBe(24_000);
+    })).toBe(64_000);
     expect(getSemanticRollupMaxPromptChars({
       AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS: "999999",
     })).toBe(120_000);
@@ -366,7 +366,7 @@ describe("mem::semantic-rollup", () => {
   it("rejects oversized prompts before calling the provider", async () => {
     await kv.set(KV.summaries, "ses-a", {
       ...summary("ses-a"),
-      narrative: "x".repeat(25_000),
+      narrative: "x".repeat(70_000),
     });
 
     const result = (await sdk.trigger("mem::semantic-rollup", {
@@ -394,10 +394,10 @@ describe("mem::semantic-rollup", () => {
       windowId: "win-large",
       mark: "full",
       kind: "window",
-      maxPromptChars: 24000,
+      maxPromptChars: 64000,
     });
     expect(result.inputHash).toMatch(/^[0-9a-f]{64}$/);
-    expect(result.promptChars).toBeGreaterThan(24000);
+    expect(result.promptChars).toBeGreaterThan(64000);
     expect(provider.summarize).not.toHaveBeenCalled();
   });
 

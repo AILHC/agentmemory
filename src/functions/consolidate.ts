@@ -48,6 +48,11 @@ export interface ConsolidateObservationWindow {
   sourceSessionIds: string[];
   observationCount: number;
   estimatedChars: number;
+  observationEstimatedChars?: Record<string, number>;
+  charBudget?: number;
+  budgetApplied?: boolean;
+  overBudget?: boolean;
+  overBudgetReason?: "single_observation";
   inputHash: string;
 }
 
@@ -170,6 +175,68 @@ function groupObservationsByConcept(
   );
 }
 
+function estimateObservationChars(obs: CompressedObservation): number {
+  return obs.title.length + obs.narrative.length + obs.files.join(", ").length + 32;
+}
+
+function windowChunksByBudget<T extends CompressedObservation>(
+  observations: T[],
+  maxObservationsPerWindow: number,
+  charBudget?: number,
+): T[][] {
+  const chunks: T[][] = [];
+  let current: T[] = [];
+  let currentChars = 0;
+  const maxCount = Math.max(1, maxObservationsPerWindow);
+
+  for (const obs of observations) {
+    const obsChars = estimateObservationChars(obs);
+    const wouldExceedCount = current.length >= maxCount;
+    const wouldExceedBudget =
+      charBudget !== undefined && current.length > 0 && currentChars + obsChars > charBudget;
+    if (wouldExceedCount || wouldExceedBudget) {
+      chunks.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(obs);
+    currentChars += obsChars;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+function consolidateWindowFromChunk(
+  concept: string,
+  chunk: Array<CompressedObservation & { sid: string }>,
+  index: number,
+  charBudget?: number,
+  windowKey = concept,
+): ConsolidateObservationWindow {
+  const observationIds = chunk.map((o) => o.id);
+  const sessionIds = [...new Set(chunk.map((o) => o.sid))];
+  const observationEstimatedChars = Object.fromEntries(chunk.map((o) => [o.id, estimateObservationChars(o)]));
+  const estimatedChars = Object.values(observationEstimatedChars).reduce((sum, chars) => sum + chars, 0);
+  const budgetApplied = charBudget !== undefined;
+  const overBudget = budgetApplied && estimatedChars > charBudget;
+  return {
+    windowId: `memory-consolidate:${windowKey}:${index + 1}`,
+    concept,
+    observationIds,
+    sourceObservationIds: observationIds,
+    sessionIds,
+    sourceSessionIds: sessionIds,
+    observationCount: chunk.length,
+    estimatedChars,
+    observationEstimatedChars,
+    ...(budgetApplied ? { charBudget, budgetApplied } : {}),
+    ...(overBudget && chunk.length === 1
+      ? { overBudget: true, overBudgetReason: "single_observation" as const }
+      : {}),
+    inputHash: stableHash(["memory-consolidate", concept, observationIds, sessionIds, estimatedChars]),
+  };
+}
+
 export async function planConsolidateObservationWindows(options: {
   kv: StateKV;
   project?: string;
@@ -183,9 +250,15 @@ export async function planConsolidateObservationWindows(options: {
   totalObservations: number;
   windows: ConsolidateObservationWindow[];
   reason?: string;
+  charBudget?: number;
+  budgetApplied: boolean;
+  maxWindowEstimatedChars: number;
+  overBudgetWindowCount: number;
 }> {
   const minObs = options.minObservationsPerConcept ?? options.minObservations ?? 10;
   const minImportance = options.minImportance ?? 5;
+  const charBudget = options.charBudget !== undefined ? Math.max(1, options.charBudget) : undefined;
+  const budgetApplied = charBudget !== undefined;
   const allObs = await collectConsolidationObservations(options.kv, options.project, minImportance);
   if (allObs.length < minObs) {
     return {
@@ -193,6 +266,10 @@ export async function planConsolidateObservationWindows(options: {
       totalObservations: allObs.length,
       windows: [],
       reason: "insufficient_observations",
+      ...(budgetApplied ? { charBudget } : {}),
+      budgetApplied,
+      maxWindowEstimatedChars: 0,
+      overBudgetWindowCount: 0,
     };
   }
 
@@ -204,27 +281,12 @@ export async function planConsolidateObservationWindows(options: {
       .sort((a, b) => b.importance - a.importance)
       .filter((obs) => !coveredObservationIds.has(obs.id));
     const chunkSize = Math.max(1, options.maxObservationsPerWindow ?? sorted.length);
-    for (let i = 0; i < sorted.length; i += chunkSize) {
-      const chunk = sorted.slice(i, i + chunkSize);
+    const chunks = windowChunksByBudget(sorted, chunkSize, charBudget);
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
       if (chunk.length === 0) continue;
       for (const obs of chunk) coveredObservationIds.add(obs.id);
-      const observationIds = chunk.map((o) => o.id);
-      const sessionIds = [...new Set(chunk.map((o) => o.sid))];
-      const estimatedChars = chunk.reduce(
-        (sum, o) => sum + o.title.length + o.narrative.length + o.files.join(", ").length + 32,
-        0,
-      );
-      windows.push({
-        windowId: `memory-consolidate:${concept}:${Math.floor(i / chunkSize) + 1}`,
-        concept,
-        observationIds,
-        sourceObservationIds: observationIds,
-        sessionIds,
-        sourceSessionIds: sessionIds,
-        observationCount: chunk.length,
-        estimatedChars,
-        inputHash: stableHash(["memory-consolidate", concept, observationIds, sessionIds, estimatedChars]),
-      });
+      windows.push(consolidateWindowFromChunk(concept, chunk, i, charBudget));
     }
   }
   const remaining = allObs
@@ -232,28 +294,27 @@ export async function planConsolidateObservationWindows(options: {
     .sort((a, b) => b.importance - a.importance);
   if (remaining.length > 0) {
     const chunkSize = Math.max(1, options.maxObservationsPerWindow ?? remaining.length);
-    for (let i = 0; i < remaining.length; i += chunkSize) {
-      const chunk = remaining.slice(i, i + chunkSize);
-      const observationIds = chunk.map((o) => o.id);
-      const sessionIds = [...new Set(chunk.map((o) => o.sid))];
-      const estimatedChars = chunk.reduce(
-        (sum, o) => sum + o.title.length + o.narrative.length + o.files.join(", ").length + 32,
-        0,
-      );
-      windows.push({
-        windowId: `memory-consolidate:remaining:${Math.floor(i / chunkSize) + 1}`,
-        concept: "remaining-observations",
-        observationIds,
-        sourceObservationIds: observationIds,
-        sessionIds,
-        sourceSessionIds: sessionIds,
-        observationCount: chunk.length,
-        estimatedChars,
-        inputHash: stableHash(["memory-consolidate", "remaining-observations", observationIds, sessionIds, estimatedChars]),
-      });
+    const chunks = windowChunksByBudget(remaining, chunkSize, charBudget);
+    for (let i = 0; i < chunks.length; i++) {
+      windows.push(consolidateWindowFromChunk("remaining-observations", chunks[i], i, charBudget, "remaining"));
     }
   }
-  return { success: true, totalObservations: allObs.length, windows };
+  const maxWindowEstimatedChars = windows.reduce(
+    (max, window) => Math.max(max, window.estimatedChars),
+    0,
+  );
+  const overBudgetWindowCount = budgetApplied
+    ? windows.filter((window) => charBudget !== undefined && window.estimatedChars > charBudget).length
+    : 0;
+  return {
+    success: true,
+    totalObservations: allObs.length,
+    windows,
+    ...(budgetApplied ? { charBudget } : {}),
+    budgetApplied,
+    maxWindowEstimatedChars,
+    overBudgetWindowCount,
+  };
 }
 
 async function persistConsolidatedMemory(
