@@ -511,9 +511,10 @@ describe("review viewer interaction", () => {
     expect(document.getElementById("session-list")).toBe(sessionList);
     expect(document.getElementById("session-category-pane")).toBe(sessionCategory);
     expect(renderEvents).toHaveLength(baselineRenderCount);
-    const detailDrawer = document.getElementById("detail-drawer-root");
-    expect(detailDrawer?.innerHTML).toContain("first lesson");
-    expect(detailDrawer?.innerHTML).toContain("Lesson");
-    expect(detailDrawer?.innerHTML).toContain("lesson-a");
+    const sessionDetail = document.getElementById("session-detail");
+    expect(sessionDetail?.innerHTML).toContain("first lesson");
+    expect(sessionDetail?.innerHTML).toContain("Lesson");
+    expect(sessionDetail?.innerHTML).toContain("lesson-a");
+    expect(document.getElementById("detail-drawer-root")?.innerHTML).toBe("");
   });
 });

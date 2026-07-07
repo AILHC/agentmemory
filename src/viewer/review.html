@@ -97,7 +97,8 @@
     .status-line strong { color: var(--ink); }
     .viewer-body { padding: 24px; min-height: 0; flex: 1; overflow: hidden; }
     .grid { display: grid; gap: 18px; height: 100%; min-height: 0; overflow: hidden; }
-    .grid.sessions { grid-template-columns: minmax(270px, 330px) minmax(260px, 330px) minmax(420px, 1fr); }
+    .grid.sessions { grid-template-columns: minmax(250px, 310px) minmax(230px, 300px) minmax(310px, 390px) minmax(420px, 1fr); }
+    .grid.observations { grid-template-columns: minmax(270px, 330px) minmax(260px, 330px) minmax(420px, 1fr); }
     .grid.two-col { grid-template-columns: minmax(330px, 420px) minmax(520px, 1fr); }
     .pane {
       background: var(--panel-soft);
@@ -113,6 +114,19 @@
       padding: 18px 20px 12px;
       border-bottom: 1px solid var(--border-light);
       background: var(--panel-soft);
+      flex-shrink: 0;
+    }
+    .pane-head-row { display: flex; align-items: center; gap: 10px; }
+    .drill-back {
+      display: none;
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      background: #fff;
+      color: var(--ink);
+      height: 30px;
+      padding: 0 10px;
+      font: 700 12px var(--ui);
+      cursor: pointer;
       flex-shrink: 0;
     }
     .pane-title { font-size: 17px; font-weight: 700; margin: 0; }
@@ -278,9 +292,11 @@
     }
     .pager button:disabled { opacity: 0.45; cursor: default; }
     @media (max-width: 1050px) {
-      .grid.sessions, .grid.two-col { grid-template-columns: 1fr; }
-      .grid { overflow: auto; }
-      .pane { min-height: 300px; max-height: none; }
+      .grid.sessions, .grid.observations, .grid.two-col { grid-template-columns: 1fr; }
+      .grid { overflow: hidden; }
+      .pane { display: none; min-height: 0; max-height: none; height: 100%; }
+      .pane.mobile-active { display: flex; }
+      .drill-back { display: inline-flex; align-items: center; }
       .detail-drawer { width: 100vw; min-width: 0; }
       .detail-secondary { grid-template-columns: 1fr; }
       .topbar { height: auto; padding: 16px; align-items: flex-start; flex-direction: column; }
@@ -356,6 +372,11 @@
           expandedByTab: {},
           observationSessionId: ''
         },
+        drill: {
+          sessions: 'sessions',
+          observations: 'filters',
+          tabById: {},
+        },
         filters: {},
         pages: {},
       };
@@ -408,6 +429,25 @@
       }
       function countBadge(label, count, kind) {
         return '<span class="badge ' + (kind || '') + '">' + esc(label) + ': ' + esc(count) + '</span>';
+      }
+      function isNarrowLayout() {
+        if (window.matchMedia) return window.matchMedia('(max-width: 1050px)').matches;
+        return window.innerWidth ? window.innerWidth <= 1050 : false;
+      }
+      function mobileActiveClass(view, active) {
+        return isNarrowLayout() && view === active ? ' mobile-active' : '';
+      }
+      function tabDrillView(tab) {
+        return store.drill.tabById[tab] || 'list';
+      }
+      function drillBackButton(target, label) {
+        return '<button type="button" class="drill-back" data-ui="drill-back" data-target="' + attr(target) + '">‹ ' + esc(label) + '</button>';
+      }
+      function paneHead(title, subtitle, backTarget, backLabel) {
+        return '<div class="pane-head"><div class="pane-head-row">' +
+          (backTarget ? drillBackButton(backTarget, backLabel || 'Back') : '') +
+          '<div><h2 class="pane-title">' + esc(title) + '</h2><div class="pane-sub">' + esc(subtitle || '') + '</div></div>' +
+          '</div></div>';
       }
       function renderRaw(item) {
         return '<details class="raw"><summary>Raw JSON</summary><pre>' + esc(JSON.stringify(item, null, 2)) + '</pre></details>';
@@ -678,6 +718,7 @@
           renderSessionListPaneOnly();
           renderSessionCategoryPaneOnly();
           renderSessionContentPaneOnly();
+          renderSessionDetailPaneOnly();
           return;
         }
         if (store.activeTab === 'observations') {
@@ -694,27 +735,31 @@
         var app = getElementById('app');
         if (store.activeTab === 'sessions') {
           var sid = idOf(selectedSession());
+          var sessionView = store.drill.sessions || 'sessions';
           app.innerHTML =
             '<div class="grid sessions" id="sessions-grid">' +
-            '<section class="pane" id="session-list-pane"><div class="pane-head"><h2 class="pane-title">Sessions</h2><div class="pane-sub">Select a session, then inspect extracted categories.</div></div><div class="list" data-scroll-key="sessions" id="session-list"></div></section>' +
-            '<section class="pane" id="session-category-pane"><div class="pane-head"><h2 class="pane-title">Extraction Categories</h2><div class="pane-sub">Current session: loading</div></div><div class="list" data-scroll-key="session-categories:' + attr(sid || 'none') + '" id="session-category-list"></div></section>' +
-            '<section class="pane" id="session-content-pane"><div class="pane-head"><h2 class="pane-title">Content</h2><div class="pane-sub">Select a category.</div></div><div class="list" data-scroll-key="session-content:' + attr(sid || 'none') + '" id="session-content-list"></div></section>' +
+            '<section class="pane' + mobileActiveClass('sessions', sessionView) + '" id="session-list-pane">' + paneHead('Sessions', 'Select a session, then inspect extracted categories.') + '<div class="list" data-scroll-key="sessions" id="session-list"></div></section>' +
+            '<section class="pane' + mobileActiveClass('categories', sessionView) + '" id="session-category-pane">' + paneHead('Extraction Categories', 'Current session: loading', 'sessions', 'Sessions') + '<div class="list" data-scroll-key="session-categories:' + attr(sid || 'none') + '" id="session-category-list"></div></section>' +
+            '<section class="pane' + mobileActiveClass('content', sessionView) + '" id="session-content-pane">' + paneHead('Content', 'Select a category.', 'categories', 'Categories') + '<div class="list" data-scroll-key="session-content:' + attr(sid || 'none') + '" id="session-content-list"></div></section>' +
+            '<section class="pane' + mobileActiveClass('detail', sessionView) + '" id="session-detail-pane">' + paneHead('Detail', 'Select an item to inspect fields.', 'content', 'Content') + '<div class="list" id="session-detail"></div></section>' +
             '</div>';
           return;
         }
         if (store.activeTab === 'observations') {
+          var observationView = store.drill.observations || 'filters';
           app.innerHTML =
-            '<div class="grid sessions" id="observations-grid">' +
-            '<section class="pane" id="observation-filter-pane"><div class="pane-head"><h2 class="pane-title">Observation Filters</h2><div class="pane-sub">Observations are loaded per session.</div></div><div class="list" data-scroll-key="observation-sessions" id="observation-filter-list"></div></section>' +
-            '<section class="pane" id="observation-list-pane"><div class="pane-head"><h2 class="pane-title">Observation List</h2><div class="pane-sub">Current session observations.</div></div><div class="list" data-scroll-key="observation-list" id="observation-list"></div></section>' +
-            '<section class="pane" id="observation-detail-pane"><div class="pane-head"><h2 class="pane-title">Observation Detail</h2><div class="pane-sub">Select an observation to inspect raw fields.</div></div><div class="list" id="observation-detail"></div></section>' +
+            '<div class="grid observations" id="observations-grid">' +
+            '<section class="pane' + mobileActiveClass('filters', observationView) + '" id="observation-filter-pane">' + paneHead('Observation Filters', 'Observations are loaded per session.') + '<div class="list" data-scroll-key="observation-sessions" id="observation-filter-list"></div></section>' +
+            '<section class="pane' + mobileActiveClass('list', observationView) + '" id="observation-list-pane">' + paneHead('Observation List', 'Current session observations.', 'filters', 'Filters') + '<div class="list" data-scroll-key="observation-list" id="observation-list"></div></section>' +
+            '<section class="pane' + mobileActiveClass('detail', observationView) + '" id="observation-detail-pane">' + paneHead('Observation Detail', 'Inspect raw fields.', 'list', 'List') + '<div class="list" id="observation-detail"></div></section>' +
             '</div>';
           return;
         }
+        var tabView = tabDrillView(store.activeTab);
         app.innerHTML =
           '<div class="grid two-col" id="review-tab-grid">' +
-          '<section class="pane" id="tab-list-pane"><div class="pane-head"><h2 class="pane-title">' + esc(TAB_CONFIG[store.activeTab].label) + '</h2><div class="pane-sub">Select an item.</div></div><div class="list" data-scroll-key="tab-list:' + attr(store.activeTab) + '" id="tab-list"></div></section>' +
-          '<section class="pane" id="tab-detail-pane"><div class="pane-head"><h2 class="pane-title">' + esc(TAB_CONFIG[store.activeTab].label) + ' Detail</h2><div class="pane-sub">Readable fields, source fields, and raw JSON.</div></div><div class="list" id="tab-detail"></div></section>' +
+          '<section class="pane' + mobileActiveClass('list', tabView) + '" id="tab-list-pane">' + paneHead(TAB_CONFIG[store.activeTab].label, 'Select an item.') + '<div class="list" data-scroll-key="tab-list:' + attr(store.activeTab) + '" id="tab-list"></div></section>' +
+          '<section class="pane' + mobileActiveClass('detail', tabView) + '" id="tab-detail-pane">' + paneHead(TAB_CONFIG[store.activeTab].label + ' Detail', 'Readable fields, source fields, and raw JSON.', 'list', TAB_CONFIG[store.activeTab].label) + '<div class="list" id="tab-detail"></div></section>' +
           '</div>';
       }
 
@@ -741,7 +786,7 @@
         }).join('') || renderEmpty('No session selected');
         var header = pane.querySelector('[class="pane-head"]');
         if (header) {
-          header.innerHTML = '<h2 class="pane-title">Extraction Categories</h2><div class="pane-sub">Current session: ' + esc(sid ? shortId(sid) : 'none') + '</div>';
+          header.outerHTML = paneHead('Extraction Categories', 'Current session: ' + (sid ? shortId(sid) : 'none'), 'sessions', 'Sessions');
         }
       }
       function renderSessionContentPaneOnly() {
@@ -749,17 +794,18 @@
         var pane = getElementById('session-content-pane');
         if (!pane) return;
         if (!session) {
-          pane.innerHTML = '<div class="pane-head"><h2 class="pane-title">Content</h2><div class="pane-sub">No session selected</div></div><div class="list" id="session-content-list">' + renderEmpty('No session selected') + '</div>';
+          pane.innerHTML = paneHead('Content', 'No session selected', 'categories', 'Categories') + '<div class="list" id="session-content-list">' + renderEmpty('No session selected') + '</div>';
           return;
         }
         var category = store.selected.sessionCategory || 'summary';
           var sid = idOf(session);
           var key = 'session-content:' + sid + ':' + category;
-        pane.innerHTML = '<div class="pane-head"><h2 class="pane-title">Content List: ' + esc(TAB_CONFIG[category] ? TAB_CONFIG[category].label : category) + '</h2><div class="pane-sub">Summary from backend stats and session store.</div></div>';
+        pane.innerHTML = paneHead('Content List: ' + (TAB_CONFIG[category] ? TAB_CONFIG[category].label : category), 'Summary from backend stats and session store.', 'categories', 'Categories');
 
         if (category === 'summary') {
           var summary = sessionSummaryForSession(session);
           var summaryKey = 'session-content:' + sid + ':summary';
+          store.selected.itemByTab.summaries = idOf(summary);
           pane.innerHTML += '<div class="list" id="session-content-list"><div class="pane-sub">Count: 1</div>' +
             renderItemList(summaryKey, [summary], 'summaries', true) + '</div>';
           return;
@@ -802,6 +848,25 @@
           pagerHtml(key, total);
       }
 
+      function renderSessionDetailPaneOnly() {
+        var pane = getElementById('session-detail-pane');
+        var detail = getElementById('session-detail');
+        if (!pane || !detail) return;
+        var session = selectedSession();
+        if (!session) {
+          pane.innerHTML = paneHead('Detail', 'No session selected', 'content', 'Content') + '<div class="list" id="session-detail">' + renderEmpty('No session selected') + '</div>';
+          return;
+        }
+        var category = store.selected.sessionCategory || 'summary';
+        var type = category === 'summary' ? 'summaries' : category;
+        var items = category === 'summary' ? [sessionSummaryForSession(session)] : sessionCategoryItems(category, session);
+        var selectedId = store.selected.itemByTab[type] || store.selected.itemByTab[category] || (items[0] && idOf(items[0])) || '';
+        if (selectedId && !store.selected.itemByTab[type]) store.selected.itemByTab[type] = selectedId;
+        var selected = selectedSessionItemFor(type, selectedId) || items[0] || null;
+        pane.innerHTML = paneHead('Detail: ' + (TAB_CONFIG[type] ? TAB_CONFIG[type].label : type), selected ? itemTitle(selected, type) : 'No item selected', 'content', 'Content') +
+          '<div class="list" id="session-detail">' + (selected ? renderDetail(selected, type) : renderEmpty('No item selected')) + '</div>';
+      }
+
       function renderTabListPaneOnly(tab) {
         var tabData = store.cache[tab];
         var pane = getElementById('tab-list');
@@ -834,7 +899,8 @@
         var paneRoot = getElementById('tab-detail-pane');
         var detailHeader = paneRoot && paneRoot.querySelector('.pane-head');
         if (detailHeader) {
-          detailHeader.innerHTML = '<h2 class="pane-title">' + esc(TAB_CONFIG[tab].label) + ' Detail</h2><div class="pane-sub">Total: ' + esc(countLabel) + '</div>';
+          detailHeader.innerHTML = '<div class="pane-head-row">' + drillBackButton('list', TAB_CONFIG[tab].label) +
+            '<div><h2 class="pane-title">' + esc(TAB_CONFIG[tab].label) + ' Detail</h2><div class="pane-sub">Total: ' + esc(countLabel) + '</div></div></div>';
         }
       }
       function renderObservationFilterPaneOnly() {
@@ -1379,6 +1445,7 @@
             renderSessionListPaneOnly();
             renderSessionCategoryPaneOnly();
             renderSessionContentPaneOnly();
+            renderSessionDetailPaneOnly();
           } else {
             renderAppShellForActiveTab();
             renderTabListPaneOnly(store.activeTab);
@@ -1389,25 +1456,45 @@
           store.selected.sessionId = sid;
           store.selected.sessionCategory = 'summary';
           store.selected.observationSessionId = sid;
+          store.drill.sessions = isNarrowLayout() ? 'categories' : 'sessions';
           store.pages['session-content:summary'] = 0;
-          var list = getElementById('session-list');
-          updateRowActive(list, '[data-ui="select-session"]', sid, 'data-id');
           loadSessionStats(sid);
+          if (isNarrowLayout()) {
+            renderAppShellForActiveTab();
+            renderSessionListPaneOnly();
+          } else {
+            var list = getElementById('session-list');
+            updateRowActive(list, '[data-ui="select-session"]', sid, 'data-id');
+          }
           renderSessionCategoryPaneOnly();
           renderSessionContentPaneOnly();
+          renderSessionDetailPaneOnly();
         } else if (ui === 'session-category') {
           var cat = target.getAttribute('data-category') || 'summary';
           store.selected.sessionCategory = cat;
-          var categoryPane = getElementById('session-category-list');
-          updateRowActive(categoryPane, '[data-ui="session-category"]', cat, 'data-category');
+          store.drill.sessions = isNarrowLayout() ? 'content' : store.drill.sessions;
           await ensureCategoryDataForRightPane(cat, store.selected.sessionId);
+          if (isNarrowLayout()) {
+            renderAppShellForActiveTab();
+            renderSessionListPaneOnly();
+            renderSessionCategoryPaneOnly();
+          } else {
+            var categoryPane = getElementById('session-category-list');
+            updateRowActive(categoryPane, '[data-ui="session-category"]', cat, 'data-category');
+          }
           renderSessionContentPaneOnly();
+          renderSessionDetailPaneOnly();
         } else if (ui === 'observation-session') {
           var obsSessionId = target.getAttribute('data-id') || '';
           store.selected.observationSessionId = obsSessionId;
+          store.drill.observations = isNarrowLayout() ? 'list' : store.drill.observations;
           updateRowActive(getElementById('observation-filter-list'), '[data-ui="observation-session"]', obsSessionId, 'data-id');
           await loadObservationsForSession(obsSessionId);
           if (store.activeTab === 'observations') {
+            if (isNarrowLayout()) {
+              renderAppShellForActiveTab();
+              renderObservationFilterPaneOnly();
+            }
             renderObservationListPaneOnly();
             renderObservationDetailPaneOnly();
           }
@@ -1423,13 +1510,30 @@
             updateRowActive(container, '[data-ui="select-item"]', selectedId);
           }
           if (store.activeTab === 'sessions') {
-            renderSessionContentPaneOnly();
+            if (isNarrowLayout()) {
+              store.drill.sessions = 'detail';
+              renderAppShellForActiveTab();
+              renderSessionListPaneOnly();
+              renderSessionCategoryPaneOnly();
+              renderSessionContentPaneOnly();
+            }
+            renderSessionDetailPaneOnly();
           } else if (store.activeTab === 'observations') {
+            if (isNarrowLayout()) {
+              store.drill.observations = 'detail';
+              renderAppShellForActiveTab();
+              renderObservationFilterPaneOnly();
+              renderObservationListPaneOnly();
+            }
             renderObservationDetailPaneOnly();
           } else {
+            if (isNarrowLayout()) {
+              store.drill.tabById[itemType] = 'detail';
+              renderAppShellForActiveTab();
+              renderTabListPaneOnly(itemType);
+            }
             renderTabDetailPaneOnly(itemType);
           }
-          openDetailDrawer(selectedItemFor(itemType, selectedId, selectedKey), itemType);
         } else if (ui === 'expand-item') {
           var exKey = target.getAttribute('data-key') || '';
           var exId = target.getAttribute('data-id') || '';
@@ -1440,12 +1544,10 @@
           updateRowActive(container, '[data-ui="expand-item"]', exId);
           if (store.activeTab === 'sessions') {
             renderSessionContentPaneOnly();
+            renderSessionDetailPaneOnly();
           } else {
             renderTabListPaneOnly(store.activeTab);
             renderTabDetailPaneOnly(store.activeTab);
-          }
-          if (willExpand) {
-            openDetailDrawer(selectedItemFor(exType, exId, exKey), exType);
           }
         } else if (ui === 'page') {
           var pageKey = target.getAttribute('data-tab') || '';
@@ -1453,6 +1555,7 @@
           store.pages[pageKey] = Math.max(0, (store.pages[pageKey] || 0) + dir);
           if (store.activeTab === 'sessions') {
             renderSessionContentPaneOnly();
+            renderSessionDetailPaneOnly();
           } else if (store.activeTab === 'observations') {
             renderObservationListPaneOnly();
             renderObservationDetailPaneOnly();
@@ -1463,6 +1566,27 @@
         } else if (ui === 'close-detail') {
           if (target === e.target || target.tagName === 'BUTTON') {
             closeDetailDrawer();
+          }
+        } else if (ui === 'drill-back') {
+          var drillTarget = target.getAttribute('data-target') || 'list';
+          if (store.activeTab === 'sessions') {
+            store.drill.sessions = drillTarget;
+            renderAppShellForActiveTab();
+            renderSessionListPaneOnly();
+            renderSessionCategoryPaneOnly();
+            renderSessionContentPaneOnly();
+            renderSessionDetailPaneOnly();
+          } else if (store.activeTab === 'observations') {
+            store.drill.observations = drillTarget;
+            renderAppShellForActiveTab();
+            renderObservationFilterPaneOnly();
+            renderObservationListPaneOnly();
+            renderObservationDetailPaneOnly();
+          } else {
+            store.drill.tabById[store.activeTab] = drillTarget;
+            renderAppShellForActiveTab();
+            renderTabListPaneOnly(store.activeTab);
+            renderTabDetailPaneOnly(store.activeTab);
           }
         }
       });
@@ -1478,14 +1602,24 @@
         if (key === 'sessions') {
           renderSessionListPaneOnly();
         } else if (key === 'observations' || key.indexOf('session-content:') === 0) {
-          if (store.activeTab === 'sessions') renderSessionContentPaneOnly();
+          if (store.activeTab === 'sessions') {
+            renderSessionContentPaneOnly();
+            renderSessionDetailPaneOnly();
+          }
           if (store.activeTab === 'observations') renderObservationListPaneOnly();
         } else if (store.activeTab === 'sessions') {
           renderSessionContentPaneOnly();
+          renderSessionDetailPaneOnly();
         } else {
           renderTabListPaneOnly(store.activeTab);
           renderTabDetailPaneOnly(store.activeTab);
         }
+      });
+      window.addEventListener('resize', function() {
+        clearTimeout(store.resizeTimer);
+        store.resizeTimer = setTimeout(function() {
+          render();
+        }, 120);
       });
       window.addEventListener('hashchange', async function() {
         store.activeTab = tabFromHash();
