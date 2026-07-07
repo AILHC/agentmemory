@@ -269,6 +269,14 @@
         crystals: { label: 'Crystals' },
         insights: { label: 'Insights' }
       };
+      var SESSION_SCOPE = {
+        observations: true,
+        lessons: true,
+        semantic: true,
+        procedural: true,
+        crystals: true,
+        insights: true,
+      };
       var store = {
         activeTab: 'sessions',
         loaded: false,
@@ -278,6 +286,8 @@
         meta: {},
         cache: {},
         observationsBySession: {},
+        sessionItemsByType: {},
+        sessionStatsById: {},
         selected: {
           sessionId: '',
           sessionCategory: 'summary',
@@ -286,8 +296,19 @@
           observationSessionId: ''
         },
         filters: {},
-        pages: {}
+        pages: {},
       };
+
+      var debug = window.__agentmemoryReviewDebug;
+      if (debug && typeof debug === 'object') {
+        debug.store = store;
+      }
+
+      function emitDebug(event, payload) {
+        if (debug && typeof debug[event] === 'function') {
+          debug[event](payload);
+        }
+      }
 
       function esc(value) {
         return String(value == null ? '' : value)
@@ -306,16 +327,16 @@
         if (!value) return '';
         try { return new Date(value).toLocaleString(); } catch { return String(value); }
       }
+      function safeList(value) {
+        return Array.isArray(value) ? value : [];
+      }
       function idOf(item) {
         if (!item) return '';
-        return String(item.id || item.sessionId || item.memoryId || item.title || item.content || '');
+        return String(item.id || item.sessionId || item.memoryId || item.title || item.content || item.filepath || '');
       }
       function shortId(value) {
         var s = String(value || '');
         return s.length > 18 ? s.slice(0, 18) + '...' : s;
-      }
-      function asArray(value) {
-        return Array.isArray(value) ? value : [];
       }
       function firstText(item, keys) {
         for (var i = 0; i < keys.length; i++) {
@@ -336,10 +357,11 @@
       function apiUrl(path) {
         return REST + '/agentmemory/' + path;
       }
-      async function apiGet(path) {
-        var res = await fetch(apiUrl(path), { method: 'GET', headers: { 'Accept': 'application/json' } });
-        if (!res.ok) throw new Error(path + ' failed: ' + res.status);
-        return await res.json();
+      function apiGet(path) {
+        return fetch(apiUrl(path), { method: 'GET', headers: { 'Accept': 'application/json' } }).then(function(res) {
+          if (!res.ok) throw new Error(path + ' failed: ' + res.status);
+          return res.json();
+        });
       }
       function setStatus(html) {
         document.getElementById('status-line').innerHTML = html;
@@ -358,6 +380,29 @@
           return encodeURIComponent(k) + '=' + encodeURIComponent(String(params[k]));
         }).join('&');
       }
+      function getElementById(id) { return document.getElementById(id); }
+      function ensureObject(obj) {
+        if (!obj) return {};
+        return obj;
+      }
+      function sessionScopedState(type, sessionId) {
+        var bucket = ensureObject(store.sessionItemsByType[type]);
+        store.sessionItemsByType[type] = bucket;
+        var state = bucket[sessionId];
+        if (!state) {
+          state = { loading: false, error: '', items: [], total: 0 };
+          bucket[sessionId] = state;
+        }
+        return state;
+      }
+      function observationState(sessionId) {
+        var state = store.observationsBySession[sessionId];
+        if (!state) {
+          state = { loading: false, error: '', items: [], total: 0 };
+          store.observationsBySession[sessionId] = state;
+        }
+        return state;
+      }
 
       async function init() {
         store.activeTab = tabFromHash();
@@ -365,6 +410,15 @@
         render();
         await loadBaseData();
         await ensureTabData(store.activeTab);
+        if (store.activeTab === 'observations') {
+          store.selected.observationSessionId = store.selected.observationSessionId || store.selected.sessionId;
+          if (store.selected.observationSessionId) {
+            await loadObservationsForSession(store.selected.observationSessionId);
+          }
+        }
+        if (store.selected.sessionId) {
+          loadSessionStats(store.selected.sessionId);
+        }
         render();
       }
 
@@ -380,7 +434,8 @@
           var sessionsPage = await fetchStoreAll('sessions');
           store.sessions = asArray(sessionsPage.items);
           store.cache.sessions = sessionsPage;
-          store.cache.summaries = await fetchStoreAll('summaries');
+          var summaries = await fetchStoreAll('summaries');
+          store.cache.summaries = summaries;
           if (!store.selected.sessionId && store.sessions.length) {
             store.selected.sessionId = idOf(sortedSessions()[0]);
           }
@@ -396,7 +451,6 @@
         if (tab === 'sessions' || tab === 'observations') return;
         if (store.cache[tab]) return;
         store.cache[tab] = { loading: true, items: [] };
-        render();
         try {
           store.cache[tab] = await fetchStoreAll(tab);
         } catch (err) {
@@ -405,14 +459,118 @@
       }
 
       async function loadObservationsForSession(sessionId) {
-        if (!sessionId || store.observationsBySession[sessionId]) return;
-        store.observationsBySession[sessionId] = { loading: true, items: [] };
-        render();
+        if (!sessionId) return;
+        var state = observationState(sessionId);
+        if (state.loading) return;
+        if (state.loaded) return;
+        state.loading = true;
+        state.error = '';
+        state.items = [];
+        state.total = 0;
         try {
-          store.observationsBySession[sessionId] = await fetchStoreAll('observations', { sessionId: sessionId });
+          var payload = await fetchStoreAll('observations', { sessionId: sessionId });
+          state.items = asArray(payload.items);
+          state.total = Number(payload.total || payload.returned || state.items.length) || 0;
+          state.loaded = true;
         } catch (err) {
-          store.observationsBySession[sessionId] = { error: err instanceof Error ? err.message : String(err), items: [] };
+          state.error = err instanceof Error ? err.message : String(err);
+        } finally {
+          state.loading = false;
         }
+      }
+
+      async function ensureSessionData(type, sessionId) {
+        if (!type || !sessionId || !SESSION_SCOPE[type]) return;
+        if (type === 'observations') {
+          await loadObservationsForSession(sessionId);
+          return;
+        }
+        var state = sessionScopedState(type, sessionId);
+        if (state.loading || state.loaded) return;
+        state.loading = true;
+        state.error = '';
+        state.items = [];
+        state.total = 0;
+        try {
+          var payload = await fetchStoreAll(type, { sessionId: sessionId });
+          state.items = asArray(payload.items);
+          state.total = Number(payload.total || payload.returned || state.items.length) || 0;
+          state.loaded = true;
+        } catch (err) {
+          state.error = err instanceof Error ? err.message : String(err);
+        } finally {
+          state.loading = false;
+        }
+      }
+
+      async function loadSessionStats(sessionId) {
+        if (!sessionId) return;
+        var current = store.sessionStatsById[sessionId];
+        if (current && current.loading) return;
+        if (current && current.loaded && !current.error) return;
+        store.sessionStatsById[sessionId] = {
+          loading: true,
+          loaded: false,
+          error: '',
+          categories: {},
+          sessionId: sessionId,
+        };
+        try {
+          var result = await apiGet('viewer/session-stats?' + query({ sessionId: sessionId }));
+          if (result && result.success) {
+            store.sessionStatsById[sessionId] = {
+              loading: false,
+              loaded: true,
+              error: '',
+              categories: ensureObject(result.categories),
+              sessionId: sessionId,
+            };
+          } else {
+            throw new Error('session-stats response missing success flag');
+          }
+        } catch (err) {
+          store.sessionStatsById[sessionId] = {
+            loading: false,
+            loaded: true,
+            error: err instanceof Error ? err.message : String(err),
+            categories: {},
+            sessionId: sessionId,
+          };
+        }
+
+        if (store.activeTab === 'sessions' && store.selected.sessionId === sessionId) {
+          renderSessionCategoryPaneOnly();
+          if (store.selected.sessionCategory !== 'summary') {
+            renderSessionContentPaneOnly();
+          }
+        }
+      }
+
+      function sessionStat(state, category) {
+        var stat = state && state.categories && state.categories[category];
+        if (!stat) return null;
+        if (stat.status === 'failed') return -1;
+        if (typeof stat.count === 'number') return stat.count;
+        return null;
+      }
+
+      function sessionCategoryCountText(session, category) {
+        var sessionId = idOf(session);
+        var state = sessionId ? store.sessionStatsById[sessionId] : null;
+        var cached = sessionStat(state, category);
+        if (cached === -1) return '!';
+        if (state && state.error) return '!';
+        if (cached !== null) return String(cached);
+        return '...';
+      }
+
+      function sessionCategoryCount(session, category) {
+        var sessionId = idOf(session);
+        var state = sessionId ? store.sessionStatsById[sessionId] : null;
+        if (!state || state.loading) return null;
+        if (state.error) return -1;
+        if (sessionStat(state, category) === -1) return -1;
+        return sessionStat(state, category);
       }
 
       async function fetchStoreAll(type, extra) {
@@ -429,8 +587,10 @@
         return Object.assign({}, last || {}, { items: items, returned: items.length, hasMore: false, completeness: 'complete' });
       }
 
+      function asArray(value) { return Array.isArray(value) ? value : []; }
+
       function renderTabs() {
-        var tabs = document.getElementById('tabs');
+        var tabs = getElementById('tabs');
         tabs.innerHTML = TAB_IDS.map(function(tab) {
           var active = store.activeTab === tab ? ' active' : '';
           return '<button class="' + active + '" type="button" data-ui="tab" data-tab="' + attr(tab) + '">' + esc(TAB_CONFIG[tab].label) + '</button>';
@@ -438,9 +598,11 @@
       }
 
       function render() {
-        var app = document.getElementById('app');
+        emitDebug('render', { reason: 'global' });
         renderTabs();
         setStatus(statusHtml());
+        var app = getElementById('app');
+
         if (store.error) {
           app.innerHTML = '<div class="pane"><div class="error">' + esc(store.error) + '</div></div>';
           return;
@@ -449,15 +611,214 @@
           app.innerHTML = '<div class="pane"><div class="loading">Loading sessions...</div></div>';
           return;
         }
+
+        renderAppShellForActiveTab();
         if (store.activeTab === 'sessions') {
-          app.innerHTML = renderSessionsTab();
-        } else if (store.activeTab === 'summaries') {
-          app.innerHTML = renderTwoColumnTab('summaries', tabItems('summaries'));
-        } else if (store.activeTab === 'observations') {
-          app.innerHTML = renderObservationsTab();
-        } else {
-          app.innerHTML = renderTwoColumnTab(store.activeTab, tabItems(store.activeTab));
+          renderSessionListPaneOnly();
+          renderSessionCategoryPaneOnly();
+          renderSessionContentPaneOnly();
+          return;
         }
+        if (store.activeTab === 'observations') {
+          renderObservationFilterPaneOnly();
+          renderObservationListPaneOnly();
+          renderObservationDetailPaneOnly();
+          return;
+        }
+        renderTabListPaneOnly(store.activeTab);
+        renderTabDetailPaneOnly(store.activeTab);
+      }
+
+      function renderAppShellForActiveTab() {
+        var app = getElementById('app');
+        if (store.activeTab === 'sessions') {
+          var sid = idOf(selectedSession());
+          app.innerHTML =
+            '<div class="grid sessions" id="sessions-grid">' +
+            '<section class="pane" id="session-list-pane"><div class="pane-head"><h2 class="pane-title">Sessions</h2><div class="pane-sub">Select a session, then inspect extracted categories.</div></div><div class="list" data-scroll-key="sessions" id="session-list"></div></section>' +
+            '<section class="pane" id="session-category-pane"><div class="pane-head"><h2 class="pane-title">Extraction Categories</h2><div class="pane-sub">Current session: loading</div></div><div class="list" data-scroll-key="session-categories:' + attr(sid || 'none') + '" id="session-category-list"></div></section>' +
+            '<section class="pane" id="session-content-pane"><div class="pane-head"><h2 class="pane-title">Content</h2><div class="pane-sub">Select a category.</div></div><div class="list" data-scroll-key="session-content:' + attr(sid || 'none') + '" id="session-content-list"></div></section>' +
+            '</div>';
+          return;
+        }
+        if (store.activeTab === 'observations') {
+          app.innerHTML =
+            '<div class="grid sessions" id="observations-grid">' +
+            '<section class="pane" id="observation-filter-pane"><div class="pane-head"><h2 class="pane-title">Observation Filters</h2><div class="pane-sub">Observations are loaded per session.</div></div><div class="list" data-scroll-key="observation-sessions" id="observation-filter-list"></div></section>' +
+            '<section class="pane" id="observation-list-pane"><div class="pane-head"><h2 class="pane-title">Observation List</h2><div class="pane-sub">Current session observations.</div></div><div class="list" data-scroll-key="observation-list" id="observation-list"></div></section>' +
+            '<section class="pane" id="observation-detail-pane"><div class="pane-head"><h2 class="pane-title">Observation Detail</h2><div class="pane-sub">Select an observation to inspect raw fields.</div></div><div class="list" id="observation-detail"></div></section>' +
+            '</div>';
+          return;
+        }
+        app.innerHTML =
+          '<div class="grid two-col" id="review-tab-grid">' +
+          '<section class="pane" id="tab-list-pane"><div class="pane-head"><h2 class="pane-title">' + esc(TAB_CONFIG[store.activeTab].label) + '</h2><div class="pane-sub">Select an item.</div></div><div class="list" data-scroll-key="tab-list:' + attr(store.activeTab) + '" id="tab-list"></div></section>' +
+          '<section class="pane" id="tab-detail-pane"><div class="pane-head"><h2 class="pane-title">' + esc(TAB_CONFIG[store.activeTab].label) + ' Detail</h2><div class="pane-sub">Readable fields, source fields, and raw JSON.</div></div><div class="list" id="tab-detail"></div></section>' +
+          '</div>';
+      }
+
+      function renderSessionListPaneOnly() {
+        var pane = getElementById('session-list');
+        if (!pane) return;
+        var sessions = filterItems('sessions', sortedSessions());
+        pane.innerHTML = renderSearch('sessions', 'Search session / prompt / project') +
+          '<div class="list" data-scroll-key="sessions" id="session-list-rows">' +
+          (sessions.length ? sessions.map(renderSessionRow).join('') : renderEmpty('No sessions')) +
+          '</div>';
+      }
+      function renderSessionCategoryPaneOnly() {
+        var pane = getElementById('session-category-pane');
+        var list = getElementById('session-category-list');
+        if (!pane || !list) return;
+        var session = selectedSession();
+        var sid = idOf(session);
+        var cats = sessionCategories(session);
+        list.innerHTML = cats.map(function(c) {
+          return '<button type="button" class="row ' + (store.selected.sessionCategory === c.id ? 'active' : '') + '" data-ui="session-category" data-category="' + attr(c.id) + '">' +
+            '<div class="row-title"><span>' + esc(c.label) + '</span><span>' + esc(c.countText) + '</span></div>' +
+            '<div class="row-meta">' + esc(c.meta) + '</div></button>';
+        }).join('') || renderEmpty('No session selected');
+        var header = pane.querySelector('[class="pane-head"]');
+        if (header) {
+          header.innerHTML = '<h2 class="pane-title">Extraction Categories</h2><div class="pane-sub">Current session: ' + esc(sid ? shortId(sid) : 'none') + '</div>';
+        }
+      }
+      function renderSessionContentPaneOnly() {
+        var session = selectedSession();
+        var pane = getElementById('session-content-pane');
+        if (!pane) return;
+        if (!session) {
+          pane.innerHTML = '<div class="pane-head"><h2 class="pane-title">Content</h2><div class="pane-sub">No session selected</div></div><div class="list" id="session-content-list">' + renderEmpty('No session selected') + '</div>';
+          return;
+        }
+        var category = store.selected.sessionCategory || 'summary';
+          var sid = idOf(session);
+          var key = 'session-content:' + sid + ':' + category;
+        pane.innerHTML = '<div class="pane-head"><h2 class="pane-title">Content List: ' + esc(TAB_CONFIG[category] ? TAB_CONFIG[category].label : category) + '</h2><div class="pane-sub">Summary from backend stats and session store.</div></div>';
+
+        if (category === 'summary') {
+          var summary = sessionSummaryForSession(session);
+          pane.innerHTML += '<div class="list" id="session-content-list">' + renderSummaryDetail(summary) + '</div>';
+          return;
+        }
+
+        if (category === 'observations') {
+          var obsState = observationState(sid);
+          if (obsState.loading) {
+            pane.innerHTML += '<div class="list" id="session-content-list"><div class="loading">Loading ' + esc(category) + '...</div></div>';
+            return;
+          }
+          if (obsState.error) {
+            pane.innerHTML += '<div class="list" id="session-content-list"><div class="error">' + esc(obsState.error) + '</div></div>';
+            return;
+          }
+        } else {
+          var catState = sessionScopedState(category, sid);
+          if (catState.error) {
+            pane.innerHTML += '<div class="list" id="session-content-list"><div class="error">' + esc(catState.error) + '</div></div>';
+            return;
+          }
+          if (catState.loading && !catState.items.length) {
+            pane.innerHTML += '<div class="list" id="session-content-list"><div class="loading">Loading ' + esc(category) + '...</div></div>';
+            return;
+          }
+        }
+
+        var listItems = sessionCategoryItems(category, session);
+        var filtered = filterItems(key, listItems);
+        var selectedId = store.selected.itemByTab[category] || (filtered[0] && idOf(filtered[0])) || '';
+        if (!selectedId && filtered.length) {
+          selectedId = idOf(filtered[0]);
+          store.selected.itemByTab[category] = selectedId;
+        }
+        var selected = filtered.find(function(item) { return idOf(item) === selectedId; }) || filtered[0] || null;
+        var countForTotal = sessionCategoryCount(session, category);
+        var countText = countForTotal === null ? '...' : countForTotal < 0 ? '!' : String(countForTotal);
+        var total = countForTotal != null && countForTotal >= 0 ? countForTotal : filtered.length;
+        pane.innerHTML += '<div class="list" id="session-content-list"><div class="pane-sub">Count: ' + esc(countText) + '</div>' + renderSearch(key, 'Filter current category') +
+          (filtered.length ? renderItemList(key, listItems, category, true) : renderEmpty('No items')) + '</div>' +
+          pagerHtml(key, total) +
+          '<div class="detail">' + (selected ? renderDetail(selected, category) : renderEmpty('No item selected')) + '</div>';
+      }
+
+      function renderTabListPaneOnly(tab) {
+        var tabData = store.cache[tab];
+        var pane = getElementById('tab-list');
+        if (!pane) return;
+        if (tabData && tabData.loading) {
+          pane.innerHTML = '<div class="loading">Loading ' + esc(tab) + '...</div>';
+          return;
+        }
+        if (tabData && tabData.error) {
+          pane.innerHTML = '<div class="error">' + esc(tabData.error) + '</div>';
+          return;
+        }
+
+        var items = tabItems(tab);
+        var list = filterItems(tab, items);
+        var selectedId = store.selected.itemByTab[tab] || (list[0] && idOf(list[0])) || '';
+        if (!store.selected.itemByTab[tab] && selectedId) store.selected.itemByTab[tab] = selectedId;
+        pane.innerHTML = renderSearch(tab, 'Search ' + TAB_CONFIG[tab].label.toLowerCase()) +
+          (list.length ? renderItemList(tab, items, tab, true) : renderEmpty('No items'));
+      }
+      function renderTabDetailPaneOnly(tab) {
+        var pane = getElementById('tab-detail');
+        if (!pane) return;
+        var items = tabItems(tab);
+        var filtered = filterItems(tab, items);
+        var selectedId = store.selected.itemByTab[tab] || (filtered[0] && idOf(filtered[0])) || '';
+        var selected = filtered.find(function(item) { return idOf(item) === selectedId; }) || filtered[0] || null;
+        pane.innerHTML = renderDetail(selected, tab);
+        var countLabel = tabDataCountLabel(tab, filtered.length);
+        var paneRoot = getElementById('tab-detail-pane');
+        var detailHeader = paneRoot && paneRoot.querySelector('.pane-head');
+        if (detailHeader) {
+          detailHeader.innerHTML = '<h2 class="pane-title">' + esc(TAB_CONFIG[tab].label) + ' Detail</h2><div class="pane-sub">Total: ' + esc(countLabel) + '</div>';
+        }
+      }
+      function renderObservationFilterPaneOnly() {
+        var pane = getElementById('observation-filter-pane');
+        var list = getElementById('observation-filter-list');
+        if (!pane || !list) return;
+        list.innerHTML = sortedSessions().map(function(s) {
+          var id = idOf(s);
+          return '<button type="button" class="row ' + (id === store.selected.observationSessionId ? 'active' : '') + '" data-ui="observation-session" data-id="' + attr(id) + '">' +
+            '<div class="row-title"><span>' + esc(shortId(id)) + '</span><span>' + esc(s.observationCount || 0) + '</span></div>' +
+            '<div class="row-meta">' + esc(truncate(s.firstPrompt || s.project || '', 120)) + '</div></button>';
+        }).join('') || renderEmpty('No sessions');
+      }
+      function renderObservationListPaneOnly() {
+        var pane = getElementById('observation-list');
+        if (!pane) return;
+        var sessionId = store.selected.observationSessionId || store.selected.sessionId;
+        var items = observationState(sessionId).items || [];
+        if (!sessionId) {
+          pane.innerHTML = renderEmpty('No session selected');
+          return;
+        }
+        if (observationState(sessionId).loading) {
+          pane.innerHTML = renderEmpty('Loading observations...');
+          return;
+        }
+        if (observationState(sessionId).error) {
+          pane.innerHTML = '<div class="error">' + esc(observationState(sessionId).error) + '</div>';
+          return;
+        }
+        var key = 'observations';
+        var selectedId = store.selected.itemByTab[key] || ((items[0] && idOf(items[0])) || '');
+        if (!store.selected.itemByTab[key] && selectedId) store.selected.itemByTab[key] = selectedId;
+        pane.innerHTML = renderSearch(key, 'Search title / tool / file') +
+          (items.length ? renderItemList(key, items, 'observations', true) : renderEmpty('No observations for this session'));
+      }
+      function renderObservationDetailPaneOnly() {
+        var detail = getElementById('observation-detail');
+        if (!detail) return;
+        var sessionId = store.selected.observationSessionId || store.selected.sessionId;
+        var obs = observationState(sessionId).items || [];
+        var filtered = filterItems('observations', obs);
+        var selectedId = store.selected.itemByTab['observations'] || (filtered[0] && idOf(filtered[0])) || '';
+        var selected = filtered.find(function(item) { return idOf(item) === selectedId; }) || filtered[0] || null;
+        detail.innerHTML = renderDetail(selected, 'observations');
       }
 
       function statusHtml() {
@@ -465,7 +826,7 @@
         var obsTotal = store.meta.observations ? store.meta.observations.total : store.sessions.reduce(function(sum, s) { return sum + (Number(s.observationCount) || 0); }, 0);
         var pieces = [
           '<strong>' + esc(sessionTotal) + '</strong> sessions',
-          '<strong>' + esc(obsTotal) + '</strong> observations'
+          '<strong>' + esc(obsTotal) + '</strong> observations',
         ];
         ['lessons', 'semantic', 'procedural', 'crystals', 'insights'].forEach(function(tab) {
           var meta = store.meta[tab];
@@ -486,18 +847,61 @@
         var summaries = tabItems('summaries');
         var bySession = new Map(summaries.map(function(summary) { return [String(summary.sessionId || summary.id || ''), summary]; }));
         return store.sessions.map(function(s) {
-          var summary = bySession.get(idOf(s));
-          return summary ? Object.assign({ id: idOf(s), sessionId: idOf(s) }, summary) : {
-            id: idOf(s),
-            sessionId: idOf(s),
-            title: firstText(s, ['firstPrompt']) || idOf(s),
+          var sid = idOf(s);
+          var summary = bySession.get(sid);
+          return summary ? Object.assign({ id: sid, sessionId: sid }, summary) : {
+            id: sid,
+            sessionId: sid,
+            title: firstText(s, ['firstPrompt']) || sid,
             narrative: '',
             observationCount: s.observationCount,
             project: s.project,
-            startedAt: s.startedAt
+            startedAt: s.startedAt,
+            keyDecisions: asArray(s.keyDecisions),
+            filesModified: asArray(s.filesModified),
           };
         });
       }
+      function sessionSummaryForSession(session) {
+        if (!session) return null;
+        var sid = idOf(session);
+        var summary = summaryItems().find(function(item) { return item.sessionId === sid; });
+        return summary || {
+          id: sid,
+          sessionId: sid,
+          title: firstText(session, ['firstPrompt']) || sid,
+          narrative: '',
+          confidence: session.confidence,
+          createdAt: session.createdAt,
+          updatedAt: session.updatedAt
+        };
+      }
+
+      function sessionCategories(session) {
+        var sid = session ? idOf(session) : '';
+        var categories = session ? [
+          { id: 'summary', label: 'Summary', countText: sessionCategoryCountText(session, 'summary'), meta: 'summary by sessionId' },
+          { id: 'observations', label: 'Observations', countText: sessionCategoryCountText(session, 'observations'), meta: 'paged viewer-store by sessionId' },
+          { id: 'lessons', label: 'Lessons', countText: sessionCategoryCountText(session, 'lessons'), meta: 'session-scoped viewer/store' },
+          { id: 'semantic', label: 'Semantic', countText: sessionCategoryCountText(session, 'semantic'), meta: 'session-scoped viewer/store' },
+          { id: 'procedural', label: 'Procedural', countText: sessionCategoryCountText(session, 'procedural'), meta: 'session-scoped viewer/store' },
+          { id: 'crystals', label: 'Crystals', countText: sessionCategoryCountText(session, 'crystals'), meta: 'session-scoped viewer/store' },
+          { id: 'insights', label: 'Insights', countText: sessionCategoryCountText(session, 'insights'), meta: 'session-scoped viewer/store' },
+        ] : [];
+        return categories;
+      }
+      function sessionCategoryItems(category, session) {
+        var sid = idOf(session);
+        if (!sid) return [];
+        if (category === 'observations') return observationState(sid).items || [];
+        if (category === 'lessons') return sessionScopedState('lessons', sid).items || [];
+        if (category === 'semantic') return sessionScopedState('semantic', sid).items || [];
+        if (category === 'procedural') return sessionScopedState('procedural', sid).items || [];
+        if (category === 'crystals') return sessionScopedState('crystals', sid).items || [];
+        if (category === 'insights') return sessionScopedState('insights', sid).items || [];
+        return [];
+      }
+
       function tabItems(tab) {
         var data = store.cache[tab];
         if (Array.isArray(data)) return data;
@@ -505,10 +909,10 @@
         return [];
       }
       function filterItems(tab, items) {
-        var query = String(store.filters[tab] || '').toLowerCase().trim();
-        if (!query) return items;
+        var filter = String(store.filters[tab] || '').toLowerCase().trim();
+        if (!filter) return items;
         return items.filter(function(item) {
-          return JSON.stringify(item).toLowerCase().indexOf(query) >= 0;
+          return JSON.stringify(item).toLowerCase().indexOf(filter) >= 0;
         });
       }
       function pageItems(tab, items) {
@@ -521,20 +925,16 @@
         var pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
         return '<div class="pager"><button type="button" data-ui="page" data-tab="' + attr(tab) + '" data-dir="-1" ' + (page <= 0 ? 'disabled' : '') + '>Prev</button><span>Page ' + (page + 1) + ' / ' + pages + ' · ' + total + ' items</span><button type="button" data-ui="page" data-tab="' + attr(tab) + '" data-dir="1" ' + (page >= pages - 1 ? 'disabled' : '') + '>Next</button></div>';
       }
-
-      function renderSessionsTab() {
-        var session = selectedSession();
-        return '<div class="grid sessions">' +
-          renderSessionListPane() +
-          renderSessionCategoryPane(session) +
-          renderSessionContentPane(session) +
-          '</div>';
+      function tabDataCountLabel(tab, fallback) {
+        var state = store.cache[tab];
+        if (state && state.total != null) return state.total;
+        if (state && state.error) return 'error';
+        if (store.loading) return '...';
+        return fallback;
       }
-      function renderSessionListPane() {
-        var sessions = filterItems('sessions', sortedSessions());
-        return '<section class="pane"><div class="pane-head"><h2 class="pane-title">Sessions</h2><div class="pane-sub">Select a session, then inspect extracted categories.</div></div>' +
-          renderSearch('sessions', 'Search session / prompt / project') +
-          '<div class="list">' + (sessions.length ? sessions.map(renderSessionRow).join('') : renderEmpty('No sessions')) + '</div></section>';
+
+      function renderSearch(key, placeholder) {
+        return '<div class="pane-tools"><input class="search" data-ui="filter" data-key="' + attr(key) + '" type="search" placeholder="' + attr(placeholder) + '" value="' + attr(store.filters[key] || '') + '"></div>';
       }
       function renderSessionRow(s) {
         var id = idOf(s);
@@ -544,126 +944,13 @@
           '<div class="row-body">' + esc(truncate(s.firstPrompt || s.project || s.cwd || '', 140)) + '</div>' +
           '</button>';
       }
-      function renderSessionCategoryPane(session) {
-        var cats = sessionCategories(session);
-        return '<section class="pane"><div class="pane-head"><h2 class="pane-title">Extraction Categories</h2><div class="pane-sub">Current session: ' + esc(session ? shortId(idOf(session)) : 'none') + '</div></div><div class="list">' +
-          cats.map(function(c) {
-            return '<button type="button" class="row ' + (store.selected.sessionCategory === c.id ? 'active' : '') + '" data-ui="session-category" data-category="' + attr(c.id) + '">' +
-              '<div class="row-title"><span>' + esc(c.label) + '</span><span>' + esc(c.count) + '</span></div>' +
-              '<div class="row-meta">' + esc(c.meta) + '</div></button>';
-          }).join('') + '</div></section>';
-      }
-      function sessionCategories(session) {
-        var sid = session ? idOf(session) : '';
-        var obs = observationState(sid).items || [];
-        return [
-          { id: 'summary', label: 'Summary', count: session ? 1 : 0, meta: 'summary joined by sessionId' },
-          { id: 'observations', label: 'Observations', count: session ? (session.observationCount || obs.length || 0) : 0, meta: 'paged viewer-store by sessionId' },
-          { id: 'lessons', label: 'Lessons', count: relatedLessons(sid).length, meta: 'sourceIds when resolvable' },
-          { id: 'semantic', label: 'Semantic', count: relatedBySession('semantic', sid, 'sourceSessionIds').length, meta: 'sourceSessionIds match' },
-          { id: 'procedural', label: 'Procedural', count: relatedBySession('procedural', sid, 'sourceSessionIds').length, meta: 'sourceSessionIds match' },
-          { id: 'crystals', label: 'Crystals', count: relatedBySession('crystals', sid, 'sessionId').length, meta: 'sessionId match' },
-          { id: 'insights', label: 'Insights', count: tabItems('insights').length, meta: 'indirect source ids, not guessed' }
-        ];
-      }
-      function observationState(sessionId) {
-        return store.observationsBySession[sessionId] || { items: [] };
-      }
-      function relatedBySession(tab, sessionId, field) {
-        if (!sessionId) return [];
-        return tabItems(tab).filter(function(item) {
-          var value = item && item[field];
-          return Array.isArray(value) ? value.indexOf(sessionId) >= 0 : value === sessionId;
-        });
-      }
-      function relatedLessons(sessionId) {
-        if (!sessionId) return [];
-        var obsState = observationState(sessionId);
-        var obsIds = new Set((obsState.items || []).map(function(o) { return idOf(o); }));
-        return tabItems('lessons').filter(function(l) {
-          return asArray(l.sourceIds).some(function(id) { return obsIds.has(String(id)); });
-        });
-      }
-      function renderSessionContentPane(session) {
-        if (!session) return '<section class="pane"><div class="empty">No session selected</div></section>';
-        var category = store.selected.sessionCategory || 'summary';
-        var items = sessionCategoryItems(category, session);
-        var title = TAB_CONFIG[category] ? TAB_CONFIG[category].label : category;
-        if (category === 'summary') {
-          return '<section class="pane"><div class="pane-head"><h2 class="pane-title">Content List: Summary</h2><div class="pane-sub">Click rows to expand detail.</div></div><div class="list">' + renderDetail(summaryItems().find(function(s) { return s.sessionId === idOf(session); }) || session, 'summaries') + '</div></section>';
-        }
-        return '<section class="pane"><div class="pane-head"><h2 class="pane-title">Content List: ' + esc(title) + '</h2><div class="pane-sub">Click an item to expand raw details.</div></div>' +
-          renderSearch('session-' + category, 'Filter current category') +
-          '<div class="list">' + renderItemList('session-' + category, items, category) + '</div>' +
-          pagerHtml('session-' + category, filterItems('session-' + category, items).length) + '</section>';
-      }
-      function sessionCategoryItems(category, session) {
-        var sid = idOf(session);
-        if (category === 'observations') return observationState(sid).items || [];
-        if (category === 'lessons') return relatedLessons(sid);
-        if (category === 'semantic') return relatedBySession('semantic', sid, 'sourceSessionIds');
-        if (category === 'procedural') return relatedBySession('procedural', sid, 'sourceSessionIds');
-        if (category === 'crystals') return relatedBySession('crystals', sid, 'sessionId');
-        if (category === 'insights') return tabItems('insights');
-        return [];
-      }
-
-      function renderTwoColumnTab(tab, items) {
-        var data = store.cache[tab];
-        if (data && data.loading) return '<div class="pane"><div class="loading">Loading ' + esc(tab) + '...</div></div>';
-        if (data && data.error) return '<div class="pane"><div class="error">' + esc(data.error) + '</div></div>';
-        var filtered = filterItems(tab, items);
-        var selectedId = store.selected.itemByTab[tab] || (filtered[0] && idOf(filtered[0])) || '';
-        if (!store.selected.itemByTab[tab] && selectedId) store.selected.itemByTab[tab] = selectedId;
-        var selected = filtered.find(function(item) { return idOf(item) === selectedId; }) || filtered[0] || null;
-        return '<div class="grid two-col">' +
-          '<section class="pane"><div class="pane-head"><h2 class="pane-title">' + esc(TAB_CONFIG[tab].label) + '</h2><div class="pane-sub">' + esc(items.length) + ' total items</div></div>' +
-          renderSearch(tab, 'Search ' + TAB_CONFIG[tab].label.toLowerCase()) +
-          '<div class="list">' + renderItemList(tab, items, tab, true) + '</div>' +
-          pagerHtml(tab, filtered.length) + '</section>' +
-          '<section class="pane"><div class="pane-head"><h2 class="pane-title">' + esc(TAB_CONFIG[tab].label) + ' Detail</h2><div class="pane-sub">Readable fields, source fields, and raw JSON.</div></div><div class="list">' +
-          (selected ? renderDetail(selected, tab) : renderEmpty(tab === 'procedural' ? 'No procedural memories in this state.' : 'No item selected')) +
-          '</div></section></div>';
-      }
-      function renderObservationsTab() {
-        var sessionId = store.selected.observationSessionId || store.selected.sessionId || (sortedSessions()[0] && idOf(sortedSessions()[0])) || '';
-        if (sessionId && !store.selected.observationSessionId) store.selected.observationSessionId = sessionId;
-        var obs = observationState(sessionId).items || [];
-        return '<div class="grid sessions">' +
-          renderObservationFilterPane(sessionId) +
-          '<section class="pane"><div class="pane-head"><h2 class="pane-title">Observation List</h2><div class="pane-sub">' + esc(obs.length || '') + ' loaded for current session.</div></div>' +
-          renderSearch('observations', 'Search title / tool / file') +
-          '<div class="list">' + renderItemList('observations', obs, 'observations', true) + '</div>' +
-          pagerHtml('observations', filterItems('observations', obs).length) + '</section>' +
-          '<section class="pane"><div class="pane-head"><h2 class="pane-title">Observation Detail</h2><div class="pane-sub">Select an observation to inspect raw fields.</div></div><div class="list">' + renderSelectedDetail('observations', obs) + '</div></section>' +
-          '</div>';
-      }
-      function renderObservationFilterPane(activeSessionId) {
-        return '<section class="pane"><div class="pane-head"><h2 class="pane-title">Observation Filters</h2><div class="pane-sub">Observations are loaded per session.</div></div><div class="list">' +
-          sortedSessions().map(function(s) {
-            var id = idOf(s);
-            return '<button type="button" class="row ' + (id === activeSessionId ? 'active' : '') + '" data-ui="observation-session" data-id="' + attr(id) + '">' +
-              '<div class="row-title"><span>' + esc(shortId(id)) + '</span><span>' + esc(s.observationCount || 0) + '</span></div>' +
-              '<div class="row-meta">' + esc(truncate(s.firstPrompt || s.project || '', 120)) + '</div></button>';
-          }).join('') + '</div></section>';
-      }
-      function renderSelectedDetail(tab, items) {
-        var filtered = filterItems(tab, items);
-        var selectedId = store.selected.itemByTab[tab] || (filtered[0] && idOf(filtered[0])) || '';
-        var selected = filtered.find(function(item) { return idOf(item) === selectedId; }) || filtered[0] || null;
-        return selected ? renderDetail(selected, tab) : renderEmpty('No item selected');
-      }
-
-      function renderSearch(key, placeholder) {
-        return '<div class="pane-tools"><input class="search" data-ui="filter" data-key="' + attr(key) + '" type="search" placeholder="' + attr(placeholder) + '" value="' + attr(store.filters[key] || '') + '"></div>';
-      }
       function renderItemList(key, items, type, selectMode) {
         var filtered = filterItems(key, items);
         var page = pageItems(key, filtered);
         if (!page.length) return renderEmpty('No items');
         return page.map(function(item) {
           var id = idOf(item);
-          var selected = selectMode && store.selected.itemByTab[key] === id;
+          var selected = selectMode && store.selected.itemByTab[type] === id;
           var expanded = !selectMode && store.selected.expandedByTab[key] === id;
           var row = '<button type="button" class="row ' + (selected || expanded ? 'active' : '') + '" data-ui="' + (selectMode ? 'select-item' : 'expand-item') + '" data-key="' + attr(key) + '" data-type="' + attr(type) + '" data-id="' + attr(id) + '">' +
             '<div class="row-title"><span>' + esc(itemTitle(item, type)) + '</span></div>' +
@@ -675,18 +962,20 @@
       }
       function itemTitle(item, type) {
         if (type === 'summaries') return item.title || shortId(item.sessionId);
-        if (type === 'observations') return item.title || item.toolName || shortId(item.id);
+        if (type === 'observations') return item.title || item.subtitle || item.toolName || shortId(item.id);
         if (type === 'semantic') return item.fact || shortId(item.id);
-        if (type === 'crystals') return item.title || shortId(item.id);
+        if (type === 'crystals') return item.title || item.sessionId || shortId(item.id);
         if (type === 'insights') return item.title || shortId(item.id);
         if (type === 'lessons') return item.content || shortId(item.id);
-        if (type === 'procedural') return item.title || item.name || shortId(item.id);
+        if (type === 'procedural') return item.name || item.title || shortId(item.id);
         return item.title || item.content || item.id || 'item';
       }
       function itemMeta(item, type) {
         var parts = [];
         if (item.confidence != null) parts.push('confidence ' + item.confidence);
+        if (item.strength != null) parts.push('strength ' + item.strength);
         if (item.updatedAt || item.createdAt || item.timestamp) parts.push(formatDate(item.updatedAt || item.createdAt || item.timestamp));
+        if (item.frequency != null) parts.push('frequency ' + item.frequency);
         if (item.sessionId) parts.push('session ' + shortId(item.sessionId));
         if (type === 'observations' && item.sourceEventIndex != null) parts.push('event ' + item.sourceEventIndex);
         return parts.join(' · ');
@@ -696,32 +985,203 @@
         if (type === 'semantic') return item.fact || '';
         if (type === 'crystals') return item.narrative || '';
         if (type === 'insights') return item.content || '';
-        if (type === 'observations') return firstText(item, ['narrative', 'assistantResponse', 'userPrompt', 'toolOutput', 'toolInput']);
-        return firstText(item, ['content', 'context', 'summary', 'description', 'narrative']);
+        if (type === 'observations') return firstText(item, ['narrative', 'title', 'subtitle', 'facts', 'assistantResponse', 'toolOutput', 'toolInput']);
+        if (type === 'procedural') return [item.triggerCondition, asArray(item.steps).join(' '), item.expectedOutcome].filter(Boolean).join(' ');
+        return firstText(item, ['content', 'context', 'summary', 'description', 'narrative', 'name']);
       }
       function renderBadges(item, type) {
         var badges = [];
         if (item.sessionId) badges.push('<span class="badge green">sessionId</span>');
-        if (asArray(item.sourceSessionIds).length) badges.push(countBadge('sourceSessionIds', item.sourceSessionIds.length, 'green'));
-        if (asArray(item.sourceIds).length) badges.push(countBadge('sourceIds', item.sourceIds.length, 'amber'));
-        if (asArray(item.sourceLessonIds).length) badges.push(countBadge('sourceLessonIds', item.sourceLessonIds.length, 'amber'));
-        if (asArray(item.sourceCrystalIds).length) badges.push(countBadge('sourceCrystalIds', item.sourceCrystalIds.length, 'amber'));
+        if (safeList(item.sourceSessionIds).length) badges.push(countBadge('sourceSessionIds', item.sourceSessionIds.length, 'green'));
+        if (safeList(item.sourceIds).length) badges.push(countBadge('sourceIds', item.sourceIds.length, 'amber'));
+        if (safeList(item.sourceLessonIds).length) badges.push(countBadge('sourceLessonIds', item.sourceLessonIds.length, 'amber'));
+        if (safeList(item.sourceCrystalIds).length) badges.push(countBadge('sourceCrystalIds', item.sourceCrystalIds.length, 'amber'));
+        if (safeList(item.tags).length) badges.push(countBadge('tags', item.tags.length, ''));
+        if (safeList(item.concepts).length) badges.push(countBadge('concepts', item.concepts.length, ''));
         if (item.observationCount != null) badges.push(countBadge('observations', item.observationCount, ''));
-        if (type === 'procedural' && !Object.keys(item || {}).length) badges.push('<span class="badge amber">empty</span>');
         return badges.length ? '<div class="badge-row">' + badges.join('') + '</div>' : '';
       }
       function renderDetail(item, type) {
         if (!item) return renderEmpty('No detail');
-        return '<article class="detail"><h3>' + esc(itemTitle(item, type)) + '</h3>' +
-          renderBadges(item, type) +
-          '<div class="section"><div class="section-title">Content</div>' + renderTextBlock(itemBody(item, type), 'No readable content') + '</div>' +
+        if (type === 'summaries') return renderSummaryDetail(item);
+        if (type === 'observations') return renderObservationDetail(item);
+        if (type === 'semantic') return renderSemanticDetail(item);
+        if (type === 'lessons') return renderLessonDetail(item);
+        if (type === 'crystals') return renderCrystalDetail(item);
+        if (type === 'insights') return renderInsightDetail(item);
+        if (type === 'procedural') return renderProceduralDetail(item);
+        return renderGenericDetail(item, type);
+      }
+      function renderSummaryDetail(item) {
+        return '<article class="detail"><h3>' + esc(itemTitle(item, 'summaries')) + '</h3>' +
+          '<div class="section"><div class="section-title">Summary</div>' +
+          renderFieldRows([
+            ['title', item.title],
+            ['narrative', item.narrative],
+            ['keyDecisions', item.keyDecisions, true],
+            ['filesModified', item.filesModified, true],
+            ['concepts', item.concepts, true],
+          ]) + '</div>' +
           renderSourceSection(item) +
           renderRaw(item) + '</article>';
       }
+      function renderObservationDetail(item) {
+        return '<article class="detail"><h3>' + esc(itemTitle(item, 'observations')) + '</h3>' +
+          '<div class="section"><div class="section-title">Observation</div>' +
+          renderFieldRows([
+            ['title', item.title],
+            ['subtitle', item.subtitle],
+            ['type', item.type],
+            ['narrative', item.narrative],
+            ['facts', item.facts, true],
+            ['concepts', item.concepts, true],
+            ['files', item.files, true],
+            ['importance', item.importance],
+            ['confidence', item.confidence],
+            ['timestamp', item.timestamp],
+          ]) + '</div>' +
+          renderSourceSection(item) +
+          renderRaw(item) + '</article>';
+      }
+      function renderSemanticDetail(item) {
+        return '<article class="detail"><h3>' + esc(itemTitle(item, 'semantic')) + '</h3>' +
+          '<div class="section"><div class="section-title">Semantic Memory</div>' +
+          renderFieldRows([
+            ['fact', item.fact],
+            ['confidence', item.confidence],
+            ['sourceSessionIds', item.sourceSessionIds, true],
+            ['sourceMemoryIds', item.sourceMemoryIds, true],
+            ['extractionRunId', item.extractionRunId],
+            ['extractionWindowId', item.extractionWindowId],
+            ['strength', item.strength],
+            ['accessCount', item.accessCount],
+            ['createdAt', item.createdAt],
+            ['updatedAt', item.updatedAt],
+          ]) + '</div>' +
+          renderSourceSection(item) +
+          renderRaw(item) + '</article>';
+      }
+      function renderLessonDetail(item) {
+        return '<article class="detail"><h3>' + esc(itemTitle(item, 'lessons')) + '</h3>' +
+          '<div class="section"><div class="section-title">Lesson</div>' +
+          renderFieldRows([
+            ['content', item.content],
+            ['context', item.context],
+            ['confidence', item.confidence],
+            ['reinforcements', item.reinforcements],
+            ['source', item.source],
+            ['origin', item.origin],
+            ['sourceIds', item.sourceIds, true],
+            ['sourceRunId', item.sourceRunId],
+            ['tags', item.tags, true],
+            ['createdAt', item.createdAt],
+            ['updatedAt', item.updatedAt],
+          ]) + '</div>' +
+          renderSourceSection(item) +
+          renderRaw(item) + '</article>';
+      }
+      function renderCrystalDetail(item) {
+        return '<article class="detail"><h3>' + esc(itemTitle(item, 'crystals')) + '</h3>' +
+          '<div class="section"><div class="section-title">Crystal</div>' +
+          renderFieldRows([
+            ['narrative', item.narrative],
+            ['keyOutcomes', item.keyOutcomes, true],
+            ['filesAffected', item.filesAffected, true],
+            ['lessons', item.lessons, true],
+            ['sourceActionIds', item.sourceActionIds, true],
+            ['sessionId', item.sessionId],
+            ['project', item.project],
+            ['createdAt', item.createdAt],
+          ]) + '</div>' +
+          renderSourceSection(item) +
+          renderRaw(item) + '</article>';
+      }
+      function renderInsightDetail(item) {
+        return '<article class="detail"><h3>' + esc(itemTitle(item, 'insights')) + '</h3>' +
+          '<div class="section"><div class="section-title">Insight</div>' +
+          renderFieldRows([
+            ['title', item.title],
+            ['content', item.content],
+            ['confidence', item.confidence],
+            ['reinforcements', item.reinforcements],
+            ['sourceConceptCluster', item.sourceConceptCluster],
+            ['sourceMemoryIds', item.sourceMemoryIds, true],
+            ['sourceLessonIds', item.sourceLessonIds, true],
+            ['sourceCrystalIds', item.sourceCrystalIds, true],
+            ['tags', item.tags, true],
+            ['createdAt', item.createdAt],
+            ['updatedAt', item.updatedAt],
+          ]) + '</div>' +
+          renderSourceSection(item) +
+          renderRaw(item) + '</article>';
+      }
+      function renderProceduralDetail(item) {
+        var steps = safeList(item.steps).map(function(step, index) {
+          return '<li>' + esc(String(step || '')) + '</li>';
+        }).join('');
+        return '<article class="detail"><h3>' + esc(itemTitle(item, 'procedural')) + '</h3>' +
+          '<div class="section"><div class="section-title">Procedural Memory</div>' +
+          renderFieldRows([
+            ['name', item.name],
+            ['triggerCondition', item.triggerCondition],
+            ['expectedOutcome', item.expectedOutcome],
+            ['frequency', item.frequency],
+            ['strength', item.strength],
+            ['tags', item.tags, true],
+            ['concepts', item.concepts, true],
+            ['sourceObservationIds', item.sourceObservationIds, true],
+            ['createdAt', item.createdAt],
+            ['updatedAt', item.updatedAt],
+          ]) +
+          (steps ? '<h4>steps</h4><ol>' + steps + '</ol>' : '') +
+          '</div>' +
+          renderSourceSection(item) +
+          renderRaw(item) + '</article>';
+      }
+      function renderGenericDetail(item, type) {
+        return '<article class="detail"><h3>' + esc(itemTitle(item, type)) + '</h3>' +
+          '<div class="section"><div class="section-title">Details</div>' + renderTextBlock(JSON.stringify(item, null, 2), '') + '</div>' +
+          renderSourceSection(item) +
+          renderRaw(item) + '</article>';
+      }
+      function renderFieldRows(rows) {
+        return rows.map(function(row) {
+          var label = row[0];
+          var value = row[1];
+          var isArray = row[2] === true;
+          if (value == null || value === '') return '';
+          var rendered;
+          if (isArray) {
+            var values = safeList(value);
+            if (!values.length) return '';
+            rendered = values.map(function(v) { return esc(v); }).join(', ');
+          } else {
+            rendered = esc(String(value));
+          }
+          return '<div><span class="badge">' + esc(label) + '</span> <span class="row-meta">' + rendered + '</span></div>';
+        }).join('');
+      }
       function renderSourceSection(item) {
-        var fields = ['sessionId', 'sessionIds', 'sourceSessionIds', 'sourceIds', 'sourceMemoryIds', 'sourceLessonIds', 'sourceCrystalIds', 'sourceActionIds', 'sourceRunId', 'origin'];
-        var rows = fields.filter(function(k) { return item && item[k] != null && item[k] !== ''; }).map(function(k) {
-          var value = Array.isArray(item[k]) ? item[k].join(', ') : item[k];
+        var fields = [
+          'sessionId',
+          'sessionIds',
+          'sourceSessionIds',
+          'sourceObservationIds',
+          'sourceIds',
+          'sourceMemoryIds',
+          'sourceLessonIds',
+          'sourceCrystalIds',
+          'sourceActionIds',
+          'extractionRunId',
+          'extractionWindowId',
+          'extractionMark',
+          'sourceRunId',
+          'origin'
+        ];
+        var rows = fields.filter(function(k) {
+          return item && item[k] != null && item[k] !== '';
+        }).map(function(k) {
+          var value = asArray(item[k]).length ? item[k].join(', ') : item[k];
           return '<div><span class="badge">' + esc(k) + '</span> <span class="row-meta">' + esc(truncate(value, 220)) + '</span></div>';
         });
         if (!rows.length) return '<div class="section"><div class="section-title">Source Support</div><div class="row-meta">No explicit source fields on this item.</div></div>';
@@ -729,6 +1189,32 @@
       }
       function renderEmpty(message) {
         return '<div class="empty">' + esc(message) + '</div>';
+      }
+
+      function listContainerFromKey(key) {
+        if (key === 'sessions') return getElementById('session-list-rows');
+        if (key === 'observations') return getElementById('observation-list');
+        if (key.indexOf('session-content:') === 0) return getElementById('session-content-list');
+        return getElementById('tab-list');
+      }
+      function updateRowActive(container, selector, activeId, dataKey) {
+        if (!container || !container.querySelectorAll) return;
+        dataKey = dataKey || 'data-id';
+        var rows = container.querySelectorAll(selector);
+        for (var i = 0; i < rows.length; i++) {
+          var row = rows[i];
+          var value = row.getAttribute(dataKey || 'data-id') || '';
+          if (value === activeId) {
+            row.className = row.className.replace(/\bactive\b/g, '').trim() + ' active';
+          } else {
+            row.className = row.className.replace(/\bactive\b/g, '').trim();
+          }
+        }
+      }
+      async function ensureCategoryDataForRightPane(category, sessionId) {
+        if (!sessionId) return;
+        if (category === 'summary') return;
+        await ensureSessionData(category, sessionId);
       }
 
       document.addEventListener('click', async function(e) {
@@ -739,40 +1225,104 @@
           store.activeTab = target.getAttribute('data-tab') || 'sessions';
           setRoute(store.activeTab);
           await ensureTabData(store.activeTab);
+          renderTabs();
+          setStatus(statusHtml());
           if (store.activeTab === 'observations') {
             store.selected.observationSessionId = store.selected.observationSessionId || store.selected.sessionId;
-            await loadObservationsForSession(store.selected.observationSessionId);
+            renderAppShellForActiveTab();
+            renderObservationFilterPaneOnly();
+            renderObservationListPaneOnly();
+            renderObservationDetailPaneOnly();
+            if (store.selected.observationSessionId) {
+              var obsLoad = loadObservationsForSession(store.selected.observationSessionId);
+              renderObservationListPaneOnly();
+              renderObservationDetailPaneOnly();
+              await obsLoad;
+              if (store.activeTab === 'observations') {
+                renderObservationListPaneOnly();
+                renderObservationDetailPaneOnly();
+              }
+            }
+          } else if (store.activeTab === 'sessions') {
+            renderAppShellForActiveTab();
+            renderSessionListPaneOnly();
+            renderSessionCategoryPaneOnly();
+            renderSessionContentPaneOnly();
+          } else {
+            renderAppShellForActiveTab();
+            renderTabListPaneOnly(store.activeTab);
+            renderTabDetailPaneOnly(store.activeTab);
           }
-          render();
         } else if (ui === 'select-session') {
-          store.selected.sessionId = target.getAttribute('data-id') || '';
+          var sid = target.getAttribute('data-id') || '';
+          store.selected.sessionId = sid;
           store.selected.sessionCategory = 'summary';
-          render();
+          store.selected.observationSessionId = sid;
+          store.pages['session-content:summary'] = 0;
+          var list = getElementById('session-list');
+          updateRowActive(list, '[data-ui="select-session"]', sid, 'data-id');
+          loadSessionStats(sid);
+          renderSessionCategoryPaneOnly();
+          renderSessionContentPaneOnly();
         } else if (ui === 'session-category') {
           var cat = target.getAttribute('data-category') || 'summary';
           store.selected.sessionCategory = cat;
-          if (cat === 'observations') await loadObservationsForSession(store.selected.sessionId);
-          if (cat === 'lessons') await loadObservationsForSession(store.selected.sessionId);
-          await ensureTabData(cat);
-          render();
+          var categoryPane = getElementById('session-category-list');
+          updateRowActive(categoryPane, '[data-ui="session-category"]', cat, 'data-category');
+          await ensureCategoryDataForRightPane(cat, store.selected.sessionId);
+          renderSessionContentPaneOnly();
         } else if (ui === 'observation-session') {
-          store.selected.observationSessionId = target.getAttribute('data-id') || '';
-          await loadObservationsForSession(store.selected.observationSessionId);
-          render();
+          var obsSessionId = target.getAttribute('data-id') || '';
+          store.selected.observationSessionId = obsSessionId;
+          updateRowActive(getElementById('observation-filter-list'), '[data-ui="observation-session"]', obsSessionId, 'data-id');
+          await loadObservationsForSession(obsSessionId);
+          if (store.activeTab === 'observations') {
+            renderObservationListPaneOnly();
+            renderObservationDetailPaneOnly();
+          }
         } else if (ui === 'select-item') {
-          var key = target.getAttribute('data-key') || '';
-          store.selected.itemByTab[key] = target.getAttribute('data-id') || '';
-          render();
+          var selectedKey = target.getAttribute('data-key') || '';
+          var itemType = target.getAttribute('data-type') || '';
+          var selectedId = target.getAttribute('data-id') || '';
+          if (itemType) {
+            store.selected.itemByTab[itemType] = selectedId;
+          }
+          if (selectedKey) {
+            var container = listContainerFromKey(selectedKey);
+            updateRowActive(container, '[data-ui="select-item"]', selectedId);
+          }
+          if (store.activeTab === 'sessions') {
+            renderSessionContentPaneOnly();
+          } else if (store.activeTab === 'observations') {
+            renderObservationDetailPaneOnly();
+          } else {
+            renderTabDetailPaneOnly(itemType);
+          }
         } else if (ui === 'expand-item') {
           var exKey = target.getAttribute('data-key') || '';
           var exId = target.getAttribute('data-id') || '';
           store.selected.expandedByTab[exKey] = store.selected.expandedByTab[exKey] === exId ? '' : exId;
-          render();
+          var container = listContainerFromKey(exKey);
+          updateRowActive(container, '[data-ui="expand-item"]', exId);
+          if (store.activeTab === 'sessions') {
+            renderSessionContentPaneOnly();
+          } else {
+            renderTabListPaneOnly(store.activeTab);
+            renderTabDetailPaneOnly(store.activeTab);
+          }
         } else if (ui === 'page') {
           var pageKey = target.getAttribute('data-tab') || '';
           var dir = Number(target.getAttribute('data-dir') || 0);
           store.pages[pageKey] = Math.max(0, (store.pages[pageKey] || 0) + dir);
-          render();
+          if (store.activeTab === 'sessions') {
+            renderSessionContentPaneOnly();
+          } else if (store.activeTab === 'observations') {
+            renderObservationListPaneOnly();
+            renderObservationDetailPaneOnly();
+          } else {
+            renderTabListPaneOnly(store.activeTab);
+            renderTabDetailPaneOnly(store.activeTab);
+          }
         }
       });
       document.addEventListener('input', function(e) {
@@ -781,7 +1331,17 @@
         var key = target.getAttribute('data-key') || '';
         store.filters[key] = target.value || '';
         store.pages[key] = 0;
-        render();
+        if (key === 'sessions') {
+          renderSessionListPaneOnly();
+        } else if (key === 'observations' || key.indexOf('session-content:') === 0) {
+          if (store.activeTab === 'sessions') renderSessionContentPaneOnly();
+          if (store.activeTab === 'observations') renderObservationListPaneOnly();
+        } else if (store.activeTab === 'sessions') {
+          renderSessionContentPaneOnly();
+        } else {
+          renderTabListPaneOnly(store.activeTab);
+          renderTabDetailPaneOnly(store.activeTab);
+        }
       });
       window.addEventListener('hashchange', async function() {
         store.activeTab = tabFromHash();

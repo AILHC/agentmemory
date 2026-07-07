@@ -75,6 +75,7 @@ describe("viewer document security", () => {
     expect(rendered.html).not.toContain("method: 'POST'");
     expect(rendered.html).not.toContain("method: \"DELETE\"");
     expect(rendered.html).not.toContain("method: 'DELETE'");
+    expect(rendered.html).toContain("viewer/session-stats");
     expect(rendered.html).not.toContain("lessons?limit=");
     expect(rendered.html).not.toContain("crystals?limit=");
     expect(rendered.html).not.toContain("insights?limit=");

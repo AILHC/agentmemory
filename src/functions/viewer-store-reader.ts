@@ -50,6 +50,30 @@ export interface ViewerStoreList {
   stores: ViewerStoreSummary[];
 }
 
+export type ViewerSessionStatStatus = "complete" | "failed";
+
+export interface ViewerSessionCategoryStat {
+  count: number;
+  status: ViewerSessionStatStatus;
+  source: string;
+  attribution?: string;
+  error?: string;
+}
+
+export interface ViewerSessionStats {
+  success: true;
+  sessionId: string;
+  categories: Record<
+    "summary" | "observations" | "lessons" | "semantic" | "procedural" | "crystals" | "insights",
+    ViewerSessionCategoryStat
+  >;
+}
+
+export interface ViewerSessionStatsRequest {
+  sessionId: string;
+  includeDeleted?: boolean;
+}
+
 export interface ViewerStoreRequest {
   type: ViewerStoreType;
   limit?: number;
@@ -143,6 +167,7 @@ export async function listViewerStore(
 
   const { source, items, filters: storeFilters } = await readFlatStore(kv, request.type, {
     includeDeleted,
+    sessionId: request.sessionId,
   });
   return pageItems(request.type, source, items, {
     limit,
@@ -152,48 +177,287 @@ export async function listViewerStore(
   });
 }
 
+export async function buildObservationIdSet(
+  kv: KeyValueStore,
+  sessionId: string,
+): Promise<Set<string>> {
+  const observations = await kv.list<CompressedObservation>(KV.observations(sessionId));
+  return new Set(observations.map((observation) => observation.id));
+}
+
+export function lessonBelongsToSession(
+  lesson: Lesson,
+  sessionId: string,
+  observationIds: Set<string>,
+): boolean {
+  return lesson.sourceIds.includes(sessionId) || lesson.sourceIds.some((id) => observationIds.has(id));
+}
+
+export function semanticBelongsToSession(
+  semantic: SemanticMemory,
+  sessionId: string,
+): boolean {
+  return semantic.sourceSessionIds.includes(sessionId);
+}
+
+export function proceduralBelongsToSession(
+  procedural: ProceduralMemory,
+  sessionId: string,
+): boolean {
+  return procedural.sourceSessionIds.includes(sessionId);
+}
+
+export function crystalBelongsToSession(
+  crystal: Crystal,
+  sessionId: string,
+): boolean {
+  return crystal.sessionId === sessionId;
+}
+
+export function insightBelongsToSession(
+  insight: Insight,
+  sourceIds: {
+    semanticMemoryIds: Set<string>;
+    lessonIds: Set<string>;
+    crystalIds: Set<string>;
+  },
+): boolean {
+  return (
+    insight.sourceMemoryIds.some((id) => sourceIds.semanticMemoryIds.has(id)) ||
+    insight.sourceLessonIds.some((id) => sourceIds.lessonIds.has(id)) ||
+    insight.sourceCrystalIds.some((id) => sourceIds.crystalIds.has(id))
+  );
+}
+
+export async function listViewerSessionStats(
+  kv: KeyValueStore,
+  request: ViewerSessionStatsRequest,
+): Promise<ViewerSessionStats> {
+  const sessionId = request.sessionId?.trim();
+  if (!sessionId) {
+    throw new Error("sessionId is required");
+  }
+
+  const includeDeleted = request.includeDeleted !== false;
+
+  const categories = await Promise.all([
+    safeCategoryStat(KV.summaries, async () => ({
+      count: (await kv.list<SessionSummary>(KV.summaries))
+        .filter((summary) => summary.sessionId === sessionId)
+        .length,
+    })),
+    safeCategoryStat("mem:sessions.observationCount", async () => {
+      const session = await kv.get<Session>(KV.sessions, sessionId);
+      const countValue = session?.observationCount;
+      const isValidCount = typeof countValue === "number" && Number.isFinite(countValue) && countValue >= 0;
+      if (isValidCount) {
+        return { count: countValue, source: "mem:sessions.observationCount" };
+      }
+
+      const observations = await kv.list<CompressedObservation>(KV.observations(sessionId));
+      return {
+        count: observations.length,
+        source: KV.observations(sessionId),
+        attribution: "mem:sessions.observationCount",
+      };
+    }),
+    safeCategoryStat(KV.lessons, async () => ({
+      count: (await getSessionScopedLessons(kv, sessionId, includeDeleted)).length,
+    })),
+    safeCategoryStat(KV.semantic, async () => ({
+      count: (await getSessionScopedSemantic(kv, sessionId)).length,
+    })),
+    safeCategoryStat(KV.procedural, async () => ({
+      count: (await getSessionScopedProcedural(kv, sessionId)).length,
+    })),
+    safeCategoryStat(KV.crystals, async () => ({
+      count: (await getSessionScopedCrystals(kv, sessionId)).length,
+    })),
+    safeCategoryStat(KV.insights, async () => ({
+      count: (await getSessionScopedInsights(kv, sessionId, includeDeleted)).length,
+    })),
+  ]);
+
+  return {
+    success: true,
+    sessionId,
+    categories: {
+      summary: categories[0],
+      observations: categories[1],
+      lessons: categories[2],
+      semantic: categories[3],
+      procedural: categories[4],
+      crystals: categories[5],
+      insights: categories[6],
+    },
+  };
+}
+
 async function readFlatStore(
   kv: KeyValueStore,
   type: Exclude<ViewerStoreType, "observations">,
-  options: { includeDeleted: boolean },
+  options: { includeDeleted: boolean; sessionId?: string },
 ): Promise<{ source: string; items: unknown[]; filters: Record<string, string> }> {
   switch (type) {
     case "sessions": {
       const sessions = await kv.list<Session>(KV.sessions);
-      return { source: KV.sessions, items: sortByDateDesc(sessions, "startedAt"), filters: {} };
+      const filtered = options.sessionId
+        ? sessions.filter((session) => session.id === options.sessionId)
+        : sessions;
+      return {
+        source: KV.sessions,
+        items: sortByDateDesc(filtered, "startedAt"),
+        filters: {},
+      };
     }
     case "summaries": {
       const summaries = await kv.list<SessionSummary>(KV.summaries);
-      return { source: KV.summaries, items: sortByDateDesc(summaries, "createdAt"), filters: {} };
+      const filtered = options.sessionId
+        ? summaries.filter((summary) => summary.sessionId === options.sessionId)
+        : summaries;
+      return { source: KV.summaries, items: sortByDateDesc(filtered, "createdAt"), filters: {} };
     }
     case "lessons": {
-      const lessons = await kv.list<Lesson>(KV.lessons);
+      const filtered = options.sessionId
+        ? await getSessionScopedLessons(kv, options.sessionId, options.includeDeleted)
+        : filterDeleted(await kv.list<Lesson>(KV.lessons), options.includeDeleted)
+            .sort(compareConfidenceDesc);
       return {
         source: KV.lessons,
-        items: filterDeleted(lessons, options.includeDeleted).sort(compareConfidenceDesc),
+        items: filtered,
         filters: deletedFilter(options.includeDeleted),
       };
     }
     case "semantic": {
-      const semantic = await kv.list<SemanticMemory>(KV.semantic);
+      const semantic = await (options.sessionId
+        ? getSessionScopedSemantic(kv, options.sessionId)
+        : kv.list<SemanticMemory>(KV.semantic));
       return { source: KV.semantic, items: sortByDateDesc(semantic, "updatedAt"), filters: {} };
     }
     case "procedural": {
-      const procedural = await kv.list<ProceduralMemory>(KV.procedural);
+      const procedural = await (options.sessionId
+        ? getSessionScopedProcedural(kv, options.sessionId)
+        : kv.list<ProceduralMemory>(KV.procedural));
       return { source: KV.procedural, items: sortByDateDesc(procedural, "updatedAt"), filters: {} };
     }
     case "crystals": {
-      const crystals = await kv.list<Crystal>(KV.crystals);
+      const crystals = await (options.sessionId
+        ? getSessionScopedCrystals(kv, options.sessionId)
+        : kv.list<Crystal>(KV.crystals));
       return { source: KV.crystals, items: sortByDateDesc(crystals, "createdAt"), filters: {} };
     }
     case "insights": {
-      const insights = await kv.list<Insight>(KV.insights);
+      const insights = await (options.sessionId
+        ? getSessionScopedInsights(kv, options.sessionId, options.includeDeleted)
+        : filterDeleted(await kv.list<Insight>(KV.insights), options.includeDeleted));
       return {
         source: KV.insights,
-        items: filterDeleted(insights, options.includeDeleted).sort(compareConfidenceDesc),
+        items: insights.sort(compareConfidenceDesc),
         filters: deletedFilter(options.includeDeleted),
       };
     }
+  }
+}
+
+async function getSessionScopedLessons(
+  kv: KeyValueStore,
+  sessionId: string,
+  includeDeleted: boolean,
+): Promise<Lesson[]> {
+  const lessons = await kv.list<Lesson>(KV.lessons);
+  const observationIds = await buildObservationIdSet(kv, sessionId);
+  return filterDeleted(lessons, includeDeleted)
+    .filter((lesson) => lessonBelongsToSession(lesson, sessionId, observationIds))
+    .sort(compareConfidenceDesc);
+}
+
+async function getSessionScopedSemantic(
+  kv: KeyValueStore,
+  sessionId: string,
+): Promise<SemanticMemory[]> {
+  const semantic = await kv.list<SemanticMemory>(KV.semantic);
+  return semantic.filter((item) => semanticBelongsToSession(item, sessionId));
+}
+
+async function getSessionScopedProcedural(
+  kv: KeyValueStore,
+  sessionId: string,
+): Promise<ProceduralMemory[]> {
+  const procedural = await kv.list<ProceduralMemory>(KV.procedural);
+  return procedural.filter((item) => proceduralBelongsToSession(item, sessionId));
+}
+
+async function getSessionScopedCrystals(
+  kv: KeyValueStore,
+  sessionId: string,
+): Promise<Crystal[]> {
+  const crystals = await kv.list<Crystal>(KV.crystals);
+  return crystals.filter((crystal) => crystalBelongsToSession(crystal, sessionId));
+}
+
+async function getSessionScopedInsights(
+  kv: KeyValueStore,
+  sessionId: string,
+  includeDeleted: boolean,
+): Promise<Insight[]> {
+  const [insights, sourceIds] = await Promise.all([
+    kv.list<Insight>(KV.insights),
+    getInsightSourceIds(kv, sessionId, includeDeleted),
+  ]);
+  return filterDeleted(insights, includeDeleted)
+    .filter((insight) => insightBelongsToSession(insight, sourceIds))
+    .sort(compareConfidenceDesc);
+}
+
+async function getInsightSourceIds(
+  kv: KeyValueStore,
+  sessionId: string,
+  includeDeleted: boolean,
+): Promise<{
+  semanticMemoryIds: Set<string>;
+  lessonIds: Set<string>;
+  crystalIds: Set<string>;
+}> {
+  const [semantic, lessons, crystals] = await Promise.all([
+    kv.list<SemanticMemory>(KV.semantic),
+    kv.list<Lesson>(KV.lessons),
+    kv.list<Crystal>(KV.crystals),
+  ]);
+  const observationIds = await buildObservationIdSet(kv, sessionId);
+  return {
+    semanticMemoryIds: new Set(
+      semantic.filter((item) => semanticBelongsToSession(item, sessionId)).map((item) => item.id),
+    ),
+    lessonIds: new Set(
+      filterDeleted(lessons, includeDeleted)
+        .filter((lesson) => lessonBelongsToSession(lesson, sessionId, observationIds))
+        .map((lesson) => lesson.id),
+    ),
+    crystalIds: new Set(
+      crystals.filter((crystal) => crystalBelongsToSession(crystal, sessionId)).map((crystal) => crystal.id),
+    ),
+  };
+}
+
+async function safeCategoryStat(
+  source: string,
+  calculate: () => Promise<Omit<ViewerSessionCategoryStat, "status" | "source" | "error"> & { source?: string }>,
+): Promise<ViewerSessionCategoryStat> {
+  try {
+    const data = await calculate();
+    return {
+      status: "complete",
+      source: data.source ?? source,
+      count: data.count,
+      ...(data.attribution ? { attribution: data.attribution } : {}),
+    };
+  } catch (error) {
+    return {
+      status: "failed",
+      source,
+      count: 0,
+      error: error instanceof Error ? error.message : "failed",
+    };
   }
 }
 

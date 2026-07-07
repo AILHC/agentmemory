@@ -17,6 +17,7 @@ import type { ReplayLessonExtractionConfig } from "../functions/lesson-extract.j
 import { logger } from "../logger.js";
 import {
   isViewerStoreType,
+  listViewerSessionStats,
   listViewerStore,
   listViewerStores,
   MAX_VIEWER_STORE_LIMIT,
@@ -3761,6 +3762,39 @@ export function registerApiTriggers(
     type: "http",
     function_id: "api::viewer-store",
     config: { api_path: "/agentmemory/viewer/store", http_method: "GET" },
+  });
+
+  sdk.registerFunction("api::viewer-session-stats",
+    async (req: ApiRequest): Promise<Response> => {
+      const denied = checkAuth(req, secret);
+      if (denied) return denied;
+      const params = req.query_params || {};
+      const sessionId = asNonEmptyString(params.sessionId);
+      if (!sessionId) {
+        return { status_code: 400, body: { error: "sessionId is required" } };
+      }
+      const includeDeleted = parseOptionalBoolean(params.includeDeleted);
+      if (includeDeleted === null) {
+        return { status_code: 400, body: { error: "includeDeleted must be true or false" } };
+      }
+      try {
+        const result = await listViewerSessionStats(kv, {
+          sessionId,
+          includeDeleted,
+        });
+        return { status_code: 200, body: result };
+      } catch (error) {
+        return {
+          status_code: 400,
+          body: { error: error instanceof Error ? error.message : "invalid session stats request" },
+        };
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::viewer-session-stats",
+    config: { api_path: "/agentmemory/viewer/session-stats", http_method: "GET" },
   });
 
   sdk.registerFunction("api::viewer", 
