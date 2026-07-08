@@ -12,6 +12,7 @@ import {
   isConsolidationEnabled,
   isContextInjectionEnabled,
   isDropStaleIndexEnabled,
+  getWorkerInvocationTimeoutMs,
 } from "./config.js";
 import {
   createProvider,
@@ -197,7 +198,7 @@ async function main() {
 
   const sdk = registerWorker(config.engineUrl, {
     workerName: "agentmemory",
-    invocationTimeoutMs: 180000,
+    invocationTimeoutMs: getWorkerInvocationTimeoutMs(),
     otel: {
       serviceName: OTEL_CONFIG.serviceName,
       serviceVersion: OTEL_CONFIG.serviceVersion,

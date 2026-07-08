@@ -21,6 +21,7 @@ import { join, dirname, delimiter as PATH_DELIMITER } from "node:path";
 import { fileURLToPath } from "node:url";
 import { homedir, platform } from "node:os";
 import * as p from "@clack/prompts";
+import { Agent } from "undici";
 import { generateId } from "./state/schema.js";
 import {
   buildDiagnostics,
@@ -66,6 +67,24 @@ const IS_VERBOSE =
 setBootVerbose(IS_VERBOSE);
 
 const IS_RESET = args.includes("--reset");
+
+type FetchInitWithDispatcher = RequestInit & {
+  dispatcher?: Agent;
+};
+
+function buildLongHttpFetchInit(
+  init: RequestInit,
+  timeoutMs: number,
+): FetchInitWithDispatcher {
+  return {
+    ...init,
+    signal: AbortSignal.timeout(timeoutMs),
+    dispatcher: new Agent({
+      headersTimeout: timeoutMs,
+      bodyTimeout: timeoutMs,
+    }),
+  };
+}
 
 // --version / -V early exit. Print VERSION + exit before any side effects
 // (engine boot, env load, dir mkdir). `-v` is taken by --verbose so we
@@ -2718,12 +2737,17 @@ async function runImportJsonl(): Promise<void> {
   spinner.start("scanning files");
 
   try {
-    const res = await fetch(`${base}/agentmemory/replay/import-jsonl`, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    const res = await fetch(
+      `${base}/agentmemory/replay/import-jsonl`,
+      buildLongHttpFetchInit(
+        {
+          method: "POST",
+          headers,
+          body: JSON.stringify(body),
+        },
+        timeoutMs,
+      ),
+    );
     const text = await res.text();
     let json: {
       success?: boolean;
@@ -2826,12 +2850,17 @@ async function runFinalizeReplayIndex(): Promise<void> {
   const spinner = p.spinner();
   spinner.start("finalizing replay index");
   try {
-    const res = await fetch(`${base}/agentmemory/replay/finalize-deferred-index`, {
-      method: "POST",
-      headers,
-      body: "{}",
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    const res = await fetch(
+      `${base}/agentmemory/replay/finalize-deferred-index`,
+      buildLongHttpFetchInit(
+        {
+          method: "POST",
+          headers,
+          body: "{}",
+        },
+        timeoutMs,
+      ),
+    );
     const text = await res.text();
     let json: {
       success?: boolean;

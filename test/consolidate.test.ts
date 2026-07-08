@@ -8,7 +8,10 @@ import {
   planConsolidateObservationWindows,
   runConsolidateObservationWindow,
 } from "../src/functions/consolidate.js";
-import { getMemoryConsolidateCompressTimeoutMs } from "../src/config.js";
+import {
+  getMemoryConsolidateCompressTimeoutMs,
+  getWorkerInvocationTimeoutMs,
+} from "../src/config.js";
 import { KV } from "../src/state/schema.js";
 import type { CompressedObservation, MemoryProvider, Session } from "../src/types.js";
 
@@ -93,6 +96,21 @@ describe("consolidate full window helpers", () => {
     expect(getMemoryConsolidateCompressTimeoutMs({
       AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS: "999999",
     })).toBe(300_000);
+  });
+
+  it("bounds AGENTMEMORY_WORKER_INVOCATION_TIMEOUT_MS config", () => {
+    expect(getWorkerInvocationTimeoutMs({
+      AGENTMEMORY_WORKER_INVOCATION_TIMEOUT_MS: "not-a-number",
+    })).toBe(3_600_000);
+    expect(getWorkerInvocationTimeoutMs({
+      AGENTMEMORY_WORKER_INVOCATION_TIMEOUT_MS: "0",
+    })).toBe(3_600_000);
+    expect(getWorkerInvocationTimeoutMs({
+      AGENTMEMORY_WORKER_INVOCATION_TIMEOUT_MS: "180000",
+    })).toBe(180_000);
+    expect(getWorkerInvocationTimeoutMs({
+      AGENTMEMORY_WORKER_INVOCATION_TIMEOUT_MS: "99999999",
+    })).toBe(7_200_000);
   });
 
   it("splits concept observations into stable windows without dropping eligible observations", async () => {

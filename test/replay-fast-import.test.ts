@@ -153,6 +153,29 @@ function writeCodexSession(
   writeFileSync(join(dir, name), lines.join("\n"));
 }
 
+function hasLoneSurrogate(value: unknown): boolean {
+  if (typeof value === "string") {
+    for (let i = 0; i < value.length; i += 1) {
+      const code = value.charCodeAt(i);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = value.charCodeAt(i + 1);
+        if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+        i += 1;
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        return true;
+      }
+    }
+    return false;
+  }
+  if (Array.isArray(value)) return value.some((item) => hasLoneSurrogate(item));
+  if (value && typeof value === "object") {
+    return Object.entries(value).some(
+      ([key, item]) => hasLoneSurrogate(key) || hasLoneSurrogate(item),
+    );
+  }
+  return false;
+}
+
 describe("replay fast import", () => {
   let tmpRoot: string;
   let kv: ReturnType<typeof mockKV>;
@@ -372,6 +395,148 @@ describe("replay fast import", () => {
     expect(duplicate.skippedDuplicate).toBe(1);
     expect(duplicate.lessonExtraction?.created).toBe(1);
     expect(duplicate.lessonExtraction?.reinforced).toBe(0);
+  });
+
+  it("sanitizes lone UTF-16 surrogates before replay state writes", async () => {
+    const dir = join(tmpRoot, "lone-surrogate");
+    mkdirSync(dir, { recursive: true });
+    writeCodexSession(dir, "session.jsonl", {
+      sessionId: "lone-surrogate-session",
+      events: [
+        {
+          id: "prompt-1",
+          role: "user",
+          message: `first prompt has a broken surrogate ${String.fromCharCode(0xd83d)} marker`,
+          timestamp: "2026-01-01T00:00:00.000Z",
+        },
+        {
+          id: "response-1",
+          role: "assistant",
+          message: `tool output contains a broken surrogate ${String.fromCharCode(0xd83d)} marker`,
+          timestamp: "2026-01-01T00:00:01.000Z",
+        },
+      ],
+    });
+
+    const result = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number };
+
+    expect(result.success).toBe(true);
+    expect(result.observations).toBe(2);
+    expect(kv.getSetCalls().some((call) => hasLoneSurrogate(call.value))).toBe(false);
+    const writtenValues = kv
+      .getSetCalls()
+      .filter((call) => call.scope === KV.observations("lone-surrogate-session"))
+      .map((call) => call.value);
+    expect(writtenValues).toHaveLength(2);
+    expect(writtenValues.some((value) => hasLoneSurrogate(value))).toBe(false);
+  });
+
+  it("sanitizes lone UTF-16 surrogates in replay object keys without changing valid emoji", async () => {
+    const dir = join(tmpRoot, "lone-surrogate-key");
+    mkdirSync(dir, { recursive: true });
+    const brokenKey = `broken${String.fromCharCode(0xd83d)}key`;
+    const validEmoji = "valid emoji 😀 remains";
+    const lines = [
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:00.000Z",
+        type: "session_meta",
+        payload: { id: "lone-surrogate-key-session", cwd: "/workspace/key" },
+      }),
+      JSON.stringify({
+        timestamp: "2026-01-01T00:00:01.000Z",
+        type: "response_item",
+        payload: {
+          type: "function_call",
+          name: "bad_key_tool",
+          arguments: {
+            [brokenKey]: "value",
+            ok: validEmoji,
+          },
+        },
+      }),
+    ];
+    writeFileSync(join(dir, "session.jsonl"), lines.join("\n"));
+
+    const result = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number };
+
+    expect(result.success).toBe(true);
+    expect(result.observations).toBe(1);
+    const stored = await kv.list<{ toolInput?: Record<string, unknown> }>(
+      KV.observations("lone-surrogate-key-session"),
+    );
+    expect(stored.some((value) => hasLoneSurrogate(value))).toBe(false);
+    expect(stored[0].toolInput?.ok).toBe(validEmoji);
+  });
+
+  it("reconciles session observationCount when resuming a partial importing session", async () => {
+    const dir = join(tmpRoot, "partial-resume");
+    mkdirSync(dir, { recursive: true });
+    writeCodexSession(dir, "session.jsonl", {
+      sessionId: "partial-session",
+      events: [
+        {
+          id: "prompt-1",
+          role: "user",
+          message: "first imported observation",
+          timestamp: "2026-01-01T00:00:00.000Z",
+        },
+        {
+          id: "response-1",
+          role: "assistant",
+          message: "second imported observation",
+          timestamp: "2026-01-01T00:00:01.000Z",
+        },
+        {
+          id: "response-2",
+          role: "assistant",
+          message: "third imported observation",
+          timestamp: "2026-01-01T00:00:02.000Z",
+        },
+      ],
+    });
+
+    const first = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number };
+    expect(first.success).toBe(true);
+    expect(first.observations).toBe(3);
+
+    const storedObservations = await kv.list<{ id: string }>(
+      KV.observations("partial-session"),
+    );
+    await kv.delete(
+      KV.observations("partial-session"),
+      storedObservations[storedObservations.length - 1].id,
+    );
+    await kv.set<Session>(KV.sessions, "partial-session", {
+      id: "partial-session",
+      project: "/workspace/partial-session",
+      cwd: "/workspace/partial-session",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:00:02.000Z",
+      status: "completed",
+      observationCount: 0,
+      tags: ["jsonl-import", "jsonl-importing"],
+    });
+
+    const resumed = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number; skippedDuplicate?: number };
+
+    expect(resumed.success).toBe(true);
+    expect(resumed.observations).toBe(1);
+    expect(resumed.skippedDuplicate).toBe(2);
+    const session = await kv.get<Session>(KV.sessions, "partial-session");
+    expect(session?.observationCount).toBe(3);
+    expect(session?.tags).not.toContain("jsonl-importing");
   });
 
   it("writes the top-level session row before observations and clears jsonl-importing at the end", async () => {
@@ -641,6 +806,164 @@ describe("replay fast import", () => {
     expect(clearedMarker).toMatchObject({ dirty: false, inProgress: false });
   });
 
+  it("completes stale manual dirty markers when a retry finds only duplicate observations", async () => {
+    const dir = join(tmpRoot, "manual-duplicate-retry");
+    mkdirSync(dir, { recursive: true });
+    writeCodexSession(dir, "session.jsonl", {
+      sessionId: "manual-duplicate-session",
+      events: [
+        {
+          id: "prompt-1",
+          role: "user",
+          message: "manual retry should recover an active dirty marker",
+          timestamp: "2026-01-01T00:00:01.000Z",
+        },
+      ],
+    });
+
+    const first = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      indexMode: "manual",
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number };
+    expect(first.success).toBe(true);
+    expect(first.observations).toBe(1);
+
+    const staleMarker = await kv.get<{
+      dirty: boolean;
+      reason: "replay-import-deferred";
+      updatedAt: string;
+      importRunId: string;
+      sessionIds: string[];
+      inProgress: boolean;
+    }>(KV.state, "search-index-dirty");
+    expect(staleMarker).toBeTruthy();
+    const activeStaleMarker = {
+      ...staleMarker!,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      inProgress: true,
+      ownerPid: process.pid,
+    };
+    await kv.set(KV.state, "search-index-dirty", activeStaleMarker);
+    await kv.set(
+      KV.state,
+      `search-index-dirty:${staleMarker!.importRunId}`,
+      activeStaleMarker,
+    );
+
+    const retry = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      indexMode: "manual",
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number; skippedDuplicate?: number };
+
+    expect(retry.success).toBe(true);
+    expect(retry.observations).toBe(0);
+    expect(retry.skippedDuplicate).toBe(1);
+
+    const finalize = (await sdk.trigger(
+      "mem::replay::finalize-deferred-index",
+    )) as { success: boolean; rebuilt?: number; dirtyCleared?: boolean };
+    expect(finalize).toEqual({
+      success: true,
+      rebuilt: 7,
+      dirtyCleared: true,
+    });
+  });
+
+  it("keeps fresh active manual dirty markers blocking finalize", async () => {
+    const dir = join(tmpRoot, "manual-fresh-active-marker");
+    mkdirSync(dir, { recursive: true });
+    writeCodexSession(dir, "session.jsonl", {
+      sessionId: "manual-fresh-active-session",
+      events: [
+        {
+          id: "prompt-1",
+          role: "user",
+          message: "fresh active marker should not be cleared by another retry",
+          timestamp: "2026-01-01T00:00:01.000Z",
+        },
+      ],
+    });
+
+    const first = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      indexMode: "manual",
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number };
+    expect(first.success).toBe(true);
+    expect(first.observations).toBe(1);
+
+    await kv.set(KV.state, "search-index-dirty:other-active-run", {
+      dirty: true,
+      reason: "replay-import-deferred",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      importRunId: "other-active-run",
+      sessionIds: ["manual-fresh-active-session"],
+      inProgress: true,
+      ownerPid: process.ppid,
+    });
+
+    const retry = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      indexMode: "manual",
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number; skippedDuplicate?: number };
+    expect(retry.success).toBe(true);
+    expect(retry.observations).toBe(0);
+    expect(retry.skippedDuplicate).toBe(1);
+
+    const finalize = (await sdk.trigger(
+      "mem::replay::finalize-deferred-index",
+    )) as { success: boolean; error?: string };
+    expect(finalize).toEqual({
+      success: false,
+      error: "deferred replay import is still in progress",
+    });
+  });
+
+  it("does not force manual finalize for a duplicate-only import with no deferred marker", async () => {
+    const dir = join(tmpRoot, "manual-noop-duplicate");
+    mkdirSync(dir, { recursive: true });
+    writeCodexSession(dir, "session.jsonl", {
+      sessionId: "manual-noop-duplicate-session",
+      events: [
+        {
+          id: "prompt-1",
+          role: "user",
+          message: "duplicate-only manual import should stay a no-op",
+          timestamp: "2026-01-01T00:00:01.000Z",
+        },
+      ],
+    });
+
+    const first = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number };
+    expect(first.success).toBe(true);
+    expect(first.observations).toBe(1);
+
+    const retry = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      indexMode: "manual",
+      lessonExtraction: { enabled: false },
+    })) as {
+      success: boolean;
+      observations?: number;
+      skippedDuplicate?: number;
+      indexing?: { dirty: boolean; requiresFinalize: boolean };
+    };
+
+    expect(retry.success).toBe(true);
+    expect(retry.observations).toBe(0);
+    expect(retry.skippedDuplicate).toBe(1);
+    expect(retry.indexing).toMatchObject({
+      dirty: false,
+      requiresFinalize: false,
+    });
+  });
+
   it("does not finalize while any deferred replay import run marker is active", async () => {
     await kv.set(KV.state, "search-index-dirty", {
       dirty: true,
@@ -668,6 +991,43 @@ describe("replay fast import", () => {
       error: "deferred replay import is still in progress",
     });
     expect(mockRebuildIndex).not.toHaveBeenCalled();
+  });
+
+  it("finalize releases stale inactive manual dirty markers for completed sessions", async () => {
+    await kv.set<Session>(KV.sessions, "stale-completed-session", {
+      id: "stale-completed-session",
+      project: "/workspace/stale-completed-session",
+      cwd: "/workspace/stale-completed-session",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:00:01.000Z",
+      status: "completed",
+      observationCount: 1,
+      tags: ["jsonl-import"],
+    });
+    const staleMarker = {
+      dirty: true,
+      reason: "replay-import-deferred" as const,
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      importRunId: "stale-completed-run",
+      sessionIds: ["stale-completed-session"],
+      inProgress: true,
+    };
+    await kv.set(KV.state, "search-index-dirty", staleMarker);
+    await kv.set(KV.state, "search-index-dirty:stale-completed-run", staleMarker);
+
+    const finalize = (await sdk.trigger(
+      "mem::replay::finalize-deferred-index",
+    )) as {
+      success: boolean;
+      rebuilt?: number;
+      dirtyCleared?: boolean;
+    };
+
+    expect(finalize).toEqual({
+      success: true,
+      rebuilt: 7,
+      dirtyCleared: true,
+    });
   });
 
   it("fails finalize when rebuilt index cannot be strictly persisted", async () => {

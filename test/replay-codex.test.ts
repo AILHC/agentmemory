@@ -105,6 +105,9 @@ describe("replay import copy", () => {
     expect(cli).toContain('body["indexMode"] = "manual"');
     expect(cli).toContain('body["lessonExtraction"] = { enabled: false }');
     expect(cli).toContain("AbortSignal.timeout(timeoutMs)");
+    expect(cli).toContain("buildLongHttpFetchInit");
+    expect(cli).toContain("headersTimeout: timeoutMs");
+    expect(cli).toContain("bodyTimeout: timeoutMs");
     expect(cli).toContain("finalize-replay-index");
     expect(cli).toContain("/agentmemory/replay/finalize-deferred-index");
   });

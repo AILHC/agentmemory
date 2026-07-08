@@ -42,6 +42,8 @@ export const MAX_REPLAY_EVENT_PAYLOAD_CHARS = 5000;
 const REPLAY_LIST_DEDUP_OBSERVATION_LIMIT = 2_000;
 const SEARCH_INDEX_DIRTY_KEY = "search-index-dirty";
 const SEARCH_INDEX_DIRTY_RUN_KEY_PREFIX = `${SEARCH_INDEX_DIRTY_KEY}:`;
+const REPLAY_DIRTY_MARKER_STALE_MS = 5 * 60 * 1000;
+const activeReplayImportRunIds = new Set<string>();
 
 const SENSITIVE_PATH_PATTERNS: RegExp[] = [
   /(^|[\\/_.-])secret([\\/_.-]|s?$)/i,
@@ -92,10 +94,49 @@ type SearchIndexDirtyMarker = {
   importRunId: string;
   sessionIds: string[];
   inProgress: boolean;
+  ownerPid?: number;
 };
 
 function replaySearchIndexDirtyRunKey(importRunId: string): string {
   return `${SEARCH_INDEX_DIRTY_RUN_KEY_PREFIX}${importRunId}`;
+}
+
+function isProcessAlive(pid: unknown): boolean {
+  if (!Number.isInteger(pid) || (pid as number) <= 0) return false;
+  try {
+    process.kill(pid as number, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+function replayImportMarkerHasActiveOwner(
+  marker: SearchIndexDirtyMarker,
+): boolean {
+  if (
+    marker.ownerPid === process.pid &&
+    activeReplayImportRunIds.has(marker.importRunId)
+  ) {
+    return true;
+  }
+  return !!(
+    marker.ownerPid &&
+    marker.ownerPid !== process.pid &&
+    isProcessAlive(marker.ownerPid)
+  );
+}
+
+function legacyReplayImportMarkerIsFresh(
+  marker: SearchIndexDirtyMarker,
+  now = Date.now(),
+): boolean {
+  if (marker.ownerPid) return false;
+  const updatedAt = Date.parse(marker.updatedAt);
+  return (
+    !Number.isFinite(updatedAt) ||
+    now - updatedAt < REPLAY_DIRTY_MARKER_STALE_MS
+  );
 }
 
 async function isSymlink(path: string): Promise<boolean> {
@@ -266,6 +307,47 @@ function valuesEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+function sanitizeLoneSurrogates(input: string): string {
+  let out = "";
+  let changed = false;
+  for (let i = 0; i < input.length; i += 1) {
+    const code = input.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = input.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        out += input[i] + input[i + 1];
+        i += 1;
+      } else {
+        out += "\ufffd";
+        changed = true;
+      }
+      continue;
+    }
+    if (code >= 0xdc00 && code <= 0xdfff) {
+      out += "\ufffd";
+      changed = true;
+      continue;
+    }
+    out += input[i];
+  }
+  return changed ? out : input;
+}
+
+function sanitizeReplayJsonValue<T>(value: T): T {
+  if (typeof value === "string") return sanitizeLoneSurrogates(value) as T;
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeReplayJsonValue(item)) as T;
+  }
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value)) {
+      out[sanitizeLoneSurrogates(key)] = sanitizeReplayJsonValue(item);
+    }
+    return out as T;
+  }
+  return value;
+}
+
 async function setWithCommitProbe<T>(
   kv: StateKV,
   scope: string,
@@ -320,6 +402,7 @@ async function markReplaySearchIndexDirty(
   const marker: SearchIndexDirtyMarker = {
     ...patch,
     dirty: true,
+    ownerPid: process.pid,
     updatedAt: new Date().toISOString(),
     sessionIds,
   };
@@ -330,6 +413,87 @@ async function markReplaySearchIndexDirty(
     replaySearchIndexDirtyRunKey(patch.importRunId),
     marker,
   );
+}
+
+async function completeCoveredReplaySearchIndexDirtyRuns(
+  kv: StateKV,
+  currentImportRunId: string,
+  completedSessionIds: string[],
+): Promise<void> {
+  const completed = new Set(completedSessionIds);
+  if (completed.size === 0) return;
+  const markers = await listReplaySearchIndexDirtyMarkers(kv);
+  const now = Date.now();
+  for (const marker of markers) {
+    if (marker.importRunId === currentImportRunId || !marker.inProgress) continue;
+    if (replayImportMarkerHasActiveOwner(marker)) {
+      continue;
+    }
+    if (legacyReplayImportMarkerIsFresh(marker, now)) {
+      continue;
+    }
+    if (!marker.sessionIds.every((sessionId) => completed.has(sessionId))) continue;
+    await setWithCommitProbe(
+      kv,
+      KV.state,
+      replaySearchIndexDirtyRunKey(marker.importRunId),
+      {
+        ...marker,
+        inProgress: false,
+        updatedAt: new Date().toISOString(),
+      },
+    );
+  }
+}
+
+async function markerSessionsAreImportComplete(
+  kv: StateKV,
+  marker: SearchIndexDirtyMarker,
+): Promise<boolean> {
+  for (const sessionId of marker.sessionIds) {
+    const session = await kv.get<Session>(KV.sessions, sessionId);
+    if (!session || session.tags?.includes("jsonl-importing")) return false;
+  }
+  return true;
+}
+
+async function releaseInactiveReplaySearchIndexDirtyRuns(
+  kv: StateKV,
+): Promise<void> {
+  const now = Date.now();
+  const globalMarker = await readReplaySearchIndexDirty(kv);
+  const markersByRunId = new Map<string, SearchIndexDirtyMarker>();
+  for (const marker of await listReplaySearchIndexDirtyMarkers(kv)) {
+    markersByRunId.set(marker.importRunId, marker);
+  }
+  if (globalMarker) markersByRunId.set(globalMarker.importRunId, globalMarker);
+
+  for (const marker of markersByRunId.values()) {
+    if (!marker.inProgress) continue;
+    if (replayImportMarkerHasActiveOwner(marker)) continue;
+    if (legacyReplayImportMarkerIsFresh(marker, now)) continue;
+    if (!(await markerSessionsAreImportComplete(kv, marker))) continue;
+
+    const releasedMarker = {
+      ...marker,
+      inProgress: false,
+      updatedAt: new Date().toISOString(),
+    };
+    await setWithCommitProbe(
+      kv,
+      KV.state,
+      replaySearchIndexDirtyRunKey(marker.importRunId),
+      releasedMarker,
+    );
+    if (globalMarker?.importRunId === marker.importRunId) {
+      await setWithCommitProbe(
+        kv,
+        KV.state,
+        SEARCH_INDEX_DIRTY_KEY,
+        releasedMarker,
+      );
+    }
+  }
 }
 
 async function loadExistingObservationIds(
@@ -555,6 +719,7 @@ export function registerReplayFunctions(
       | { success: true; rebuilt: number; dirtyCleared: boolean }
       | { success: false; error: string }
     > => {
+      await releaseInactiveReplaySearchIndexDirtyRuns(kv);
       const marker = await readReplaySearchIndexDirty(kv);
       const dirtyMarkers = (await listReplaySearchIndexDirtyMarkers(kv)).filter(
         (item) => item.dirty,
@@ -812,8 +977,29 @@ export function registerReplayFunctions(
       const importRunId = generateId("replay_import");
       const sessionRowCache = new Map<string, Session>();
       const sessionObservationCounts = new Map<string, number>();
+      const sessionImportObservationIds = new Map<string, Set<string>>();
+      const reconcileSessionObservationCount = (
+        sessionId: string,
+        fallbackCount: number,
+      ): number =>
+        Math.max(
+          sessionObservationCounts.get(sessionId) ?? fallbackCount,
+          sessionImportObservationIds.get(sessionId)?.size ?? 0,
+          fallbackCount,
+        );
+      const existingManualDirtyMarkers =
+        indexMode === "manual"
+          ? (await listReplaySearchIndexDirtyMarkers(kv)).filter(
+              (marker) => marker.dirty,
+            )
+          : [];
+      const existingManualDirtySessionIds = new Set(
+        existingManualDirtyMarkers.flatMap((marker) => marker.sessionIds),
+      );
       let deferredDirtyTouched = false;
 
+      activeReplayImportRunIds.add(importRunId);
+      try {
       const parsedFiles: Array<{ parsed: ReturnType<typeof parseTranscriptText> }> = [];
       const batchTopLevelSessionIds = new Set<string>();
 
@@ -920,8 +1106,12 @@ export function registerReplayFunctions(
             (o) => typeof o.userPrompt === "string" && o.userPrompt.trim().length > 0,
           );
           const firstPrompt = firstPromptObs?.userPrompt
-            ? firstPromptObs.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
+            ? sanitizeLoneSurrogates(
+                firstPromptObs.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200),
+              )
             : undefined;
+          const replayProject = sanitizeLoneSurrogates(parsed.project);
+          const replayCwd = sanitizeLoneSurrogates(parsed.cwd);
 
           const cachedSession = sessionRowCache.get(targetSessionId) ?? null;
           const storedSession =
@@ -944,8 +1134,8 @@ export function registerReplayFunctions(
                 }
               : {
                   id: targetSessionId,
-                  project: parsed.project,
-                  cwd: parsed.cwd,
+                  project: replayProject,
+                  cwd: replayCwd,
                   startedAt: parsed.startedAt,
                   endedAt: parsed.endedAt,
                   status: "completed",
@@ -968,13 +1158,14 @@ export function registerReplayFunctions(
             nextSession.observationCount =
               sessionObservationCounts.get(targetSessionId) ??
               nextSession.observationCount;
+            const safeNextSession = sanitizeReplayJsonValue(nextSession);
             await setWithCommitProbe(
               kv,
               KV.sessions,
               targetSessionId,
-              nextSession,
+              safeNextSession,
             );
-            sessionRowCache.set(targetSessionId, nextSession);
+            sessionRowCache.set(targetSessionId, safeNextSession);
           }
 
           const existingObservationIds = await loadExistingObservationIds(
@@ -986,8 +1177,31 @@ export function registerReplayFunctions(
           const newRawObservations: RawObservation[] = [];
           const newCompressedObservations: CompressedObservation[] = [];
           let dirtyMarkedForGroup = false;
+          if (
+            indexMode === "manual" &&
+            (existingManualDirtySessionIds.has(targetSessionId) ||
+              storedSession?.tags?.includes("jsonl-importing"))
+          ) {
+            await markReplaySearchIndexDirty(kv, {
+              reason: "replay-import-deferred",
+              importRunId,
+              sessionIds: [targetSessionId],
+              inProgress: true,
+            });
+            deferredDirtyTouched = true;
+            dirtyMarkedForGroup = true;
+          }
           for (const obs of observations) {
-            if (successfulNewObservationIds.has(obs.id)) {
+            const safeObs = sanitizeReplayJsonValue(obs);
+            let importedObservationIds =
+              sessionImportObservationIds.get(targetSessionId);
+            if (!importedObservationIds) {
+              importedObservationIds = new Set<string>();
+              sessionImportObservationIds.set(targetSessionId, importedObservationIds);
+            }
+            importedObservationIds.add(safeObs.id);
+
+            if (successfulNewObservationIds.has(safeObs.id)) {
               skippedDuplicate += 1;
               continue;
             }
@@ -996,10 +1210,10 @@ export function registerReplayFunctions(
               existingObservationIds === null
                 ? await kv.get<ReplayStoredObservation>(
                     KV.observations(targetSessionId),
-                    obs.id,
+                    safeObs.id,
                   )
-                : existingObservationIds.has(obs.id)
-                  ? ({ id: obs.id } as ReplayStoredObservation)
+                : existingObservationIds.has(safeObs.id)
+                  ? ({ id: safeObs.id } as ReplayStoredObservation)
                   : null;
             if (existingObservation) {
               skippedDuplicate += 1;
@@ -1017,49 +1231,52 @@ export function registerReplayFunctions(
               dirtyMarkedForGroup = true;
             }
 
-            const synthetic = buildSyntheticCompression(obs);
+            const synthetic = sanitizeReplayJsonValue(
+              buildSyntheticCompression(safeObs),
+            );
             const storedObservation: ReplayStoredObservation = {
               ...synthetic,
-              hookType: obs.hookType,
-              userPrompt: obs.userPrompt,
-              assistantResponse: obs.assistantResponse,
-              toolName: obs.toolName,
-              toolInput: obs.toolInput,
-              toolOutput: obs.toolOutput,
-              modality: obs.modality,
-              imageData: obs.imageData,
-              agentId: obs.agentId,
-              sourceFormat: obs.sourceFormat,
-              sourceFileHash: obs.sourceFileHash,
-              sourceSessionId: obs.sourceSessionId,
-              sourceEventId: obs.sourceEventId,
-              sourceEventIndex: obs.sourceEventIndex,
-              importKey: obs.importKey,
-              lineage: obs.lineage,
-              parentSessionId: obs.parentSessionId,
+              hookType: safeObs.hookType,
+              userPrompt: safeObs.userPrompt,
+              assistantResponse: safeObs.assistantResponse,
+              toolName: safeObs.toolName,
+              toolInput: safeObs.toolInput,
+              toolOutput: safeObs.toolOutput,
+              modality: safeObs.modality,
+              imageData: safeObs.imageData,
+              agentId: safeObs.agentId,
+              sourceFormat: safeObs.sourceFormat,
+              sourceFileHash: safeObs.sourceFileHash,
+              sourceSessionId: safeObs.sourceSessionId,
+              sourceEventId: safeObs.sourceEventId,
+              sourceEventIndex: safeObs.sourceEventIndex,
+              importKey: safeObs.importKey,
+              lineage: safeObs.lineage,
+              parentSessionId: safeObs.parentSessionId,
             };
             await setWithCommitProbe(
               kv,
               KV.observations(targetSessionId),
-              obs.id,
+              safeObs.id,
               storedObservation,
             );
-            existingObservationIds?.add(obs.id);
-            successfulNewObservationIds.add(obs.id);
+            existingObservationIds?.add(safeObs.id);
+            successfulNewObservationIds.add(safeObs.id);
             sessionObservationCounts.set(
               targetSessionId,
               (sessionObservationCounts.get(targetSessionId) ?? 0) + 1,
             );
-            newRawObservations.push(obs);
+            newRawObservations.push(safeObs);
             newCompressedObservations.push(synthetic);
             created += 1;
           }
 
           const sessionRow = sessionRowCache.get(targetSessionId);
           if (sessionRow) {
-            sessionRow.observationCount =
-              sessionObservationCounts.get(targetSessionId) ??
-              sessionRow.observationCount;
+            sessionRow.observationCount = reconcileSessionObservationCount(
+              targetSessionId,
+              sessionRow.observationCount,
+            );
             sessionRowCache.set(targetSessionId, sessionRow);
           }
 
@@ -1113,12 +1330,18 @@ export function registerReplayFunctions(
         const finalizedSession: Session = {
           ...sessionRow,
           status: "completed",
-          observationCount:
-            sessionObservationCounts.get(sessionId) ??
+          observationCount: reconcileSessionObservationCount(
+            sessionId,
             sessionRow.observationCount,
+          ),
           tags: addTag(removeTag(sessionRow.tags, "jsonl-importing"), "jsonl-import"),
         };
-        await setWithCommitProbe(kv, KV.sessions, sessionId, finalizedSession);
+        await setWithCommitProbe(
+          kv,
+          KV.sessions,
+          sessionId,
+          sanitizeReplayJsonValue(finalizedSession),
+        );
       }
 
       let indexed = 0;
@@ -1151,6 +1374,11 @@ export function registerReplayFunctions(
           sessionIds: returnedSessionIds,
           inProgress: false,
         });
+        await completeCoveredReplaySearchIndexDirtyRuns(
+          kv,
+          importRunId,
+          returnedSessionIds,
+        );
         indexDirty = true;
         requiresFinalize = true;
       }
@@ -1199,6 +1427,9 @@ export function registerReplayFunctions(
         maxFiles,
         maxFilesUpperBound: MAX_FILES_UPPER_BOUND,
       };
+      } finally {
+        activeReplayImportRunIds.delete(importRunId);
+      }
     },
   );
 }

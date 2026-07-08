@@ -239,6 +239,16 @@ export function getMemoryConsolidateCompressTimeoutMs(
   );
 }
 
+export function getWorkerInvocationTimeoutMs(
+  env: Record<string, string | undefined> = getMergedEnv(),
+): number {
+  return parseBoundedPositiveInt(
+    env.AGENTMEMORY_WORKER_INVOCATION_TIMEOUT_MS,
+    3_600_000,
+    7_200_000,
+  );
+}
+
 function detectProvider(env: Record<string, string>): ProviderConfig {
   const maxTokens = parseInt(env["MAX_TOKENS"] || "4096", 10);
   const explicitProvider = (env["AGENTMEMORY_PROVIDER"] || "").toLowerCase();
