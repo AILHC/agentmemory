@@ -9,6 +9,7 @@ import { memoryToObservation } from '../state/memory-utils.js'
 import { recordAccessBatch } from './access-tracker.js'
 import { logger } from "../logger.js";
 import { getAgentId, isAgentScopeIsolated } from "../config.js";
+import type { IndexPersistenceSaveOptions } from "../state/index-persistence.js";
 
 let index: SearchIndex | null = null
 let vectorIndex: VectorIndex | null = null
@@ -47,16 +48,16 @@ export function vectorIndexRemove(id: string): void {
 // isolation don't need to wire persistence.
 let indexPersistence: {
   scheduleSave: () => void;
-  save: () => Promise<void>;
-  saveStrict?: () => Promise<boolean>;
+  save: (options?: IndexPersistenceSaveOptions) => Promise<void>;
+  saveStrict?: (options?: IndexPersistenceSaveOptions) => Promise<boolean>;
 } | null = null;
 
 export function setIndexPersistence(
   p:
     | {
         scheduleSave: () => void;
-        save: () => Promise<void>;
-        saveStrict?: () => Promise<boolean>;
+        save: (options?: IndexPersistenceSaveOptions) => Promise<void>;
+        saveStrict?: (options?: IndexPersistenceSaveOptions) => Promise<boolean>;
       }
     | null,
 ): void {
@@ -80,9 +81,11 @@ export async function flushIndexSave(): Promise<void> {
   await indexPersistence?.save();
 }
 
-export async function flushIndexSaveStrict(): Promise<boolean> {
+export async function flushIndexSaveStrict(
+  options: IndexPersistenceSaveOptions = {},
+): Promise<boolean> {
   if (!indexPersistence?.saveStrict) return false;
-  return indexPersistence.saveStrict();
+  return indexPersistence.saveStrict(options);
 }
 
 // Hard cap on embedding input length. Most providers cap input around
@@ -336,13 +339,21 @@ export type ReindexSessionsResult = {
   failedSessionIds: string[];
 };
 
+export type ReindexSessionsOptions = {
+  includeVector?: boolean;
+  shouldIndex?: (obs: CompressedObservation) => boolean;
+};
+
 export async function reindexSessions(
   kv: StateKV,
   sessionIds: string[],
+  options: ReindexSessionsOptions = {},
 ): Promise<ReindexSessionsResult> {
   const idx = getSearchIndex();
   const uniqueSessionIds = Array.from(new Set(sessionIds.filter(Boolean)));
   const batchSize = getRebuildEmbedBatchSize();
+  const includeVector = options.includeVector !== false;
+  const shouldIndex = options.shouldIndex;
   type EmbedJob = {
     id: string;
     sessionId: string;
@@ -350,10 +361,6 @@ export async function reindexSessions(
     context: { kind: "memory" | "observation" | "synthetic"; logId: string };
   };
   const pending: EmbedJob[] = [];
-  const loaded: Array<{
-    sessionId: string;
-    observations: CompressedObservation[];
-  }> = [];
   const failedSessionIds: string[] = [];
   let indexed = 0;
 
@@ -368,33 +375,35 @@ export async function reindexSessions(
   };
 
   for (const sessionId of uniqueSessionIds) {
+    let observations: CompressedObservation[];
     try {
-      const observations = await kv.list<CompressedObservation>(
+      observations = await kv.list<CompressedObservation>(
         KV.observations(sessionId),
       );
-      loaded.push({ sessionId, observations });
     } catch (err) {
       logger.warn("reindexSessions: failed to load observations", {
         sessionId,
         error: err instanceof Error ? err.message : String(err),
       });
       failedSessionIds.push(sessionId);
+      continue;
     }
-  }
 
-  for (const { sessionId, observations } of loaded) {
     idx.removeBySession(sessionId);
-    vectorIndex?.removeBySession(sessionId);
+    if (includeVector) vectorIndex?.removeBySession(sessionId);
 
     for (const obs of observations) {
       if (!obs.title || !obs.narrative) continue;
+      if (shouldIndex && !shouldIndex(obs)) continue;
       idx.add(obs);
-      await enqueue({
-        id: obs.id,
-        sessionId: obs.sessionId || sessionId,
-        text: obs.title + " " + obs.narrative,
-        context: { kind: "observation", logId: obs.id },
-      });
+      if (includeVector) {
+        await enqueue({
+          id: obs.id,
+          sessionId: obs.sessionId || sessionId,
+          text: obs.title + " " + obs.narrative,
+          context: { kind: "observation", logId: obs.id },
+        });
+      }
       indexed++;
     }
   }

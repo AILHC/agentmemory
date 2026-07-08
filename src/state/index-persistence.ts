@@ -29,6 +29,10 @@ type IndexPersistenceOptions = {
   createGeneration?: () => string;
 };
 
+export type IndexPersistenceSaveOptions = {
+  includeVector?: boolean;
+};
+
 function shardChars(options: IndexPersistenceOptions): number {
   const configured = options.shardChars;
   if (typeof configured !== "number" || !Number.isFinite(configured)) {
@@ -87,25 +91,25 @@ export class IndexPersistence {
     }, DEBOUNCE_MS);
   }
 
-  async save(): Promise<void> {
+  async save(options: IndexPersistenceSaveOptions = {}): Promise<void> {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     try {
-      await this.persist();
+      await this.persist(options);
     } catch (err) {
       this.logFailure(err);
     }
   }
 
-  async saveStrict(): Promise<boolean> {
+  async saveStrict(options: IndexPersistenceSaveOptions = {}): Promise<boolean> {
     if (this.timer) {
       clearTimeout(this.timer);
       this.timer = null;
     }
     try {
-      await this.persist();
+      await this.persist(options);
       return true;
     } catch (err) {
       this.logFailure(err);
@@ -159,9 +163,9 @@ export class IndexPersistence {
     });
   }
 
-  private async persist(): Promise<void> {
+  private async persist(options: IndexPersistenceSaveOptions): Promise<void> {
     await this.saveBm25Index(this.bm25.serialize());
-    if (this.vector) {
+    if (options.includeVector !== false && this.vector) {
       await this.saveVectorIndex(this.vector.serialize());
     }
   }

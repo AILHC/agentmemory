@@ -241,6 +241,17 @@ describe("IndexPersistence", () => {
     expect(loaded.vector!.size).toBe(1);
   });
 
+  it("can save BM25 without rewriting vectors", async () => {
+    const bm25 = makeBm25("obs_1", "bm25 only replay finalize");
+    const vector = makeVector();
+
+    const persistence = new IndexPersistence(kv as never, bm25, vector);
+    await persistence.saveStrict({ includeVector: false });
+
+    await expect(kv.get(BM25_SCOPE, BM25_MANIFEST_KEY)).resolves.not.toBeNull();
+    await expect(kv.get(BM25_SCOPE, VECTOR_MANIFEST_KEY)).resolves.toBeNull();
+  });
+
   it("saves vector index shards outside the BM25 scope", async () => {
     const bm25 = new SearchIndex();
     const vector = new VectorIndex();

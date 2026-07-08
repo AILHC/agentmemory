@@ -22,7 +22,7 @@ import { safeAudit } from "./audit.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
 import {
   flushIndexSaveStrict,
-  rebuildIndex,
+  getSearchIndex,
   reindexSessions,
 } from "./search.js";
 import { logger } from "../logger.js";
@@ -217,6 +217,35 @@ function rawFromCompressed(obs: ReplayStoredObservation): RawObservation {
   };
 }
 
+function shouldIndexReplayObservation(obs: CompressedObservation): boolean {
+  const replayObs = obs as ReplayStoredObservation;
+  if (!obs.title || !obs.narrative) return false;
+
+  const hookType = replayObs.hookType;
+  if (hookType === "prompt_submit" || hookType === "stop") return true;
+  if (hookType === "post_tool_failure") return true;
+  if (hookType === "pre_tool_use" || hookType === "post_tool_use") {
+    return false;
+  }
+
+  if (obs.type === "conversation" || obs.type === "error") return true;
+
+  const title = obs.title.toLowerCase();
+  if (title === "prompt_submit" || title === "stop") return true;
+  if (
+    title === "post_tool_use" ||
+    title === "pre_tool_use" ||
+    title === "shell_command" ||
+    title === "exec_command" ||
+    title === "apply_patch" ||
+    title === "mcp_tool_call"
+  ) {
+    return false;
+  }
+
+  return false;
+}
+
 function normalizeReplayLoadLimit(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value)) {
     return DEFAULT_REPLAY_LOAD_LIMIT;
@@ -370,27 +399,6 @@ async function readReplaySearchIndexDirty(
   return kv.get<SearchIndexDirtyMarker>(KV.state, SEARCH_INDEX_DIRTY_KEY);
 }
 
-function isReplaySearchIndexDirtyMarker(
-  value: unknown,
-): value is SearchIndexDirtyMarker {
-  const candidate = value as Partial<SearchIndexDirtyMarker> | null;
-  return (
-    !!candidate &&
-    candidate.reason === "replay-import-deferred" &&
-    typeof candidate.importRunId === "string" &&
-    Array.isArray(candidate.sessionIds) &&
-    typeof candidate.dirty === "boolean" &&
-    typeof candidate.inProgress === "boolean"
-  );
-}
-
-async function listReplaySearchIndexDirtyMarkers(
-  kv: StateKV,
-): Promise<SearchIndexDirtyMarker[]> {
-  const values = await kv.list<unknown>(KV.state);
-  return values.filter(isReplaySearchIndexDirtyMarker);
-}
-
 async function markReplaySearchIndexDirty(
   kv: StateKV,
   patch: Omit<SearchIndexDirtyMarker, "dirty" | "updatedAt">,
@@ -399,51 +407,24 @@ async function markReplaySearchIndexDirty(
   const sessionIds = Array.from(
     new Set([...(existing?.sessionIds || []), ...patch.sessionIds]),
   );
-  const marker: SearchIndexDirtyMarker = {
+  const globalMarker: SearchIndexDirtyMarker = {
     ...patch,
     dirty: true,
     ownerPid: process.pid,
     updatedAt: new Date().toISOString(),
     sessionIds,
   };
-  await setWithCommitProbe(kv, KV.state, SEARCH_INDEX_DIRTY_KEY, marker);
+  const runMarker: SearchIndexDirtyMarker = {
+    ...globalMarker,
+    sessionIds: Array.from(new Set(patch.sessionIds)),
+  };
+  await setWithCommitProbe(kv, KV.state, SEARCH_INDEX_DIRTY_KEY, globalMarker);
   await setWithCommitProbe(
     kv,
     KV.state,
     replaySearchIndexDirtyRunKey(patch.importRunId),
-    marker,
+    runMarker,
   );
-}
-
-async function completeCoveredReplaySearchIndexDirtyRuns(
-  kv: StateKV,
-  currentImportRunId: string,
-  completedSessionIds: string[],
-): Promise<void> {
-  const completed = new Set(completedSessionIds);
-  if (completed.size === 0) return;
-  const markers = await listReplaySearchIndexDirtyMarkers(kv);
-  const now = Date.now();
-  for (const marker of markers) {
-    if (marker.importRunId === currentImportRunId || !marker.inProgress) continue;
-    if (replayImportMarkerHasActiveOwner(marker)) {
-      continue;
-    }
-    if (legacyReplayImportMarkerIsFresh(marker, now)) {
-      continue;
-    }
-    if (!marker.sessionIds.every((sessionId) => completed.has(sessionId))) continue;
-    await setWithCommitProbe(
-      kv,
-      KV.state,
-      replaySearchIndexDirtyRunKey(marker.importRunId),
-      {
-        ...marker,
-        inProgress: false,
-        updatedAt: new Date().toISOString(),
-      },
-    );
-  }
 }
 
 async function markerSessionsAreImportComplete(
@@ -452,9 +433,36 @@ async function markerSessionsAreImportComplete(
 ): Promise<boolean> {
   for (const sessionId of marker.sessionIds) {
     const session = await kv.get<Session>(KV.sessions, sessionId);
-    if (!session || session.tags?.includes("jsonl-importing")) return false;
+    if (session?.tags?.includes("jsonl-importing")) return false;
   }
   return true;
+}
+
+async function dirtySessionsAreCoveredByLoadedSearchIndex(
+  kv: StateKV,
+  sessionIds: string[],
+): Promise<boolean> {
+  const idx = getSearchIndex();
+  let sawIndexableObservation = false;
+  for (const sessionId of Array.from(new Set(sessionIds.filter(Boolean)))) {
+    let observations: CompressedObservation[];
+    try {
+      observations = await kv.list<CompressedObservation>(
+        KV.observations(sessionId),
+      );
+    } catch {
+      return false;
+    }
+    for (const obs of observations) {
+      if (shouldIndexReplayObservation(obs)) {
+        sawIndexableObservation = true;
+        if (!idx.has(obs.id)) return false;
+      } else if (idx.has(obs.id)) {
+        return false;
+      }
+    }
+  }
+  return sawIndexableObservation;
 }
 
 async function releaseInactiveReplaySearchIndexDirtyRuns(
@@ -462,48 +470,38 @@ async function releaseInactiveReplaySearchIndexDirtyRuns(
 ): Promise<void> {
   const now = Date.now();
   const globalMarker = await readReplaySearchIndexDirty(kv);
-  const markersByRunId = new Map<string, SearchIndexDirtyMarker>();
-  for (const marker of await listReplaySearchIndexDirtyMarkers(kv)) {
-    markersByRunId.set(marker.importRunId, marker);
-  }
-  if (globalMarker) markersByRunId.set(globalMarker.importRunId, globalMarker);
+  if (!globalMarker?.inProgress) return;
+  if (replayImportMarkerHasActiveOwner(globalMarker)) return;
+  if (legacyReplayImportMarkerIsFresh(globalMarker, now)) return;
+  if (!(await markerSessionsAreImportComplete(kv, globalMarker))) return;
 
-  for (const marker of markersByRunId.values()) {
-    if (!marker.inProgress) continue;
-    if (replayImportMarkerHasActiveOwner(marker)) continue;
-    if (legacyReplayImportMarkerIsFresh(marker, now)) continue;
-    if (!(await markerSessionsAreImportComplete(kv, marker))) continue;
-
-    const releasedMarker = {
-      ...marker,
-      inProgress: false,
-      updatedAt: new Date().toISOString(),
-    };
-    await setWithCommitProbe(
-      kv,
-      KV.state,
-      replaySearchIndexDirtyRunKey(marker.importRunId),
-      releasedMarker,
-    );
-    if (globalMarker?.importRunId === marker.importRunId) {
-      await setWithCommitProbe(
-        kv,
-        KV.state,
-        SEARCH_INDEX_DIRTY_KEY,
-        releasedMarker,
-      );
-    }
-  }
+  const releasedMarker = {
+    ...globalMarker,
+    inProgress: false,
+    updatedAt: new Date().toISOString(),
+  };
+  await setWithCommitProbe(
+    kv,
+    KV.state,
+    replaySearchIndexDirtyRunKey(globalMarker.importRunId),
+    {
+      ...releasedMarker,
+      sessionIds: [],
+    },
+  );
+  await setWithCommitProbe(kv, KV.state, SEARCH_INDEX_DIRTY_KEY, releasedMarker);
 }
 
 async function loadExistingObservationIds(
   kv: StateKV,
   session: Session | null,
   sessionId: string,
+  usePointLookups = false,
 ): Promise<Set<string> | null> {
   if (!session) return new Set();
   const importing = session.tags?.includes("jsonl-importing") ?? false;
   if (
+    usePointLookups ||
     importing ||
     session.observationCount > REPLAY_LIST_DEDUP_OBSERVATION_LIMIT
   ) {
@@ -721,24 +719,58 @@ export function registerReplayFunctions(
     > => {
       await releaseInactiveReplaySearchIndexDirtyRuns(kv);
       const marker = await readReplaySearchIndexDirty(kv);
-      const dirtyMarkers = (await listReplaySearchIndexDirtyMarkers(kv)).filter(
-        (item) => item.dirty,
-      );
-      const initialDirtyRunIds = new Set(
-        dirtyMarkers.map((item) => item.importRunId),
-      );
-      if (!marker?.dirty && initialDirtyRunIds.size === 0) {
+      if (!marker?.dirty) {
         return { success: true, rebuilt: 0, dirtyCleared: false };
       }
-      if (dirtyMarkers.some((item) => item.inProgress) || marker?.inProgress) {
+      if (
+        marker.inProgress ||
+        !(await markerSessionsAreImportComplete(kv, marker))
+      ) {
         return {
           success: false,
           error: "deferred replay import is still in progress",
         };
       }
-      const rebuilt = await rebuildIndex(kv);
-      const saved = await flushIndexSaveStrict();
-      if (!saved) {
+      if (
+        await dirtySessionsAreCoveredByLoadedSearchIndex(kv, marker.sessionIds)
+      ) {
+        const latest = await readReplaySearchIndexDirty(kv);
+        if (
+          latest?.dirty &&
+          !latest.inProgress &&
+          latest.importRunId === marker.importRunId &&
+          latest.updatedAt === marker.updatedAt
+        ) {
+          const now = new Date().toISOString();
+          await setWithCommitProbe(kv, KV.state, SEARCH_INDEX_DIRTY_KEY, {
+            ...latest,
+            dirty: false,
+            inProgress: false,
+            updatedAt: now,
+          });
+          await setWithCommitProbe(
+            kv,
+            KV.state,
+            replaySearchIndexDirtyRunKey(latest.importRunId),
+            {
+              ...latest,
+              dirty: false,
+              inProgress: false,
+              updatedAt: now,
+              sessionIds: [],
+            },
+          );
+          return { success: true, rebuilt: 0, dirtyCleared: true };
+        }
+        return { success: true, rebuilt: 0, dirtyCleared: false };
+      }
+      const reindex = await reindexSessions(kv, marker.sessionIds, {
+        includeVector: false,
+        shouldIndex: shouldIndexReplayObservation,
+      });
+      const rebuilt = reindex.indexed;
+      const saved = await flushIndexSaveStrict({ includeVector: false });
+      if (reindex.failedSessionIds.length > 0 || !saved) {
         return {
           success: false,
           error:
@@ -746,59 +778,33 @@ export function registerReplayFunctions(
         };
       }
       const latest = await readReplaySearchIndexDirty(kv);
-      const latestDirtyMarkers = (
-        await listReplaySearchIndexDirtyMarkers(kv)
-      ).filter((item) => item.dirty);
-      const latestDirtyRunIds = new Set(
-        latestDirtyMarkers.map((item) => item.importRunId),
-      );
-      const sameDirtyRuns =
-        latestDirtyRunIds.size === initialDirtyRunIds.size &&
-        [...latestDirtyRunIds].every((runId) => initialDirtyRunIds.has(runId));
       if (
-        latestDirtyMarkers.some((item) => item.inProgress) ||
-        latest?.inProgress ||
-        !sameDirtyRuns
+        !latest?.dirty ||
+        latest.inProgress ||
+        latest.importRunId !== marker.importRunId ||
+        latest.updatedAt !== marker.updatedAt
       ) {
         return { success: true, rebuilt, dirtyCleared: false };
       }
-      if (
-        initialDirtyRunIds.size === 0 &&
-        (!latest?.dirty || latest.importRunId !== marker?.importRunId)
-      ) {
-        return { success: true, rebuilt, dirtyCleared: false };
-      }
-      const sessionIds = Array.from(
-        new Set([
-          ...(latest?.sessionIds || marker?.sessionIds || []),
-          ...latestDirtyMarkers.flatMap((item) => item.sessionIds),
-        ]),
-      );
       const now = new Date().toISOString();
-      const baseMarker = latest ?? marker ?? latestDirtyMarkers[0];
-      if (!baseMarker) {
-        return { success: true, rebuilt, dirtyCleared: false };
-      }
       await setWithCommitProbe(kv, KV.state, SEARCH_INDEX_DIRTY_KEY, {
-        ...baseMarker,
+        ...latest,
         dirty: false,
         inProgress: false,
         updatedAt: now,
-        sessionIds,
       });
-      for (const dirtyMarker of latestDirtyMarkers) {
-        await setWithCommitProbe(
-          kv,
-          KV.state,
-          replaySearchIndexDirtyRunKey(dirtyMarker.importRunId),
-          {
-            ...dirtyMarker,
-            dirty: false,
-            inProgress: false,
-            updatedAt: now,
-          },
-        );
-      }
+      await setWithCommitProbe(
+        kv,
+        KV.state,
+        replaySearchIndexDirtyRunKey(latest.importRunId),
+        {
+          ...latest,
+          dirty: false,
+          inProgress: false,
+          updatedAt: now,
+          sessionIds: [],
+        },
+      );
       return { success: true, rebuilt, dirtyCleared: true };
     },
   );
@@ -987,15 +993,6 @@ export function registerReplayFunctions(
           sessionImportObservationIds.get(sessionId)?.size ?? 0,
           fallbackCount,
         );
-      const existingManualDirtyMarkers =
-        indexMode === "manual"
-          ? (await listReplaySearchIndexDirtyMarkers(kv)).filter(
-              (marker) => marker.dirty,
-            )
-          : [];
-      const existingManualDirtySessionIds = new Set(
-        existingManualDirtyMarkers.flatMap((marker) => marker.sessionIds),
-      );
       let deferredDirtyTouched = false;
 
       activeReplayImportRunIds.add(importRunId);
@@ -1172,25 +1169,12 @@ export function registerReplayFunctions(
             kv,
             storedSession,
             targetSessionId,
+            indexMode === "manual",
           );
           const successfulNewObservationIds = new Set<string>();
           const newRawObservations: RawObservation[] = [];
           const newCompressedObservations: CompressedObservation[] = [];
           let dirtyMarkedForGroup = false;
-          if (
-            indexMode === "manual" &&
-            (existingManualDirtySessionIds.has(targetSessionId) ||
-              storedSession?.tags?.includes("jsonl-importing"))
-          ) {
-            await markReplaySearchIndexDirty(kv, {
-              reason: "replay-import-deferred",
-              importRunId,
-              sessionIds: [targetSessionId],
-              inProgress: true,
-            });
-            deferredDirtyTouched = true;
-            dirtyMarkedForGroup = true;
-          }
           for (const obs of observations) {
             const safeObs = sanitizeReplayJsonValue(obs);
             let importedObservationIds =
@@ -1351,10 +1335,13 @@ export function registerReplayFunctions(
       let requiresFinalize = indexMode === "manual" && deferredDirtyTouched;
 
       if (indexMode === "session" && returnedSessionIds.length > 0) {
-        const reindex = await reindexSessions(kv, returnedSessionIds);
+        const reindex = await reindexSessions(kv, returnedSessionIds, {
+          includeVector: false,
+          shouldIndex: shouldIndexReplayObservation,
+        });
         indexed = reindex.indexed;
         failedSessionIds = reindex.failedSessionIds;
-        indexSaved = await flushIndexSaveStrict();
+        indexSaved = await flushIndexSaveStrict({ includeVector: false });
         if (failedSessionIds.length > 0 || !indexSaved) {
           await markReplaySearchIndexDirty(kv, {
             reason: "replay-import-deferred",
@@ -1374,11 +1361,6 @@ export function registerReplayFunctions(
           sessionIds: returnedSessionIds,
           inProgress: false,
         });
-        await completeCoveredReplaySearchIndexDirtyRuns(
-          kv,
-          importRunId,
-          returnedSessionIds,
-        );
         indexDirty = true;
         requiresFinalize = true;
       }

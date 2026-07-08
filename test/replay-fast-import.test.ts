@@ -12,18 +12,20 @@ vi.mock("../src/logger.js", () => ({
 
 const {
   mockSearchAdd,
+  mockSearchHas,
   mockRebuildIndex,
   mockFlushIndexSaveStrict,
   mockReindexSessions,
 } = vi.hoisted(() => ({
   mockSearchAdd: vi.fn(),
+  mockSearchHas: vi.fn(() => false),
   mockRebuildIndex: vi.fn(async () => 7),
   mockFlushIndexSaveStrict: vi.fn(async () => true),
   mockReindexSessions: vi.fn(async () => ({ indexed: 1, failedSessionIds: [] })),
 }));
 
 vi.mock("../src/functions/search.js", () => ({
-  getSearchIndex: () => ({ add: mockSearchAdd }),
+  getSearchIndex: () => ({ add: mockSearchAdd, has: mockSearchHas }),
   rebuildIndex: mockRebuildIndex,
   flushIndexSaveStrict: mockFlushIndexSaveStrict,
   reindexSessions: mockReindexSessions,
@@ -186,6 +188,8 @@ describe("replay fast import", () => {
     kv = mockKV();
     sdk = mockSdk(kv);
     mockSearchAdd.mockClear();
+    mockSearchHas.mockClear();
+    mockSearchHas.mockReturnValue(false);
     mockRebuildIndex.mockClear();
     mockRebuildIndex.mockResolvedValue(7);
     mockFlushIndexSaveStrict.mockClear();
@@ -246,8 +250,12 @@ describe("replay fast import", () => {
     expect(mockReindexSessions).toHaveBeenCalledWith(
       expect.anything(),
       ["session-mode-session"],
+      expect.objectContaining({
+        includeVector: false,
+        shouldIndex: expect.any(Function),
+      }),
     );
-    expect(mockFlushIndexSaveStrict).toHaveBeenCalled();
+    expect(mockFlushIndexSaveStrict).toHaveBeenCalledWith({ includeVector: false });
   });
 
   it("uses brand-new/list/get dedupe paths and filters in-group duplicates once", async () => {
@@ -732,6 +740,14 @@ describe("replay fast import", () => {
   it("persists the manual dirty marker before observation writes and only finalize rebuilds it", async () => {
     const dir = join(tmpRoot, "dirty-marker");
     mkdirSync(dir, { recursive: true });
+    await kv.set(KV.state, "search-index-dirty", {
+      dirty: true,
+      reason: "replay-import-deferred",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      importRunId: "previous-run",
+      sessionIds: ["previous-dirty-session"],
+      inProgress: false,
+    });
     writeCodexSession(dir, "session.jsonl", {
       sessionId: "dirty-session",
       events: [
@@ -783,6 +799,26 @@ describe("replay fast import", () => {
       inProgress: false,
     });
     expect(marker?.sessionIds).toContain("dirty-session");
+    expect(marker?.sessionIds).toContain("previous-dirty-session");
+
+    const runMarker = await kv.get<{
+      dirty: boolean;
+      sessionIds: string[];
+      inProgress: boolean;
+    }>(KV.state, `search-index-dirty:${marker!.importRunId}`);
+    expect(runMarker).toMatchObject({
+      dirty: true,
+      inProgress: false,
+      sessionIds: ["dirty-session"],
+    });
+
+    const originalList = kv.list;
+    kv.list = (async <T>(scope: string): Promise<T[]> => {
+      if (scope === KV.state) {
+        throw new Error("finalize should not list global state");
+      }
+      return originalList<T>(scope);
+    }) as typeof kv.list;
 
     const finalize = (await sdk.trigger(
       "mem::replay::finalize-deferred-index",
@@ -793,17 +829,146 @@ describe("replay fast import", () => {
     };
     expect(finalize).toEqual({
       success: true,
-      rebuilt: 7,
+      rebuilt: 1,
       dirtyCleared: true,
     });
-    expect(mockRebuildIndex).toHaveBeenCalledTimes(1);
-    expect(mockFlushIndexSaveStrict).toHaveBeenCalledTimes(1);
+    expect(mockRebuildIndex).not.toHaveBeenCalled();
+    expect(mockReindexSessions).toHaveBeenCalledWith(kv, [
+      "previous-dirty-session",
+      "dirty-session",
+    ], expect.objectContaining({
+      includeVector: false,
+      shouldIndex: expect.any(Function),
+    }));
+    expect(mockFlushIndexSaveStrict).toHaveBeenCalledWith({ includeVector: false });
 
     const clearedMarker = await kv.get<{ dirty: boolean; inProgress: boolean }>(
       KV.state,
       "search-index-dirty",
     );
     expect(clearedMarker).toMatchObject({ dirty: false, inProgress: false });
+    const clearedRunMarker = await kv.get<{ sessionIds: string[] }>(
+      KV.state,
+      `search-index-dirty:${marker!.importRunId}`,
+    );
+    expect(clearedRunMarker?.sessionIds).toEqual([]);
+  });
+
+  it("clears a dirty marker without rebuilding when loaded BM25 already covers it", async () => {
+    await kv.set<Session>(KV.sessions, "covered-session", {
+      id: "covered-session",
+      project: "/workspace/covered-session",
+      cwd: "/workspace/covered-session",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:00:01.000Z",
+      status: "completed",
+      observationCount: 1,
+      tags: ["jsonl-import"],
+    });
+    await kv.set(KV.observations("covered-session"), "covered-obs", {
+      id: "covered-obs",
+      sessionId: "covered-session",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "conversation",
+      title: "covered",
+      subtitle: "",
+      facts: [],
+      narrative: "already persisted in BM25 before a later finalize crash",
+      concepts: [],
+      files: [],
+      importance: 5,
+    });
+    await kv.set(KV.state, "search-index-dirty", {
+      dirty: true,
+      reason: "replay-import-deferred",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      importRunId: "covered-run",
+      sessionIds: ["covered-session"],
+      inProgress: false,
+    });
+    mockSearchHas.mockReturnValue(true);
+
+    const finalize = (await sdk.trigger(
+      "mem::replay::finalize-deferred-index",
+    )) as {
+      success: boolean;
+      rebuilt?: number;
+      dirtyCleared?: boolean;
+    };
+
+    expect(finalize).toEqual({
+      success: true,
+      rebuilt: 0,
+      dirtyCleared: true,
+    });
+    expect(mockReindexSessions).not.toHaveBeenCalled();
+    expect(mockFlushIndexSaveStrict).not.toHaveBeenCalled();
+    const marker = await kv.get<{ dirty: boolean; inProgress: boolean }>(
+      KV.state,
+      "search-index-dirty",
+    );
+    expect(marker).toMatchObject({ dirty: false, inProgress: false });
+  });
+
+  it("rebuilds dirty replay sessions when loaded BM25 still contains skipped tool events", async () => {
+    await kv.set<Session>(KV.sessions, "covered-with-tool-session", {
+      id: "covered-with-tool-session",
+      project: "/workspace/covered-with-tool-session",
+      cwd: "/workspace/covered-with-tool-session",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:00:01.000Z",
+      status: "completed",
+      observationCount: 2,
+      tags: ["jsonl-import"],
+    });
+    await kv.set(KV.observations("covered-with-tool-session"), "covered-prompt", {
+      id: "covered-prompt",
+      sessionId: "covered-with-tool-session",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "conversation",
+      title: "prompt_submit",
+      narrative: "already persisted in BM25",
+      concepts: [],
+      facts: [],
+      files: [],
+      importance: 5,
+    });
+    await kv.set(KV.observations("covered-with-tool-session"), "covered-tool", {
+      id: "covered-tool",
+      sessionId: "covered-with-tool-session",
+      timestamp: "2026-01-01T00:00:01.000Z",
+      hookType: "post_tool_use",
+      type: "other",
+      title: "post_tool_use",
+      narrative: "old BM25 entry should force cleanup",
+      concepts: [],
+      facts: [],
+      files: [],
+      importance: 5,
+    });
+    await kv.set(KV.state, "search-index-dirty", {
+      dirty: true,
+      reason: "replay-import-deferred",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      importRunId: "covered-with-tool-run",
+      sessionIds: ["covered-with-tool-session"],
+      inProgress: false,
+    });
+    mockSearchHas.mockImplementation((id: string) =>
+      id === "covered-prompt" || id === "covered-tool",
+    );
+
+    const finalize = (await sdk.trigger(
+      "mem::replay::finalize-deferred-index",
+    )) as { success: boolean; rebuilt?: number };
+
+    expect(finalize).toMatchObject({ success: true, rebuilt: 1 });
+    expect(mockReindexSessions).toHaveBeenCalledWith(kv, [
+      "covered-with-tool-session",
+    ], expect.objectContaining({
+      includeVector: false,
+      shouldIndex: expect.any(Function),
+    }));
   });
 
   it("completes stale manual dirty markers when a retry finds only duplicate observations", async () => {
@@ -866,7 +1031,7 @@ describe("replay fast import", () => {
     )) as { success: boolean; rebuilt?: number; dirtyCleared?: boolean };
     expect(finalize).toEqual({
       success: true,
-      rebuilt: 7,
+      rebuilt: 1,
       dirtyCleared: true,
     });
   });
@@ -894,7 +1059,7 @@ describe("replay fast import", () => {
     expect(first.success).toBe(true);
     expect(first.observations).toBe(1);
 
-    await kv.set(KV.state, "search-index-dirty:other-active-run", {
+    await kv.set(KV.state, "search-index-dirty", {
       dirty: true,
       reason: "replay-import-deferred",
       updatedAt: "2026-01-01T00:00:00.000Z",
@@ -964,22 +1129,65 @@ describe("replay fast import", () => {
     });
   });
 
-  it("does not finalize while any deferred replay import run marker is active", async () => {
+  it("uses point lookups for manual duplicate retries instead of listing large sessions", async () => {
+    const dir = join(tmpRoot, "manual-point-lookup-duplicate");
+    mkdirSync(dir, { recursive: true });
+    writeCodexSession(dir, "session.jsonl", {
+      sessionId: "manual-point-lookup-session",
+      events: [
+        {
+          id: "prompt-1",
+          role: "user",
+          message: "manual duplicate retries should not enumerate the whole session",
+          timestamp: "2026-01-01T00:00:01.000Z",
+        },
+      ],
+    });
+
+    const first = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number };
+    expect(first.success).toBe(true);
+    expect(first.observations).toBe(1);
+
+    const session = await kv.get<Session>(KV.sessions, "manual-point-lookup-session");
+    await kv.set(KV.sessions, "manual-point-lookup-session", {
+      ...session!,
+      observationCount: 1884,
+    });
+
+    const originalList = kv.list;
+    kv.list = (async <T>(scope: string): Promise<T[]> => {
+      if (scope === KV.state) {
+        throw new Error("manual retry should not list global state");
+      }
+      if (scope === KV.observations("manual-point-lookup-session")) {
+        throw new Error("manual retry should not list existing observations");
+      }
+      return originalList<T>(scope);
+    }) as typeof kv.list;
+
+    const retry = (await sdk.trigger("mem::replay::import-jsonl", {
+      path: dir,
+      indexMode: "manual",
+      lessonExtraction: { enabled: false },
+    })) as { success: boolean; observations?: number; skippedDuplicate?: number };
+
+    expect(retry.success).toBe(true);
+    expect(retry.observations).toBe(0);
+    expect(retry.skippedDuplicate).toBe(1);
+  });
+
+  it("does not finalize while the global deferred replay import marker is active", async () => {
     await kv.set(KV.state, "search-index-dirty", {
       dirty: true,
       reason: "replay-import-deferred",
       updatedAt: "2026-01-01T00:00:00.000Z",
-      importRunId: "finished-run",
-      sessionIds: ["finished-session"],
-      inProgress: false,
-    });
-    await kv.set(KV.state, "search-index-dirty:active-run", {
-      dirty: true,
-      reason: "replay-import-deferred",
-      updatedAt: "2026-01-01T00:00:01.000Z",
       importRunId: "active-run",
       sessionIds: ["active-session"],
       inProgress: true,
+      ownerPid: process.ppid,
     });
 
     const finalize = (await sdk.trigger(
@@ -991,6 +1199,39 @@ describe("replay fast import", () => {
       error: "deferred replay import is still in progress",
     });
     expect(mockRebuildIndex).not.toHaveBeenCalled();
+    expect(mockReindexSessions).not.toHaveBeenCalled();
+  });
+
+  it("does not finalize while a dirty marker references an importing session", async () => {
+    await kv.set<Session>(KV.sessions, "still-importing-session", {
+      id: "still-importing-session",
+      project: "/workspace/still-importing-session",
+      cwd: "/workspace/still-importing-session",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:00:01.000Z",
+      status: "completed",
+      observationCount: 1,
+      tags: ["jsonl-import", "jsonl-importing"],
+    });
+    await kv.set(KV.state, "search-index-dirty", {
+      dirty: true,
+      reason: "replay-import-deferred",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      importRunId: "covered-active-run",
+      sessionIds: ["still-importing-session"],
+      inProgress: false,
+    });
+
+    const finalize = (await sdk.trigger(
+      "mem::replay::finalize-deferred-index",
+    )) as { success: boolean; error?: string };
+
+    expect(finalize).toEqual({
+      success: false,
+      error: "deferred replay import is still in progress",
+    });
+    expect(mockRebuildIndex).not.toHaveBeenCalled();
+    expect(mockReindexSessions).not.toHaveBeenCalled();
   });
 
   it("finalize releases stale inactive manual dirty markers for completed sessions", async () => {
@@ -1025,7 +1266,7 @@ describe("replay fast import", () => {
 
     expect(finalize).toEqual({
       success: true,
-      rebuilt: 7,
+      rebuilt: 1,
       dirtyCleared: true,
     });
   });
@@ -1049,12 +1290,98 @@ describe("replay fast import", () => {
       success: false,
       error: "failed to persist rebuilt replay index; dirty marker remains",
     });
-    expect(mockRebuildIndex).toHaveBeenCalledTimes(1);
+    expect(mockRebuildIndex).not.toHaveBeenCalled();
+    expect(mockReindexSessions).toHaveBeenCalledWith(kv, [
+      "persist-fails-session",
+    ], expect.objectContaining({
+      includeVector: false,
+      shouldIndex: expect.any(Function),
+    }));
 
     const marker = await kv.get<{ dirty: boolean; inProgress: boolean }>(
       KV.state,
       "search-index-dirty",
     );
     expect(marker).toMatchObject({ dirty: true, inProgress: false });
+  });
+
+  it("finalize passes replay index filtering to targeted reindex", async () => {
+    await kv.set<Session>(KV.sessions, "filter-session", {
+      id: "filter-session",
+      project: "/workspace/filter-session",
+      cwd: "/workspace/filter-session",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:00:01.000Z",
+      status: "completed",
+      observationCount: 2,
+      tags: ["jsonl-import"],
+    });
+    await kv.set(KV.observations("filter-session"), "prompt-obs", {
+      id: "prompt-obs",
+      sessionId: "filter-session",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "conversation",
+      title: "prompt_submit",
+      narrative: "user decision should remain searchable",
+      facts: [],
+      concepts: [],
+      files: [],
+      importance: 5,
+    });
+    await kv.set(KV.observations("filter-session"), "tool-obs", {
+      id: "tool-obs",
+      sessionId: "filter-session",
+      timestamp: "2026-01-01T00:00:01.000Z",
+      hookType: "post_tool_use",
+      type: "other",
+      title: "post_tool_use",
+      narrative: "tool result should remain stored but not indexed",
+      facts: [],
+      concepts: [],
+      files: [],
+      importance: 5,
+    });
+    await kv.set(KV.state, "search-index-dirty", {
+      dirty: true,
+      reason: "replay-import-deferred",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      importRunId: "filter-run",
+      sessionIds: ["filter-session"],
+      inProgress: false,
+    });
+
+    const finalize = (await sdk.trigger(
+      "mem::replay::finalize-deferred-index",
+    )) as { success: boolean };
+
+    expect(finalize.success).toBe(true);
+    const options = mockReindexSessions.mock.calls.at(-1)?.[2];
+    expect(options).toMatchObject({ includeVector: false });
+    expect(options?.shouldIndex).toEqual(expect.any(Function));
+    expect(options.shouldIndex({
+      id: "prompt-obs",
+      sessionId: "filter-session",
+      timestamp: "2026-01-01T00:00:00.000Z",
+      type: "conversation",
+      title: "prompt_submit",
+      narrative: "user decision should remain searchable",
+      facts: [],
+      concepts: [],
+      files: [],
+      importance: 5,
+    })).toBe(true);
+    expect(options.shouldIndex({
+      id: "tool-obs",
+      sessionId: "filter-session",
+      timestamp: "2026-01-01T00:00:01.000Z",
+      type: "other",
+      title: "post_tool_use",
+      narrative: "tool result should remain stored but not indexed",
+      facts: [],
+      concepts: [],
+      files: [],
+      importance: 5,
+      hookType: "post_tool_use",
+    })).toBe(false);
   });
 });
