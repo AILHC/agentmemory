@@ -46,6 +46,16 @@ export class VectorIndex {
     this.vectors.delete(obsId);
   }
 
+  removeBySession(sessionId: string): number {
+    let removed = 0;
+    for (const [obsId, entry] of Array.from(this.vectors.entries())) {
+      if (entry.sessionId !== sessionId) continue;
+      this.vectors.delete(obsId);
+      removed++;
+    }
+    return removed;
+  }
+
   search(
     query: Float32Array,
     limit = 20,

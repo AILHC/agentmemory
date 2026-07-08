@@ -23,6 +23,17 @@ describe("VectorIndex", () => {
     expect(index.size).toBe(0);
   });
 
+  it("removes all vectors for one session without touching other sessions", () => {
+    index.add("obs-target", "session-target", new Float32Array([1, 0]));
+    index.add("obs-other", "session-other", new Float32Array([0, 1]));
+
+    expect(index.removeBySession("session-target")).toBe(1);
+
+    expect(index.size).toBe(1);
+    expect(index.search(new Float32Array([1, 0]), 10).some((r) => r.obsId === "obs-target")).toBe(false);
+    expect(index.search(new Float32Array([0, 1]), 10).some((r) => r.obsId === "obs-other")).toBe(true);
+  });
+
   it("returns empty array when searching empty index", () => {
     const results = index.search(new Float32Array([0.1, 0.2, 0.3]));
     expect(results).toEqual([]);

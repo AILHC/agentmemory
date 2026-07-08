@@ -158,6 +158,8 @@ describe("import-jsonl re-key on parsed.sessionId (#775)", () => {
     const sessionWrites = kv
       .getSetCalls()
       .filter((c) => c.scope === KV.sessions && c.key === "sess-fresh");
-    expect(sessionWrites.length).toBe(1);
+    expect(sessionWrites.length).toBeGreaterThanOrEqual(1);
+    expect((sessionWrites[0]?.value as any).id).toBe("sess-fresh");
+    expect((sessionWrites.at(-1)?.value as any).id).toBe("sess-fresh");
   });
 });

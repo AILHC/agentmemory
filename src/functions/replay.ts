@@ -10,7 +10,7 @@ import type {
   MemoryProvider,
 } from "../types.js";
 import type { StateKV } from "../state/kv.js";
-import { KV, fingerprintId } from "../state/schema.js";
+import { KV, fingerprintId, generateId } from "../state/schema.js";
 import { detectTranscriptFormat, parseTranscriptText } from "../replay/format.js";
 import {
   computeSourceFileHash,
@@ -20,7 +20,11 @@ import {
 import { projectTimeline, type Timeline } from "../replay/timeline.js";
 import { safeAudit } from "./audit.js";
 import { buildSyntheticCompression } from "./compress-synthetic.js";
-import { getSearchIndex } from "./search.js";
+import {
+  flushIndexSaveStrict,
+  rebuildIndex,
+  reindexSessions,
+} from "./search.js";
 import { logger } from "../logger.js";
 import {
   extractLessonsFromReplay,
@@ -35,6 +39,9 @@ export const DEFAULT_REPLAY_LOAD_LIMIT = 500;
 export const MAX_REPLAY_LOAD_LIMIT = 1000;
 export const DEFAULT_REPLAY_EVENT_PAYLOAD_CHARS = 1200;
 export const MAX_REPLAY_EVENT_PAYLOAD_CHARS = 5000;
+const REPLAY_LIST_DEDUP_OBSERVATION_LIMIT = 2_000;
+const SEARCH_INDEX_DIRTY_KEY = "search-index-dirty";
+const SEARCH_INDEX_DIRTY_RUN_KEY_PREFIX = `${SEARCH_INDEX_DIRTY_KEY}:`;
 
 const SENSITIVE_PATH_PATTERNS: RegExp[] = [
   /(^|[\\/_.-])secret([\\/_.-]|s?$)/i,
@@ -75,6 +82,21 @@ type ReplayStoredObservation = CompressedObservation &
       | "parentSessionId"
     >
   >;
+
+type ReplayImportIndexMode = "session" | "manual";
+
+type SearchIndexDirtyMarker = {
+  dirty: boolean;
+  reason: "replay-import-deferred";
+  updatedAt: string;
+  importRunId: string;
+  sessionIds: string[];
+  inProgress: boolean;
+};
+
+function replaySearchIndexDirtyRunKey(importRunId: string): string {
+  return `${SEARCH_INDEX_DIRTY_RUN_KEY_PREFIX}${importRunId}`;
+}
 
 async function isSymlink(path: string): Promise<boolean> {
   try {
@@ -217,6 +239,114 @@ function validateReplayLessonExtractionPayload(raw: unknown): string | null {
   const unknownKeys = Object.keys(payload).filter((key) => !allowedKeys.has(key));
   if (unknownKeys.length === 0) return null;
   return `invalid lessonExtraction. Allowed fields: ${Array.from(allowedKeys).join(", ")}`;
+}
+
+function addTag(tags: string[] | undefined, tag: string): string[] {
+  const next = tags ? [...tags] : [];
+  if (!next.includes(tag)) next.push(tag);
+  return next;
+}
+
+function removeTag(tags: string[] | undefined, tag: string): string[] | undefined {
+  const next = (tags || []).filter((item) => item !== tag);
+  return next.length > 0 ? next : undefined;
+}
+
+function isStateSetTimeout(err: unknown): boolean {
+  const code = (err as { code?: unknown })?.code;
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    code === "TIMEOUT" ||
+    (/state::set/i.test(message) &&
+      /timeout|timed out|Invocation timeout/i.test(message))
+  );
+}
+
+function valuesEqual(a: unknown, b: unknown): boolean {
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+async function setWithCommitProbe<T>(
+  kv: StateKV,
+  scope: string,
+  key: string,
+  value: T,
+): Promise<T> {
+  try {
+    return await kv.set(scope, key, value);
+  } catch (err) {
+    if (!isStateSetTimeout(err)) throw err;
+    const committed = await kv.get<T>(scope, key).catch(() => null);
+    if (committed !== null && valuesEqual(committed, value)) return committed;
+    throw err;
+  }
+}
+
+async function readReplaySearchIndexDirty(
+  kv: StateKV,
+): Promise<SearchIndexDirtyMarker | null> {
+  return kv.get<SearchIndexDirtyMarker>(KV.state, SEARCH_INDEX_DIRTY_KEY);
+}
+
+function isReplaySearchIndexDirtyMarker(
+  value: unknown,
+): value is SearchIndexDirtyMarker {
+  const candidate = value as Partial<SearchIndexDirtyMarker> | null;
+  return (
+    !!candidate &&
+    candidate.reason === "replay-import-deferred" &&
+    typeof candidate.importRunId === "string" &&
+    Array.isArray(candidate.sessionIds) &&
+    typeof candidate.dirty === "boolean" &&
+    typeof candidate.inProgress === "boolean"
+  );
+}
+
+async function listReplaySearchIndexDirtyMarkers(
+  kv: StateKV,
+): Promise<SearchIndexDirtyMarker[]> {
+  const values = await kv.list<unknown>(KV.state);
+  return values.filter(isReplaySearchIndexDirtyMarker);
+}
+
+async function markReplaySearchIndexDirty(
+  kv: StateKV,
+  patch: Omit<SearchIndexDirtyMarker, "dirty" | "updatedAt">,
+): Promise<void> {
+  const existing = await readReplaySearchIndexDirty(kv);
+  const sessionIds = Array.from(
+    new Set([...(existing?.sessionIds || []), ...patch.sessionIds]),
+  );
+  const marker: SearchIndexDirtyMarker = {
+    ...patch,
+    dirty: true,
+    updatedAt: new Date().toISOString(),
+    sessionIds,
+  };
+  await setWithCommitProbe(kv, KV.state, SEARCH_INDEX_DIRTY_KEY, marker);
+  await setWithCommitProbe(
+    kv,
+    KV.state,
+    replaySearchIndexDirtyRunKey(patch.importRunId),
+    marker,
+  );
+}
+
+async function loadExistingObservationIds(
+  kv: StateKV,
+  session: Session | null,
+  sessionId: string,
+): Promise<Set<string> | null> {
+  if (!session) return new Set();
+  const importing = session.tags?.includes("jsonl-importing") ?? false;
+  if (
+    importing ||
+    session.observationCount > REPLAY_LIST_DEDUP_OBSERVATION_LIMIT
+  ) {
+    return null;
+  }
+  const existing = await kv.list<ReplayStoredObservation>(KV.observations(sessionId));
+  return new Set(existing.map((obs) => obs.id));
 }
 
 async function deriveCrystal(
@@ -420,11 +550,101 @@ export function registerReplayFunctions(
   );
 
   sdk.registerFunction(
+    "mem::replay::finalize-deferred-index",
+    async (): Promise<
+      | { success: true; rebuilt: number; dirtyCleared: boolean }
+      | { success: false; error: string }
+    > => {
+      const marker = await readReplaySearchIndexDirty(kv);
+      const dirtyMarkers = (await listReplaySearchIndexDirtyMarkers(kv)).filter(
+        (item) => item.dirty,
+      );
+      const initialDirtyRunIds = new Set(
+        dirtyMarkers.map((item) => item.importRunId),
+      );
+      if (!marker?.dirty && initialDirtyRunIds.size === 0) {
+        return { success: true, rebuilt: 0, dirtyCleared: false };
+      }
+      if (dirtyMarkers.some((item) => item.inProgress) || marker?.inProgress) {
+        return {
+          success: false,
+          error: "deferred replay import is still in progress",
+        };
+      }
+      const rebuilt = await rebuildIndex(kv);
+      const saved = await flushIndexSaveStrict();
+      if (!saved) {
+        return {
+          success: false,
+          error:
+            "failed to persist rebuilt replay index; dirty marker remains",
+        };
+      }
+      const latest = await readReplaySearchIndexDirty(kv);
+      const latestDirtyMarkers = (
+        await listReplaySearchIndexDirtyMarkers(kv)
+      ).filter((item) => item.dirty);
+      const latestDirtyRunIds = new Set(
+        latestDirtyMarkers.map((item) => item.importRunId),
+      );
+      const sameDirtyRuns =
+        latestDirtyRunIds.size === initialDirtyRunIds.size &&
+        [...latestDirtyRunIds].every((runId) => initialDirtyRunIds.has(runId));
+      if (
+        latestDirtyMarkers.some((item) => item.inProgress) ||
+        latest?.inProgress ||
+        !sameDirtyRuns
+      ) {
+        return { success: true, rebuilt, dirtyCleared: false };
+      }
+      if (
+        initialDirtyRunIds.size === 0 &&
+        (!latest?.dirty || latest.importRunId !== marker?.importRunId)
+      ) {
+        return { success: true, rebuilt, dirtyCleared: false };
+      }
+      const sessionIds = Array.from(
+        new Set([
+          ...(latest?.sessionIds || marker?.sessionIds || []),
+          ...latestDirtyMarkers.flatMap((item) => item.sessionIds),
+        ]),
+      );
+      const now = new Date().toISOString();
+      const baseMarker = latest ?? marker ?? latestDirtyMarkers[0];
+      if (!baseMarker) {
+        return { success: true, rebuilt, dirtyCleared: false };
+      }
+      await setWithCommitProbe(kv, KV.state, SEARCH_INDEX_DIRTY_KEY, {
+        ...baseMarker,
+        dirty: false,
+        inProgress: false,
+        updatedAt: now,
+        sessionIds,
+      });
+      for (const dirtyMarker of latestDirtyMarkers) {
+        await setWithCommitProbe(
+          kv,
+          KV.state,
+          replaySearchIndexDirtyRunKey(dirtyMarker.importRunId),
+          {
+            ...dirtyMarker,
+            dirty: false,
+            inProgress: false,
+            updatedAt: now,
+          },
+        );
+      }
+      return { success: true, rebuilt, dirtyCleared: true };
+    },
+  );
+
+  sdk.registerFunction(
     "mem::replay::import-jsonl",
     async (
       data: {
         path?: string;
         maxFiles?: number;
+        indexMode?: ReplayImportIndexMode;
         lessonExtraction?: Partial<ReplayLessonExtractionConfig>;
       } = {},
     ): Promise<
@@ -457,6 +677,14 @@ export function registerReplayFunctions(
             reinforced: number;
             skipped: number;
             errors: string[];
+          };
+          indexing: {
+            mode: ReplayImportIndexMode;
+            indexed: number;
+            saved: boolean;
+            dirty: boolean;
+            requiresFinalize: boolean;
+            failedSessionIds: string[];
           };
           discovered: number;
           truncated: boolean;
@@ -511,6 +739,17 @@ export function registerReplayFunctions(
         process.env,
         data.lessonExtraction || {},
       );
+      if (
+        data.indexMode !== undefined &&
+        data.indexMode !== "session" &&
+        data.indexMode !== "manual"
+      ) {
+        return {
+          success: false,
+          error: "indexMode must be 'session' or 'manual'",
+        };
+      }
+      const indexMode: ReplayImportIndexMode = data.indexMode ?? "session";
       if (stat.isDirectory()) {
         const found = await findJsonlFiles(abs, maxFiles);
         files = found.files;
@@ -543,6 +782,14 @@ export function registerReplayFunctions(
             {},
             lessonExtractionConfig.enabled,
           ),
+          indexing: {
+            mode: indexMode,
+            indexed: 0,
+            saved: false,
+            dirty: false,
+            requiresFinalize: false,
+            failedSessionIds: [],
+          },
           discovered,
           truncated,
           traversalCapped,
@@ -562,6 +809,10 @@ export function registerReplayFunctions(
       let mergedSidechainSession = 0;
       let ambiguousLineage = 0;
       const lessonExtractionResults: Record<string, ExtractLessonsResult> = {};
+      const importRunId = generateId("replay_import");
+      const sessionRowCache = new Map<string, Session>();
+      const sessionObservationCounts = new Map<string, number>();
+      let deferredDirtyTouched = false;
 
       const parsedFiles: Array<{ parsed: ReturnType<typeof parseTranscriptText> }> = [];
       const batchTopLevelSessionIds = new Set<string>();
@@ -672,56 +923,98 @@ export function registerReplayFunctions(
             ? firstPromptObs.userPrompt.replace(/\s+/g, " ").trim().slice(0, 200)
             : undefined;
 
-          const existing = await kv.get<Session>(KV.sessions, targetSessionId);
-          let pendingNewSession: Session | null = null;
-          if (existing) {
-            if (parsed.endedAt > (existing.endedAt || "")) {
-              existing.endedAt = parsed.endedAt;
-            }
-            if (existing.status === "active") existing.status = "completed";
-            const existingTags = existing.tags || [];
-            if (!existingTags.includes("jsonl-import")) {
-              existing.tags = [...existingTags, "jsonl-import"];
-            }
-            if (!existing.firstPrompt && firstPrompt) {
-              existing.firstPrompt = firstPrompt;
-            }
-            // #775: re-key on targetSessionId, not existing.id. Older
-            // session rows may be missing the `id` field; existing.id
-            // would then be undefined, JSON.stringify would drop the
-            // `key` from the state::set payload, and the engine would
-            // reject the call with `missing field \`key\``.
-            if (!existing.id) existing.id = targetSessionId;
-            await kv.set(KV.sessions, targetSessionId, existing);
-          } else if (
-            batchTopLevelSessionIds.has(targetSessionId) &&
+          const cachedSession = sessionRowCache.get(targetSessionId) ?? null;
+          const storedSession =
+            cachedSession ?? (await kv.get<Session>(KV.sessions, targetSessionId));
+          if (!sessionObservationCounts.has(targetSessionId)) {
+            sessionObservationCounts.set(
+              targetSessionId,
+              storedSession?.observationCount ?? 0,
+            );
+          }
+          const canCreateSessionRow =
             group.lineage !== "child" &&
-            group.lineage !== "sidechain"
-          ) {
-            pendingNewSession = {
-              id: targetSessionId,
-              project: parsed.project,
-              cwd: parsed.cwd,
-              startedAt: parsed.startedAt,
-              endedAt: parsed.endedAt,
-              status: "completed",
-              observationCount: 0,
-              tags: ["jsonl-import"],
-              firstPrompt,
-            };
+            group.lineage !== "sidechain" &&
+            batchTopLevelSessionIds.has(targetSessionId);
+          if (storedSession || canCreateSessionRow) {
+            const nextSession: Session = storedSession
+              ? {
+                  ...storedSession,
+                  id: storedSession.id || targetSessionId,
+                }
+              : {
+                  id: targetSessionId,
+                  project: parsed.project,
+                  cwd: parsed.cwd,
+                  startedAt: parsed.startedAt,
+                  endedAt: parsed.endedAt,
+                  status: "completed",
+                  observationCount:
+                    sessionObservationCounts.get(targetSessionId) ?? 0,
+                  tags: [],
+                  firstPrompt,
+                };
+            if (parsed.endedAt > (nextSession.endedAt || "")) {
+              nextSession.endedAt = parsed.endedAt;
+            }
+            if (nextSession.status === "active") nextSession.status = "completed";
+            nextSession.tags = addTag(
+              addTag(nextSession.tags, "jsonl-import"),
+              "jsonl-importing",
+            );
+            if (!nextSession.firstPrompt && firstPrompt) {
+              nextSession.firstPrompt = firstPrompt;
+            }
+            nextSession.observationCount =
+              sessionObservationCounts.get(targetSessionId) ??
+              nextSession.observationCount;
+            await setWithCommitProbe(
+              kv,
+              KV.sessions,
+              targetSessionId,
+              nextSession,
+            );
+            sessionRowCache.set(targetSessionId, nextSession);
           }
 
-          const searchIndex = getSearchIndex();
+          const existingObservationIds = await loadExistingObservationIds(
+            kv,
+            storedSession,
+            targetSessionId,
+          );
+          const successfulNewObservationIds = new Set<string>();
           const newRawObservations: RawObservation[] = [];
           const newCompressedObservations: CompressedObservation[] = [];
+          let dirtyMarkedForGroup = false;
           for (const obs of observations) {
-            const existingObservation = await kv.get<ReplayStoredObservation>(
-              KV.observations(targetSessionId),
-              obs.id,
-            );
+            if (successfulNewObservationIds.has(obs.id)) {
+              skippedDuplicate += 1;
+              continue;
+            }
+
+            const existingObservation =
+              existingObservationIds === null
+                ? await kv.get<ReplayStoredObservation>(
+                    KV.observations(targetSessionId),
+                    obs.id,
+                  )
+                : existingObservationIds.has(obs.id)
+                  ? ({ id: obs.id } as ReplayStoredObservation)
+                  : null;
             if (existingObservation) {
               skippedDuplicate += 1;
               continue;
+            }
+
+            if (indexMode === "manual" && !dirtyMarkedForGroup) {
+              await markReplaySearchIndexDirty(kv, {
+                reason: "replay-import-deferred",
+                importRunId,
+                sessionIds: [targetSessionId],
+                inProgress: true,
+              });
+              deferredDirtyTouched = true;
+              dirtyMarkedForGroup = true;
             }
 
             const synthetic = buildSyntheticCompression(obs);
@@ -745,69 +1038,122 @@ export function registerReplayFunctions(
               lineage: obs.lineage,
               parentSessionId: obs.parentSessionId,
             };
-            await kv.set(
+            await setWithCommitProbe(
+              kv,
               KV.observations(targetSessionId),
               obs.id,
               storedObservation,
             );
-            searchIndex.add(synthetic);
+            existingObservationIds?.add(obs.id);
+            successfulNewObservationIds.add(obs.id);
+            sessionObservationCounts.set(
+              targetSessionId,
+              (sessionObservationCounts.get(targetSessionId) ?? 0) + 1,
+            );
             newRawObservations.push(obs);
             newCompressedObservations.push(synthetic);
             created += 1;
           }
 
-          const storedObservations = await kv.list<ReplayStoredObservation>(
-            KV.observations(targetSessionId),
-          );
-          const sessionRow = await kv.get<Session>(KV.sessions, targetSessionId);
+          const sessionRow = sessionRowCache.get(targetSessionId);
           if (sessionRow) {
-            await kv.set(KV.sessions, targetSessionId, {
-              ...sessionRow,
-              observationCount: storedObservations.length,
-            });
-          } else if (pendingNewSession) {
-            await kv.set(KV.sessions, targetSessionId, {
-              ...pendingNewSession,
-              observationCount: storedObservations.length,
-            });
+            sessionRow.observationCount =
+              sessionObservationCounts.get(targetSessionId) ??
+              sessionRow.observationCount;
+            sessionRowCache.set(targetSessionId, sessionRow);
           }
 
           sessionIds.add(targetSessionId);
 
           if (newRawObservations.length > 0) {
-            const extraction = await extractLessonsFromReplay({
-              kv,
-              sessionId: targetSessionId,
-              project: parsed.project,
-              rawObservations: newRawObservations,
-              firstPrompt,
-              config: lessonExtractionConfig,
-            }).catch((error) => ({
-              lessonIds: [],
-              created: 0,
-              reinforced: 0,
-              skipped: 0,
-              errors: [
-                error instanceof Error ? error.message : String(error),
-              ],
-            }));
+            const extraction = lessonExtractionConfig.enabled
+              ? await extractLessonsFromReplay({
+                  kv,
+                  sessionId: targetSessionId,
+                  project: parsed.project,
+                  rawObservations: newRawObservations,
+                  firstPrompt,
+                  config: lessonExtractionConfig,
+                }).catch((error) => ({
+                  lessonIds: [],
+                  created: 0,
+                  reinforced: 0,
+                  skipped: 0,
+                  errors: [
+                    error instanceof Error ? error.message : String(error),
+                  ],
+                }))
+              : {
+                  lessonIds: [],
+                  created: 0,
+                  reinforced: 0,
+                  skipped: 0,
+                  errors: [],
+                };
 
             lessonExtractionResults[targetSessionId] = extraction;
 
-            await deriveCrystal(
-              kv,
-              targetSessionId,
-              parsed.project,
-              newRawObservations,
-              newCompressedObservations,
-              firstPrompt,
-              extraction.lessonIds,
-            );
+            if (lessonExtractionConfig.enabled) {
+              await deriveCrystal(
+                kv,
+                targetSessionId,
+                parsed.project,
+                newRawObservations,
+                newCompressedObservations,
+                firstPrompt,
+                extraction.lessonIds,
+              );
+            }
           }
         }
       }
 
       const returnedSessionIds = Array.from(sessionIds);
+      for (const [sessionId, sessionRow] of sessionRowCache) {
+        const finalizedSession: Session = {
+          ...sessionRow,
+          status: "completed",
+          observationCount:
+            sessionObservationCounts.get(sessionId) ??
+            sessionRow.observationCount,
+          tags: addTag(removeTag(sessionRow.tags, "jsonl-importing"), "jsonl-import"),
+        };
+        await setWithCommitProbe(kv, KV.sessions, sessionId, finalizedSession);
+      }
+
+      let indexed = 0;
+      let failedSessionIds: string[] = [];
+      let indexSaved = false;
+      let indexDirty = false;
+      let requiresFinalize = indexMode === "manual" && deferredDirtyTouched;
+
+      if (indexMode === "session" && returnedSessionIds.length > 0) {
+        const reindex = await reindexSessions(kv, returnedSessionIds);
+        indexed = reindex.indexed;
+        failedSessionIds = reindex.failedSessionIds;
+        indexSaved = await flushIndexSaveStrict();
+        if (failedSessionIds.length > 0 || !indexSaved) {
+          await markReplaySearchIndexDirty(kv, {
+            reason: "replay-import-deferred",
+            importRunId,
+            sessionIds: returnedSessionIds,
+            inProgress: false,
+          });
+          indexDirty = true;
+          requiresFinalize = true;
+        }
+      }
+
+      if (indexMode === "manual" && deferredDirtyTouched) {
+        await markReplaySearchIndexDirty(kv, {
+          reason: "replay-import-deferred",
+          importRunId,
+          sessionIds: returnedSessionIds,
+          inProgress: false,
+        });
+        indexDirty = true;
+        requiresFinalize = true;
+      }
       await safeAudit(kv, "import", "mem::replay::import-jsonl", returnedSessionIds, {
         source: "jsonl",
         files: files.length,
@@ -839,6 +1185,14 @@ export function registerReplayFunctions(
           lessonExtractionResults,
           lessonExtractionConfig.enabled,
         ),
+        indexing: {
+          mode: indexMode,
+          indexed,
+          saved: indexSaved,
+          dirty: indexDirty,
+          requiresFinalize,
+          failedSessionIds,
+        },
         discovered,
         truncated,
         traversalCapped,

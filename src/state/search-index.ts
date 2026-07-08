@@ -74,6 +74,16 @@ export class SearchIndex {
     this.sortedTerms = null;
   }
 
+  removeBySession(sessionId: string): number {
+    const ids = Array.from(this.entries.values())
+      .filter((entry) => entry.sessionId === sessionId)
+      .map((entry) => entry.obsId);
+    for (const id of ids) {
+      this.remove(id);
+    }
+    return ids.length;
+  }
+
   search(
     query: string,
     limit = 20,

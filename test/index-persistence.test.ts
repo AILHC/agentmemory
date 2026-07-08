@@ -756,6 +756,21 @@ describe("IndexPersistence", () => {
     await expect(persistence.save()).resolves.toBeUndefined();
   });
 
+  it("saveStrict() reports persistence failure without changing save() semantics", async () => {
+    const failingKv = {
+      ...mockKV(),
+      set: vi.fn(async () => {
+        throw new Error("TIMEOUT");
+      }),
+    };
+    const bm25 = new SearchIndex();
+    bm25.add(makeObs({ id: "obs_1", title: "auth handler" }));
+    const persistence = new IndexPersistence(failingKv as never, bm25, null);
+
+    await expect(persistence.saveStrict()).resolves.toBe(false);
+    await expect(persistence.save()).resolves.toBeUndefined();
+  });
+
   // #797: first run after upgrading to 0.9.25 crashed with
   // 'TypeError: Cannot read properties of undefined (reading "v")'
   // because some iii-state adapters return `undefined` (not `null`)

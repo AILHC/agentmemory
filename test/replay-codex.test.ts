@@ -1,4 +1,5 @@
 import { describe, expect, it, beforeEach, vi } from "vitest";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,12 +14,16 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-const { mockSearchAdd } = vi.hoisted(() => ({
+const { mockSearchAdd, mockReindexSessions } = vi.hoisted(() => ({
   mockSearchAdd: vi.fn(),
+  mockReindexSessions: vi.fn(async () => ({ indexed: 0, failedSessionIds: [] })),
 }));
 
 vi.mock("../src/functions/search.js", () => ({
   getSearchIndex: () => ({ add: mockSearchAdd }),
+  rebuildIndex: vi.fn(async () => 0),
+  flushIndexSaveStrict: vi.fn(async () => false),
+  reindexSessions: mockReindexSessions,
 }));
 
 const fixturePath = (...parts: string[]) =>
@@ -87,6 +92,39 @@ describe("replay import copy", () => {
     expect(viewer).not.toContain("import Claude Code JSONL transcripts");
     expect(cli).toContain("Claude Code or Codex");
     expect(viewer).toContain("Claude Code or Codex");
+  });
+
+  it("documents and forwards bulk import controls from the CLI", () => {
+    const cli = readFileSync(join(__dirname, "..", "src", "cli.ts"), "utf-8");
+
+    expect(cli).toContain("--manual-index");
+    expect(cli).not.toContain("--defer-index");
+    expect(cli).not.toContain("--deferred-index");
+    expect(cli).toContain("--no-lesson-extraction");
+    expect(cli).toContain("--timeout-ms <N>");
+    expect(cli).toContain('body["indexMode"] = "manual"');
+    expect(cli).toContain('body["lessonExtraction"] = { enabled: false }');
+    expect(cli).toContain("AbortSignal.timeout(timeoutMs)");
+    expect(cli).toContain("finalize-replay-index");
+    expect(cli).toContain("/agentmemory/replay/finalize-deferred-index");
+  });
+
+  it("rejects removed legacy import index flags before making an import request", () => {
+    for (const flag of ["--defer-index", "--deferred-index"]) {
+      const result = spawnSync(
+        process.execPath,
+        ["--import", "tsx", join(__dirname, "..", "src", "cli.ts"), "import-jsonl", flag],
+        {
+          cwd: join(__dirname, ".."),
+          encoding: "utf-8",
+        },
+      );
+
+      expect(result.status).toBe(1);
+      expect(`${result.stdout}\n${result.stderr}`).toContain(
+        `Unknown import-jsonl option: ${flag}`,
+      );
+    }
   });
 });
 
@@ -631,6 +669,8 @@ describe("replay import sdk", () => {
     kv = mockKV();
     sdk = mockSdk(kv);
     mockSearchAdd.mockClear();
+    mockReindexSessions.mockClear();
+    mockReindexSessions.mockResolvedValue({ indexed: 0, failedSessionIds: [] });
     registerReplayFunctions(sdk, kv as never, noopProvider());
   });
 
@@ -671,7 +711,7 @@ describe("replay import sdk", () => {
     expect(kinds).toContain("response");
   });
 
-  it("skips duplicate observations and search indexing on repeated import of the same directory", async () => {
+  it("skips duplicate observations on repeated import of the same directory", async () => {
     const dir = writeCodexFixture();
 
     const first = (await sdk.trigger("mem::replay::import-jsonl", { path: dir })) as {
@@ -685,7 +725,6 @@ describe("replay import sdk", () => {
     const firstTimeline = (await sdk.trigger("mem::replay::load", {
       sessionId,
     })) as { success: boolean; timeline: { eventCount: number } };
-    const firstSearchAdds = mockSearchAdd.mock.calls.length;
 
     const second = (await sdk.trigger("mem::replay::import-jsonl", { path: dir })) as {
       success: boolean;
@@ -703,7 +742,7 @@ describe("replay import sdk", () => {
     expect(second.skippedDuplicate).toBeGreaterThan(0);
     expect(afterSession?.observationCount).toBe(beforeSession?.observationCount);
     expect(secondTimeline.timeline.eventCount).toBe(firstTimeline.timeline.eventCount);
-    expect(mockSearchAdd.mock.calls.length).toBe(firstSearchAdds);
+    expect(mockSearchAdd).not.toHaveBeenCalled();
     const audits = await kv.list<any>(KV.audit);
     expect(JSON.stringify(audits)).not.toContain(dir);
     expect(JSON.stringify(audits)).toContain("sourceFileHashes");
@@ -739,7 +778,7 @@ describe("replay import sdk", () => {
     expect(new Set(second.sessionIds).size).toBe(second.sessionIds?.length);
   });
 
-  it("only indexes new events when importing overlapping Codex files for the same session", async () => {
+  it("does not append per-observation index entries when importing overlapping Codex files", async () => {
     const dir = join(tmpRoot, "overlap");
     mkdirSync(dir, { recursive: true });
     const oldText = [
@@ -767,7 +806,6 @@ describe("replay import sdk", () => {
       success: boolean;
       created?: number;
     };
-    const firstSearchAdds = mockSearchAdd.mock.calls.length;
 
     writeFileSync(join(dir, "02-new.jsonl"), newText);
     const second = (await sdk.trigger("mem::replay::import-jsonl", { path: dir })) as {
@@ -780,7 +818,8 @@ describe("replay import sdk", () => {
     expect(second.success).toBe(true);
     expect(second.created).toBe(1);
     expect(second.skippedDuplicate).toBeGreaterThan(0);
-    expect(mockSearchAdd.mock.calls.length - firstSearchAdds).toBe(1);
+    expect(mockSearchAdd).not.toHaveBeenCalled();
+    expect(mockReindexSessions).toHaveBeenCalledWith(expect.anything(), ["overlap-session"]);
   });
 
   it("does not reinforce old lessons or drop crystal lesson links on overlapping import", async () => {

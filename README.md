@@ -494,7 +494,16 @@ npx @agentmemory/agentmemory import-jsonl
 npx @agentmemory/agentmemory import-jsonl ~/.claude/projects/-my-project/abc123.jsonl
 ```
 
-Imported sessions show up in the Replay picker alongside native ones. Under the hood each entry routes through the `mem::replay::load`, `mem::replay::sessions`, and `mem::replay::import-jsonl` iii functions — no side-channel servers.
+Imported sessions show up in the Replay picker alongside native ones. By default `import-jsonl` writes all observations first, then reindexes the imported session once and persists that index. Under the hood each entry routes through the `mem::replay::load`, `mem::replay::sessions`, and `mem::replay::import-jsonl` iii functions — no side-channel servers.
+
+For bulk backfills where you plan to run full extraction later, skip import-time session indexing and the lightweight replay lesson/crystal pass:
+
+```bash
+npx @agentmemory/agentmemory import-jsonl <jsonl-file-or-directory> --manual-index --no-lesson-extraction
+npx @agentmemory/agentmemory finalize-replay-index
+```
+
+Run `finalize-replay-index` only after all bulk import batches have succeeded. The older `--defer-index` / `--deferred-index` flags are not accepted; use `--manual-index`.
 
 `GET /agentmemory/replay/load?sessionId=<id>` returns a bounded preview page by default.
 
@@ -1558,7 +1567,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-149 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+150 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
 
 <details>
 <summary>Key endpoints</summary>

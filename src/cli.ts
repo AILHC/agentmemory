@@ -170,6 +170,11 @@ Commands:
   import-jsonl [p]   Import Claude Code or Codex JSONL transcripts (default: ~/.claude/projects)
                      --max-files <N> | --max-files=<N>: override scan cap (default 200, max 1000;
                      out-of-range is rejected; for trees >1000 files, batch by subdirectory)
+                     --manual-index: skip session indexing during import; run finalize-replay-index after all batches
+                     --no-lesson-extraction: disable replay lesson/crystal generation for bulk import
+                     --timeout-ms <N>: import HTTP timeout (default 600000)
+  finalize-replay-index
+                     Rebuild and persist search index after manual replay import
 
 Options:
   --help, -h         Show this help
@@ -2606,10 +2611,32 @@ async function runImportJsonl(): Promise<void> {
   // 3112 into pathArg).
   const VALUE_FLAGS = new Set(["--port", "--tools"]);
   let maxFiles: number | undefined;
+  let manualIndex = false;
+  let lessonExtractionEnabled = true;
+  let timeoutMs = 600_000;
   const tail = args.slice(1);
   const positional: string[] = [];
   for (let i = 0; i < tail.length; i++) {
     const a = tail[i]!;
+    if (a === "--manual-index") {
+      manualIndex = true;
+      continue;
+    }
+    if (a === "--no-lesson-extraction") {
+      lessonExtractionEnabled = false;
+      continue;
+    }
+    if (a === "--timeout-ms") {
+      const raw = tail[i + 1];
+      const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
+      if (Number.isInteger(parsed) && parsed > 0) {
+        timeoutMs = parsed;
+      } else if (raw !== undefined) {
+        p.log.warn(`Ignoring --timeout-ms ${raw}: expected a positive integer.`);
+      }
+      i++;
+      continue;
+    }
     if (a === "--max-files") {
       const raw = tail[i + 1];
       const parsed = raw !== undefined ? parseInt(raw, 10) : NaN;
@@ -2635,7 +2662,10 @@ async function runImportJsonl(): Promise<void> {
       i++;
       continue;
     }
-    if (a.startsWith("-")) continue;
+    if (a.startsWith("-")) {
+      p.log.error(`Unknown import-jsonl option: ${a}`);
+      process.exit(1);
+    }
     positional.push(a);
   }
   const pathArg = positional[0];
@@ -2669,12 +2699,21 @@ async function runImportJsonl(): Promise<void> {
   const body: Record<string, unknown> = {};
   if (pathArg) body["path"] = pathArg;
   if (maxFiles !== undefined) body["maxFiles"] = maxFiles;
+  if (manualIndex) body["indexMode"] = "manual";
+  if (!lessonExtractionEnabled) {
+    body["lessonExtraction"] = { enabled: false };
+  }
 
   const headers: Record<string, string> = { "content-type": "application/json" };
   const secret = process.env["AGENTMEMORY_SECRET"];
   if (secret) headers["authorization"] = `Bearer ${secret}`;
 
   p.log.info(`Importing JSONL from ${pathArg || "~/.claude/projects"}…`);
+  if (manualIndex) {
+    p.log.info(
+      "Manual index mode enabled; run `agentmemory finalize-replay-index` after bulk import.",
+    );
+  }
   const spinner = p.spinner();
   spinner.start("scanning files");
 
@@ -2683,7 +2722,7 @@ async function runImportJsonl(): Promise<void> {
       method: "POST",
       headers,
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(120_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
     const text = await res.text();
     let json: {
@@ -2767,7 +2806,62 @@ async function runImportJsonl(): Promise<void> {
   } catch (err) {
     spinner.stop("failed");
     if (err instanceof Error && err.name === "TimeoutError") {
-      p.log.error("import timed out after 2 minutes");
+      p.log.error(`import timed out after ${timeoutMs}ms`);
+    } else {
+      p.log.error(err instanceof Error ? err.message : String(err));
+    }
+    process.exit(1);
+  }
+}
+
+async function runFinalizeReplayIndex(): Promise<void> {
+  const port = getRestPort();
+  const base = `http://localhost:${port}`;
+  const timeoutMs = 600_000;
+
+  const headers: Record<string, string> = { "content-type": "application/json" };
+  const secret = process.env["AGENTMEMORY_SECRET"];
+  if (secret) headers["authorization"] = `Bearer ${secret}`;
+
+  const spinner = p.spinner();
+  spinner.start("finalizing replay index");
+  try {
+    const res = await fetch(`${base}/agentmemory/replay/finalize-deferred-index`, {
+      method: "POST",
+      headers,
+      body: "{}",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const text = await res.text();
+    let json: {
+      success?: boolean;
+      error?: string;
+      rebuilt?: number;
+      dirtyCleared?: boolean;
+    } = {};
+    if (text.length > 0) {
+      try {
+        json = JSON.parse(text);
+      } catch {
+        spinner.stop("failed");
+        p.log.error(
+          `server returned non-JSON response (HTTP ${res.status}): ${text.slice(0, 200)}`,
+        );
+        process.exit(1);
+      }
+    }
+    if (!res.ok || json.success !== true) {
+      spinner.stop("failed");
+      p.log.error(json.error || `HTTP ${res.status}`);
+      process.exit(1);
+    }
+    spinner.stop(
+      `rebuilt ${json.rebuilt ?? 0} indexed item(s); dirty cleared: ${json.dirtyCleared === true ? "yes" : "no"}`,
+    );
+  } catch (err) {
+    spinner.stop("failed");
+    if (err instanceof Error && err.name === "TimeoutError") {
+      p.log.error(`finalize timed out after ${timeoutMs}ms`);
     } else {
       p.log.error(err instanceof Error ? err.message : String(err));
     }
@@ -2928,6 +3022,7 @@ const commands: Record<string, () => Promise<void>> = {
   remove: runRemove,
   mcp: runMcp,
   "import-jsonl": runImportJsonl,
+  "finalize-replay-index": runFinalizeReplayIndex,
 };
 
 const handler = commands[args[0] ?? ""] ?? main;

@@ -118,6 +118,32 @@ describe("SearchIndex", () => {
       expect(index.search("auth")).toHaveLength(1);
     });
 
+    it("removes all entries for one session without touching other sessions", () => {
+      index.add(
+        makeObs({
+          id: "obs-target",
+          sessionId: "session-target",
+          title: "alpha",
+          narrative: "target narrative",
+        }),
+      );
+      index.add(
+        makeObs({
+          id: "obs-other",
+          sessionId: "session-other",
+          title: "beta",
+          narrative: "other narrative",
+        }),
+      );
+
+      expect(index.removeBySession("session-target")).toBe(1);
+
+      expect(index.has("obs-target")).toBe(false);
+      expect(index.has("obs-other")).toBe(true);
+      expect(index.search("alpha", 10).some((r) => r.obsId === "obs-target")).toBe(false);
+      expect(index.search("beta", 10).some((r) => r.obsId === "obs-other")).toBe(true);
+    });
+
     it("cleans up empty posting lists and the prefix cache", () => {
       // unique_concept_xyz appears only in obs_a. After removing obs_a,
       // a prefix search for "unique_" must NOT surface it from the

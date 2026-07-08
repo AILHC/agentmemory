@@ -93,12 +93,23 @@ export class IndexPersistence {
       this.timer = null;
     }
     try {
-      await this.saveBm25Index(this.bm25.serialize());
-      if (this.vector) {
-        await this.saveVectorIndex(this.vector.serialize());
-      }
+      await this.persist();
     } catch (err) {
       this.logFailure(err);
+    }
+  }
+
+  async saveStrict(): Promise<boolean> {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    try {
+      await this.persist();
+      return true;
+    } catch (err) {
+      this.logFailure(err);
+      return false;
     }
   }
 
@@ -146,6 +157,13 @@ export class IndexPersistence {
           ? "iii-engine state::set timed out; recent index updates remain in memory and will retry on the next debounce flush"
           : undefined,
     });
+  }
+
+  private async persist(): Promise<void> {
+    await this.saveBm25Index(this.bm25.serialize());
+    if (this.vector) {
+      await this.saveVectorIndex(this.vector.serialize());
+    }
   }
 
   private async saveBm25Index(serialized: string): Promise<void> {

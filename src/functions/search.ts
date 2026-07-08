@@ -48,10 +48,17 @@ export function vectorIndexRemove(id: string): void {
 let indexPersistence: {
   scheduleSave: () => void;
   save: () => Promise<void>;
+  saveStrict?: () => Promise<boolean>;
 } | null = null;
 
 export function setIndexPersistence(
-  p: { scheduleSave: () => void; save: () => Promise<void> } | null,
+  p:
+    | {
+        scheduleSave: () => void;
+        save: () => Promise<void>;
+        saveStrict?: () => Promise<boolean>;
+      }
+    | null,
 ): void {
   indexPersistence = p;
 }
@@ -71,6 +78,11 @@ export function scheduleIndexSave(): void {
 // committed before this is invoked).
 export async function flushIndexSave(): Promise<void> {
   await indexPersistence?.save();
+}
+
+export async function flushIndexSaveStrict(): Promise<boolean> {
+  if (!indexPersistence?.saveStrict) return false;
+  return indexPersistence.saveStrict();
 }
 
 // Hard cap on embedding input length. Most providers cap input around
@@ -317,6 +329,78 @@ export async function rebuildIndex(kv: StateKV): Promise<number> {
   // Drain the last partial batch.
   await flush()
   return count
+}
+
+export type ReindexSessionsResult = {
+  indexed: number;
+  failedSessionIds: string[];
+};
+
+export async function reindexSessions(
+  kv: StateKV,
+  sessionIds: string[],
+): Promise<ReindexSessionsResult> {
+  const idx = getSearchIndex();
+  const uniqueSessionIds = Array.from(new Set(sessionIds.filter(Boolean)));
+  const batchSize = getRebuildEmbedBatchSize();
+  type EmbedJob = {
+    id: string;
+    sessionId: string;
+    text: string;
+    context: { kind: "memory" | "observation" | "synthetic"; logId: string };
+  };
+  const pending: EmbedJob[] = [];
+  const loaded: Array<{
+    sessionId: string;
+    observations: CompressedObservation[];
+  }> = [];
+  const failedSessionIds: string[] = [];
+  let indexed = 0;
+
+  const flush = async (): Promise<void> => {
+    if (pending.length === 0) return;
+    await vectorIndexAddBatchGuarded(pending);
+    pending.length = 0;
+  };
+  const enqueue = async (job: EmbedJob): Promise<void> => {
+    pending.push(job);
+    if (pending.length >= batchSize) await flush();
+  };
+
+  for (const sessionId of uniqueSessionIds) {
+    try {
+      const observations = await kv.list<CompressedObservation>(
+        KV.observations(sessionId),
+      );
+      loaded.push({ sessionId, observations });
+    } catch (err) {
+      logger.warn("reindexSessions: failed to load observations", {
+        sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      failedSessionIds.push(sessionId);
+    }
+  }
+
+  for (const { sessionId, observations } of loaded) {
+    idx.removeBySession(sessionId);
+    vectorIndex?.removeBySession(sessionId);
+
+    for (const obs of observations) {
+      if (!obs.title || !obs.narrative) continue;
+      idx.add(obs);
+      await enqueue({
+        id: obs.id,
+        sessionId: obs.sessionId || sessionId,
+        text: obs.title + " " + obs.narrative,
+        context: { kind: "observation", logId: obs.id },
+      });
+      indexed++;
+    }
+  }
+
+  await flush();
+  return { indexed, failedSessionIds };
 }
 
 export function registerSearchFunction(sdk: ISdk, kv: StateKV): void {

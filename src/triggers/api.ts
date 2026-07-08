@@ -1350,6 +1350,7 @@ export function registerApiTriggers(
       req: ApiRequest<{
         path?: string;
         maxFiles?: number;
+        indexMode?: "session" | "manual";
         lessonExtraction?: Record<string, unknown>;
       }>,
     ): Promise<Response> => {
@@ -1359,6 +1360,7 @@ export function registerApiTriggers(
       const payload: {
         path?: string;
         maxFiles?: number;
+        indexMode?: "session" | "manual";
         lessonExtraction?: Partial<ReplayLessonExtractionConfig>;
       } = {};
       if (body.path !== undefined) {
@@ -1386,6 +1388,15 @@ export function registerApiTriggers(
         }
         payload.maxFiles = n;
       }
+      if (body.indexMode !== undefined) {
+        if (body.indexMode !== "session" && body.indexMode !== "manual") {
+          return {
+            status_code: 400,
+            body: { error: "indexMode must be 'session' or 'manual'" },
+          };
+        }
+        payload.indexMode = body.indexMode;
+      }
       const parsedLessonExtraction = parseLessonExtractionPayload(body.lessonExtraction);
       if (parsedLessonExtraction === null) {
         return {
@@ -1410,6 +1421,27 @@ export function registerApiTriggers(
     type: "http",
     function_id: "api::replay::import",
     config: { api_path: "/agentmemory/replay/import-jsonl", http_method: "POST" },
+  });
+
+  sdk.registerFunction(
+    "api::replay::finalize-deferred-index",
+    async (req: ApiRequest): Promise<Response> => {
+      const authErr = checkAuth(req, secret);
+      if (authErr) return authErr;
+      const result = await sdk.trigger({
+        function_id: "mem::replay::finalize-deferred-index",
+        payload: {},
+      });
+      return { status_code: 202, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::replay::finalize-deferred-index",
+    config: {
+      api_path: "/agentmemory/replay/finalize-deferred-index",
+      http_method: "POST",
+    },
   });
 
   sdk.registerFunction("api::session::start",
