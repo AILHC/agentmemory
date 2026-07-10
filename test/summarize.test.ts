@@ -10,6 +10,7 @@ vi.mock("../src/state/schema.js", () => ({
     summaries: "summaries",
     observations: (sessionId: string) => `obs:${sessionId}`,
     summaryResumableRuns: "summary-resumable-runs",
+    summaryResumableActiveRuns: "summary-resumable-active-runs",
     summaryResumablePartials: (runId: string) =>
       `summary-resumable-partials:${runId}`,
     audit: "audit",
@@ -835,6 +836,78 @@ describe("mem::summarize-resumable", () => {
     });
   });
 
+  it("retries a skipped chunk and recovers a legacy too-many-skips terminal run", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_retry_skip", 1);
+    const provider = makeProvider([
+      "garbage one",
+      "garbage two",
+      summaryXml({ title: "Recovered single chunk" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    const first = await handler({ sessionId: "ses_retry_skip" });
+    const [legacyRun] = await kv.list<any>("summary-resumable-runs");
+    expect(legacyRun.status).toBe("in_progress");
+    await kv.set("summary-resumable-runs", legacyRun.id, {
+      ...legacyRun,
+      status: "failed",
+      lastError:
+        "too_many_chunks_skipped: 1/1 chunks failed to parse after retry",
+    });
+
+    const resumed = await handler({ sessionId: "ses_retry_skip" });
+
+    expect(first).toMatchObject({
+      success: false,
+      status: "failed",
+      completedChunks: 0,
+      totalChunks: 1,
+      skippedChunks: 1,
+    });
+    expect(resumed).toMatchObject({
+      success: true,
+      status: "succeeded",
+      completedChunks: 1,
+      totalChunks: 1,
+      skippedChunks: 0,
+      summary: { title: "Recovered single chunk" },
+    });
+    expect(provider.calls).toHaveLength(3);
+  });
+
+  it("keeps an in-progress run bound when new observations are appended", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_append", 250);
+    const provider = makeProvider([
+      summaryXml({ title: "Chunk 1" }),
+      summaryXml({ title: "Chunk 2" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId: "ses_append" });
+    const appended = makeObs(250, "ses_append");
+    await kv.set("obs:ses_append", appended.id, appended);
+    const resumed = await handler({ sessionId: "ses_append" });
+
+    expect(resumed).toMatchObject({
+      success: true,
+      status: "in_progress",
+      completedChunks: 2,
+      totalChunks: 3,
+      skippedChunks: 0,
+    });
+    expect(provider.calls).toHaveLength(2);
+    expect(provider.calls[1].user).toContain("obs 100");
+    expect(provider.calls[1].user).not.toContain("obs 250");
+    const [run] = await kv.list<any>("summary-resumable-runs");
+    expect(run.observationIds).toHaveLength(250);
+    expect(run.chunkObservationCounts).toEqual([100, 100, 50]);
+    expect(
+      await kv.get<any>("summary-resumable-active-runs", "ses_append"),
+    ).toMatchObject({ runId: run.id, inputHash: run.inputHash });
+  });
+
   it("runs the final reduce as one step, persists it, and is idempotent", async () => {
     const kv = mockKV();
     await seedSummarySession(kv, "ses_reduce", 250);
@@ -978,20 +1051,61 @@ describe("mem::summarize-resumable", () => {
     expect(provider.calls[0].system).not.toContain("merging multiple partial summaries");
   });
 
-  it("keeps the existing two-attempt chunk skip semantics", async () => {
+  it("commits a persisted single-chunk partial without calling reduce", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_single_partial", 1);
+    const provider = makeProvider([
+      summaryXml({ title: "Persisted single partial" }),
+      summaryXml({ title: "Unexpected reduce" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+    const originalSet = kv.set;
+    let interruptRunCompletion = true;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (
+        scope === "summary-resumable-runs" &&
+        (data as { status?: string }).status === "succeeded" &&
+        interruptRunCompletion
+      ) {
+        interruptRunCompletion = false;
+        throw new Error("run completion interrupted");
+      }
+      return originalSet(scope, key, data);
+    };
+
+    await handler({ sessionId: "ses_single_partial" }).catch(() => undefined);
+    const resumed = await handler({ sessionId: "ses_single_partial" });
+
+    expect(resumed).toMatchObject({
+      success: true,
+      status: "succeeded",
+      completedChunks: 1,
+      totalChunks: 1,
+      skippedChunks: 0,
+      summary: { title: "Persisted single partial" },
+    });
+    expect(provider.calls).toHaveLength(1);
+    expect(
+      await kv.get<any>("summaries", "ses_single_partial"),
+    ).toMatchObject({ title: "Persisted single partial" });
+  });
+
+  it("retries a skipped multi-chunk partial before advancing", async () => {
     const kv = mockKV();
     await seedSummarySession(kv, "ses_step_skip", 250);
     const provider = makeProvider([
       summaryXml({ title: "Chunk 1" }),
       "garbage one",
       "garbage two",
+      summaryXml({ title: "Recovered chunk 2" }),
       summaryXml({ title: "Chunk 3" }),
-      summaryXml({ title: "Merged with skip" }),
+      summaryXml({ title: "Merged after retry" }),
     ]);
     const { handler } = setupResumableHandler(kv, provider);
 
     await handler({ sessionId: "ses_step_skip" });
     const skipped = await handler({ sessionId: "ses_step_skip" });
+    const retried = await handler({ sessionId: "ses_step_skip" });
     await handler({ sessionId: "ses_step_skip" });
     const result = await handler({ sessionId: "ses_step_skip" });
 
@@ -1002,14 +1116,21 @@ describe("mem::summarize-resumable", () => {
       totalChunks: 3,
       skippedChunks: 1,
     });
-    expect(provider.calls).toHaveLength(5);
+    expect(retried).toMatchObject({
+      success: true,
+      status: "in_progress",
+      completedChunks: 2,
+      totalChunks: 3,
+      skippedChunks: 0,
+    });
+    expect(provider.calls).toHaveLength(6);
     expect(result).toMatchObject({
       success: true,
       status: "succeeded",
-      completedChunks: 2,
+      completedChunks: 3,
       totalChunks: 3,
-      skippedChunks: 1,
-      summary: { title: "Merged with skip" },
+      skippedChunks: 0,
+      summary: { title: "Merged after retry" },
     });
   });
 

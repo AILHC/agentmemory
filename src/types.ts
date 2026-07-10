@@ -139,11 +139,21 @@ export interface ResumableSummaryRun {
   inputHash: string;
   chunkSize: number;
   totalChunks: number;
+  observationIds: string[];
+  chunkObservationCounts: number[];
   completedChunks: number;
   skippedChunks: number;
   status: ResumableSummaryRunStatus;
   summary?: SessionSummary;
   lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ResumableSummaryActiveRun {
+  sessionId: string;
+  runId: string;
+  inputHash: string;
   createdAt: string;
   updatedAt: string;
 }

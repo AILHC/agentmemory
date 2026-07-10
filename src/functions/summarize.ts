@@ -8,6 +8,7 @@ import type {
   MemoryProviderCallOptions,
   ResumableSummaryRun,
   ResumableSummaryPartial,
+  ResumableSummaryActiveRun,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -374,6 +375,63 @@ function resumableSummaryRunId(
   return `sumr_${bindingHash.slice(0, 24)}`;
 }
 
+function summaryChunkObservationCounts(
+  chunks: CompressedObservation[][],
+): number[] {
+  return chunks.map((chunk) => chunk.length);
+}
+
+function selectBoundSummaryObservations(
+  observations: CompressedObservation[],
+  observationIds: string[],
+): CompressedObservation[] | null {
+  const observationById = new Map(
+    observations.map((observation) => [observation.id, observation]),
+  );
+  const bound = observationIds.map((id) => observationById.get(id));
+  return bound.every(
+    (observation): observation is CompressedObservation => Boolean(observation),
+  )
+    ? bound
+    : null;
+}
+
+function rebuildBoundSummaryChunks(
+  compressed: CompressedObservation[],
+  chunkObservationCounts: number[],
+): CompressedObservation[][] | null {
+  const chunks: CompressedObservation[][] = [];
+  let offset = 0;
+  for (const count of chunkObservationCounts) {
+    if (!Number.isInteger(count) || count <= 0) return null;
+    const chunk = compressed.slice(offset, offset + count);
+    if (chunk.length !== count) return null;
+    chunks.push(chunk);
+    offset += count;
+  }
+  return offset === compressed.length ? chunks : null;
+}
+
+function isRecoverableLegacySummaryRun(run: ResumableSummaryRun): boolean {
+  return (
+    run.status === "failed" &&
+    run.lastError?.startsWith("too_many_chunks_skipped:") === true
+  );
+}
+
+async function clearActiveSummaryRun(
+  kv: StateKV,
+  run: ResumableSummaryRun,
+): Promise<void> {
+  const active = await kv.get<ResumableSummaryActiveRun>(
+    KV.summaryResumableActiveRuns,
+    run.sessionId,
+  );
+  if (active?.runId === run.id) {
+    await kv.delete(KV.summaryResumableActiveRuns, run.sessionId);
+  }
+}
+
 function resumableResponse(
   status: ResumableSummaryResponse["status"],
   completedChunks: number,
@@ -428,6 +486,7 @@ async function persistResumableSummary(
   };
   await kv.set(KV.summaryResumableRuns, run.id, succeededRun);
   await kv.set(KV.summaries, run.sessionId, summary);
+  await clearActiveSummaryRun(kv, succeededRun);
   await safeAudit(kv, "compress", "mem::summarize-resumable", [run.sessionId], {
     title: summary.title,
     observationCount: summary.observationCount,
@@ -470,20 +529,78 @@ async function runResumableSummaryStep(
       const observations = await kv.list<CompressedObservation>(
         KV.observations(sessionId),
       );
-      const compressed = observations.filter((observation) => observation.title);
-      if (compressed.length === 0) {
-        return resumableResponse("failed", 0, 0, 0, {
-          error: "no_observations",
-        });
+      const now = new Date().toISOString();
+      const configuredChunkSize = getSummarizeRuntimeConfig().chunkSize;
+      let chunkSize = configuredChunkSize;
+      let compressed: CompressedObservation[] = [];
+      let chunks: CompressedObservation[][] = [];
+      let inputHash = "";
+      let runId = "";
+      let run: ResumableSummaryRun | null = null;
+      let active = await kv.get<ResumableSummaryActiveRun>(
+        KV.summaryResumableActiveRuns,
+        sessionId,
+      );
+
+      if (active?.sessionId === sessionId) {
+        const activeRun = await kv.get<ResumableSummaryRun>(
+          KV.summaryResumableRuns,
+          active.runId,
+        );
+        if (
+          activeRun &&
+          active.inputHash === activeRun.inputHash &&
+          Array.isArray(activeRun.observationIds) &&
+          activeRun.observationIds.every((id) => typeof id === "string") &&
+          Array.isArray(activeRun.chunkObservationCounts)
+        ) {
+          const bound = selectBoundSummaryObservations(
+            observations,
+            activeRun.observationIds,
+          );
+          const rebuilt = bound
+            ? rebuildBoundSummaryChunks(
+                bound,
+                activeRun.chunkObservationCounts,
+              )
+            : null;
+          if (
+            bound &&
+            rebuilt &&
+            resumableSummaryInputHash(session, bound) === activeRun.inputHash
+          ) {
+            run = activeRun;
+            runId = activeRun.id;
+            inputHash = activeRun.inputHash;
+            chunkSize = activeRun.chunkSize;
+            compressed = bound;
+            chunks = rebuilt;
+          }
+        }
       }
 
-      const chunkSize = getSummarizeRuntimeConfig().chunkSize;
-      const chunks = buildTurnAwareSummaryChunks(compressed, chunkSize);
+      if (active && !run) {
+        await kv.delete(KV.summaryResumableActiveRuns, sessionId);
+        active = null;
+      }
+
+      if (!run) {
+        compressed = observations.filter((observation) => observation.title);
+        if (compressed.length === 0) {
+          return resumableResponse("failed", 0, 0, 0, {
+            error: "no_observations",
+          });
+        }
+        chunkSize = configuredChunkSize;
+        chunks = buildTurnAwareSummaryChunks(compressed, chunkSize);
+        inputHash = resumableSummaryInputHash(session, compressed);
+        runId = resumableSummaryRunId(sessionId, inputHash, chunkSize);
+        run = await kv.get<ResumableSummaryRun>(
+          KV.summaryResumableRuns,
+          runId,
+        );
+      }
       totalChunks = chunks.length;
-      const inputHash = resumableSummaryInputHash(session, compressed);
-      const runId = resumableSummaryRunId(sessionId, inputHash, chunkSize);
-      const now = new Date().toISOString();
-      let run = await kv.get<ResumableSummaryRun>(KV.summaryResumableRuns, runId);
 
       if (
         run &&
@@ -504,6 +621,8 @@ async function runResumableSummaryStep(
           inputHash,
           chunkSize,
           totalChunks,
+          observationIds: compressed.map((observation) => observation.id),
+          chunkObservationCounts: summaryChunkObservationCounts(chunks),
           completedChunks: 0,
           skippedChunks: 0,
           status: "in_progress",
@@ -511,6 +630,39 @@ async function runResumableSummaryStep(
           updatedAt: now,
         };
         await kv.set(KV.summaryResumableRuns, runId, run);
+      } else if (
+        !Array.isArray(run.observationIds) ||
+        !Array.isArray(run.chunkObservationCounts)
+      ) {
+        run = {
+          ...run,
+          observationIds: compressed.map((observation) => observation.id),
+          chunkObservationCounts: summaryChunkObservationCounts(chunks),
+          updatedAt: now,
+        };
+        await kv.set(KV.summaryResumableRuns, runId, run);
+      }
+
+      if (isRecoverableLegacySummaryRun(run)) {
+        run = {
+          ...run,
+          status: "in_progress",
+          lastError: undefined,
+          updatedAt: now,
+        };
+        await kv.set(KV.summaryResumableRuns, runId, run);
+      }
+
+      if (run.status !== "succeeded") {
+        const activeRun: ResumableSummaryActiveRun = {
+          sessionId,
+          runId,
+          inputHash,
+          createdAt: active?.runId === runId ? active.createdAt : now,
+          updatedAt: now,
+        };
+        await kv.set(KV.summaryResumableActiveRuns, sessionId, activeRun);
+        active = activeRun;
       }
 
       completedChunks = run.completedChunks;
@@ -527,6 +679,7 @@ async function runResumableSummaryStep(
           );
         }
         await kv.set(KV.summaries, sessionId, run.summary);
+        await clearActiveSummaryRun(kv, run);
         return resumableResponse(
           "succeeded",
           completedChunks,
@@ -590,10 +743,50 @@ async function runResumableSummaryStep(
         await kv.set(KV.summaryResumableRuns, runId, run);
       }
 
+      const persistedSinglePartial = partialByIndex.get(0);
+      if (
+        totalChunks === 1 &&
+        persistedSinglePartial?.status === "completed" &&
+        persistedSinglePartial.summary
+      ) {
+        const validationError = validateFinalSummary(
+          persistedSinglePartial.summary,
+        );
+        if (validationError) {
+          run = {
+            ...run,
+            status: "failed",
+            completedChunks,
+            skippedChunks,
+            lastError: validationError,
+            updatedAt: new Date().toISOString(),
+          };
+          await kv.set(KV.summaryResumableRuns, runId, run);
+          return resumableResponse(
+            "failed",
+            completedChunks,
+            totalChunks,
+            skippedChunks,
+            { error: validationError },
+          );
+        }
+        return persistResumableSummary(
+          kv,
+          run,
+          persistedSinglePartial.summary,
+          completedChunks,
+          skippedChunks,
+        );
+      }
+
       const nextChunkIndex = chunks.findIndex(
-        (_chunk, index) => !partialByIndex.has(index),
+        (_chunk, index) => {
+          const partial = partialByIndex.get(index);
+          return !partial || partial.status === "skipped";
+        },
       );
       if (nextChunkIndex >= 0) {
+        const previousPartial = partialByIndex.get(nextChunkIndex);
         const callOptions = resolveStageModelCallOptions("summary", data.model);
         const summary = await summarizeChunkWithRetry(
           provider,
@@ -621,6 +814,7 @@ async function runResumableSummaryStep(
           partial,
         );
         partialByIndex.set(nextChunkIndex, partial);
+        if (previousPartial?.status === "skipped") skippedChunks -= 1;
         completedChunks += summary ? 1 : 0;
         skippedChunks += summary ? 0 : 1;
 
@@ -628,7 +822,7 @@ async function runResumableSummaryStep(
           const error = `too_many_chunks_skipped: ${skippedChunks}/${totalChunks} chunks failed to parse after retry`;
           run = {
             ...run,
-            status: "failed",
+            status: "in_progress",
             completedChunks,
             skippedChunks,
             lastError: error,

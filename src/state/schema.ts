@@ -6,6 +6,7 @@ export const KV = {
   memories: "mem:memories",
   summaries: "mem:summaries",
   summaryResumableRuns: "mem:summary-resumable:runs",
+  summaryResumableActiveRuns: "mem:summary-resumable:active-runs",
   summaryResumablePartials: (runId: string) =>
     `mem:summary-resumable:partials:${runId}`,
   config: "mem:config",
