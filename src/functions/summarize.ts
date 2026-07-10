@@ -6,6 +6,8 @@ import type {
   MemoryProvider,
   Session,
   MemoryProviderCallOptions,
+  ResumableSummaryRun,
+  ResumableSummaryPartial,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -38,29 +40,6 @@ const MAX_SKIP_RATIO = 0.5;
 type SummaryLineageInput = {
   lineage?: Session["lineage"];
   parentSessionId?: string;
-};
-
-type ResumableSummaryRun = {
-  id: string;
-  sessionId: string;
-  inputHash: string;
-  chunkSize: number;
-  totalChunks: number;
-  completedChunks: number;
-  skippedChunks: number;
-  status: "in_progress" | "succeeded" | "failed";
-  summary?: SessionSummary;
-  lastError?: string;
-  createdAt: string;
-  updatedAt: string;
-};
-
-type ResumableSummaryPartial = {
-  runId: string;
-  chunkIndex: number;
-  status: "completed" | "skipped";
-  summary?: SessionSummary;
-  createdAt: string;
 };
 
 type ResumableSummaryResponse = {
