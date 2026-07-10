@@ -1566,6 +1566,35 @@ export function registerApiTriggers(
     },
   });
 
+  sdk.registerFunction(
+    "api::summarize-resumable",
+    async (
+      req: ApiRequest<{ sessionId: string; model?: string }>,
+    ): Promise<Response> => {
+      const body = (req.body as Record<string, unknown>) || {};
+      const sessionId = asNonEmptyString(body.sessionId);
+      if (!sessionId) {
+        return { status_code: 400, body: { error: "sessionId is required" } };
+      }
+      const model = optionalModelString(body);
+      if (model === null) return invalidModelResponse();
+      const result = await sdk.trigger({
+        function_id: "mem::summarize-resumable",
+        payload: { sessionId, ...(model ? { model } : {}) },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::summarize-resumable",
+    config: {
+      api_path: "/agentmemory/summarize/resumable",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
   sdk.registerFunction("api::session::commit",
     async (req: ApiRequest): Promise<Response> => {
       const body = (req.body ?? {}) as Record<string, unknown>;

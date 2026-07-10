@@ -9,6 +9,9 @@ vi.mock("../src/state/schema.js", () => ({
     sessions: "sessions",
     summaries: "summaries",
     observations: (sessionId: string) => `obs:${sessionId}`,
+    summaryResumableRuns: "summary-resumable-runs",
+    summaryResumablePartials: (runId: string) =>
+      `summary-resumable-partials:${runId}`,
     audit: "audit",
   },
 }));
@@ -33,6 +36,7 @@ import {
   buildTurnAwareSummaryChunks,
   registerSummarizeFunction,
 } from "../src/functions/summarize.js";
+import { registerApiTriggers } from "../src/triggers/api.js";
 import type {
   CompressedObservation,
   Session,
@@ -165,6 +169,38 @@ async function setupHandler(opts: {
   registerSummarizeFunction(sdk as any, kv as any, opts.provider);
   const handler = sdk.functions.get("mem::summarize")!;
   return { handler, kv };
+}
+
+async function seedSummarySession(
+  kv: ReturnType<typeof mockKV>,
+  sessionId: string,
+  obsCount: number,
+): Promise<void> {
+  const session: Session = {
+    id: sessionId,
+    project: "test-project",
+    cwd: "/tmp",
+    startedAt: new Date().toISOString(),
+    status: "completed",
+    observationCount: obsCount,
+  };
+  await kv.set("sessions", sessionId, session);
+  for (let i = 0; i < obsCount; i++) {
+    const observation = makeObs(i, sessionId);
+    await kv.set(`obs:${sessionId}`, observation.id, observation);
+  }
+}
+
+function setupResumableHandler(
+  kv: ReturnType<typeof mockKV>,
+  provider: MemoryProvider,
+): { handler: Function; sdk: ReturnType<typeof mockSdk> } {
+  const sdk = mockSdk();
+  registerSummarizeFunction(sdk as any, kv as any, provider);
+  return {
+    handler: sdk.functions.get("mem::summarize-resumable")!,
+    sdk,
+  };
 }
 
 describe("mem::summarize chunking", () => {
@@ -742,5 +778,277 @@ describe("mem::summarize chunking", () => {
 
     expect(result.success).toBe(false);
     expect(result.error).toBe("parse_failed");
+  });
+});
+
+describe("mem::summarize-resumable", () => {
+  const ORIGINAL_ENV = { ...process.env };
+
+  beforeEach(() => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "100";
+    delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+    delete process.env.AGENTMEMORY_SUMMARY_MODEL;
+  });
+
+  afterEach(() => {
+    process.env = { ...ORIGINAL_ENV };
+  });
+
+  it("executes only one chunk work unit per call", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_step", 250);
+    const provider = makeProvider([summaryXml({ title: "Chunk 1" })]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    const result = await handler({ sessionId: "ses_step" });
+
+    expect(provider.calls).toHaveLength(1);
+    expect(result).toEqual({
+      success: true,
+      status: "in_progress",
+      completedChunks: 1,
+      totalChunks: 3,
+      skippedChunks: 0,
+    });
+  });
+
+  it("resumes from persisted partials after the service is rebuilt", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_rebuild", 250);
+    const firstProvider = makeProvider([summaryXml({ title: "Chunk 1" })]);
+    const firstService = setupResumableHandler(kv, firstProvider);
+
+    await firstService.handler({ sessionId: "ses_rebuild" });
+
+    const secondProvider = makeProvider([summaryXml({ title: "Chunk 2" })]);
+    const rebuiltService = setupResumableHandler(kv, secondProvider);
+    const result = await rebuiltService.handler({ sessionId: "ses_rebuild" });
+
+    expect(firstProvider.calls).toHaveLength(1);
+    expect(secondProvider.calls).toHaveLength(1);
+    expect(result).toMatchObject({
+      success: true,
+      status: "in_progress",
+      completedChunks: 2,
+      totalChunks: 3,
+      skippedChunks: 0,
+    });
+  });
+
+  it("runs the final reduce as one step, persists it, and is idempotent", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_reduce", 250);
+    const provider = makeProvider([
+      summaryXml({ title: "Chunk 1", decisions: ["d1"] }),
+      summaryXml({ title: "Chunk 2", decisions: ["d2"] }),
+      summaryXml({ title: "Chunk 3", decisions: ["d3"] }),
+      summaryXml({ title: "Merged", decisions: ["d1", "d2", "d3"] }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId: "ses_reduce" });
+    await handler({ sessionId: "ses_reduce" });
+    const chunksComplete = await handler({ sessionId: "ses_reduce" });
+    const result = await handler({ sessionId: "ses_reduce" });
+
+    expect(chunksComplete).toMatchObject({
+      status: "in_progress",
+      completedChunks: 3,
+      totalChunks: 3,
+    });
+    expect(provider.calls).toHaveLength(4);
+    expect(provider.calls[3].system).toContain("merging multiple partial summaries");
+    expect(result).toMatchObject({
+      success: true,
+      status: "succeeded",
+      completedChunks: 3,
+      totalChunks: 3,
+      skippedChunks: 0,
+      summary: {
+        title: "Merged",
+        observationCount: 250,
+      },
+    });
+    expect(Object.keys(result).sort()).toEqual([
+      "completedChunks",
+      "skippedChunks",
+      "status",
+      "success",
+      "summary",
+      "totalChunks",
+    ]);
+    const stored = await kv.get<any>("summaries", "ses_reduce");
+    expect(stored?.title).toBe("Merged");
+
+    const repeated = await handler({ sessionId: "ses_reduce" });
+    expect(repeated).toEqual(result);
+    expect(provider.calls).toHaveLength(4);
+  });
+
+  it("does not repeat a completed reduce when the final summary write is interrupted", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_reduce_repair", 250);
+    const provider = makeProvider([
+      summaryXml({ title: "Chunk 1" }),
+      summaryXml({ title: "Chunk 2" }),
+      summaryXml({ title: "Chunk 3" }),
+      summaryXml({ title: "Merged after repair" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId: "ses_reduce_repair" });
+    await handler({ sessionId: "ses_reduce_repair" });
+    await handler({ sessionId: "ses_reduce_repair" });
+
+    const originalSet = kv.set;
+    let interruptSummaryWrite = true;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (scope === "summaries" && interruptSummaryWrite) {
+        interruptSummaryWrite = false;
+        throw new Error("summary write interrupted");
+      }
+      return originalSet(scope, key, data);
+    };
+
+    const interrupted = await handler({ sessionId: "ses_reduce_repair" });
+    const resumed = await handler({ sessionId: "ses_reduce_repair" });
+
+    expect(interrupted).toMatchObject({
+      success: false,
+      status: "failed",
+      error: "summary write interrupted",
+    });
+    expect(resumed).toMatchObject({
+      success: true,
+      status: "succeeded",
+      summary: { title: "Merged after repair" },
+    });
+    expect(provider.calls).toHaveLength(4);
+    const stored = await kv.get<any>("summaries", "ses_reduce_repair");
+    expect(stored?.title).toBe("Merged after repair");
+  });
+
+  it("does not reuse partials when the summary input hash changes", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_changed", 250);
+    const provider = makeProvider([
+      summaryXml({ title: "Old input chunk" }),
+      summaryXml({ title: "New input chunk" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId: "ses_changed" });
+    await kv.set("obs:ses_changed", "obs_0", {
+      ...makeObs(0, "ses_changed"),
+      title: "changed observation",
+    });
+    const result = await handler({ sessionId: "ses_changed" });
+
+    expect(provider.calls).toHaveLength(2);
+    expect(result).toMatchObject({
+      status: "in_progress",
+      completedChunks: 1,
+      totalChunks: 3,
+      skippedChunks: 0,
+    });
+    const partialScopes = Array.from(kv.store.keys()).filter((scope) =>
+      scope.startsWith("summary-resumable-partials:"),
+    );
+    expect(partialScopes).toHaveLength(2);
+  });
+
+  it("summarizes a small session in one step without a reduce call", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_small_step", 10);
+    const provider = makeProvider([summaryXml({ title: "Small summary" })]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    const result = await handler({ sessionId: "ses_small_step" });
+
+    expect(provider.calls).toHaveLength(1);
+    expect(result).toMatchObject({
+      success: true,
+      status: "succeeded",
+      completedChunks: 1,
+      totalChunks: 1,
+      skippedChunks: 0,
+      summary: { title: "Small summary", observationCount: 10 },
+    });
+    expect(provider.calls[0].system).toContain("session summarizer");
+    expect(provider.calls[0].system).not.toContain("merging multiple partial summaries");
+  });
+
+  it("keeps the existing two-attempt chunk skip semantics", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_step_skip", 250);
+    const provider = makeProvider([
+      summaryXml({ title: "Chunk 1" }),
+      "garbage one",
+      "garbage two",
+      summaryXml({ title: "Chunk 3" }),
+      summaryXml({ title: "Merged with skip" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId: "ses_step_skip" });
+    const skipped = await handler({ sessionId: "ses_step_skip" });
+    await handler({ sessionId: "ses_step_skip" });
+    const result = await handler({ sessionId: "ses_step_skip" });
+
+    expect(skipped).toMatchObject({
+      success: true,
+      status: "in_progress",
+      completedChunks: 1,
+      totalChunks: 3,
+      skippedChunks: 1,
+    });
+    expect(provider.calls).toHaveLength(5);
+    expect(result).toMatchObject({
+      success: true,
+      status: "succeeded",
+      completedChunks: 2,
+      totalChunks: 3,
+      skippedChunks: 1,
+      summary: { title: "Merged with skip" },
+    });
+  });
+
+  it("registers the resumable HTTP route and whitelists its payload", async () => {
+    const functions = new Map<string, Function>();
+    const triggers: Array<{ function_id: string; config: Record<string, unknown> }> = [];
+    const trigger = vi.fn(async () => ({
+      success: true,
+      status: "in_progress",
+      completedChunks: 1,
+      totalChunks: 3,
+      skippedChunks: 0,
+    }));
+    const sdk = {
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+      registerTrigger: (definition: (typeof triggers)[number]) => triggers.push(definition),
+      trigger,
+    };
+    registerApiTriggers(sdk as any, {} as any, "");
+    const handler = functions.get("api::summarize-resumable")!;
+
+    const response = await handler({
+      headers: {},
+      body: { sessionId: " session-1 ", model: "model-1", unsafe: "drop-me" },
+    });
+
+    expect(trigger).toHaveBeenCalledWith({
+      function_id: "mem::summarize-resumable",
+      payload: { sessionId: "session-1", model: "model-1" },
+    });
+    expect(response.status_code).toBe(200);
+    expect(triggers).toContainEqual({
+      type: "http",
+      function_id: "api::summarize-resumable",
+      config: {
+        api_path: "/agentmemory/summarize/resumable",
+        http_method: "POST",
+        middleware_function_ids: ["middleware::api-auth"],
+      },
+    });
   });
 });
