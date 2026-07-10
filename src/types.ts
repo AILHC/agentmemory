@@ -12,6 +12,10 @@ export interface Session {
   summary?: string;
   commitShas?: string[];
   agentId?: string;
+  sourceFormat?: "codex" | "claude-code" | "unknown";
+  sourceSessionId?: string;
+  lineage?: "top-level" | "child" | "sidechain";
+  parentSessionId?: string;
 }
 
 export interface CommitLink {

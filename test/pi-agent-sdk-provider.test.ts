@@ -176,6 +176,17 @@ describe("PiAgentSDKProvider", () => {
     expect(ProxyAgent).toHaveBeenCalledWith(process.env.HTTPS_PROXY);
   });
 
+  it("reuses the proxy dispatcher across repeated calls with the same proxy", async () => {
+    process.env.HTTPS_PROXY = "http://127.0.0.1:7890";
+    const provider = new PiAgentSDKProvider();
+
+    await provider.summarize("sys", "first prompt");
+    await provider.summarize("sys", "second prompt");
+
+    expect(ProxyAgent).toHaveBeenCalledTimes(1);
+    expect(setGlobalDispatcher).toHaveBeenCalledTimes(1);
+  });
+
   it("uses per-call model and maxTokens options without changing defaults or model env", async () => {
     process.env.PI_AGENT_MODEL = "env-model";
     const provider = new PiAgentSDKProvider("gpt-5.4", 512);

@@ -57,6 +57,7 @@ export interface LessonPromptItem {
   index: number;
   kind: "user_prompt" | "assistant_response" | "observation";
   text: string;
+  timestamp?: string;
   type?: string;
   title?: string;
   files?: string[];

@@ -198,6 +198,59 @@ describe("skill-extract", () => {
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
   });
 
+  it("adds anti-overgeneralization guidance for child sessions", async () => {
+    mockKv.get.mockImplementation((scope: string) => {
+      if (scope === "mem:sessions") {
+        return Promise.resolve({
+          id: "child-session",
+          project: "proj",
+          cwd: "/repo",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          endedAt: "2026-01-01T00:01:00.000Z",
+          status: "completed",
+          observationCount: 3,
+          lineage: "child",
+          parentSessionId: "parent-session",
+        });
+      }
+      if (scope === "mem:summaries") {
+        return Promise.resolve({
+          sessionId: "child-session",
+          project: "proj",
+          title: "Child task",
+          narrative: "Delegated implementation.",
+          keyDecisions: [],
+          filesModified: [],
+          concepts: ["delegation"],
+          observationCount: 3,
+          createdAt: "2026-01-01T00:02:00.000Z",
+        });
+      }
+      return Promise.resolve(null);
+    });
+    mockKv.list.mockResolvedValue(
+      Array.from({ length: 3 }, (_, i) => ({
+        id: `obs-${i}`,
+        sessionId: "child-session",
+        timestamp: "2026-01-01T00:00:00.000Z",
+        type: "conversation",
+        title: `step ${i}`,
+        narrative: "Did delegated work.",
+        facts: ["local detail"],
+        files: [],
+        concepts: ["delegation"],
+        importance: 7,
+      })),
+    );
+    mockProvider.summarize.mockResolvedValue("<no-skill/>");
+
+    const result = await handlers["mem::skill-extract"]({ sessionId: "child-session" });
+
+    expect(result.success).toBe(true);
+    expect(mockProvider.summarize.mock.calls[0][1]).toContain("Session lineage: child.");
+    expect(mockProvider.summarize.mock.calls[0][1]).toContain("Do not promote child-local facts");
+  });
+
   it("skill-extract returns no-skill for exploratory sessions", async () => {
     mockKv.get.mockImplementation((scope: string) => {
       if (scope === "mem:sessions") return Promise.resolve({ id: "s1", project: "test", status: "completed" });

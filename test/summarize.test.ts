@@ -29,7 +29,10 @@ vi.mock("../src/functions/audit.js", () => ({
   safeAudit: vi.fn(),
 }));
 
-import { registerSummarizeFunction } from "../src/functions/summarize.js";
+import {
+  buildTurnAwareSummaryChunks,
+  registerSummarizeFunction,
+} from "../src/functions/summarize.js";
 import type {
   CompressedObservation,
   Session,
@@ -81,6 +84,24 @@ function makeObs(i: number, sessionId: string): CompressedObservation {
     concepts: [],
     files: [`src/file_${i}.ts`],
     importance: 5,
+  };
+}
+
+function makeCompressedObservation(
+  id: string,
+  overrides: Partial<CompressedObservation> & { userPrompt?: string; hookType?: string } = {},
+): CompressedObservation & { userPrompt?: string; hookType?: string } {
+  return {
+    id,
+    sessionId: "session-1",
+    timestamp: "2026-01-01T00:00:00.000Z",
+    type: overrides.type ?? "command_run",
+    title: overrides.title ?? id,
+    narrative: overrides.narrative ?? "",
+    facts: overrides.facts ?? [],
+    files: overrides.files ?? [],
+    concepts: overrides.concepts ?? [],
+    ...overrides,
   };
 }
 
@@ -160,6 +181,87 @@ describe("mem::summarize chunking", () => {
     process.env = { ...ORIGINAL_ENV };
   });
 
+  it("keeps a user prompt and its following work in the same summary chunk", () => {
+    const observations = [
+      makeCompressedObservation("obs-1", {
+        type: "conversation",
+        hookType: "prompt_submit",
+        title: "User asks A",
+        narrative: "User asks A.",
+        userPrompt: "Do A",
+      }),
+      makeCompressedObservation("obs-2", {
+        type: "command_run",
+        title: "Tool for A",
+        narrative: "Tool work for A.",
+      }),
+      makeCompressedObservation("obs-3", {
+        type: "conversation",
+        title: "Answer A",
+        narrative: "Assistant answer for A.",
+      }),
+      makeCompressedObservation("obs-4", {
+        type: "conversation",
+        hookType: "prompt_submit",
+        title: "User asks B",
+        narrative: "User asks B.",
+        userPrompt: "Do B",
+      }),
+      makeCompressedObservation("obs-5", {
+        type: "command_run",
+        title: "Tool for B",
+        narrative: "Tool work for B.",
+      }),
+    ];
+
+    const chunks = buildTurnAwareSummaryChunks(observations, 4);
+
+    expect(chunks.map((chunk) => chunk.map((obs) => obs.id))).toEqual([
+      ["obs-1", "obs-2", "obs-3"],
+      ["obs-4", "obs-5"],
+    ]);
+  });
+
+  it("splits a single oversized turn by observation count as a fallback", () => {
+    const observations = [
+      makeCompressedObservation("obs-1", {
+        type: "conversation",
+        hookType: "prompt_submit",
+        title: "User asks A",
+        narrative: "User asks A.",
+        userPrompt: "Do A",
+      }),
+      makeCompressedObservation("obs-2", { type: "command_run", title: "Tool 1" }),
+      makeCompressedObservation("obs-3", { type: "command_run", title: "Tool 2" }),
+      makeCompressedObservation("obs-4", { type: "command_run", title: "Tool 3" }),
+    ];
+
+    const chunks = buildTurnAwareSummaryChunks(observations, 2);
+
+    expect(chunks.map((chunk) => chunk.map((obs) => obs.id))).toEqual([
+      ["obs-1", "obs-2"],
+      ["obs-3", "obs-4"],
+    ]);
+  });
+
+  it("falls back to fixed-size summary chunks when there are no user turn markers", () => {
+    const observations = [
+      makeCompressedObservation("obs-1", { type: "command_run", title: "Tool 1" }),
+      makeCompressedObservation("obs-2", { type: "command_run", title: "Tool 2" }),
+      makeCompressedObservation("obs-3", { type: "conversation", title: "Answer" }),
+      makeCompressedObservation("obs-4", { type: "command_run", title: "Tool 3" }),
+      makeCompressedObservation("obs-5", { type: "decision", title: "Decision" }),
+    ];
+
+    const chunks = buildTurnAwareSummaryChunks(observations, 2);
+
+    expect(chunks.map((chunk) => chunk.map((obs) => obs.id))).toEqual([
+      ["obs-1", "obs-2"],
+      ["obs-3", "obs-4"],
+      ["obs-5"],
+    ]);
+  });
+
   it("small session takes the single-call path (no chunking, no reduce)", async () => {
     const provider = makeProvider([
       summaryXml({
@@ -220,6 +322,48 @@ describe("mem::summarize chunking", () => {
     expect(result.durationMs).toBeGreaterThanOrEqual(0);
   });
 
+  it("includes child lineage boundaries in the summary prompt", async () => {
+    const sessionId = "child-session";
+    const provider = makeProvider([
+      summaryXml({ title: "child summary" }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId,
+      obsCount: 1,
+      provider,
+    });
+    await kv.set("sessions", sessionId, {
+      id: sessionId,
+      project: "proj",
+      cwd: "/repo",
+      startedAt: "2026-01-01T00:00:00.000Z",
+      endedAt: "2026-01-01T00:01:00.000Z",
+      status: "completed",
+      observationCount: 1,
+      lineage: "child",
+      parentSessionId: "parent-session",
+    });
+    await kv.set(`obs:${sessionId}`, "obs-1", {
+      id: "obs-1",
+      sessionId,
+      timestamp: "2026-01-01T00:00:10.000Z",
+      type: "conversation",
+      hookType: "prompt_submit",
+      title: "Child task",
+      narrative: "Investigated delegated work.",
+      facts: ["Found a local fix."],
+      files: [],
+      concepts: ["delegation"],
+    });
+
+    const result: any = await handler({ sessionId });
+
+    expect(result.success).toBe(true);
+    expect(provider.calls[0].user).toContain("Session lineage: child.");
+    expect(provider.calls[0].user).toContain("Parent session id: parent-session.");
+    expect(provider.calls[0].user).toContain("Do not imply that child-local execution details are parent-session decisions.");
+  });
+
   it("large session map-reduces: N chunk calls + 1 reduce call", async () => {
     process.env.SUMMARIZE_CHUNK_SIZE = "100";
     process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1"; // serial keeps call ordering deterministic
@@ -258,6 +402,62 @@ describe("mem::summarize chunking", () => {
     // not just the final chunk.
     expect(stored?.observationCount).toBe(250);
     expect(stored?.keyDecisions).toEqual(["dA", "dB", "dC"]);
+  });
+
+  it("uses cumulative observation ranges when reducing variable-size chunks", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "4";
+    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
+    const provider = makeProvider([
+      summaryXml({ title: "Turn A" }),
+      summaryXml({ title: "Turn B" }),
+      summaryXml({ title: "Merged turns" }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_turn_ranges",
+      obsCount: 5,
+      provider,
+    });
+    const observations = [
+      makeCompressedObservation("obs_0", {
+        sessionId: "ses_turn_ranges",
+        type: "conversation",
+        hookType: "prompt_submit",
+        title: "User asks A",
+        userPrompt: "Do A",
+      }),
+      makeCompressedObservation("obs_1", {
+        sessionId: "ses_turn_ranges",
+        type: "command_run",
+        title: "Tool for A",
+      }),
+      makeCompressedObservation("obs_2", {
+        sessionId: "ses_turn_ranges",
+        type: "conversation",
+        title: "Answer A",
+      }),
+      makeCompressedObservation("obs_3", {
+        sessionId: "ses_turn_ranges",
+        type: "conversation",
+        hookType: "prompt_submit",
+        title: "User asks B",
+        userPrompt: "Do B",
+      }),
+      makeCompressedObservation("obs_4", {
+        sessionId: "ses_turn_ranges",
+        type: "command_run",
+        title: "Tool for B",
+      }),
+    ];
+    for (const observation of observations) {
+      await kv.set("obs:ses_turn_ranges", observation.id, observation);
+    }
+
+    const result: any = await handler({ sessionId: "ses_turn_ranges" });
+
+    expect(result.success).toBe(true);
+    expect(provider.calls).toHaveLength(3);
+    expect(provider.calls[2].user).toContain("obs 1-3");
+    expect(provider.calls[2].user).toContain("obs 4-5");
   });
 
   it("injects output language policy into chunk and reduce summary calls", async () => {

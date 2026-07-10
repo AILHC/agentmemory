@@ -6,6 +6,7 @@ import { validateOutput } from "../src/eval/validator.js";
 import { LessonExtractionOutputSchema } from "../src/eval/schemas.js";
 import {
   DEFAULT_REPLAY_LESSON_CONFIG,
+  buildTurnAwareLessonChunks,
   extractHeuristicLessonCandidates,
   extractLlmLessonCandidates,
   extractLessonsFromReplay,
@@ -283,6 +284,127 @@ describe("heuristic replay lesson extraction", () => {
 });
 
 describe("lesson extraction end-to-end", () => {
+  it("keeps lesson prompt items for one user turn in the same chunk", () => {
+    const items = [
+      { index: 1, kind: "user_prompt" as const, text: "Do A" },
+      { index: 2, kind: "assistant_response" as const, text: "Answer A" },
+      { index: 3, kind: "observation" as const, text: "Tool evidence A" },
+      { index: 4, kind: "user_prompt" as const, text: "Do B" },
+      { index: 5, kind: "assistant_response" as const, text: "Answer B" },
+    ];
+
+    const chunks = buildTurnAwareLessonChunks(items, 4);
+
+    expect(chunks.map((chunk) => chunk.map((item) => item.index))).toEqual([
+      [1, 2, 3],
+      [4, 5],
+    ]);
+  });
+
+  it("splits one oversized lesson turn by item count as a fallback", () => {
+    const items = [
+      { index: 1, kind: "user_prompt" as const, text: "Do A" },
+      { index: 2, kind: "assistant_response" as const, text: "Answer A1" },
+      { index: 3, kind: "observation" as const, text: "Observation A2" },
+      { index: 4, kind: "observation" as const, text: "Observation A3" },
+    ];
+
+    const chunks = buildTurnAwareLessonChunks(items, 2);
+
+    expect(chunks.map((chunk) => chunk.map((item) => item.index))).toEqual([
+      [1, 2],
+      [3, 4],
+    ]);
+  });
+
+  it("falls back to fixed-size lesson chunks when there are no user prompt items", () => {
+    const items = [
+      { index: 1, kind: "assistant_response" as const, text: "Answer 1" },
+      { index: 2, kind: "observation" as const, text: "Observation 1" },
+      { index: 3, kind: "assistant_response" as const, text: "Answer 2" },
+      { index: 4, kind: "observation" as const, text: "Observation 2" },
+      { index: 5, kind: "observation" as const, text: "Observation 3" },
+    ];
+
+    const chunks = buildTurnAwareLessonChunks(items, 2);
+
+    expect(chunks.map((chunk) => chunk.map((item) => item.index))).toEqual([
+      [1, 2],
+      [3, 4],
+      [5],
+    ]);
+  });
+
+  it("builds lesson LLM chunks from the real observation timeline", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn().mockResolvedValue("<lessons></lessons>"),
+      summarize: vi.fn(),
+    };
+    await extractLlmLessonCandidates({
+      provider: provider as never,
+      sessionId: "s1",
+      project: "proj",
+      firstPrompt: undefined,
+      config: {
+        enabled: true,
+        textLimit: 1200,
+        matchLimit: 10,
+        saveLimit: 10,
+        additionalHeuristicTerms: [],
+        allowUnbounded: false,
+        chunkSize: 3,
+        chunkConcurrency: 1,
+      },
+      rawObservations: [
+        rawObservation({
+          id: "raw-a",
+          sessionId: "s1",
+          timestamp: "2026-01-01T00:00:00.000Z",
+          hookType: "prompt_submit",
+          userPrompt: "Do A",
+        }),
+        rawObservation({
+          id: "raw-b",
+          sessionId: "s1",
+          timestamp: "2026-01-01T00:10:00.000Z",
+          hookType: "prompt_submit",
+          userPrompt: "Do B",
+        }),
+      ],
+      compressedObservations: [
+        compressedObservation({
+          id: "obs-a",
+          sessionId: "s1",
+          timestamp: "2026-01-01T00:01:00.000Z",
+          type: "decision",
+          title: "Decision A",
+          narrative: "Decision belongs to A.",
+          facts: [],
+          files: [],
+          concepts: [],
+          importance: 7,
+        }),
+        compressedObservation({
+          id: "obs-b",
+          sessionId: "s1",
+          timestamp: "2026-01-01T00:11:00.000Z",
+          type: "decision",
+          title: "Decision B",
+          narrative: "Decision belongs to B.",
+          facts: [],
+          files: [],
+          concepts: [],
+          importance: 7,
+        }),
+      ],
+    });
+
+    expect(provider.compress.mock.calls[0][1]).toContain("Do A");
+    expect(provider.compress.mock.calls[0][1]).toContain("Decision A");
+    expect(provider.compress.mock.calls[0][1]).not.toContain("Do B");
+  });
+
   it("enabled false skips extraction", async () => {
     const kv = mockKV();
     const config = { ...resolveReplayLessonExtractionConfig({}, {}), enabled: false };

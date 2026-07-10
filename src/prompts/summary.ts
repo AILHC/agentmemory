@@ -30,19 +30,54 @@ export const SUMMARY_OUTPUT_CONTRACT = {
   ],
 } as const;
 
-export function buildSummaryPrompt(observations: Array<{
+export type SummaryLineageContext = {
+  lineage?: "top-level" | "child" | "sidechain";
+  parentSessionId?: string;
+};
+
+export function buildSummaryLineageInstructions(
+  context: SummaryLineageContext = {},
+): string {
+  const lineage = context.lineage ?? "top-level";
+  if (lineage === "child") {
+    return [
+      "Session lineage: child.",
+      `Parent session id: ${context.parentSessionId ?? "unknown"}.`,
+      "Summarize only this child session's delegated work, findings, artifacts, failures, and limits.",
+      "Do not imply that child-local execution details are parent-session decisions.",
+    ].join("\n");
+  }
+  if (lineage === "sidechain") {
+    return [
+      "Session lineage: sidechain.",
+      `Parent session id: ${context.parentSessionId ?? "unknown"}.`,
+      "Summarize only this sidechain's focused work and outputs.",
+      "Do not merge sidechain details into the parent session narrative.",
+    ].join("\n");
+  }
+  return [
+    "Session lineage: top-level.",
+    "Summarize the main session's goals, decisions, task framing, validation, and outcomes.",
+    "Do not invent child-agent results unless they appear in this session's own observations.",
+  ].join("\n");
+}
+
+export function buildSummaryPrompt(
+  observations: Array<{
   type: string
   title: string
   facts: string[]
   narrative: string
   files: string[]
   concepts: string[]
-}>): string {
+}>,
+  context: SummaryLineageContext = {},
+): string {
   const lines = observations.map((obs, i) => {
     const facts = obs.facts.map((f) => `  - ${f}`).join('\n')
     return `[${i + 1}] ${obs.type}: ${obs.title}\n${obs.narrative}\nFacts:\n${facts}\nFiles: ${obs.files.join(', ')}`
   })
-  return `Session observations (${observations.length} total):\n\n${lines.join('\n\n---\n\n')}`
+  return `${buildSummaryLineageInstructions(context)}\n\nSession observations (${observations.length} total):\n\n${lines.join('\n\n---\n\n')}`
 }
 
 export const REDUCE_SYSTEM = `You are merging multiple partial summaries of the SAME coding session into one final session summary. The partials are chronological chunks of one continuous session — not separate sessions.

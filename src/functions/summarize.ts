@@ -33,6 +33,11 @@ import {
 // to parse — a half-blind narrative is worse than a clean error.
 const MAX_SKIP_RATIO = 0.5;
 
+type SummaryLineageInput = {
+  lineage?: Session["lineage"];
+  parentSessionId?: string;
+};
+
 function summarizeWithOptions(
   provider: MemoryProvider,
   systemPrompt: string,
@@ -58,6 +63,7 @@ async function summarizeChunkWithRetry(
   project: string,
   idx: number,
   total: number,
+  lineageContext: SummaryLineageInput,
   callOptions?: MemoryProviderCallOptions,
 ): Promise<SessionSummary | null> {
   for (let attempt = 1; attempt <= 2; attempt++) {
@@ -65,7 +71,7 @@ async function summarizeChunkWithRetry(
       const xml = await summarizeWithOptions(
         provider,
         withOutputLanguagePolicy(SUMMARY_SYSTEM, undefined, SUMMARY_OUTPUT_CONTRACT),
-        buildSummaryPrompt(chunk),
+        buildSummaryPrompt(chunk, lineageContext),
         callOptions,
       );
       const parsed = parseSummaryXml(xml, sessionId, project, chunk.length);
@@ -87,6 +93,70 @@ async function summarizeChunkWithRetry(
   return null;
 }
 
+function startsNewUserTurn(obs: CompressedObservation): boolean {
+  const maybeRaw = obs as CompressedObservation & {
+    hookType?: unknown;
+    userPrompt?: unknown;
+  };
+  return (
+    maybeRaw.hookType === "prompt_submit" ||
+    (typeof maybeRaw.userPrompt === "string" && maybeRaw.userPrompt.trim().length > 0)
+  );
+}
+
+export function buildTurnAwareSummaryChunks(
+  compressed: CompressedObservation[],
+  chunkSize: number,
+): CompressedObservation[][] {
+  if (chunkSize <= 0) return [compressed];
+
+  if (!compressed.some(startsNewUserTurn)) {
+    const fixedChunks: CompressedObservation[][] = [];
+    for (let i = 0; i < compressed.length; i += chunkSize) {
+      fixedChunks.push(compressed.slice(i, i + chunkSize));
+    }
+    return fixedChunks;
+  }
+
+  const segments: CompressedObservation[][] = [];
+  let currentSegment: CompressedObservation[] = [];
+  for (const obs of compressed) {
+    if (startsNewUserTurn(obs) && currentSegment.length > 0) {
+      segments.push(currentSegment);
+      currentSegment = [];
+    }
+    currentSegment.push(obs);
+  }
+  if (currentSegment.length > 0) segments.push(currentSegment);
+
+  const chunks: CompressedObservation[][] = [];
+  let currentChunk: CompressedObservation[] = [];
+  const flushCurrentChunk = () => {
+    if (currentChunk.length > 0) {
+      chunks.push(currentChunk);
+      currentChunk = [];
+    }
+  };
+
+  for (const segment of segments) {
+    if (segment.length > chunkSize) {
+      flushCurrentChunk();
+      for (let i = 0; i < segment.length; i += chunkSize) {
+        chunks.push(segment.slice(i, i + chunkSize));
+      }
+      continue;
+    }
+
+    if (currentChunk.length > 0 && currentChunk.length + segment.length > chunkSize) {
+      flushCurrentChunk();
+    }
+    currentChunk.push(...segment);
+  }
+  flushCurrentChunk();
+
+  return chunks;
+}
+
 // Returns the final summary XML string. For sessions ≤ chunk size, this is
 // a single LLM call (legacy behavior). For larger sessions, observations
 // are split into chunks processed in parallel batches, each chunk retried
@@ -97,6 +167,7 @@ async function produceSummaryXml(
   compressed: CompressedObservation[],
   sessionId: string,
   project: string,
+  lineageContext: SummaryLineageInput,
   callOptions?: MemoryProviderCallOptions,
 ): Promise<{
   response: string;
@@ -108,7 +179,7 @@ async function produceSummaryXml(
   const runtimeConfig = getSummarizeRuntimeConfig();
   const chunkSize = runtimeConfig.chunkSize;
   if (compressed.length <= chunkSize) {
-    const userPrompt = buildSummaryPrompt(compressed);
+    const userPrompt = buildSummaryPrompt(compressed, lineageContext);
     const response = await summarizeWithOptions(
       provider,
       withOutputLanguagePolicy(SUMMARY_SYSTEM, undefined, SUMMARY_OUTPUT_CONTRACT),
@@ -118,9 +189,12 @@ async function produceSummaryXml(
     return { response, mode: "single", chunks: 1, promptChars: userPrompt.length };
   }
 
-  const chunks: CompressedObservation[][] = [];
-  for (let i = 0; i < compressed.length; i += chunkSize) {
-    chunks.push(compressed.slice(i, i + chunkSize));
+  const chunks = buildTurnAwareSummaryChunks(compressed, chunkSize);
+  const chunkStartOffsets: number[] = [];
+  let nextOffset = 0;
+  for (const chunk of chunks) {
+    chunkStartOffsets.push(nextOffset);
+    nextOffset += chunk.length;
   }
   const concurrency = runtimeConfig.chunkConcurrency;
   logger.info("Summarize chunking session", {
@@ -147,6 +221,7 @@ async function produceSummaryXml(
           project,
           idx,
           chunks.length,
+          lineageContext,
           callOptions,
         );
       }),
@@ -177,8 +252,8 @@ async function produceSummaryXml(
       keyDecisions: p.keyDecisions,
       filesModified: p.filesModified,
       concepts: p.concepts,
-      obsRangeStart: originalIdx * chunkSize + 1,
-      obsRangeEnd: Math.min((originalIdx + 1) * chunkSize, compressed.length),
+      obsRangeStart: chunkStartOffsets[originalIdx] + 1,
+      obsRangeEnd: chunkStartOffsets[originalIdx] + chunks[originalIdx].length,
     };
   });
   const reducePrompt = buildReducePrompt(reduceInput);
@@ -188,8 +263,17 @@ async function produceSummaryXml(
     reducePrompt,
     callOptions,
   );
-  const chunkPromptChars = chunks.reduce((sum, chunk) => sum + buildSummaryPrompt(chunk).length, 0);
-  return { response, mode: "chunked", chunks: chunks.length, skipped, promptChars: chunkPromptChars + reducePrompt.length };
+  const chunkPromptChars = chunks.reduce(
+    (sum, chunk) => sum + buildSummaryPrompt(chunk, lineageContext).length,
+    0,
+  );
+  return {
+    response,
+    mode: "chunked",
+    chunks: chunks.length,
+    skipped,
+    promptChars: chunkPromptChars + reducePrompt.length,
+  };
 }
 
 // #783: many LLMs (DeepSeek, GPT variants, some Anthropic responses)
@@ -300,6 +384,10 @@ export function registerSummarizeFunction(
             compressed,
             sessionId,
             session.project,
+            {
+              lineage: session.lineage,
+              parentSessionId: session.parentSessionId,
+            },
             callOptions,
           );
           response = produced.response;

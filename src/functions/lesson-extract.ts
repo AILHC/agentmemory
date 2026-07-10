@@ -487,17 +487,33 @@ function collectLlmPromptItems(
   const items: LessonPromptItem[] = [];
   let index = 1;
 
-  const rawItems = collectLessonTexts(rawObservations);
-  for (const entry of rawItems) {
-    const text = truncateItem(entry.text);
-    if (!text) continue;
-    items.push({
-      index,
-      kind: entry.kind,
-      text,
-      files: undefined,
-    });
-    index += 1;
+  for (const obs of rawObservations) {
+    if (typeof obs.userPrompt === "string" && obs.userPrompt.trim()) {
+      const text = truncateItem(obs.userPrompt);
+      if (text) {
+        items.push({
+          index,
+          kind: "user_prompt",
+          text,
+          timestamp: obs.timestamp,
+          files: undefined,
+        });
+        index += 1;
+      }
+    }
+    if (typeof obs.assistantResponse === "string" && obs.assistantResponse.trim()) {
+      const text = truncateItem(obs.assistantResponse);
+      if (text) {
+        items.push({
+          index,
+          kind: "assistant_response",
+          text,
+          timestamp: obs.timestamp,
+          files: undefined,
+        });
+        index += 1;
+      }
+    }
   }
 
   const compressedItems = compressedObservations
@@ -513,12 +529,22 @@ function collectLlmPromptItems(
       index,
       kind: "observation",
       text,
+      timestamp: obs.timestamp,
       type: obs.type,
       title: obs.title,
       files: obs.files,
     });
     index += 1;
   }
+
+  items.sort((a, b) => {
+    const ta = a.timestamp ? new Date(a.timestamp).getTime() : Number.NaN;
+    const tb = b.timestamp ? new Date(b.timestamp).getTime() : Number.NaN;
+    if (Number.isFinite(ta) && Number.isFinite(tb) && ta !== tb) return ta - tb;
+    if (Number.isFinite(ta) && !Number.isFinite(tb)) return -1;
+    if (!Number.isFinite(ta) && Number.isFinite(tb)) return 1;
+    return a.index - b.index;
+  });
 
   if (firstPrompt) {
     items.unshift({
@@ -537,6 +563,58 @@ interface LessonChunkResult {
   errors: string[];
   promptChars: number;
   parseFailures: number;
+}
+
+export function buildTurnAwareLessonChunks(
+  items: LessonPromptItem[],
+  chunkSize: number,
+): LessonPromptItem[][] {
+  if (chunkSize <= 0) return [items];
+
+  if (!items.some((item) => item.kind === "user_prompt")) {
+    const fixedChunks: LessonPromptItem[][] = [];
+    for (let i = 0; i < items.length; i += chunkSize) {
+      fixedChunks.push(items.slice(i, i + chunkSize));
+    }
+    return fixedChunks;
+  }
+
+  const segments: LessonPromptItem[][] = [];
+  let currentSegment: LessonPromptItem[] = [];
+  for (const item of items) {
+    if (item.kind === "user_prompt" && currentSegment.length > 0) {
+      segments.push(currentSegment);
+      currentSegment = [];
+    }
+    currentSegment.push(item);
+  }
+  if (currentSegment.length > 0) segments.push(currentSegment);
+
+  const chunks: LessonPromptItem[][] = [];
+  let currentChunk: LessonPromptItem[] = [];
+  const flushCurrentChunk = () => {
+    if (currentChunk.length > 0) {
+      chunks.push(currentChunk);
+      currentChunk = [];
+    }
+  };
+
+  for (const segment of segments) {
+    if (segment.length > chunkSize) {
+      flushCurrentChunk();
+      for (let i = 0; i < segment.length; i += chunkSize) {
+        chunks.push(segment.slice(i, i + chunkSize));
+      }
+      continue;
+    }
+    if (currentChunk.length > 0 && currentChunk.length + segment.length > chunkSize) {
+      flushCurrentChunk();
+    }
+    currentChunk.push(...segment);
+  }
+  flushCurrentChunk();
+
+  return chunks;
 }
 
 async function extractLlmChunkWithRetry(
@@ -649,11 +727,7 @@ export async function extractLlmLessonCandidates(
   const callOptions = config.model
     ? { model: config.model, modelSource: config.modelSource }
     : resolveStageModelCallOptions("lesson");
-  const chunks: LessonPromptItem[][] = [];
-
-  for (let i = 0; i < items.length; i += chunkSize) {
-    chunks.push(items.slice(i, i + chunkSize));
-  }
+  const chunks = buildTurnAwareLessonChunks(items, chunkSize);
 
   const chunkResults: Array<LessonChunkResult | null> = new Array(chunks.length).fill(null);
   const errors: string[] = [];

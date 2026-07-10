@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { resolveProject } from "../src/hooks/_project.js";
 
 describe("resolveProject — hook project basename resolver", () => {
@@ -49,7 +49,7 @@ describe("resolveProject — hook project basename resolver", () => {
   it("falls back to basename(cwd) when not in a git repo", () => {
     const dir = mkdtempSync(join(tmpdir(), "amem-noproj-"));
     try {
-      expect(resolveProject(dir)).toBe(dir.split("/").pop());
+      expect(resolveProject(dir)).toBe(basename(dir));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

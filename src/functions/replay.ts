@@ -1051,36 +1051,15 @@ export function registerReplayFunctions(
           const obsLineage = obs.lineage ?? parsed.lineage ?? "top-level";
           let targetSessionId = baseTargetSessionId;
 
-          if (obsLineage === "child") {
+          if (obsLineage === "child" || obsLineage === "sidechain") {
             const parentSessionId = obs.parentSessionId ?? parsed.parentSessionId;
             if (!parentSessionId) {
               ambiguousLineage += 1;
               continue;
             }
-            const parentExists =
-              batchTopLevelSessionIds.has(parentSessionId) ||
-              sessionIds.has(parentSessionId) ||
-              (await kv.get<Session>(KV.sessions, parentSessionId));
-            if (!parentExists) {
-              filteredChildSession += 1;
-              continue;
-            }
-            targetSessionId = parentSessionId;
-          } else if (obsLineage === "sidechain") {
-            const parentSessionId = obs.parentSessionId ?? parsed.parentSessionId;
-            if (!parentSessionId) {
-              ambiguousLineage += 1;
-              continue;
-            }
-            const parentExists =
-              batchTopLevelSessionIds.has(parentSessionId) ||
-              sessionIds.has(parentSessionId) ||
-              (await kv.get<Session>(KV.sessions, parentSessionId));
-            if (!parentExists) {
-              filteredSidechainSession += 1;
-              continue;
-            }
-            targetSessionId = parentSessionId;
+            obs.parentSessionId = parentSessionId;
+            targetSessionId =
+              obs.sourceSessionId ?? parsed.sourceSessionId ?? baseTargetSessionId;
           }
 
           const groupKey = `${obsLineage}:${targetSessionId}`;
@@ -1088,8 +1067,6 @@ export function registerReplayFunctions(
           if (!group) {
             group = { lineage: obsLineage, targetSessionId, observations: [] };
             groups.set(groupKey, group);
-            if (obsLineage === "child") mergedChildSession += 1;
-            if (obsLineage === "sidechain") mergedSidechainSession += 1;
           }
           obs.sessionId = targetSessionId;
           group.observations.push(obs);
@@ -1120,8 +1097,8 @@ export function registerReplayFunctions(
             );
           }
           const canCreateSessionRow =
-            group.lineage !== "child" &&
-            group.lineage !== "sidechain" &&
+            group.lineage === "child" ||
+            group.lineage === "sidechain" ||
             batchTopLevelSessionIds.has(targetSessionId);
           if (storedSession || canCreateSessionRow) {
             const nextSession: Session = storedSession
@@ -1149,6 +1126,22 @@ export function registerReplayFunctions(
               addTag(nextSession.tags, "jsonl-import"),
               "jsonl-importing",
             );
+            nextSession.sourceFormat = parsed.sourceFormat;
+            nextSession.sourceSessionId =
+              observations[0]?.sourceSessionId ??
+              parsed.sourceSessionId ??
+              targetSessionId;
+            nextSession.lineage =
+              group.lineage === "child" || group.lineage === "sidechain"
+                ? group.lineage
+                : "top-level";
+            if (
+              nextSession.lineage === "child" ||
+              nextSession.lineage === "sidechain"
+            ) {
+              nextSession.parentSessionId =
+                observations[0]?.parentSessionId ?? parsed.parentSessionId;
+            }
             if (!nextSession.firstPrompt && firstPrompt) {
               nextSession.firstPrompt = firstPrompt;
             }

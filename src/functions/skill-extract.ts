@@ -40,7 +40,21 @@ Rules:
 function buildSkillPrompt(
   summary: SessionSummary,
   observations: CompressedObservation[],
+  session: Session,
 ): string {
+  const lineageGuidance =
+    session.lineage === "child" || session.lineage === "sidechain"
+      ? [
+          `Session lineage: ${session.lineage}.`,
+          `Parent session id: ${session.parentSessionId ?? "unknown"}.`,
+          "Only extract a skill if this session demonstrates a reusable procedure that should apply beyond this delegated subtask.",
+          "Do not promote child-local facts, one-off implementation details, or parent-specific decisions into a general skill.",
+        ].join("\n")
+      : [
+          "Session lineage: top-level.",
+          "Prefer procedures that are reusable across future sessions and supported by the session summary and observations.",
+        ].join("\n");
+
   const obsText = observations
     .filter((o) => o.importance >= 4)
     .sort((a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime())
@@ -51,7 +65,10 @@ function buildSkillPrompt(
     )
     .join("\n");
 
-  return `## Session Summary
+  return `## Lineage Guidance
+${lineageGuidance}
+
+## Session Summary
 Title: ${summary.title}
 Narrative: ${summary.narrative}
 Key Decisions: ${summary.keyDecisions.join("; ")}
@@ -154,7 +171,7 @@ export function registerSkillExtractFunctions(
       }
 
       try {
-        const prompt = buildSkillPrompt(summary, observations);
+        const prompt = buildSkillPrompt(summary, observations, session);
         const systemPrompt = withOutputLanguagePolicy(SKILL_EXTRACT_SYSTEM);
         const callOptions = resolveStageModelCallOptions("skill_extract", data.model);
         const response = callOptions

@@ -822,7 +822,11 @@ describe("replay import sdk", () => {
     expect(second.created).toBe(1);
     expect(second.skippedDuplicate).toBeGreaterThan(0);
     expect(mockSearchAdd).not.toHaveBeenCalled();
-    expect(mockReindexSessions).toHaveBeenCalledWith(expect.anything(), ["overlap-session"]);
+    expect(mockReindexSessions).toHaveBeenCalledWith(
+      expect.anything(),
+      ["overlap-session"],
+      expect.objectContaining({ includeVector: false }),
+    );
   });
 
   it("does not reinforce old lessons or drop crystal lesson links on overlapping import", async () => {
@@ -1055,7 +1059,7 @@ describe("replay import sdk", () => {
     expect(sessions).toHaveLength(1);
   });
 
-  it("merges Codex child sessions only when the parent session exists", async () => {
+  it("preserves Codex child sessions when importing replay files", async () => {
     const parentDir = join(tmpRoot, "child-merge-parent-first");
     mkdirSync(parentDir, { recursive: true });
     const parent = [
@@ -1099,14 +1103,33 @@ describe("replay import sdk", () => {
     };
 
     expect(merged.success).toBe(true);
-    expect(merged.mergedChildSession).toBeGreaterThanOrEqual(1);
+    expect(merged.mergedChildSession).toBe(0);
     expect(merged.filteredChildSession).toBe(0);
-    expect(await kv.get<Session>(KV.sessions, "child-session")).toBeNull();
-    expect(await kv.list(KV.observations("parent-session"))).toHaveLength(2);
+
+    const parentSession = await kv.get<Session>(KV.sessions, "parent-session");
+    const childSession = await kv.get<Session>(KV.sessions, "child-session");
+    expect(parentSession).toBeTruthy();
+    expect(childSession).toMatchObject({
+      id: "child-session",
+      lineage: "child",
+      parentSessionId: "parent-session",
+    });
+
+    expect(await kv.list(KV.observations("parent-session"))).toHaveLength(1);
+    const childObservations = await kv.list(KV.observations("child-session"));
+    expect(childObservations).toHaveLength(1);
+    expect(childObservations[0]).toMatchObject({
+      sessionId: "child-session",
+      sourceSessionId: "child-session",
+      lineage: "child",
+      parentSessionId: "parent-session",
+    });
 
     const childOnlyDir = join(tmpRoot, "child-filtered");
     mkdirSync(childOnlyDir, { recursive: true });
-    const missingParentChild = child.replaceAll("parent-session", "missing-parent-session");
+    const missingParentChild = child
+      .replaceAll("child-session", "orphan-child-session")
+      .replaceAll("parent-session", "missing-parent-session");
     writeFileSync(join(childOnlyDir, "child.jsonl"), missingParentChild);
     const filtered = (await sdk.trigger("mem::replay::import-jsonl", {
       path: childOnlyDir,
@@ -1116,11 +1139,21 @@ describe("replay import sdk", () => {
     };
 
     expect(filtered.success).toBe(true);
-    expect(filtered.filteredChildSession).toBeGreaterThanOrEqual(1);
-    expect(await kv.get<Session>(KV.sessions, "child-session")).toBeNull();
+    expect(filtered.filteredChildSession).toBe(0);
+
+    const orphanChildSession = await kv.get<Session>(
+      KV.sessions,
+      "orphan-child-session",
+    );
+    expect(orphanChildSession).toMatchObject({
+      id: "orphan-child-session",
+      lineage: "child",
+      parentSessionId: "missing-parent-session",
+    });
+    expect(await kv.list(KV.observations("orphan-child-session"))).toHaveLength(1);
   });
 
-  it("merges Codex child sessions even when the child file sorts before the parent file", async () => {
+  it("preserves Codex child sessions when the child file sorts before the parent file", async () => {
     const dir = join(tmpRoot, "child-before-parent");
     mkdirSync(dir, { recursive: true });
     const parent = [
@@ -1161,13 +1194,18 @@ describe("replay import sdk", () => {
     };
 
     expect(result.success).toBe(true);
-    expect(result.mergedChildSession).toBeGreaterThanOrEqual(1);
-    expect(result.filteredChildSession).toBe(0);
-    expect(await kv.get<Session>(KV.sessions, "early-child-session")).toBeNull();
-    expect(await kv.list(KV.observations("late-parent-session"))).toHaveLength(2);
+    expect(result.mergedChildSession).toBe(0);
+    expect(await kv.get<Session>(KV.sessions, "late-parent-session")).toBeTruthy();
+    expect(await kv.get<Session>(KV.sessions, "early-child-session")).toMatchObject({
+      id: "early-child-session",
+      lineage: "child",
+      parentSessionId: "late-parent-session",
+    });
+    expect(await kv.list(KV.observations("late-parent-session"))).toHaveLength(1);
+    expect(await kv.list(KV.observations("early-child-session"))).toHaveLength(1);
   });
 
-  it("merges or filters Claude sidechain sessions without creating top-level sidechain sessions", async () => {
+  it("preserves Claude sidechain sessions when importing replay files", async () => {
     const dir = join(tmpRoot, "claude-sidechain");
     mkdirSync(dir, { recursive: true });
     const parent = JSON.stringify({
@@ -1198,10 +1236,16 @@ describe("replay import sdk", () => {
     };
 
     expect(merged.success).toBe(true);
-    expect(merged.mergedSidechainSession).toBeGreaterThanOrEqual(1);
+    expect(merged.mergedSidechainSession).toBe(0);
     expect(merged.filteredSidechainSession).toBe(0);
-    expect(await kv.get<Session>(KV.sessions, "claude-sidechain")).toBeNull();
-    expect(await kv.list(KV.observations("claude-parent"))).toHaveLength(2);
+    expect(await kv.get<Session>(KV.sessions, "claude-parent")).toBeTruthy();
+    expect(await kv.get<Session>(KV.sessions, "claude-sidechain")).toMatchObject({
+      id: "claude-sidechain",
+      lineage: "sidechain",
+      parentSessionId: "claude-parent",
+    });
+    expect(await kv.list(KV.observations("claude-parent"))).toHaveLength(1);
+    expect(await kv.list(KV.observations("claude-sidechain"))).toHaveLength(1);
 
     const missingParentDir = join(tmpRoot, "claude-sidechain-filtered");
     mkdirSync(missingParentDir, { recursive: true });
@@ -1224,11 +1268,16 @@ describe("replay import sdk", () => {
     };
 
     expect(filtered.success).toBe(true);
-    expect(filtered.filteredSidechainSession).toBeGreaterThanOrEqual(1);
-    expect(await kv.get<Session>(KV.sessions, "orphan-sidechain")).toBeNull();
+    expect(filtered.filteredSidechainSession).toBe(0);
+    expect(await kv.get<Session>(KV.sessions, "orphan-sidechain")).toMatchObject({
+      id: "orphan-sidechain",
+      lineage: "sidechain",
+      parentSessionId: "missing-claude-parent",
+    });
+    expect(await kv.list(KV.observations("orphan-sidechain"))).toHaveLength(1);
   });
 
-  it("merges Claude sidechain sessions even when the sidechain file sorts before the parent file", async () => {
+  it("preserves Claude sidechain sessions when the sidechain file sorts before the parent file", async () => {
     const dir = join(tmpRoot, "sidechain-before-parent");
     mkdirSync(dir, { recursive: true });
     const parent = JSON.stringify({
@@ -1259,10 +1308,15 @@ describe("replay import sdk", () => {
     };
 
     expect(result.success).toBe(true);
-    expect(result.mergedSidechainSession).toBeGreaterThanOrEqual(1);
-    expect(result.filteredSidechainSession).toBe(0);
-    expect(await kv.get<Session>(KV.sessions, "early-claude-sidechain")).toBeNull();
-    expect(await kv.list(KV.observations("late-claude-parent"))).toHaveLength(2);
+    expect(result.mergedSidechainSession).toBe(0);
+    expect(await kv.get<Session>(KV.sessions, "late-claude-parent")).toBeTruthy();
+    expect(await kv.get<Session>(KV.sessions, "early-claude-sidechain")).toMatchObject({
+      id: "early-claude-sidechain",
+      lineage: "sidechain",
+      parentSessionId: "late-claude-parent",
+    });
+    expect(await kv.list(KV.observations("late-claude-parent"))).toHaveLength(1);
+    expect(await kv.list(KV.observations("early-claude-sidechain"))).toHaveLength(1);
   });
 
   it("imports Claude parentUuid-only sessions as top-level sessions", async () => {

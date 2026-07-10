@@ -35,6 +35,35 @@ describe("replay import identity", () => {
     expect(first.targetSessionId).toBe("sess-real");
   });
 
+  it("keeps observation identity stable when target session changes", () => {
+    const context = {
+      sourceFormat: "codex" as const,
+      sourceFileHash: computeSourceFileHash("child session jsonl"),
+    };
+
+    const mergedTarget = buildReplaySourceIdentity({
+      context,
+      sourceSessionId: "child-session",
+      targetSessionId: "parent-session",
+      sourceEventId: "event-1",
+      sourceEventIndex: 0,
+      hookType: "prompt_submit",
+    });
+    const preservedTarget = buildReplaySourceIdentity({
+      context,
+      sourceSessionId: "child-session",
+      targetSessionId: "child-session",
+      sourceEventId: "event-1",
+      sourceEventIndex: 0,
+      hookType: "prompt_submit",
+    });
+
+    expect(mergedTarget.importKey).toBe(preservedTarget.importKey);
+    expect(mergedTarget.observationId).toBe(preservedTarget.observationId);
+    expect(mergedTarget.targetSessionId).toBe("parent-session");
+    expect(preservedTarget.targetSessionId).toBe("child-session");
+  });
+
   it("hashes JSONL content independently of file path", () => {
     const text = [
       JSON.stringify({ type: "session_meta", payload: { id: "s1" } }),

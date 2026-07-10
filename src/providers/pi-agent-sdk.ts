@@ -88,6 +88,8 @@ export class PiAgentSDKProvider implements MemoryProvider {
   private modulesPromise: Promise<ModuleBundle> | null = null;
   private model: string;
   private maxTokens: number;
+  private proxyAgent: ProxyAgent | null = null;
+  private proxyAgentUrl: string | null = null;
 
   constructor(model?: string, maxTokens = 4096) {
     this.model = model || "gpt-5.4";
@@ -192,7 +194,11 @@ export class PiAgentSDKProvider implements MemoryProvider {
     const proxyUrl =
       process.env["HTTPS_PROXY"] || process.env["HTTP_PROXY"] || process.env["ALL_PROXY"];
     if (proxyUrl) {
-      setGlobalDispatcher(new ProxyAgent(proxyUrl));
+      if (!this.proxyAgent || this.proxyAgentUrl !== proxyUrl) {
+        this.proxyAgent = new ProxyAgent(proxyUrl);
+        this.proxyAgentUrl = proxyUrl;
+        setGlobalDispatcher(this.proxyAgent);
+      }
     }
   }
 
