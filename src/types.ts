@@ -128,6 +128,36 @@ export interface SessionSummary {
   observationCount: number;
 }
 
+export type ResumableSummaryRunStatus =
+  | "in_progress"
+  | "succeeded"
+  | "failed";
+
+export interface ResumableSummaryRun {
+  id: string;
+  sessionId: string;
+  inputHash: string;
+  chunkSize: number;
+  totalChunks: number;
+  completedChunks: number;
+  skippedChunks: number;
+  status: ResumableSummaryRunStatus;
+  summary?: SessionSummary;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ResumableSummaryPartialStatus = "completed" | "skipped";
+
+export interface ResumableSummaryPartial {
+  runId: string;
+  chunkIndex: number;
+  status: ResumableSummaryPartialStatus;
+  summary?: SessionSummary;
+  createdAt: string;
+}
+
 export type HookType =
   | "session_start"
   | "prompt_submit"
