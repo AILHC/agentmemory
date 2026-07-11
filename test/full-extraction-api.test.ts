@@ -120,9 +120,9 @@ describe("full extraction REST wrappers", () => {
       },
       {
         api: "api::full-crystals-auto",
-        body: { project: " repo ", olderThanDays: 7, dryRun: true },
+        body: { project: " repo ", olderThanDays: 7, dryRun: true, model: " crystal-model " },
         function_id: "mem::full-crystals-auto",
-        payload: { project: "repo", olderThanDays: 7, dryRun: true },
+        payload: { project: "repo", olderThanDays: 7, dryRun: true, model: "crystal-model" },
       },
     ];
 

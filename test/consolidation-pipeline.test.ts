@@ -22,7 +22,7 @@ import {
   registerConsolidationPipelineFunction,
   runConsolidationProceduralWindow,
 } from "../src/functions/consolidation-pipeline.js";
-import { isConsolidationEnabled } from "../src/config.js";
+import { isConsolidationEnabled, resolveStageModelCallOptions, resolveStageModelMetadata } from "../src/config.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
 import { logger } from "../src/logger.js";
 
@@ -323,6 +323,8 @@ describe("Consolidation Pipeline", () => {
     const stored = await kv.list<ProceduralMemory>("mem:procedural");
     expect(stored).toHaveLength(1);
     expect(stored[0].name).toBe("Full Procedure");
+    expect(resolveStageModelMetadata).toHaveBeenCalledWith("procedural", provider, undefined);
+    expect(resolveStageModelCallOptions).toHaveBeenCalledWith("procedural", undefined);
   });
 
   it("consolidation records an audit entry", async () => {

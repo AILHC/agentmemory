@@ -57,6 +57,8 @@ export const STAGE_MODEL_KEYS = [
   "skill_extract",
   "semantic_rollup",
   "memory_consolidate",
+  "procedural",
+  "crystal",
   "reflect_insight",
 ] as const;
 
@@ -69,6 +71,8 @@ export type StageModelSource =
   | "AGENTMEMORY_SKILL_EXTRACT_MODEL"
   | "AGENTMEMORY_SEMANTIC_ROLLUP_MODEL"
   | "AGENTMEMORY_MEMORY_CONSOLIDATE_MODEL"
+  | "AGENTMEMORY_PROCEDURAL_MODEL"
+  | "AGENTMEMORY_CRYSTAL_MODEL"
   | "AGENTMEMORY_REFLECT_INSIGHT_MODEL"
   | "AGENTMEMORY_DEFAULT_STAGE_MODEL"
   | "PI_AGENT_MODEL"
@@ -95,6 +99,8 @@ const STAGE_MODEL_ENV: Record<StageModelKey, StageModelSource> = {
   skill_extract: "AGENTMEMORY_SKILL_EXTRACT_MODEL",
   semantic_rollup: "AGENTMEMORY_SEMANTIC_ROLLUP_MODEL",
   memory_consolidate: "AGENTMEMORY_MEMORY_CONSOLIDATE_MODEL",
+  procedural: "AGENTMEMORY_PROCEDURAL_MODEL",
+  crystal: "AGENTMEMORY_CRYSTAL_MODEL",
   reflect_insight: "AGENTMEMORY_REFLECT_INSIGHT_MODEL",
 };
 

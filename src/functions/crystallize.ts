@@ -3,6 +3,7 @@ import type { StateKV } from "../state/kv.js";
 import { KV, generateId } from "../state/schema.js";
 import type { Action, ActionEdge, Crystal, MemoryProvider } from "../types.js";
 import { withOutputLanguagePolicy } from "../prompts/output-language.js";
+import { resolveStageModelCallOptions } from "../config.js";
 
 interface CrystalDigest {
   narrative: string;
@@ -77,6 +78,7 @@ async function runAutoCrystallize(
     olderThanDays?: number;
     project?: string;
     dryRun?: boolean;
+    model?: string;
   },
   failedGroupsMakeRunFail: boolean,
 ): Promise<Record<string, unknown>> {
@@ -110,6 +112,7 @@ async function runAutoCrystallize(
       const result = (await sdk.trigger({ function_id: "mem::crystallize", payload: {
         actionIds,
         project: group.project,
+        ...(data.model ? { model: data.model } : {}),
       } })) as { success: boolean; crystal?: Crystal; error?: string };
 
       if (result.success && result.crystal) {
@@ -156,6 +159,7 @@ export function registerCrystallizeFunction(
       actionIds: string[];
       sessionId?: string;
       project?: string;
+      model?: string;
     }) => {
       if (!data.actionIds || data.actionIds.length === 0) {
         return { success: false, error: "actionIds is required" };
@@ -183,12 +187,19 @@ export function registerCrystallizeFunction(
       );
 
       const prompt = buildChainText(actions, relevantEdges);
+      const callOptions = resolveStageModelCallOptions("crystal", data.model);
 
       try {
-        const response = await provider.summarize(
-          withOutputLanguagePolicy(CRYSTALLIZE_SYSTEM),
-          prompt,
-        );
+        const response = callOptions
+          ? await provider.summarize(
+              withOutputLanguagePolicy(CRYSTALLIZE_SYSTEM),
+              prompt,
+              callOptions,
+            )
+          : await provider.summarize(
+              withOutputLanguagePolicy(CRYSTALLIZE_SYSTEM),
+              prompt,
+            );
         const digest = parseDigest(response);
 
         const crystal: Crystal = {
@@ -281,13 +292,13 @@ export function registerCrystallizeFunction(
 
   sdk.registerFunction(
     "mem::auto-crystallize",
-    async (data: { olderThanDays?: number; project?: string; dryRun?: boolean }) =>
+    async (data: { olderThanDays?: number; project?: string; dryRun?: boolean; model?: string }) =>
       runAutoCrystallize(sdk, kv, data, false),
   );
 
   sdk.registerFunction(
     "mem::full-crystals-auto",
-    async (data: { olderThanDays?: number; project?: string; dryRun?: boolean }) =>
+    async (data: { olderThanDays?: number; project?: string; dryRun?: boolean; model?: string }) =>
       runAutoCrystallize(sdk, kv, data, true),
   );
 }

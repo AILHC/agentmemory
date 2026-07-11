@@ -327,6 +327,7 @@ const allowedFullCrystalAutoKeys = new Set([
   "olderThanDays",
   "project",
   "dryRun",
+  "model",
 ]);
 const allowedExtractionRunRecordKeys = new Set([
   "runId",
@@ -427,6 +428,9 @@ function buildRuntimeConfigResponse(provider: unknown): Response {
         summarizeChunkConcurrency: summarizeRuntimeConfig.chunkConcurrency,
         summarizeChunkSize: summarizeRuntimeConfig.chunkSize,
         providerName: providerNameFrom(provider),
+        observationCompression: {
+          zeroModel: !isAutoCompressEnabled(),
+        },
         outputLanguageConfigured: outputLanguage === "zh-CN",
         outputLanguage,
         modelRouting: buildModelRouting(provider),
@@ -989,10 +993,13 @@ export function registerApiTriggers(
     if (dryRun === null) return { status_code: 400, body: { error: "dryRun must be a boolean" } };
     const project = optionalNonEmptyString(body, "project");
     if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
+    const model = optionalNonEmptyString(body, "model");
+    if (model === null) return { status_code: 400, body: { error: "model must be a non-empty string" } };
     const payload: Record<string, unknown> = {};
     if (olderThanDays !== undefined) payload.olderThanDays = olderThanDays;
     if (project !== undefined) payload.project = project;
     if (dryRun !== undefined) payload.dryRun = dryRun;
+    if (model !== undefined) payload.model = model;
     const result = await sdk.trigger({
       function_id: "mem::full-crystals-auto",
       payload,

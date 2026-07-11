@@ -121,6 +121,22 @@ describe("Crystallize Functions", () => {
       );
     });
 
+    it("uses the crystal stage model when the provider supports overrides", async () => {
+      process.env.AGENTMEMORY_CRYSTAL_MODEL = "crystal-model";
+      provider = { ...mockProvider(), name: "pi-agent-sdk" };
+      registerCrystallizeFunction(sdk as never, kv as never, provider);
+      const action = makeAction({ id: "act_crystal_model", status: "done" });
+      await kv.set("mem:actions", action.id, action);
+
+      await sdk.trigger("mem::crystallize", { actionIds: [action.id] });
+
+      expect(provider.summarize).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.any(String),
+        { model: "crystal-model", modelSource: "AGENTMEMORY_CRYSTAL_MODEL" },
+      );
+    });
+
     it("marks source actions with crystallizedInto", async () => {
       const action = makeAction({ id: "act_mark", status: "done" });
       await kv.set("mem:actions", action.id, action);

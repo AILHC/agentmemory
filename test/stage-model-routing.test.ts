@@ -30,6 +30,8 @@ describe("resolveStageModel", () => {
     delete process.env.AGENTMEMORY_SKILL_EXTRACT_MODEL;
     delete process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MODEL;
     delete process.env.AGENTMEMORY_MEMORY_CONSOLIDATE_MODEL;
+    delete process.env.AGENTMEMORY_PROCEDURAL_MODEL;
+    delete process.env.AGENTMEMORY_CRYSTAL_MODEL;
     delete process.env.AGENTMEMORY_REFLECT_INSIGHT_MODEL;
     delete process.env.AGENTMEMORY_DEFAULT_STAGE_MODEL;
     delete process.env.PI_AGENT_MODEL;
@@ -60,6 +62,24 @@ describe("resolveStageModel", () => {
       stage: "lesson",
       model: "lesson-model",
       source: "AGENTMEMORY_LESSON_MODEL",
+    });
+  });
+
+  it("resolves independent procedural and crystal stage models", async () => {
+    useIsolatedHome();
+    process.env.AGENTMEMORY_PROCEDURAL_MODEL = "procedural-model";
+    process.env.AGENTMEMORY_CRYSTAL_MODEL = "crystal-model";
+    const { resolveStageModel } = await loadConfigModule();
+
+    expect(resolveStageModel("procedural")).toEqual({
+      stage: "procedural",
+      model: "procedural-model",
+      source: "AGENTMEMORY_PROCEDURAL_MODEL",
+    });
+    expect(resolveStageModel("crystal")).toEqual({
+      stage: "crystal",
+      model: "crystal-model",
+      source: "AGENTMEMORY_CRYSTAL_MODEL",
     });
   });
 

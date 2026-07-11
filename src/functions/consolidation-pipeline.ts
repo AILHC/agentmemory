@@ -204,7 +204,7 @@ export async function runConsolidationProceduralWindow(
   options: ConsolidationProceduralWindowOptions,
 ): Promise<Record<string, unknown>> {
   const startMs = Date.now();
-  const stageMetadata = resolveStageModelMetadata("memory_consolidate", options.provider, options.model);
+  const stageMetadata = resolveStageModelMetadata("procedural", options.provider, options.model);
   const responseMetadata = (status: string, extra: Record<string, unknown> = {}) => ({
     status,
     ...stageMetadata,
@@ -245,7 +245,7 @@ export async function runConsolidationProceduralWindow(
       options.kv,
       options.provider,
       patterns,
-      resolveStageModelCallOptions("memory_consolidate", options.model),
+      resolveStageModelCallOptions("procedural", options.model),
     );
     return {
       success: true,
@@ -295,6 +295,10 @@ export function registerConsolidationPipelineFunction(
       const results: Record<string, unknown> = {};
       const callOptions = resolveStageModelCallOptions(
         "memory_consolidate",
+        data?.model,
+      );
+      const proceduralCallOptions = resolveStageModelCallOptions(
+        "procedural",
         data?.model,
       );
 
@@ -446,7 +450,7 @@ export function registerConsolidationPipelineFunction(
               kv,
               provider,
               patterns,
-              callOptions,
+              proceduralCallOptions,
             );
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
