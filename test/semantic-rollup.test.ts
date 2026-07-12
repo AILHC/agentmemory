@@ -8,6 +8,7 @@ import { registerSemanticRollupFunction } from "../src/functions/semantic-rollup
 import { getSemanticRollupMaxPromptChars } from "../src/config.js";
 import { KV } from "../src/state/schema.js";
 import type { MemoryProvider, SemanticMemory, SessionSummary } from "../src/types.js";
+import { ProviderCallError } from "../src/providers/provider-call-result.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -81,6 +82,9 @@ describe("mem::semantic-rollup", () => {
   beforeEach(() => {
     delete process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MODEL;
     delete process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS;
+    delete process.env.AGENTMEMORY_EVALUATION_MODE;
+    delete process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY;
+    delete process.env.PI_AGENT_MODEL;
     sdk = mockSdk();
     kv = mockKV();
     provider = {
@@ -94,6 +98,9 @@ describe("mem::semantic-rollup", () => {
   afterEach(() => {
     delete process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MODEL;
     delete process.env.AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS;
+    delete process.env.AGENTMEMORY_EVALUATION_MODE;
+    delete process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY;
+    delete process.env.PI_AGENT_MODEL;
   });
 
   it("writes window rollup semantic memories with provenance and audit", async () => {
@@ -141,6 +148,120 @@ describe("mem::semantic-rollup", () => {
       operation: "semantic_rollup",
       targetIds: result.semanticMemoryIds,
     });
+  });
+
+  it("blocks semantic rollup before the provider", async () => {
+    process.env.AGENTMEMORY_EVALUATION_MODE = "context-strategy";
+    process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY = JSON.stringify({
+      schemaVersion: 1,
+      expectedProvider: "pi-agent-sdk",
+      expectedModel: "gpt-5.4",
+      worstTokensPerChar: 0.5,
+      fixedTokens: 1,
+      proportionalReserve: 0,
+      contextWindow: 1,
+      modelMaxTokens: 8192,
+      maxOutputTokens: 128,
+      reasoningReserve: 0,
+      safetyMargin: 0,
+      calibrationHash: `sha256:${"c".repeat(64)}`,
+    });
+    process.env.PI_AGENT_MODEL = "gpt-5.4";
+    provider.name = "pi-agent-sdk";
+    provider.summarizeWithMetadata = vi.fn(async () => ({ text: "unexpected" }));
+    await kv.set(KV.summaries, "ses-a", summary("ses-a"));
+    await kv.set(KV.summaries, "ses-b", summary("ses-b"));
+
+    const result: any = await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-preflight",
+      windowId: "window-preflight",
+      mark: "full",
+      kind: "window",
+      sessionIds: ["ses-a", "ses-b"],
+    });
+
+    expect(result).toMatchObject({ success: false, status: "infeasible", error: "infeasible" });
+    expect(provider.summarizeWithMetadata).not.toHaveBeenCalled();
+    expect(result.telemetry).toEqual([
+      expect.objectContaining({ providerInvoked: false, preflightBlocked: true }),
+    ]);
+  });
+
+  it("returns summarize telemetry without changing semantic output", async () => {
+    provider.summarize = vi.fn(() => {
+      throw new Error("legacy summarize path should not be used");
+    });
+    provider.summarizeWithMetadata = vi.fn(async () => ({
+      text: '<facts><fact confidence="0.92">提炼事实</fact></facts>',
+      metadata: {
+        inputTokens: 12,
+        outputTokens: 5,
+        totalTokens: 17,
+        maxOutputTokens: 4096,
+        stopReason: "stop" as const,
+        responseModel: "semantic-model",
+      },
+    }));
+    await kv.set(KV.summaries, "ses-a", summary("ses-a"));
+
+    const result = (await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-telemetry",
+      windowId: "win-telemetry",
+      mark: "full",
+      kind: "window",
+      sessionIds: ["ses-a"],
+    })) as any;
+
+    expect(result.success).toBe(true);
+    expect(result.telemetry).toEqual([
+      expect.objectContaining({
+        operation: "summarize",
+        callRole: "window",
+        callIndex: 0,
+        metadataStatus: "supported",
+        metadata: expect.objectContaining({
+          inputTokens: 12,
+          outputTokens: 5,
+          totalTokens: 17,
+          maxOutputTokens: 4096,
+          responseModel: "semantic-model",
+        }),
+      }),
+    ]);
+    expect(JSON.stringify(result.telemetry)).not.toContain("提炼事实");
+    expect(JSON.stringify(result.telemetry)).not.toContain("Extract durable semantic facts");
+  });
+
+  it("keeps ProviderCallError metadata on semantic failure responses", async () => {
+    const metadata = {
+      inputTokens: 4,
+      outputTokens: 0,
+      totalTokens: 4,
+      maxOutputTokens: 4096,
+      stopReason: "error" as const,
+      responseModel: "semantic-error-model",
+    };
+    provider.summarizeWithMetadata = vi.fn(async () => {
+      throw new ProviderCallError("pi_stream_failed", metadata);
+    });
+    await kv.set(KV.summaries, "ses-a", summary("ses-a"));
+
+    const result = (await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-error-telemetry",
+      windowId: "win-error-telemetry",
+      mark: "full",
+      kind: "window",
+      sessionIds: ["ses-a"],
+    })) as any;
+
+    expect(result.success).toBe(false);
+    expect(result.error).toBe("provider_error");
+    expect(result.telemetry).toEqual([
+      expect.objectContaining({
+        metadataStatus: "supported",
+        metadata,
+      }),
+    ]);
   });
 
   it("bounds AGENTMEMORY_SEMANTIC_ROLLUP_MAX_PROMPT_CHARS config", () => {

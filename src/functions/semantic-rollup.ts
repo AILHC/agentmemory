@@ -19,6 +19,13 @@ import {
   resolveStageModelCallOptions,
   resolveStageModelMetadata,
 } from "../config.js";
+import {
+  callProviderWithTelemetry,
+  isProviderPreflightError,
+  providerPreflightStatus,
+  sortProviderCallTelemetry,
+  type ProviderCallTelemetry,
+} from "../providers/provider-call-result.js";
 
 const MAX_ROLLUP_SOURCE_IDS = 100;
 
@@ -111,6 +118,7 @@ export function registerSemanticRollupFunction(
 ): void {
   sdk.registerFunction("mem::semantic-rollup", async (data: SemanticRollupInput) => {
     const startMs = Date.now();
+    const telemetry: ProviderCallTelemetry[] = [];
     const runId = asTrimmedString(data?.runId);
     const windowId = asTrimmedString(data?.windowId);
     const mark = asTrimmedString(data?.mark);
@@ -212,6 +220,7 @@ export function registerSemanticRollupFunction(
       charBudget,
       durationMs: Date.now() - startMs,
       parseFailures: 0,
+      telemetry: sortProviderCallTelemetry(telemetry),
       ...extra,
     });
     if (prompt.length > charBudget) {
@@ -258,10 +267,21 @@ export function registerSemanticRollupFunction(
         "semantic_rollup",
         asTrimmedString(data.model) ?? undefined,
       );
-      response = callOptions
-        ? await provider.summarize(systemPrompt, prompt, callOptions)
-        : await provider.summarize(systemPrompt, prompt);
-    } catch {
+      response = await callProviderWithTelemetry({
+        provider,
+        operation: "summarize",
+        callRole: "window",
+        callIndex: 0,
+        systemPrompt,
+        userPrompt: prompt,
+        callOptions,
+        telemetry,
+      });
+    } catch (error) {
+      if (isProviderPreflightError(error)) {
+        const status = providerPreflightStatus(error);
+        return failureDetails(status, runId, windowId, mark, kind, inputHash, responseMetadata(status));
+      }
       return failureDetails("provider_error", runId, windowId, mark, kind, inputHash, responseMetadata("failed"));
     }
     const facts = parseFactResponse(response);

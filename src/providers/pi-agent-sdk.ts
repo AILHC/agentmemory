@@ -1,9 +1,17 @@
 import { ProxyAgent, setGlobalDispatcher } from "undici";
-import type { MemoryProvider, MemoryProviderCallOptions } from "../types.js";
+import type {
+  MemoryProvider,
+  MemoryProviderCallOptions,
+  ModelCapabilities,
+  ProviderCallMetadata,
+  ProviderErrorCode,
+  ProviderCallResult,
+} from "../types.js";
 import { getEnvVar } from "../config.js";
+import { ProviderCallError } from "./provider-call-result.js";
 
-type OpenAICodexResponsesModule = typeof import("@earendil-works/pi-ai/openai-codex-responses");
-type PiAiModule = typeof import("@earendil-works/pi-ai");
+type OpenAICodexResponsesModule = typeof import("@earendil-works/pi-ai/compat");
+type PiAiModule = typeof import("@earendil-works/pi-ai/providers/all");
 type PiCodingAgentModule = typeof import("@earendil-works/pi-coding-agent");
 
 type ModuleBundle = {
@@ -30,7 +38,8 @@ type StreamOptions = {
   headers?: Record<string, string>;
   env: NodeJS.ProcessEnv;
   maxTokens: number;
-  transport: "sse";
+  transport: "auto";
+  sessionId: string;
   timeoutMs?: number;
 };
 
@@ -63,6 +72,92 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
+function optionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function providerErrorCode(event: CodexEvent): ProviderErrorCode {
+  const detail = isObject(event["error"])
+    ? event["error"]
+    : isObject(event["message"])
+      ? event["message"]
+      : {};
+  const message = typeof detail["errorMessage"] === "string"
+    ? detail["errorMessage"]
+    : "";
+  if (/model not found/i.test(message)) return "model_not_found";
+  if (/rate limit|too many requests/i.test(message)) return "rate_limited";
+  if (/timed out|timeout/i.test(message)) return "timeout";
+  if (/rejected|unsupported|forbidden|not available|invalid request/i.test(message)) {
+    return "provider_rejected";
+  }
+  return "unknown";
+}
+
+function modelCapabilities(model: unknown): ModelCapabilities {
+  if (!isObject(model)) return {};
+  return {
+    contextWindow: optionalNumber(model["contextWindow"]),
+    modelMaxTokens: optionalNumber(model["maxTokens"]),
+  };
+}
+
+function eventMetadata(
+  event: CodexEvent,
+  model: unknown,
+  maxOutputTokens: number,
+): ProviderCallMetadata {
+  const message = isObject(event["message"])
+    ? event["message"]
+    : isObject(event["error"])
+      ? event["error"]
+      : {};
+  const usage = isObject(message["usage"]) ? message["usage"] : {};
+  const inputUncachedTokens = optionalNumber(usage["input"]);
+  const cacheReadTokens = optionalNumber(usage["cacheRead"]);
+  const cacheWriteTokens = optionalNumber(usage["cacheWrite"]);
+  const outputTokens = optionalNumber(usage["output"]);
+  const inputTokens = inputUncachedTokens === undefined
+    ? undefined
+    : inputUncachedTokens + (cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0);
+  const totalTokens = inputTokens === undefined || outputTokens === undefined
+    ? undefined
+    : inputTokens + outputTokens;
+  const responseModel = typeof message["responseModel"] === "string"
+    ? message["responseModel"]
+    : typeof message["model"] === "string"
+      ? message["model"]
+      : undefined;
+  const reason = event["reason"] ?? message["stopReason"];
+  return {
+    ...(inputTokens === undefined ? {} : { inputTokens }),
+    ...(inputUncachedTokens === undefined ? {} : { inputUncachedTokens }),
+    ...(cacheReadTokens === undefined && inputUncachedTokens === undefined
+      ? {}
+      : { cacheReadTokens: cacheReadTokens ?? 0 }),
+    ...(cacheWriteTokens === undefined && inputUncachedTokens === undefined
+      ? {}
+      : { cacheWriteTokens: cacheWriteTokens ?? 0 }),
+    ...(outputTokens === undefined ? {} : { outputTokens }),
+    ...(totalTokens === undefined ? {} : { totalTokens }),
+    maxOutputTokens,
+    stopReason: reason === "length"
+      ? "max_tokens"
+      : reason === "toolUse"
+        ? "tool_use"
+        : reason === "stop"
+          ? "stop"
+          : reason === "error"
+            ? "error"
+            : reason === "aborted"
+              ? "aborted"
+          : undefined,
+    responseModel,
+    ...modelCapabilities(model),
+    ...(event["type"] === "error" ? { providerErrorCode: providerErrorCode(event) } : {}),
+  };
+}
+
 function mapAuthError(error: unknown): Error {
   if (error instanceof Error) {
     if (
@@ -77,6 +172,7 @@ function mapAuthError(error: unknown): Error {
 }
 
 function mapStreamError(error: unknown): Error {
+  if (error instanceof ProviderCallError) return error;
   if (error instanceof Error) {
     if (error.message === "pi_empty_response") return error;
   }
@@ -101,7 +197,15 @@ export class PiAgentSDKProvider implements MemoryProvider {
     userPrompt: string,
     options?: MemoryProviderCallOptions,
   ): Promise<string> {
-    return this.summarize(systemPrompt, userPrompt, options);
+    return (await this.compressWithMetadata(systemPrompt, userPrompt, options)).text;
+  }
+
+  async compressWithMetadata(
+    systemPrompt: string,
+    userPrompt: string,
+    options?: MemoryProviderCallOptions,
+  ): Promise<ProviderCallResult> {
+    return this.summarizeWithMetadata(systemPrompt, userPrompt, options);
   }
 
   async summarize(
@@ -109,6 +213,31 @@ export class PiAgentSDKProvider implements MemoryProvider {
     userPrompt: string,
     options?: MemoryProviderCallOptions,
   ): Promise<string> {
+    try {
+      return (await this.call(systemPrompt, userPrompt, options)).text;
+    } catch (err) {
+      if (err instanceof Error) {
+        const message = err.message;
+        if (
+          message === "pi_model_not_found" ||
+          message === "pi_sdk_import_failed" ||
+          message === "pi_auth_missing" ||
+          message === "pi_auth_failed" ||
+          message === "pi_stream_failed" ||
+          message === "pi_empty_response"
+        ) {
+          return Promise.reject(err);
+        }
+      }
+      return Promise.reject(mapStreamError(err));
+    }
+  }
+
+  async summarizeWithMetadata(
+    systemPrompt: string,
+    userPrompt: string,
+    options?: MemoryProviderCallOptions,
+  ): Promise<ProviderCallResult> {
     try {
       return await this.call(systemPrompt, userPrompt, options);
     } catch (err) {
@@ -129,22 +258,45 @@ export class PiAgentSDKProvider implements MemoryProvider {
     }
   }
 
+  async resolveModelCapabilities(
+    options?: MemoryProviderCallOptions,
+  ): Promise<ModelCapabilities> {
+    const modules = await this.loadModules();
+    const { AuthStorage, ModelRegistry } = modules.codingAgent as {
+      AuthStorage: { create: () => unknown };
+      ModelRegistry: { create: (auth: unknown, modelsPath?: string) => { find: (provider: string, modelName: string) => unknown } };
+    };
+    const modelName = options?.model?.trim() || this.model;
+    const registry = ModelRegistry.create(
+      AuthStorage.create(),
+      getEnvVar("PI_AGENT_MODELS_FILE") || undefined,
+    );
+    const model = registry.find("openai-codex", modelName) ??
+      modules.ai.getBuiltinModel("openai-codex", modelName as never);
+    if (!model) throw new Error("pi_model_not_found");
+    return modelCapabilities(model);
+  }
+
   private async call(
     systemPrompt: string,
     userPrompt: string,
     options?: MemoryProviderCallOptions,
-  ): Promise<string> {
+  ): Promise<ProviderCallResult> {
     const modules = await this.loadModules();
-    const { AuthStorage, ModelRegistry } = modules.codingAgent as {
+    const { AuthStorage, ModelRegistry, SessionManager } = modules.codingAgent as {
       AuthStorage: { create: () => unknown };
-      ModelRegistry: { create: (auth: unknown) => { find: (provider: string, modelName: string) => unknown; getApiKeyAndHeaders: (model: unknown) => Credentials | Promise<Credentials> }; };
+      ModelRegistry: { create: (auth: unknown, modelsPath?: string) => { find: (provider: string, modelName: string) => unknown; getApiKeyAndHeaders: (model: unknown) => Credentials | Promise<Credentials> }; };
+      SessionManager: { inMemory: () => { getSessionId: () => string } };
     };
-    const registry = ModelRegistry.create(AuthStorage.create());
+    const registry = ModelRegistry.create(
+      AuthStorage.create(),
+      getEnvVar("PI_AGENT_MODELS_FILE") || undefined,
+    );
     const modelName = options?.model?.trim() || this.model;
     const maxTokens = options?.maxTokens ?? this.maxTokens;
     const model =
       registry.find("openai-codex", modelName) ??
-      modules.ai.getModel("openai-codex", modelName);
+      modules.ai.getBuiltinModel("openai-codex", modelName as never);
     if (!model) {
       throw new Error("pi_model_not_found");
     }
@@ -162,13 +314,15 @@ export class PiAgentSDKProvider implements MemoryProvider {
       headers: credentials.headers,
       env: process.env,
       maxTokens,
-      transport: "sse",
+      transport: "auto",
+      sessionId: SessionManager.inMemory().getSessionId(),
       timeoutMs: getTimeoutMs(),
     };
 
     let output = "";
+    let metadata: ProviderCallMetadata | undefined;
     try {
-      const stream = await modules.codex.streamSimpleOpenAICodexResponses(
+      const stream = await modules.codex.streamSimple(
         model,
         context,
         streamOptions,
@@ -176,7 +330,13 @@ export class PiAgentSDKProvider implements MemoryProvider {
       for await (const rawEvent of stream as AsyncIterable<unknown>) {
         if (!isObject(rawEvent)) continue;
         if (rawEvent["type"] === "error") {
-          throw new Error("pi_stream_failed");
+          throw new ProviderCallError(
+            "pi_stream_failed",
+            eventMetadata(rawEvent, model, maxTokens),
+          );
+        }
+        if (rawEvent["type"] === "done") {
+          metadata = eventMetadata(rawEvent, model, maxTokens);
         }
         output += getEventText(rawEvent as CodexEvent);
       }
@@ -186,7 +346,7 @@ export class PiAgentSDKProvider implements MemoryProvider {
     if (!output.trim()) {
       throw new Error("pi_empty_response");
     }
-    return output;
+    return metadata ? { text: output, metadata } : { text: output };
   }
 
   private configureProxy(): void {
@@ -207,8 +367,8 @@ export class PiAgentSDKProvider implements MemoryProvider {
     this.modulesPromise = (async () => {
       try {
         const [ai, codex, codingAgent] = await Promise.all([
-          import("@earendil-works/pi-ai"),
-          import("@earendil-works/pi-ai/openai-codex-responses"),
+          import("@earendil-works/pi-ai/providers/all"),
+          import("@earendil-works/pi-ai/compat"),
           import("@earendil-works/pi-coding-agent"),
         ]);
         return { ai, codex, codingAgent };

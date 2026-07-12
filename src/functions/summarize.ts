@@ -29,28 +29,70 @@ import type { MetricsStore } from "../eval/metrics-store.js";
 import { safeAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import {
+  getContextPreflightPolicy,
+  getSummaryExperimentTreatment,
   getSummarizeRuntimeConfig,
   resolveStageModelCallOptions,
   resolveStageModelMetadata,
+  type SummaryExperimentTreatment,
 } from "../config.js";
+import {
+  callProviderWithTelemetry,
+  isProviderPreflightError,
+  providerPreflightStatus,
+  sortProviderCallTelemetry,
+  type ProviderCallIndex,
+  type ProviderCallRole,
+  type ProviderCallTelemetry,
+} from "../providers/provider-call-result.js";
 
 // Bail on the merged summary if more than this fraction of chunks fail
 // to parse — a half-blind narrative is worse than a clean error.
 const MAX_SKIP_RATIO = 0.5;
+
+function resumableCallIndex(
+  run: ResumableSummaryRun,
+  phase: "map" | "reduce",
+  ordinal: number,
+  attempt: number,
+  invocationMarker: string,
+): string {
+  return `${run.id}:${invocationMarker}:${phase}:${ordinal}:${attempt}`;
+}
+
+function resumableInvocationMarker(run: ResumableSummaryRun): string {
+  return `${run.updatedAt}:${run.completedChunks}:${run.skippedChunks}`;
+}
 
 type SummaryLineageInput = {
   lineage?: Session["lineage"];
   parentSessionId?: string;
 };
 
+type SummaryChunkPlan = {
+  chunks: CompressedObservation[][];
+  oversizedAtomicChunkIndexes: number[];
+};
+
+type SummaryChunkTelemetry = ProviderCallTelemetry & {
+  oversizedAtomicChunk?: boolean;
+  chunkObservationCount?: number;
+};
+
+type SummaryChunkTelemetryMarker = {
+  oversizedAtomicChunk: boolean;
+  chunkObservationCount: number;
+};
+
 type ResumableSummaryResponse = {
   success: boolean;
-  status: "in_progress" | "succeeded" | "failed";
+  status: "in_progress" | "succeeded" | "failed" | "infeasible" | "preflight_unavailable";
   completedChunks: number;
   totalChunks: number;
   skippedChunks: number;
   summary?: SessionSummary;
   error?: string;
+  telemetry?: ProviderCallTelemetry[];
 };
 
 function summarizeWithOptions(
@@ -58,10 +100,40 @@ function summarizeWithOptions(
   systemPrompt: string,
   userPrompt: string,
   callOptions?: MemoryProviderCallOptions,
+  telemetry?: ProviderCallTelemetry[],
+  callRole: ProviderCallRole = "single",
+  callIndex: ProviderCallIndex = 0,
 ): Promise<string> {
-  return callOptions
-    ? provider.summarize(systemPrompt, userPrompt, callOptions)
-    : provider.summarize(systemPrompt, userPrompt);
+  const contextStrategyIsNotSummary =
+    process.env.AGENTMEMORY_EVALUATION_MODE === "context-strategy"
+    && process.env.AGENTMEMORY_CONTEXT_STRATEGY_TARGET_STAGE !== "summary";
+  if (!telemetry || contextStrategyIsNotSummary) {
+    return callOptions
+      ? provider.summarize(systemPrompt, userPrompt, callOptions)
+      : provider.summarize(systemPrompt, userPrompt);
+  }
+  return callProviderWithTelemetry({
+    provider,
+    operation: "summarize",
+    callRole,
+    callIndex,
+    systemPrompt,
+    userPrompt,
+    callOptions,
+    telemetry,
+  });
+}
+
+function markChunkTelemetry(
+  telemetry: ProviderCallTelemetry[] | undefined,
+  callIndex: ProviderCallIndex,
+  marker: SummaryChunkTelemetryMarker | undefined,
+): void {
+  if (!telemetry || !marker) return;
+  const record = telemetry.find((item) => item.callIndex === callIndex) as SummaryChunkTelemetry | undefined;
+  if (!record) return;
+  record.oversizedAtomicChunk = marker.oversizedAtomicChunk;
+  record.chunkObservationCount = marker.chunkObservationCount;
 }
 
 // One chunk call with retry-once. Returns null when both attempts fail —
@@ -80,15 +152,23 @@ async function summarizeChunkWithRetry(
   total: number,
   lineageContext: SummaryLineageInput,
   callOptions?: MemoryProviderCallOptions,
+  telemetry?: ProviderCallTelemetry[],
+  nextCallIndex?: (attempt: number) => ProviderCallIndex,
+  chunkTelemetry?: SummaryChunkTelemetryMarker,
 ): Promise<SessionSummary | null> {
   for (let attempt = 1; attempt <= 2; attempt++) {
+    const callIndex = nextCallIndex?.(attempt) ?? 0;
     try {
       const xml = await summarizeWithOptions(
         provider,
         withOutputLanguagePolicy(SUMMARY_SYSTEM, undefined, SUMMARY_OUTPUT_CONTRACT),
         buildSummaryPrompt(chunk, lineageContext),
         callOptions,
+        telemetry,
+        "map",
+        callIndex,
       );
+      markChunkTelemetry(telemetry, callIndex, chunkTelemetry);
       const parsed = parseSummaryXml(xml, sessionId, project, chunk.length);
       if (parsed) return parsed;
       logger.warn("Summarize chunk parse failed", {
@@ -97,6 +177,8 @@ async function summarizeChunkWithRetry(
         attempt,
       });
     } catch (err) {
+      markChunkTelemetry(telemetry, callIndex, chunkTelemetry);
+      if (isProviderPreflightError(err)) throw err;
       logger.warn("Summarize chunk LLM call failed", {
         sessionId,
         chunk: `${idx + 1}/${total}`,
@@ -119,20 +201,10 @@ function startsNewUserTurn(obs: CompressedObservation): boolean {
   );
 }
 
-export function buildTurnAwareSummaryChunks(
+function splitRecognizedSummaryTurns(
   compressed: CompressedObservation[],
-  chunkSize: number,
-): CompressedObservation[][] {
-  if (chunkSize <= 0) return [compressed];
-
-  if (!compressed.some(startsNewUserTurn)) {
-    const fixedChunks: CompressedObservation[][] = [];
-    for (let i = 0; i < compressed.length; i += chunkSize) {
-      fixedChunks.push(compressed.slice(i, i + chunkSize));
-    }
-    return fixedChunks;
-  }
-
+): CompressedObservation[][] | null {
+  if (!compressed.some(startsNewUserTurn)) return null;
   const segments: CompressedObservation[][] = [];
   let currentSegment: CompressedObservation[] = [];
   for (const obs of compressed) {
@@ -143,6 +215,23 @@ export function buildTurnAwareSummaryChunks(
     currentSegment.push(obs);
   }
   if (currentSegment.length > 0) segments.push(currentSegment);
+  return segments;
+}
+
+export function buildTurnAwareSummaryChunks(
+  compressed: CompressedObservation[],
+  chunkSize: number,
+): CompressedObservation[][] {
+  if (chunkSize <= 0) return [compressed];
+
+  const segments = splitRecognizedSummaryTurns(compressed);
+  if (!segments) {
+    const fixedChunks: CompressedObservation[][] = [];
+    for (let i = 0; i < compressed.length; i += chunkSize) {
+      fixedChunks.push(compressed.slice(i, i + chunkSize));
+    }
+    return fixedChunks;
+  }
 
   const chunks: CompressedObservation[][] = [];
   let currentChunk: CompressedObservation[] = [];
@@ -172,6 +261,88 @@ export function buildTurnAwareSummaryChunks(
   return chunks;
 }
 
+export function buildSummaryExperimentChunks(
+  compressed: CompressedObservation[],
+  chunkSize: number,
+  treatment: SummaryExperimentTreatment,
+  estimateInputTokens?: (chunk: CompressedObservation[]) => number,
+): SummaryChunkPlan {
+  if (chunkSize <= 0) throw new Error("summary_chunk_size_invalid");
+  if (treatment.inputTarget.kind === "observation-count") {
+    if (treatment.inputTarget.targetObservations !== chunkSize) {
+      throw new Error("summary_target_observations_must_match_chunk_size");
+    }
+    if (treatment.boundaryPolicy === "current-turn-aware") {
+      return {
+        chunks: buildTurnAwareSummaryChunks(compressed, chunkSize),
+        oversizedAtomicChunkIndexes: [],
+      };
+    }
+  } else if (treatment.boundaryPolicy !== "atomic-turn") {
+    throw new Error("summary_token_target_requires_atomic_turn");
+  } else if (
+    !Number.isSafeInteger(treatment.inputTarget.targetInputTokens)
+    || treatment.inputTarget.targetInputTokens <= 0
+  ) {
+    throw new Error("summary_targetInputTokens_invalid");
+  }
+
+  const turns = splitRecognizedSummaryTurns(compressed);
+  if (!turns) {
+    return {
+      chunks: buildTurnAwareSummaryChunks(compressed, chunkSize),
+      oversizedAtomicChunkIndexes: [],
+    };
+  }
+
+  const chunks: CompressedObservation[][] = [];
+  const oversizedAtomicChunkIndexes: number[] = [];
+  let currentChunk: CompressedObservation[] = [];
+  const appendAtomicChunk = (chunk: CompressedObservation[], oversized: boolean) => {
+    chunks.push(chunk);
+    if (oversized) oversizedAtomicChunkIndexes.push(chunks.length - 1);
+  };
+  const flushCurrentChunk = () => {
+    if (currentChunk.length > 0) {
+      appendAtomicChunk(currentChunk, false);
+      currentChunk = [];
+    }
+  };
+
+  for (const turn of turns) {
+    if (treatment.inputTarget.kind === "observation-count") {
+      if (turn.length > chunkSize) {
+        flushCurrentChunk();
+        appendAtomicChunk(turn, true);
+        continue;
+      }
+      if (currentChunk.length > 0 && currentChunk.length + turn.length > chunkSize) {
+        flushCurrentChunk();
+      }
+      currentChunk.push(...turn);
+      continue;
+    }
+
+    if (!estimateInputTokens) throw new Error("summary_token_estimator_missing");
+    const targetInputTokens = treatment.inputTarget.targetInputTokens;
+    const turnTokens = estimateInputTokens(turn);
+    if (turnTokens > targetInputTokens) {
+      flushCurrentChunk();
+      appendAtomicChunk(turn, true);
+      continue;
+    }
+    if (
+      currentChunk.length > 0
+      && estimateInputTokens([...currentChunk, ...turn]) > targetInputTokens
+    ) {
+      flushCurrentChunk();
+    }
+    currentChunk.push(...turn);
+  }
+  flushCurrentChunk();
+  return { chunks, oversizedAtomicChunkIndexes };
+}
+
 // Returns the final summary XML string. For sessions ≤ chunk size, this is
 // a single LLM call (legacy behavior). For larger sessions, observations
 // are split into chunks processed in parallel batches, each chunk retried
@@ -184,6 +355,8 @@ async function produceSummaryXml(
   project: string,
   lineageContext: SummaryLineageInput,
   callOptions?: MemoryProviderCallOptions,
+  telemetry?: ProviderCallTelemetry[],
+  nextCallIndex?: () => ProviderCallIndex,
 ): Promise<{
   response: string;
   mode: "single" | "chunked";
@@ -193,18 +366,63 @@ async function produceSummaryXml(
 }> {
   const runtimeConfig = getSummarizeRuntimeConfig();
   const chunkSize = runtimeConfig.chunkSize;
-  if (compressed.length <= chunkSize) {
-    const userPrompt = buildSummaryPrompt(compressed, lineageContext);
-    const response = await summarizeWithOptions(
-      provider,
-      withOutputLanguagePolicy(SUMMARY_SYSTEM, undefined, SUMMARY_OUTPUT_CONTRACT),
-      userPrompt,
-      callOptions,
-    );
-    return { response, mode: "single", chunks: 1, promptChars: userPrompt.length };
+  const summarySystem = withOutputLanguagePolicy(
+    SUMMARY_SYSTEM,
+    undefined,
+    SUMMARY_OUTPUT_CONTRACT,
+  );
+  const treatment = getSummaryExperimentTreatment();
+  const contextPolicy = treatment?.inputTarget.kind === "token-target"
+    ? getContextPreflightPolicy()
+    : undefined;
+  if (treatment?.inputTarget.kind === "token-target" && !contextPolicy) {
+    throw new Error("summary_token_target_requires_preflight_policy");
   }
-
-  const chunks = buildTurnAwareSummaryChunks(compressed, chunkSize);
+  const chunkPlan = treatment
+    ? buildSummaryExperimentChunks(
+      compressed,
+      chunkSize,
+      treatment,
+      contextPolicy
+        ? (chunk) => Math.ceil(
+          (summarySystem.length + buildSummaryPrompt(chunk, lineageContext).length)
+          * contextPolicy.worstTokensPerChar
+          * (1 + contextPolicy.proportionalReserve)
+          + contextPolicy.fixedTokens,
+        )
+        : undefined,
+    )
+    : {
+      chunks: buildTurnAwareSummaryChunks(compressed, chunkSize),
+      oversizedAtomicChunkIndexes: [],
+    };
+  const chunks = chunkPlan.chunks;
+  if (chunks.length === 1) {
+    const userPrompt = buildSummaryPrompt(chunks[0], lineageContext);
+    const callIndex = nextCallIndex?.() ?? 0;
+    const marker: SummaryChunkTelemetryMarker | undefined = treatment
+      ? {
+        oversizedAtomicChunk: chunkPlan.oversizedAtomicChunkIndexes.includes(0),
+        chunkObservationCount: chunks[0].length,
+      }
+      : undefined;
+    try {
+      const response = await summarizeWithOptions(
+        provider,
+        summarySystem,
+        userPrompt,
+        callOptions,
+        telemetry,
+        "single",
+        callIndex,
+      );
+      markChunkTelemetry(telemetry, callIndex, marker);
+      return { response, mode: "single", chunks: 1, promptChars: userPrompt.length };
+    } catch (error) {
+      markChunkTelemetry(telemetry, callIndex, marker);
+      throw error;
+    }
+  }
   const chunkStartOffsets: number[] = [];
   let nextOffset = 0;
   for (const chunk of chunks) {
@@ -238,6 +456,14 @@ async function produceSummaryXml(
           chunks.length,
           lineageContext,
           callOptions,
+          telemetry,
+          nextCallIndex,
+          treatment
+            ? {
+              oversizedAtomicChunk: chunkPlan.oversizedAtomicChunkIndexes.includes(idx),
+              chunkObservationCount: chunk.length,
+            }
+            : undefined,
         );
       }),
     );
@@ -277,6 +503,9 @@ async function produceSummaryXml(
     withOutputLanguagePolicy(REDUCE_SYSTEM, undefined, SUMMARY_OUTPUT_CONTRACT),
     reducePrompt,
     callOptions,
+    telemetry,
+    "reduce",
+    nextCallIndex?.() ?? 0,
   );
   const chunkPromptChars = chunks.reduce(
     (sum, chunk) => sum + buildSummaryPrompt(chunk, lineageContext).length,
@@ -368,9 +597,18 @@ function resumableSummaryRunId(
   sessionId: string,
   inputHash: string,
   chunkSize: number,
+  treatment?: SummaryExperimentTreatment,
 ): string {
+  const binding = treatment
+    ? {
+      sessionId,
+      inputHash,
+      chunkSize,
+      chunkingKey: stableStringify(treatment),
+    }
+    : { sessionId, inputHash, chunkSize };
   const bindingHash = createHash("sha256")
-    .update(stableStringify({ sessionId, inputHash, chunkSize }))
+    .update(stableStringify(binding))
     .digest("hex");
   return `sumr_${bindingHash.slice(0, 24)}`;
 }
@@ -437,10 +675,14 @@ function resumableResponse(
   completedChunks: number,
   totalChunks: number,
   skippedChunks: number,
-  options: { summary?: SessionSummary; error?: string } = {},
+  options: {
+    summary?: SessionSummary;
+    error?: string;
+    telemetry?: ProviderCallTelemetry[];
+  } = {},
 ): ResumableSummaryResponse {
   return {
-    success: status !== "failed",
+    success: status === "in_progress" || status === "succeeded",
     status,
     completedChunks,
     totalChunks,
@@ -448,7 +690,10 @@ function resumableResponse(
     ...(status === "succeeded" && options.summary
       ? { summary: options.summary }
       : {}),
-    ...(status === "failed" && options.error ? { error: options.error } : {}),
+    ...(options.error ? { error: options.error } : {}),
+    ...(options.telemetry
+      ? { telemetry: sortProviderCallTelemetry(options.telemetry) }
+      : {}),
   };
 }
 
@@ -473,6 +718,7 @@ async function persistResumableSummary(
   summary: SessionSummary,
   completedChunks: number,
   skippedChunks: number,
+  telemetry?: ProviderCallTelemetry[],
 ): Promise<ResumableSummaryResponse> {
   const updatedAt = new Date().toISOString();
   const succeededRun: ResumableSummaryRun = {
@@ -497,7 +743,7 @@ async function persistResumableSummary(
     completedChunks,
     run.totalChunks,
     skippedChunks,
-    { summary },
+    { summary, ...(telemetry ? { telemetry } : {}) },
   );
 }
 
@@ -517,6 +763,7 @@ async function runResumableSummaryStep(
     let completedChunks = 0;
     let totalChunks = 0;
     let skippedChunks = 0;
+    const telemetry: ProviderCallTelemetry[] = [];
 
     try {
       const session = await kv.get<Session>(KV.sessions, sessionId);
@@ -531,9 +778,17 @@ async function runResumableSummaryStep(
       );
       const now = new Date().toISOString();
       const configuredChunkSize = getSummarizeRuntimeConfig().chunkSize;
+      const treatment = getSummaryExperimentTreatment();
+      const contextPolicy = treatment?.inputTarget.kind === "token-target"
+        ? getContextPreflightPolicy()
+        : undefined;
+      if (treatment?.inputTarget.kind === "token-target" && !contextPolicy) {
+        throw new Error("summary_token_target_requires_preflight_policy");
+      }
       let chunkSize = configuredChunkSize;
       let compressed: CompressedObservation[] = [];
       let chunks: CompressedObservation[][] = [];
+      let oversizedAtomicChunkIndexes: number[] = [];
       let inputHash = "";
       let runId = "";
       let run: ResumableSummaryRun | null = null;
@@ -592,9 +847,42 @@ async function runResumableSummaryStep(
           });
         }
         chunkSize = configuredChunkSize;
-        chunks = buildTurnAwareSummaryChunks(compressed, chunkSize);
+        const lineageContext = {
+          lineage: session.lineage,
+          parentSessionId: session.parentSessionId,
+        };
+        const summarySystem = withOutputLanguagePolicy(
+          SUMMARY_SYSTEM,
+          undefined,
+          SUMMARY_OUTPUT_CONTRACT,
+        );
+        const chunkPlan = treatment
+          ? buildSummaryExperimentChunks(
+            compressed,
+            chunkSize,
+            treatment,
+            contextPolicy
+              ? (chunk) => Math.ceil(
+                (summarySystem.length + buildSummaryPrompt(chunk, lineageContext).length)
+                * contextPolicy.worstTokensPerChar
+                * (1 + contextPolicy.proportionalReserve)
+                + contextPolicy.fixedTokens,
+              )
+              : undefined,
+          )
+          : {
+            chunks: buildTurnAwareSummaryChunks(compressed, chunkSize),
+            oversizedAtomicChunkIndexes: [],
+          };
+        chunks = chunkPlan.chunks;
+        oversizedAtomicChunkIndexes = chunkPlan.oversizedAtomicChunkIndexes;
         inputHash = resumableSummaryInputHash(session, compressed);
-        runId = resumableSummaryRunId(sessionId, inputHash, chunkSize);
+        runId = resumableSummaryRunId(
+          sessionId,
+          inputHash,
+          chunkSize,
+          treatment,
+        );
         run = await kv.get<ResumableSummaryRun>(
           KV.summaryResumableRuns,
           runId,
@@ -767,7 +1055,7 @@ async function runResumableSummaryStep(
             completedChunks,
             totalChunks,
             skippedChunks,
-            { error: validationError },
+            { error: validationError, telemetry },
           );
         }
         return persistResumableSummary(
@@ -776,6 +1064,7 @@ async function runResumableSummaryStep(
           persistedSinglePartial.summary,
           completedChunks,
           skippedChunks,
+          telemetry,
         );
       }
 
@@ -788,6 +1077,7 @@ async function runResumableSummaryStep(
       if (nextChunkIndex >= 0) {
         const previousPartial = partialByIndex.get(nextChunkIndex);
         const callOptions = resolveStageModelCallOptions("summary", data.model);
+        const invocationMarker = resumableInvocationMarker(run);
         const summary = await summarizeChunkWithRetry(
           provider,
           chunks[nextChunkIndex],
@@ -800,6 +1090,21 @@ async function runResumableSummaryStep(
             parentSessionId: session.parentSessionId,
           },
           callOptions,
+          telemetry,
+          (attempt) =>
+            resumableCallIndex(
+              run!,
+              "map",
+              nextChunkIndex,
+              attempt - 1,
+              invocationMarker,
+            ),
+          treatment
+            ? {
+              oversizedAtomicChunk: oversizedAtomicChunkIndexes.includes(nextChunkIndex),
+              chunkObservationCount: chunks[nextChunkIndex].length,
+            }
+            : undefined,
         );
         const partial: ResumableSummaryPartial = {
           runId,
@@ -834,7 +1139,7 @@ async function runResumableSummaryStep(
             completedChunks,
             totalChunks,
             skippedChunks,
-            { error },
+            { error, telemetry },
           );
         }
 
@@ -855,7 +1160,7 @@ async function runResumableSummaryStep(
               completedChunks,
               totalChunks,
               skippedChunks,
-              { error: validationError },
+              { error: validationError, telemetry },
             );
           }
           return persistResumableSummary(
@@ -864,6 +1169,7 @@ async function runResumableSummaryStep(
             summary,
             completedChunks,
             skippedChunks,
+            telemetry,
           );
         }
 
@@ -880,6 +1186,7 @@ async function runResumableSummaryStep(
           completedChunks,
           totalChunks,
           skippedChunks,
+          { telemetry },
         );
       }
 
@@ -925,7 +1232,7 @@ async function runResumableSummaryStep(
           completedChunks,
           totalChunks,
           skippedChunks,
-          { error: message },
+          { error: message, telemetry },
         );
       };
 
@@ -940,8 +1247,27 @@ async function runResumableSummaryStep(
           ),
           reducePrompt,
           resolveStageModelCallOptions("summary", data.model),
+          telemetry,
+          "reduce",
+          resumableCallIndex(
+            run!,
+            "reduce",
+            totalChunks,
+            0,
+            resumableInvocationMarker(run!),
+          ),
         );
       } catch (error) {
+        if (isProviderPreflightError(error)) {
+          const status = providerPreflightStatus(error);
+          return resumableResponse(
+            status,
+            completedChunks,
+            totalChunks,
+            skippedChunks,
+            { error: status, telemetry },
+          );
+        }
         const message = error instanceof Error ? error.message : String(error);
         return persistReduceFailure(message);
       }
@@ -963,8 +1289,19 @@ async function runResumableSummaryStep(
         summary,
         completedChunks,
         skippedChunks,
+        telemetry,
       );
     } catch (error) {
+      if (isProviderPreflightError(error)) {
+        const status = providerPreflightStatus(error);
+        return resumableResponse(
+          status,
+          completedChunks,
+          totalChunks,
+          skippedChunks,
+          { error: status, telemetry },
+        );
+      }
       const message = error instanceof Error ? error.message : String(error);
       logger.error("Resumable summarize step failed", {
         sessionId,
@@ -975,7 +1312,7 @@ async function runResumableSummaryStep(
         completedChunks,
         totalChunks,
         skippedChunks,
-        { error: message },
+        { error: message, telemetry },
       );
     }
   });
@@ -1027,9 +1364,11 @@ export function registerSummarizeFunction(
         };
       }
 
+      const telemetry: ProviderCallTelemetry[] = [];
+      const stageMetadata = resolveStageModelMetadata("summary", provider, data.model);
       try {
         const callOptions = resolveStageModelCallOptions("summary", data.model);
-        const stageMetadata = resolveStageModelMetadata("summary", provider, data.model);
+        let nextCallIndex = 0;
         // #783: chunk-level produceSummaryXml retries internally, but
         // the final merge used to parse once and bail. Wrap the
         // produce-and-parse pair in the same 2-attempt loop so a
@@ -1052,6 +1391,8 @@ export function registerSummarizeFunction(
               parentSessionId: session.parentSessionId,
             },
             callOptions,
+            telemetry,
+            () => nextCallIndex++,
           );
           response = produced.response;
           mode = produced.mode;
@@ -1092,6 +1433,7 @@ export function registerSummarizeFunction(
             promptChars,
             durationMs: latencyMs,
             parseFailures,
+            telemetry: sortProviderCallTelemetry(telemetry),
           };
         }
 
@@ -1108,6 +1450,7 @@ export function registerSummarizeFunction(
             promptChars,
             durationMs: latencyMs,
             parseFailures,
+            telemetry: sortProviderCallTelemetry(telemetry),
           };
         }
 
@@ -1141,6 +1484,7 @@ export function registerSummarizeFunction(
             promptChars,
             durationMs: latencyMs,
             parseFailures,
+            telemetry: sortProviderCallTelemetry(telemetry),
           };
         }
 
@@ -1179,8 +1523,19 @@ export function registerSummarizeFunction(
           promptChars,
           durationMs: latencyMs,
           parseFailures,
+          telemetry: sortProviderCallTelemetry(telemetry),
         };
       } catch (err) {
+        if (isProviderPreflightError(err)) {
+          const status = providerPreflightStatus(err);
+          return {
+            success: false,
+            error: status,
+            status,
+            ...stageMetadata,
+            telemetry: sortProviderCallTelemetry(telemetry),
+          };
+        }
         const msg = err instanceof Error ? err.message : String(err);
         const latencyMs = Date.now() - startMs;
         if (metricsStore) {
@@ -1190,7 +1545,11 @@ export function registerSummarizeFunction(
           sessionId,
           error: msg,
         });
-        return { success: false, error: msg };
+        return {
+          success: false,
+          error: msg,
+          telemetry: sortProviderCallTelemetry(telemetry),
+        };
       }
     },
   );

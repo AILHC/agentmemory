@@ -38,6 +38,13 @@ import {
   resolveStageModelCallOptions,
   resolveStageModelMetadata,
 } from "../config.js";
+import {
+  callProviderWithTelemetry,
+  isProviderPreflightError,
+  providerPreflightStatus,
+  sortProviderCallTelemetry,
+  type ProviderCallTelemetry,
+} from "../providers/provider-call-result.js";
 
 export interface ConsolidateObservationWindow {
   windowId: string;
@@ -83,10 +90,24 @@ function compressWithOptions(
   systemPrompt: string,
   userPrompt: string,
   callOptions?: MemoryProviderCallOptions,
+  telemetry?: ProviderCallTelemetry[],
+  callIndex = 0,
 ): Promise<string> {
-  return callOptions
-    ? provider.compress(systemPrompt, userPrompt, callOptions)
-    : provider.compress(systemPrompt, userPrompt);
+  if (!telemetry) {
+    return callOptions
+      ? provider.compress(systemPrompt, userPrompt, callOptions)
+      : provider.compress(systemPrompt, userPrompt);
+  }
+  return callProviderWithTelemetry({
+    provider,
+    operation: "compress",
+    callRole: "window",
+    callIndex,
+    systemPrompt,
+    userPrompt,
+    callOptions,
+    telemetry,
+  });
 }
 
 function parseMemoryXml(
@@ -175,8 +196,18 @@ function groupObservationsByConcept(
   );
 }
 
+const CONSOLIDATION_OBSERVATION_SEPARATOR = "\n\n";
+
+function serializeObservationForConsolidation(obs: CompressedObservation): string {
+  return `[${obs.type}] ${obs.title}\n${obs.narrative}\nFiles: ${obs.files.join(", ")}\nImportance: ${obs.importance}`;
+}
+
+function serializeConsolidationObservationPrompt(observations: CompressedObservation[]): string {
+  return observations.map(serializeObservationForConsolidation).join(CONSOLIDATION_OBSERVATION_SEPARATOR);
+}
+
 function estimateObservationChars(obs: CompressedObservation): number {
-  return obs.title.length + obs.narrative.length + obs.files.join(", ").length + 32;
+  return serializeObservationForConsolidation(obs).length;
 }
 
 function windowChunksByBudget<T extends CompressedObservation>(
@@ -190,7 +221,8 @@ function windowChunksByBudget<T extends CompressedObservation>(
   const maxCount = Math.max(1, maxObservationsPerWindow);
 
   for (const obs of observations) {
-    const obsChars = estimateObservationChars(obs);
+    const obsChars = estimateObservationChars(obs)
+      + (current.length > 0 ? CONSOLIDATION_OBSERVATION_SEPARATOR.length : 0);
     const wouldExceedCount = current.length >= maxCount;
     const wouldExceedBudget =
       charBudget !== undefined && current.length > 0 && currentChars + obsChars > charBudget;
@@ -216,7 +248,7 @@ function consolidateWindowFromChunk(
   const observationIds = chunk.map((o) => o.id);
   const sessionIds = [...new Set(chunk.map((o) => o.sid))];
   const observationEstimatedChars = Object.fromEntries(chunk.map((o) => [o.id, estimateObservationChars(o)]));
-  const estimatedChars = Object.values(observationEstimatedChars).reduce((sum, chars) => sum + chars, 0);
+  const estimatedChars = serializeConsolidationObservationPrompt(chunk).length;
   const budgetApplied = charBudget !== undefined;
   const overBudget = budgetApplied && estimatedChars > charBudget;
   return {
@@ -254,11 +286,26 @@ export async function planConsolidateObservationWindows(options: {
   budgetApplied: boolean;
   maxWindowEstimatedChars: number;
   overBudgetWindowCount: number;
+  plannerConfig: {
+    minImportance: number;
+    minObservationsPerConcept: number;
+    charBudget?: number;
+    maxObservationsPerWindow?: number;
+  };
+  eligibleWindowMaxObservationCount: number;
 }> {
   const minObs = options.minObservationsPerConcept ?? options.minObservations ?? 10;
   const minImportance = options.minImportance ?? 5;
   const charBudget = options.charBudget !== undefined ? Math.max(1, options.charBudget) : undefined;
   const budgetApplied = charBudget !== undefined;
+  const plannerConfig = {
+    minImportance,
+    minObservationsPerConcept: minObs,
+    ...(charBudget === undefined ? {} : { charBudget }),
+    ...(options.maxObservationsPerWindow === undefined
+      ? {}
+      : { maxObservationsPerWindow: Math.max(1, options.maxObservationsPerWindow) }),
+  };
   const allObs = await collectConsolidationObservations(options.kv, options.project, minImportance);
   if (allObs.length < minObs) {
     return {
@@ -270,6 +317,8 @@ export async function planConsolidateObservationWindows(options: {
       budgetApplied,
       maxWindowEstimatedChars: 0,
       overBudgetWindowCount: 0,
+      plannerConfig,
+      eligibleWindowMaxObservationCount: 0,
     };
   }
 
@@ -306,6 +355,10 @@ export async function planConsolidateObservationWindows(options: {
   const overBudgetWindowCount = budgetApplied
     ? windows.filter((window) => charBudget !== undefined && window.estimatedChars > charBudget).length
     : 0;
+  const eligibleWindowMaxObservationCount = windows.reduce(
+    (max, window) => Math.max(max, window.observationCount),
+    0,
+  );
   return {
     success: true,
     totalObservations: allObs.length,
@@ -314,6 +367,8 @@ export async function planConsolidateObservationWindows(options: {
     budgetApplied,
     maxWindowEstimatedChars,
     overBudgetWindowCount,
+    plannerConfig,
+    eligibleWindowMaxObservationCount,
   };
 }
 
@@ -384,11 +439,14 @@ export async function runConsolidateObservationWindow(
   options: ConsolidateObservationWindowOptions,
 ): Promise<Record<string, unknown>> {
   const startMs = Date.now();
+  const telemetry: ProviderCallTelemetry[] = [];
+  let nextCallIndex = 0;
   const stageMetadata = resolveStageModelMetadata("memory_consolidate", options.provider, options.model);
   const responseMetadata = (status: string, extra: Record<string, unknown> = {}) => ({
     status,
     ...stageMetadata,
     durationMs: Date.now() - startMs,
+    telemetry: sortProviderCallTelemetry(telemetry),
     ...extra,
   });
   try {
@@ -427,12 +485,7 @@ export async function runConsolidateObservationWindow(
 
     const sorted = [...obsGroup].sort((a, b) => b.importance - a.importance);
     const sessionIds = [...new Set(sorted.map((o) => o.sid))];
-    const prompt = sorted
-      .map(
-        (o) =>
-          `[${o.type}] ${o.title}\n${o.narrative}\nFiles: ${o.files.join(", ")}\nImportance: ${o.importance}`,
-      )
-      .join("\n\n");
+    const prompt = serializeConsolidationObservationPrompt(sorted);
     if (options.charBudget !== undefined && prompt.length > options.charBudget) {
       return {
         success: false,
@@ -448,17 +501,35 @@ export async function runConsolidateObservationWindow(
     }
     const callOptions = modelOptionsFromMemoryConsolidate(options.model);
     const timeoutMs = getMemoryConsolidateCompressTimeoutMs();
-    const response = await Promise.race([
-      compressWithOptions(
-        options.provider,
-        withOutputLanguagePolicy(CONSOLIDATION_SYSTEM),
-        `Concept: "${concept ?? "observation-window"}"\n\nObservations:\n${prompt}`,
-        callOptions,
-      ),
-      new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`compress timeout after ${timeoutMs}ms`)), timeoutMs),
-      ),
-    ]);
+    const callIndex = nextCallIndex++;
+    const callStartMs = Date.now();
+    let response: string;
+    try {
+      response = await Promise.race([
+        compressWithOptions(
+          options.provider,
+          withOutputLanguagePolicy(CONSOLIDATION_SYSTEM),
+          `Concept: "${concept ?? "observation-window"}"\n\nObservations:\n${prompt}`,
+          callOptions,
+          telemetry,
+          callIndex,
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`compress timeout after ${timeoutMs}ms`)), timeoutMs),
+        ),
+      ]);
+    } catch (error) {
+      if (!telemetry.some((item) => item.callIndex === callIndex)) {
+        telemetry.push({
+          operation: "compress",
+          callRole: "window",
+          callIndex,
+          durationMs: Date.now() - callStartMs,
+          metadataStatus: "unsupported",
+        });
+      }
+      throw error;
+    }
     const parsed = parseMemoryXml(response, sessionIds);
     if (!parsed) {
       return {
@@ -495,6 +566,10 @@ export async function runConsolidateObservationWindow(
       }),
     };
   } catch (err) {
+    if (isProviderPreflightError(err)) {
+      const status = providerPreflightStatus(err);
+      return { success: false, error: status, ...responseMetadata(status) };
+    }
     const msg = err instanceof Error ? err.message : String(err);
     logger.warn("Full consolidation window failed", { error: msg });
     return { success: false, error: msg, ...responseMetadata("failed") };
@@ -546,6 +621,8 @@ export function registerConsolidateFunction(
       const existingMemories = await kv.list<Memory>(KV.memories);
       const MAX_LLM_CALLS = 10;
       let llmCallCount = 0;
+      const telemetry: ProviderCallTelemetry[] = [];
+      let nextCallIndex = 0;
       const callOptions = modelOptionsFromMemoryConsolidate(data.model);
 
       const sortedGroups = [...conceptGroups.entries()]
@@ -567,6 +644,8 @@ export function registerConsolidateFunction(
           )
           .join("\n\n");
 
+        const callIndex = nextCallIndex++;
+        const callStartMs = Date.now();
         try {
           const response = await Promise.race([
             compressWithOptions(
@@ -574,6 +653,8 @@ export function registerConsolidateFunction(
               withOutputLanguagePolicy(CONSOLIDATION_SYSTEM),
               `Concept: "${concept}"\n\nObservations:\n${prompt}`,
               callOptions,
+              telemetry,
+              callIndex,
             ),
             new Promise<never>((_, reject) =>
               setTimeout(
@@ -609,6 +690,15 @@ export function registerConsolidateFunction(
           );
           consolidated++;
         } catch (err) {
+          if (!telemetry.some((item) => item.callIndex === nextCallIndex - 1)) {
+            telemetry.push({
+              operation: "compress",
+              callRole: "window",
+              callIndex: nextCallIndex - 1,
+              durationMs: Date.now() - callStartMs,
+              metadataStatus: "unsupported",
+            });
+          }
           logger.warn("Consolidation failed for concept", {
             concept,
             error: err instanceof Error ? err.message : String(err),
@@ -620,7 +710,11 @@ export function registerConsolidateFunction(
         consolidated,
         totalObs: allObs.length,
       });
-      return { consolidated, totalObservations: allObs.length };
+      return {
+        consolidated,
+        totalObservations: allObs.length,
+        telemetry: sortProviderCallTelemetry(telemetry),
+      };
     },
   );
 }

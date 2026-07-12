@@ -18,17 +18,17 @@ const state = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@earendil-works/pi-ai/openai-codex-responses", async (importOriginal) => {
+vi.mock("@earendil-works/pi-ai/compat", async (importOriginal) => {
   const actual =
-    await importOriginal<typeof import("@earendil-works/pi-ai/openai-codex-responses")>();
+    await importOriginal<typeof import("@earendil-works/pi-ai/compat")>();
   return {
     ...actual,
-    streamSimpleOpenAICodexResponses: (
+    streamSimple: (
       model: unknown,
       context: unknown,
       options: Record<string, unknown> = {},
     ) =>
-      actual.streamSimpleOpenAICodexResponses(
+      actual.streamSimple(
         model as never,
         context as never,
         {
@@ -44,11 +44,14 @@ vi.mock("@earendil-works/pi-ai/openai-codex-responses", async (importOriginal) =
   };
 });
 
-vi.mock("@earendil-works/pi-ai", () => ({
-  getModel: vi.fn(() => state.model),
+vi.mock("@earendil-works/pi-ai/providers/all", () => ({
+  getBuiltinModel: vi.fn(() => state.model),
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
+  SessionManager: {
+    inMemory: vi.fn(() => ({ getSessionId: () => "019f5a00-0000-7000-8000-000000000001" })),
+  },
   AuthStorage: {
     create: vi.fn(() => ({})),
   },
@@ -111,6 +114,7 @@ describe("pi-agent-sdk OpenAI Codex Responses payload contract", () => {
     expect(payload.tools).toBeUndefined();
     expect(payload.reasoning).toBeUndefined();
     expect(payload.reasoning_effort).toBeUndefined();
+    expect(payload.prompt_cache_key).toBe("019f5a00-0000-7000-8000-000000000001");
     expect(payload.sessionId).toBeUndefined();
     expect(payload.session_id).toBeUndefined();
 

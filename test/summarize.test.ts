@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
 vi.mock("../src/logger.js", () => ({
@@ -34,9 +35,11 @@ vi.mock("../src/functions/audit.js", () => ({
 }));
 
 import {
+  buildSummaryExperimentChunks,
   buildTurnAwareSummaryChunks,
   registerSummarizeFunction,
 } from "../src/functions/summarize.js";
+import { ProviderCallError } from "../src/providers/provider-call-result.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 import type {
   CompressedObservation,
@@ -128,6 +131,42 @@ function makeProvider(responses: string[]): MemoryProvider & {
   };
 }
 
+function makeDetailedProvider(responses: string[], delays: number[] = []): MemoryProvider & {
+  calls: Array<{ system: string; user: string; options: unknown }>;
+} {
+  const calls: Array<{ system: string; user: string; options: unknown }> = [];
+  let i = 0;
+  return {
+    name: "pi-agent-sdk",
+    calls,
+    compress: async () => "",
+    summarize: async () => {
+      throw new Error("legacy summarize path should not be used");
+    },
+    summarizeWithMetadata: async (system: string, user: string, options?: unknown) => {
+      calls.push({ system, user, options });
+      const text = responses[i] ?? responses[responses.length - 1];
+      const callIndex = i++;
+      if (delays[callIndex]) {
+        await new Promise((resolve) => setTimeout(resolve, delays[callIndex]));
+      }
+      return {
+        text,
+        metadata: {
+          inputTokens: 10 + callIndex,
+          outputTokens: 20 + callIndex,
+          totalTokens: 30 + callIndex,
+          maxOutputTokens: 4096,
+          stopReason: "stop" as const,
+          responseModel: "telemetry-model",
+          contextWindow: 128000,
+          modelMaxTokens: 8192,
+        },
+      };
+    },
+  };
+}
+
 function summaryXml(opts: {
   title: string;
   narrative?: string;
@@ -212,6 +251,10 @@ describe("mem::summarize chunking", () => {
     delete process.env.SUMMARIZE_CHUNK_CONCURRENCY;
     delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
     delete process.env.AGENTMEMORY_SUMMARY_MODEL;
+    delete process.env.AGENTMEMORY_EVALUATION_MODE;
+    delete process.env.AGENTMEMORY_CONTEXT_STRATEGY_TARGET_STAGE;
+    delete process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY;
+    delete process.env.AGENTMEMORY_SUMMARY_CONTEXT_TREATMENT;
   });
 
   afterEach(() => {
@@ -278,6 +321,146 @@ describe("mem::summarize chunking", () => {
     expect(chunks.map((chunk) => chunk.map((obs) => obs.id))).toEqual([
       ["obs-1", "obs-2"],
       ["obs-3", "obs-4"],
+    ]);
+  });
+
+  it("keeps the current B chunk plan identical to turn-aware chunking", () => {
+    const observations = [
+      makeCompressedObservation("obs-1", { hookType: "prompt_submit", userPrompt: "A" }),
+      makeCompressedObservation("obs-2"),
+      makeCompressedObservation("obs-3", { hookType: "prompt_submit", userPrompt: "B" }),
+      makeCompressedObservation("obs-4"),
+      makeCompressedObservation("obs-5"),
+    ];
+
+    const plan = buildSummaryExperimentChunks(observations, 4, {
+      boundaryPolicy: "current-turn-aware",
+      inputTarget: { kind: "observation-count", targetObservations: 4 },
+    });
+
+    expect(plan.chunks).toEqual(buildTurnAwareSummaryChunks(observations, 4));
+    expect(plan.oversizedAtomicChunkIndexes).toEqual([]);
+  });
+
+  it("keeps an oversized A turn atomic and marks its map telemetry", () => {
+    const observations = [
+      makeCompressedObservation("obs-1", { hookType: "prompt_submit", userPrompt: "A" }),
+      makeCompressedObservation("obs-2"),
+      makeCompressedObservation("obs-3"),
+      makeCompressedObservation("obs-4"),
+      makeCompressedObservation("obs-5"),
+      makeCompressedObservation("obs-6", { hookType: "prompt_submit", userPrompt: "B" }),
+      makeCompressedObservation("obs-7"),
+    ];
+
+    const plan = buildSummaryExperimentChunks(observations, 4, {
+      boundaryPolicy: "atomic-turn",
+      inputTarget: { kind: "observation-count", targetObservations: 4 },
+    });
+
+    expect(plan.chunks.map((chunk) => chunk.map((observation) => observation.id))).toEqual([
+      ["obs-1", "obs-2", "obs-3", "obs-4", "obs-5"],
+      ["obs-6", "obs-7"],
+    ]);
+    expect(plan.oversizedAtomicChunkIndexes).toEqual([0]);
+  });
+
+  it("packs W turns by targetInputTokens without splitting a recognized turn", () => {
+    const observations = [
+      makeCompressedObservation("obs-1", { hookType: "prompt_submit", userPrompt: "A" }),
+      makeCompressedObservation("obs-2"),
+      makeCompressedObservation("obs-3"),
+      makeCompressedObservation("obs-4", { hookType: "prompt_submit", userPrompt: "B" }),
+      makeCompressedObservation("obs-5"),
+    ];
+
+    const plan = buildSummaryExperimentChunks(observations, 400, {
+      boundaryPolicy: "atomic-turn",
+      inputTarget: { kind: "token-target", targetInputTokens: 30 },
+    }, (chunk) => chunk.length * 10);
+
+    expect(plan.chunks.map((chunk) => chunk.map((observation) => observation.id))).toEqual([
+      ["obs-1", "obs-2", "obs-3"],
+      ["obs-4", "obs-5"],
+    ]);
+    expect(plan.oversizedAtomicChunkIndexes).toEqual([]);
+  });
+
+  it("fails closed when an active W treatment has no targetInputTokens", () => {
+    const observations = [
+      makeCompressedObservation("obs-1", { hookType: "prompt_submit", userPrompt: "A" }),
+    ];
+
+    expect(() => buildSummaryExperimentChunks(observations, 400, {
+      boundaryPolicy: "atomic-turn",
+      inputTarget: { kind: "token-target" } as any,
+    })).toThrow(/targetInputTokens/);
+  });
+
+  it("does not activate summary experiment controls for a non-summary target stage", async () => {
+    process.env.AGENTMEMORY_EVALUATION_MODE = "context-strategy";
+    process.env.AGENTMEMORY_CONTEXT_STRATEGY_TARGET_STAGE = "memory";
+    process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY = "not-json";
+    const provider = makeProvider([summaryXml({ title: "ordinary summary" })]);
+    const { handler } = await setupHandler({
+      sessionId: "ses_non_summary_target",
+      obsCount: 1,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_non_summary_target" });
+
+    expect(result.success).toBe(true);
+    expect(provider.calls).toHaveLength(1);
+  });
+
+  it("marks every A oversized atomic map call in provider telemetry", async () => {
+    process.env.AGENTMEMORY_EVALUATION_MODE = "context-strategy";
+    process.env.AGENTMEMORY_CONTEXT_STRATEGY_TARGET_STAGE = "summary";
+    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TREATMENT = JSON.stringify({
+      boundaryPolicy: "atomic-turn",
+      inputTarget: { kind: "observation-count", targetObservations: 4 },
+    });
+    process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY = JSON.stringify({
+      schemaVersion: 1,
+      expectedProvider: "pi-agent-sdk",
+      expectedModel: "gpt-5.4",
+      worstTokensPerChar: 0.5,
+      fixedTokens: 1,
+      proportionalReserve: 0,
+      contextWindow: 128000,
+      modelMaxTokens: 8192,
+      maxOutputTokens: 4096,
+      reasoningReserve: 0,
+      safetyMargin: 0,
+      calibrationHash: `sha256:${"a".repeat(64)}`,
+    });
+    process.env.PI_AGENT_MODEL = "gpt-5.4";
+    process.env.SUMMARIZE_CHUNK_SIZE = "4";
+    const provider = makeDetailedProvider([
+      summaryXml({ title: "Atomic A" }),
+      summaryXml({ title: "Atomic B" }),
+      summaryXml({ title: "Merged" }),
+    ]);
+    const { handler, kv } = await setupHandler({
+      sessionId: "ses_atomic_telemetry",
+      obsCount: 7,
+      provider,
+    });
+    for (let index = 0; index < 7; index++) {
+      await kv.set("obs:ses_atomic_telemetry", `obs_${index}`, makeCompressedObservation(`obs_${index}`, {
+        sessionId: "ses_atomic_telemetry",
+        hookType: index === 0 || index === 5 ? "prompt_submit" : undefined,
+        userPrompt: index === 0 || index === 5 ? `Turn ${index}` : undefined,
+      }));
+    }
+
+    const result: any = await handler({ sessionId: "ses_atomic_telemetry" });
+
+    expect(result.success).toBe(true);
+    expect(result.telemetry.filter((entry: any) => entry.callRole === "map")).toEqual([
+      expect.objectContaining({ oversizedAtomicChunk: true, chunkObservationCount: 5 }),
+      expect.objectContaining({ oversizedAtomicChunk: false, chunkObservationCount: 2 }),
     ]);
   });
 
@@ -439,6 +622,87 @@ describe("mem::summarize chunking", () => {
     // not just the final chunk.
     expect(stored?.observationCount).toBe(250);
     expect(stored?.keyDecisions).toEqual(["dA", "dB", "dC"]);
+  });
+
+  it("returns per-attempt map and reduce telemetry without exposing prompt or response text", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "100";
+    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "2";
+    const provider = makeDetailedProvider([
+      summaryXml({ title: "Chunk 1" }),
+      summaryXml({ title: "Chunk 2" }),
+      summaryXml({ title: "Chunk 3" }),
+      summaryXml({ title: "Merged" }),
+    ], [20, 0, 0, 0]);
+    const { handler } = await setupHandler({
+      sessionId: "ses_telemetry",
+      obsCount: 250,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_telemetry" });
+
+    expect(result.success).toBe(true);
+    expect(result.telemetry).toHaveLength(4);
+    expect(result.telemetry.map((item: any) => [item.operation, item.callRole, item.callIndex])).toEqual([
+      ["summarize", "map", 0],
+      ["summarize", "map", 1],
+      ["summarize", "map", 2],
+      ["summarize", "reduce", 3],
+    ]);
+    expect(result.telemetry[0]).toMatchObject({
+      metadataStatus: "supported",
+      metadata: {
+        inputTokens: 10,
+        outputTokens: 20,
+        totalTokens: 30,
+        maxOutputTokens: 4096,
+        responseModel: "telemetry-model",
+      },
+    });
+    expect(JSON.stringify(result.telemetry)).not.toContain("Chunk 1");
+    expect(JSON.stringify(result.telemetry)).not.toContain("session summarizer");
+  });
+
+  it("blocks summary calls before the provider and does not retry", async () => {
+    process.env.AGENTMEMORY_EVALUATION_MODE = "context-strategy";
+    process.env.AGENTMEMORY_CONTEXT_STRATEGY_TARGET_STAGE = "summary";
+    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TREATMENT = JSON.stringify({
+      boundaryPolicy: "current-turn-aware",
+      inputTarget: { kind: "observation-count", targetObservations: 400 },
+    });
+    process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY = JSON.stringify({
+      schemaVersion: 1,
+      expectedProvider: "pi-agent-sdk",
+      expectedModel: "gpt-5.4",
+      worstTokensPerChar: 0.5,
+      fixedTokens: 1,
+      proportionalReserve: 0,
+      contextWindow: 1,
+      modelMaxTokens: 8192,
+      maxOutputTokens: 128,
+      reasoningReserve: 0,
+      safetyMargin: 0,
+      calibrationHash: `sha256:${"a".repeat(64)}`,
+    });
+    process.env.PI_AGENT_MODEL = "gpt-5.4";
+    const provider = makeDetailedProvider([summaryXml({ title: "blocked" })]);
+    const { handler } = await setupHandler({
+      sessionId: "ses_preflight_blocked",
+      obsCount: 2,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_preflight_blocked" });
+
+    expect(result).toMatchObject({ success: false, status: "infeasible", error: "infeasible" });
+    expect(provider.calls).toHaveLength(0);
+    expect(result.telemetry).toEqual([
+      expect.objectContaining({
+        providerInvoked: false,
+        preflightBlocked: true,
+        reason: "context_window_exceeded",
+      }),
+    ]);
   });
 
   it("uses cumulative observation ranges when reducing variable-size chunks", async () => {
@@ -764,6 +1028,134 @@ describe("mem::summarize chunking", () => {
     expect((provider as any).calls.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("records both final summarize attempts while preserving retry success", async () => {
+    const provider = makeDetailedProvider([
+      "not xml",
+      summaryXml({ title: "retry telemetry" }),
+    ]);
+    const { handler } = await setupHandler({
+      sessionId: "ses_retry_telemetry",
+      obsCount: 1,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_retry_telemetry" });
+
+    expect(result.success).toBe(true);
+    expect(result.summary.title).toBe("retry telemetry");
+    expect(result.telemetry).toHaveLength(2);
+    expect(result.telemetry.map((item: any) => [item.callRole, item.callIndex])).toEqual([
+      ["single", 0],
+      ["single", 1],
+    ]);
+  });
+
+  it("marks legacy provider telemetry as unsupported without inventing usage", async () => {
+    const provider = makeProvider([summaryXml({ title: "legacy" })]);
+    const { handler } = await setupHandler({
+      sessionId: "ses_legacy_telemetry",
+      obsCount: 1,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_legacy_telemetry" });
+
+    expect(result.success).toBe(true);
+    expect(result.telemetry).toEqual([
+      expect.objectContaining({
+        operation: "summarize",
+        callRole: "single",
+        callIndex: 0,
+        metadataStatus: "unsupported",
+      }),
+    ]);
+    expect(result.telemetry[0].metadata).toBeUndefined();
+  });
+
+  it("preserves supported ProviderCallError metadata on a failed stage response", async () => {
+    const metadata = {
+      inputTokens: 7,
+      outputTokens: 0,
+      totalTokens: 7,
+      maxOutputTokens: 4096,
+      stopReason: "error" as const,
+      responseModel: "error-model",
+    };
+    const provider: MemoryProvider = {
+      name: "pi-agent-sdk",
+      compress: vi.fn(),
+      summarize: vi.fn(),
+      summarizeWithMetadata: vi.fn(async () => {
+        throw new ProviderCallError("pi_stream_failed", metadata);
+      }),
+    };
+    const { handler } = await setupHandler({
+      sessionId: "ses_error_telemetry",
+      obsCount: 1,
+      provider,
+    });
+
+    const result: any = await handler({ sessionId: "ses_error_telemetry" });
+
+    expect(result.success).toBe(false);
+    expect(result.telemetry).toHaveLength(1);
+    expect(result.telemetry[0]).toMatchObject({
+      metadataStatus: "supported",
+      metadata,
+    });
+    expect(JSON.stringify(result.telemetry)).not.toContain("pi_stream_failed");
+    expect(JSON.stringify(result.telemetry)).not.toContain("summary");
+  });
+
+  it("keeps resumable map, retry, and reduce call identities unique across invocations", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "100";
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_identity", 250);
+    const provider = makeProvider([
+      summaryXml({ title: "Chunk 1" }),
+      summaryXml({ title: "Chunk 2" }),
+      summaryXml({ title: "Chunk 3" }),
+      summaryXml({ title: "Merged" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    const responses = [
+      await handler({ sessionId: "ses_identity" }),
+      await handler({ sessionId: "ses_identity" }),
+      await handler({ sessionId: "ses_identity" }),
+      await handler({ sessionId: "ses_identity" }),
+    ] as any[];
+    const callIndexes = responses.flatMap((response) =>
+      (response.telemetry ?? []).map((item: any) => item.callIndex),
+    );
+    expect(callIndexes).toHaveLength(4);
+    expect(new Set(callIndexes).size).toBe(callIndexes.length);
+    expect(responses[0].telemetry[0].callRole).toBe("map");
+    expect(responses[3].telemetry[0].callRole).toBe("reduce");
+  });
+
+  it("keeps resumable retry attempts unique across handler invocations", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_retry_identity", 1);
+    const provider = makeProvider([
+      "garbage one",
+      "garbage two",
+      summaryXml({ title: "Recovered" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    const first: any = await handler({ sessionId: "ses_retry_identity" });
+    const second: any = await handler({ sessionId: "ses_retry_identity" });
+    const callIndexes = [
+      ...first.telemetry.map((item: any) => item.callIndex),
+      ...second.telemetry.map((item: any) => item.callIndex),
+    ];
+
+    expect(callIndexes).toHaveLength(3);
+    expect(new Set(callIndexes).size).toBe(3);
+    expect(second.status).toBe("succeeded");
+  });
+
   it("returns parse_failed only after both attempts fail", async () => {
     const provider = makeProvider([
       "garbage one",
@@ -789,6 +1181,10 @@ describe("mem::summarize-resumable", () => {
     process.env.SUMMARIZE_CHUNK_SIZE = "100";
     delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
     delete process.env.AGENTMEMORY_SUMMARY_MODEL;
+    delete process.env.AGENTMEMORY_EVALUATION_MODE;
+    delete process.env.AGENTMEMORY_CONTEXT_STRATEGY_TARGET_STAGE;
+    delete process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY;
+    delete process.env.AGENTMEMORY_SUMMARY_CONTEXT_TREATMENT;
   });
 
   afterEach(() => {
@@ -810,6 +1206,14 @@ describe("mem::summarize-resumable", () => {
       completedChunks: 1,
       totalChunks: 3,
       skippedChunks: 0,
+      telemetry: [
+        expect.objectContaining({
+          operation: "summarize",
+          callRole: "map",
+          callIndex: expect.stringContaining(":map:0:0"),
+          metadataStatus: "unsupported",
+        }),
+      ],
     });
   });
 
@@ -834,6 +1238,86 @@ describe("mem::summarize-resumable", () => {
       totalChunks: 3,
       skippedChunks: 0,
     });
+  });
+
+  it("resumes an existing non-evaluation partial under the legacy run ID", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_legacy_run_id", 250);
+    const firstProvider = makeProvider([summaryXml({ title: "Chunk 1" })]);
+    const firstService = setupResumableHandler(kv, firstProvider);
+
+    await firstService.handler({ sessionId: "ses_legacy_run_id" });
+
+    const [createdRun] = await kv.list<any>("summary-resumable-runs");
+    const legacyRunId = `sumr_${createHash("sha256")
+      .update(JSON.stringify({
+        chunkSize: createdRun.chunkSize,
+        inputHash: createdRun.inputHash,
+        sessionId: createdRun.sessionId,
+      }))
+      .digest("hex")
+      .slice(0, 24)}`;
+    const partials = kv.store.get(`summary-resumable-partials:${createdRun.id}`)!;
+    await kv.set("summary-resumable-runs", legacyRunId, {
+      ...createdRun,
+      id: legacyRunId,
+    });
+    for (const [partialId, partial] of partials) {
+      await kv.set(`summary-resumable-partials:${legacyRunId}`, partialId, partial);
+    }
+    await kv.delete("summary-resumable-runs", createdRun.id);
+    await kv.delete("summary-resumable-active-runs", "ses_legacy_run_id");
+
+    const secondProvider = makeProvider([summaryXml({ title: "Chunk 2" })]);
+    const rebuiltService = setupResumableHandler(kv, secondProvider);
+    const result = await rebuiltService.handler({ sessionId: "ses_legacy_run_id" });
+
+    expect(createdRun.id).toBe(legacyRunId);
+    expect(result).toMatchObject({
+      success: true,
+      status: "in_progress",
+      completedChunks: 2,
+      totalChunks: 3,
+      skippedChunks: 0,
+    });
+    expect(secondProvider.calls[0].user).toContain("obs 100");
+    expect(secondProvider.calls[0].user).not.toContain("obs 0");
+  });
+
+  it("uses distinct resumable run IDs for different summary treatments", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_treatment_run_ids", 250);
+    process.env.AGENTMEMORY_EVALUATION_MODE = "context-strategy";
+    process.env.AGENTMEMORY_CONTEXT_STRATEGY_TARGET_STAGE = "summary";
+    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TREATMENT = JSON.stringify({
+      boundaryPolicy: "current-turn-aware",
+      inputTarget: { kind: "observation-count", targetObservations: 100 },
+    });
+    const treatmentA = setupResumableHandler(
+      kv,
+      makeProvider([summaryXml({ title: "Treatment A" })]),
+    );
+
+    await treatmentA.handler({ sessionId: "ses_treatment_run_ids" });
+    const [runA] = await kv.list<any>("summary-resumable-runs");
+    await kv.delete("summary-resumable-active-runs", "ses_treatment_run_ids");
+
+    process.env.AGENTMEMORY_SUMMARY_CONTEXT_TREATMENT = JSON.stringify({
+      boundaryPolicy: "atomic-turn",
+      inputTarget: { kind: "observation-count", targetObservations: 100 },
+    });
+    const treatmentB = setupResumableHandler(
+      kv,
+      makeProvider([summaryXml({ title: "Treatment B" })]),
+    );
+
+    await treatmentB.handler({ sessionId: "ses_treatment_run_ids" });
+    const runIds = (await kv.list<any>("summary-resumable-runs"))
+      .map((run) => run.id);
+
+    expect(runIds).toHaveLength(2);
+    expect(runIds).toContain(runA.id);
+    expect(new Set(runIds)).toHaveLength(2);
   });
 
   it("retries a skipped chunk and recovers a legacy too-many-skips terminal run", async () => {
@@ -948,13 +1432,19 @@ describe("mem::summarize-resumable", () => {
       "status",
       "success",
       "summary",
+      "telemetry",
       "totalChunks",
     ]);
     const stored = await kv.get<any>("summaries", "ses_reduce");
     expect(stored?.title).toBe("Merged");
 
     const repeated = await handler({ sessionId: "ses_reduce" });
-    expect(repeated).toEqual(result);
+    expect(repeated).toMatchObject({
+      success: true,
+      status: "succeeded",
+      summary: { title: "Merged", observationCount: 250 },
+    });
+    expect(repeated.telemetry).toBeUndefined();
     expect(provider.calls).toHaveLength(4);
   });
 

@@ -7,6 +7,7 @@ vi.mock("../src/logger.js", () => ({
 import {
   planConsolidateObservationWindows,
   runConsolidateObservationWindow,
+  registerConsolidateFunction,
 } from "../src/functions/consolidate.js";
 import {
   getMemoryConsolidateCompressTimeoutMs,
@@ -62,6 +63,9 @@ function observation(id: string, importance: number): CompressedObservation {
 describe("consolidate full window helpers", () => {
   afterEach(() => {
     delete process.env.AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS;
+    delete process.env.AGENTMEMORY_EVALUATION_MODE;
+    delete process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY;
+    delete process.env.PI_AGENT_MODEL;
     vi.useRealTimers();
   });
 
@@ -84,6 +88,11 @@ describe("consolidate full window helpers", () => {
       concept: "windows",
       observationCount: 4,
     });
+    expect(result.plannerConfig).toEqual({
+      minImportance: 5,
+      minObservationsPerConcept: 3,
+    });
+    expect(result.eligibleWindowMaxObservationCount).toBe(4);
   });
 
   it("bounds AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS config", () => {
@@ -174,6 +183,57 @@ describe("consolidate full window helpers", () => {
     }
     expect(result.maxWindowEstimatedChars).toBeLessThanOrEqual(250);
     expect(result.overBudgetWindowCount).toBe(0);
+  });
+
+  it("keeps every planned in-budget observation window within the executor prompt budget", async () => {
+    const kv = mockKV();
+    await kv.set(KV.sessions, "ses-a", session("ses-a"));
+    for (let i = 0; i < 3; i++) {
+      const obs = {
+        ...observation(`obs-${i}`, 10),
+        type: "architecture" as const,
+        title: `T${i}`,
+        narrative: "N",
+        files: ["f.ts"],
+      };
+      await kv.set(KV.observations("ses-a"), obs.id, obs);
+    }
+    const provider: MemoryProvider = {
+      name: "test",
+      summarize: vi.fn(),
+      compress: vi.fn().mockResolvedValue(`
+<memory>
+  <type>pattern</type>
+  <title>Window Pattern</title>
+  <content>Full window content.</content>
+  <concepts><concept>windows</concept></concepts>
+  <files><file>file.ts</file></files>
+  <strength>8</strength>
+</memory>`),
+    };
+
+    const plan = await planConsolidateObservationWindows({
+      kv: kv as never,
+      minObservations: 3,
+      charBudget: 93,
+    });
+    const inBudgetWindows = plan.windows.filter((window) => !window.overBudget);
+    const executions = await Promise.all(inBudgetWindows.map((window) =>
+      runConsolidateObservationWindow({
+        kv: kv as never,
+        provider,
+        concept: window.concept,
+        observationIds: window.observationIds,
+        charBudget: 93,
+      }),
+    ));
+
+    expect(executions.map((execution) => execution.promptChars)).toEqual(
+      inBudgetWindows.map((window) => window.estimatedChars),
+    );
+    expect(inBudgetWindows).toHaveLength(3);
+    expect(executions).not.toContainEqual(expect.objectContaining({ error: "input_too_large" }));
+    expect(provider.compress).toHaveBeenCalledTimes(inBudgetWindows.length);
   });
 
   it("marks a single oversized observation without recursively splitting it", async () => {
@@ -281,6 +341,116 @@ describe("consolidate full window helpers", () => {
     expect(stored).toHaveLength(1);
   });
 
+  it("uses compress detailed results and returns one sanitized telemetry record", async () => {
+    const kv = mockKV();
+    await kv.set(KV.sessions, "ses-a", session("ses-a"));
+    for (let i = 0; i < 3; i++) {
+      const obs = observation(`obs-${i}`, 20 - i);
+      await kv.set(KV.observations("ses-a"), obs.id, obs);
+    }
+    const provider: MemoryProvider = {
+      name: "pi-agent-sdk",
+      summarize: vi.fn(() => {
+        throw new Error("summarize must not be used for memory consolidate");
+      }),
+      compress: vi.fn(() => {
+        throw new Error("legacy compress path should not be used");
+      }),
+      compressWithMetadata: vi.fn(async () => ({
+        text: `
+<memory>
+  <type>pattern</type>
+  <title>Detailed Window Pattern</title>
+  <content>Detailed content.</content>
+  <concepts><concept>windows</concept></concepts>
+  <files><file>file.ts</file></files>
+  <strength>8</strength>
+</memory>`,
+        metadata: {
+          inputTokens: 101,
+          outputTokens: 23,
+          totalTokens: 124,
+          maxOutputTokens: 4096,
+          stopReason: "stop" as const,
+          responseModel: "memory-model",
+          contextWindow: 128000,
+          modelMaxTokens: 8192,
+        },
+      })),
+    };
+
+    const result = await runConsolidateObservationWindow({
+      kv: kv as never,
+      provider,
+      concept: "windows",
+      minObservations: 3,
+    });
+
+    expect(result.success).toBe(true);
+    expect(provider.compressWithMetadata).toHaveBeenCalledTimes(1);
+    expect(provider.summarize).not.toHaveBeenCalled();
+    expect(result.telemetry).toEqual([
+      {
+        operation: "compress",
+        callRole: "window",
+        callIndex: 0,
+        metadataStatus: "supported",
+        metadata: expect.objectContaining({
+          inputTokens: 101,
+          outputTokens: 23,
+          totalTokens: 124,
+          maxOutputTokens: 4096,
+        }),
+        promptChars: expect.any(Number),
+        providerInvoked: true,
+        durationMs: expect.any(Number),
+      },
+    ]);
+  });
+
+  it("blocks memory consolidate before compress reaches the provider", async () => {
+    process.env.AGENTMEMORY_EVALUATION_MODE = "context-strategy";
+    process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY = JSON.stringify({
+      schemaVersion: 1,
+      expectedProvider: "pi-agent-sdk",
+      expectedModel: "gpt-5.4",
+      worstTokensPerChar: 0.5,
+      fixedTokens: 1,
+      proportionalReserve: 0,
+      contextWindow: 1,
+      modelMaxTokens: 8192,
+      maxOutputTokens: 128,
+      reasoningReserve: 0,
+      safetyMargin: 0,
+      calibrationHash: `sha256:${"b".repeat(64)}`,
+    });
+    process.env.PI_AGENT_MODEL = "gpt-5.4";
+    const kv = mockKV();
+    await kv.set(KV.sessions, "ses-a", session("ses-a"));
+    for (let i = 0; i < 3; i++) {
+      await kv.set(KV.observations("ses-a"), `obs-${i}`, observation(`obs-${i}`, 20 - i));
+    }
+    const provider: MemoryProvider & { compressWithMetadata: ReturnType<typeof vi.fn> } = {
+      name: "pi-agent-sdk",
+      summarize: vi.fn(),
+      compress: vi.fn(),
+      compressWithMetadata: vi.fn(async () => ({ text: "unexpected" })),
+    };
+
+    const result: any = await runConsolidateObservationWindow({
+      kv: kv as never,
+      provider,
+      concept: "windows",
+      minObservations: 3,
+    });
+
+    expect(result).toMatchObject({ success: false, status: "infeasible", error: "infeasible" });
+    expect(provider.compressWithMetadata).not.toHaveBeenCalled();
+    expect(result.telemetry).toEqual([
+      expect.objectContaining({ providerInvoked: false, preflightBlocked: true }),
+    ]);
+  });
+
   it("uses AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS for full window compress timeout", async () => {
     vi.useFakeTimers();
     process.env.AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS = "1";
@@ -313,5 +483,40 @@ describe("consolidate full window helpers", () => {
       error: expect.stringContaining("compress timeout"),
     });
     expect((result as Record<string, unknown>).durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("records the real duration for a legacy consolidate timeout attempt", async () => {
+    vi.useFakeTimers();
+    process.env.AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS = "1";
+    const kv = mockKV();
+    await kv.set(KV.sessions, "ses-a", session("ses-a"));
+    for (let i = 0; i < 10; i++) {
+      const obs = observation(`obs-${i}`, 20 - i);
+      await kv.set(KV.observations("ses-a"), obs.id, obs);
+    }
+    const provider: MemoryProvider = {
+      name: "test",
+      summarize: vi.fn(),
+      compress: vi.fn(() => new Promise<string>(() => {})),
+    };
+    const functions = new Map<string, Function>();
+    const sdk = {
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    };
+    registerConsolidateFunction(sdk as never, kv as never, provider);
+
+    const pending = functions.get("mem::consolidate")!({
+      project: "agentmemory",
+      minObservations: 3,
+    });
+    await vi.advanceTimersByTimeAsync(1);
+    const result = await pending;
+
+    expect(result.telemetry).toHaveLength(1);
+    expect(result.telemetry[0]).toMatchObject({
+      operation: "compress",
+      metadataStatus: "unsupported",
+    });
+    expect(result.telemetry[0].durationMs).toBeGreaterThan(0);
   });
 });

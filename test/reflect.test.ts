@@ -6,6 +6,7 @@ vi.mock("../src/logger.js", () => ({
 
 import { registerReflectFunctions, runReflectInsightWindow } from "../src/functions/reflect.js";
 import type { Insight, GraphNode, GraphEdge, SemanticMemory, Lesson, Crystal } from "../src/types.js";
+import { ProviderCallError } from "../src/providers/provider-call-result.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -140,6 +141,8 @@ describe("Reflect", () => {
 
   afterEach(() => {
     delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+    delete process.env.AGENTMEMORY_EVALUATION_MODE;
+    delete process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY;
   });
 
   describe("mem::reflect", () => {
@@ -310,6 +313,122 @@ describe("Reflect", () => {
       expect(provider.summarize).toHaveBeenCalled();
       expect(listSpy).not.toHaveBeenCalledWith("mem:graph:nodes");
       expect(listSpy).not.toHaveBeenCalledWith("mem:graph:edges");
+    });
+
+    it("returns reflect summarize telemetry without exposing insight text", async () => {
+      provider.name = "pi-agent-sdk";
+      provider.summarize = vi.fn(() => {
+        throw new Error("legacy summarize path should not be used");
+      });
+      (provider as any).summarizeWithMetadata = vi.fn(async () => ({
+        text: XML_RESPONSE,
+        metadata: {
+          inputTokens: 18,
+          outputTokens: 12,
+          totalTokens: 30,
+          maxOutputTokens: 4096,
+          stopReason: "stop" as const,
+          responseModel: "reflect-model",
+        },
+      }));
+      await kv.set("mem:semantic", "sem_1", makeSemantic("security validation is important", "sem_1"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("Use security headers", ["security"]));
+      await kv.set("mem:crystals", "crys_1", makeCrystal("Completed security validation cleanup", ["security"]));
+
+      const result = await runReflectInsightWindow({
+        kv: kv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: ["sem_1"],
+        lessonIds: ["lsn_1"],
+        crystalIds: ["crys_1"],
+      });
+
+      expect(result.success).toBe(true);
+      expect(result.telemetry).toEqual([
+        expect.objectContaining({
+          operation: "summarize",
+          callRole: "window",
+          callIndex: 0,
+          metadataStatus: "supported",
+          metadata: expect.objectContaining({
+            inputTokens: 18,
+            totalTokens: 30,
+            maxOutputTokens: 4096,
+          }),
+        }),
+      ]);
+      expect(JSON.stringify(result.telemetry)).not.toContain("Defense in Depth");
+    });
+
+    it("blocks reflect extraction before the provider", async () => {
+      process.env.AGENTMEMORY_EVALUATION_MODE = "context-strategy";
+      process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY = JSON.stringify({
+        schemaVersion: 1,
+        expectedProvider: "pi-agent-sdk",
+        expectedModel: "gpt-5.4",
+        worstTokensPerChar: 0.5,
+        fixedTokens: 1,
+        proportionalReserve: 0,
+        contextWindow: 1,
+        modelMaxTokens: 8192,
+        maxOutputTokens: 128,
+        reasoningReserve: 0,
+        safetyMargin: 0,
+        calibrationHash: `sha256:${"e".repeat(64)}`,
+      });
+      provider.name = "pi-agent-sdk";
+      (provider as any).model = "gpt-5.4";
+      (provider as any).summarizeWithMetadata = vi.fn(async () => ({ text: "unexpected" }));
+      await kv.set("mem:semantic", "sem_preflight", makeSemantic("security validation is important", "sem_preflight"));
+      await kv.set("mem:lessons", "lsn_preflight", makeLesson("Use security headers", ["security"]));
+      await kv.set("mem:crystals", "crys_preflight", makeCrystal("Completed security cleanup", ["security"]));
+
+      const result: any = await runReflectInsightWindow({
+        kv: kv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: ["sem_preflight"],
+        lessonIds: ["lsn_preflight"],
+        crystalIds: ["crys_preflight"],
+      });
+
+      expect(result).toMatchObject({ success: false, status: "infeasible", error: "infeasible" });
+      expect((provider as any).summarizeWithMetadata).not.toHaveBeenCalled();
+      expect(result.telemetry).toEqual([
+        expect.objectContaining({ providerInvoked: false, preflightBlocked: true }),
+      ]);
+    });
+
+    it("keeps ProviderCallError metadata on a reflect failure response", async () => {
+      const metadata = {
+        inputTokens: 2,
+        outputTokens: 0,
+        totalTokens: 2,
+        maxOutputTokens: 4096,
+        stopReason: "error" as const,
+        responseModel: "reflect-error-model",
+      };
+      (provider as any).summarizeWithMetadata = vi.fn(async () => {
+        throw new ProviderCallError("pi_stream_failed", metadata);
+      });
+      await kv.set("mem:semantic", "sem_1", makeSemantic("fact about concept_a"));
+      await kv.set("mem:lessons", "lsn_1", makeLesson("lesson about concept_a", ["concept_a"]));
+      await kv.set("mem:crystals", "crys_1", makeCrystal("crystal about concept_a", ["concept_a"]));
+
+      const result = await runReflectInsightWindow({
+        kv: kv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: ["sem_1"],
+        lessonIds: ["lsn_1"],
+        crystalIds: ["crys_1"],
+      });
+
+      expect(result.success).toBe(false);
+      expect(result.telemetry).toEqual([
+        expect.objectContaining({ metadataStatus: "supported", metadata }),
+      ]);
     });
   });
 

@@ -15,6 +15,13 @@ import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 import { REFLECT_OUTPUT_CONTRACT } from "../prompts/reflect.js";
 import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 import {
+  callProviderWithTelemetry,
+  isProviderPreflightError,
+  providerPreflightStatus,
+  sortProviderCallTelemetry,
+  type ProviderCallTelemetry,
+} from "../providers/provider-call-result.js";
+import {
   resolveStageModelCallOptions,
   resolveStageModelMetadata,
 } from "../config.js";
@@ -197,11 +204,25 @@ function summarizeWithOptions(
   systemPrompt: string,
   userPrompt: string,
   model?: string,
+  telemetry?: ProviderCallTelemetry[],
+  callIndex = 0,
 ): Promise<string> {
   const callOptions = resolveStageModelCallOptions("reflect_insight", model);
-  return callOptions
-    ? provider.summarize(systemPrompt, userPrompt, callOptions)
-    : provider.summarize(systemPrompt, userPrompt);
+  if (!telemetry) {
+    return callOptions
+      ? provider.summarize(systemPrompt, userPrompt, callOptions)
+      : provider.summarize(systemPrompt, userPrompt);
+  }
+  return callProviderWithTelemetry({
+    provider,
+    operation: "summarize",
+    callRole: "window",
+    callIndex,
+    systemPrompt,
+    userPrompt,
+    callOptions,
+    telemetry,
+  });
 }
 
 export async function planReflectInsightWindows(options: {
@@ -380,11 +401,13 @@ export async function runReflectInsightWindow(
   options: ReflectInsightWindowOptions,
 ): Promise<Record<string, unknown>> {
   const startMs = Date.now();
+  const telemetry: ProviderCallTelemetry[] = [];
   const stageMetadata = resolveStageModelMetadata("reflect_insight", options.provider, options.model);
   const responseMetadata = (status: string, extra: Record<string, unknown> = {}) => ({
     status,
     ...stageMetadata,
     durationMs: Date.now() - startMs,
+    telemetry: sortProviderCallTelemetry(telemetry),
     ...extra,
   });
   if (options.useGraph === true) {
@@ -429,6 +452,8 @@ export async function runReflectInsightWindow(
       withOutputLanguagePolicy(REFLECT_SYSTEM, undefined, REFLECT_OUTPUT_CONTRACT),
       prompt,
       options.model,
+      telemetry,
+      0,
     );
     const persisted = await persistReflectInsights({
       kv: options.kv,
@@ -455,6 +480,10 @@ export async function runReflectInsightWindow(
       }),
     };
   } catch (err) {
+    if (isProviderPreflightError(err)) {
+      const status = providerPreflightStatus(err);
+      return { success: false, error: status, ...responseMetadata(status) };
+    }
     return { success: false, error: err instanceof Error ? err.message : String(err), ...responseMetadata("failed") };
   }
 }
@@ -493,6 +522,8 @@ export function registerReflectFunctions(
       const maxClusters = Math.min(data?.maxClusters ?? 10, 20);
       const maxInsightsPerCluster = 5;
       const maxTotal = 50;
+      const telemetry: ProviderCallTelemetry[] = [];
+      let callIndex = 0;
 
       const [graphNodes, graphEdges, semanticMemories, lessons, crystals] =
         await Promise.all([
@@ -583,6 +614,8 @@ export function registerReflectFunctions(
             withOutputLanguagePolicy(REFLECT_SYSTEM, undefined, REFLECT_OUTPUT_CONTRACT),
             prompt,
             data?.model,
+            telemetry,
+            callIndex++,
           );
 
           const insightRegex =
@@ -636,7 +669,11 @@ export function registerReflectFunctions(
             clusterCount++;
             totalInsights++;
           }
-        } catch {
+        } catch (error) {
+          if (isProviderPreflightError(error)) {
+            const status = providerPreflightStatus(error);
+            return { success: false, error: status, status, telemetry: sortProviderCallTelemetry(telemetry) };
+          }
           continue;
         }
       }
@@ -658,6 +695,7 @@ export function registerReflectFunctions(
         clustersProcessed: conceptClusters.length - clustersSkipped,
         clustersSkipped,
         usedFallback,
+        telemetry: sortProviderCallTelemetry(telemetry),
       };
     },
   );

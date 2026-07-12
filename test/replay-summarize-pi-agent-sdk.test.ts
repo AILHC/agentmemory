@@ -25,8 +25,8 @@ vi.mock("../src/functions/audit.js", () => ({
 
 const streamCalls: Array<{ context: unknown; options: unknown }> = [];
 
-vi.mock("@earendil-works/pi-ai/openai-codex-responses", () => ({
-  streamSimpleOpenAICodexResponses: vi.fn(
+vi.mock("@earendil-works/pi-ai/compat", () => ({
+  streamSimple: vi.fn(
     async function* (_model: unknown, context: unknown, options: unknown) {
       streamCalls.push({ context, options });
       yield {
@@ -34,15 +34,27 @@ vi.mock("@earendil-works/pi-ai/openai-codex-responses", () => ({
         text_delta:
           "<summary><title>Claude replay session</title><narrative>Recovered from import</narrative></summary>",
       };
+      yield {
+        type: "done",
+        reason: "stop",
+        message: {
+          model: "gpt-5.4",
+          responseModel: "gpt-5.4-response",
+          usage: { input: 17, output: 9, totalTokens: 26 },
+        },
+      };
     },
   ),
 }));
 
-vi.mock("@earendil-works/pi-ai", () => ({
-  getModel: vi.fn(() => ({ provider: "openai-codex", model: "gpt-5.4" })),
+vi.mock("@earendil-works/pi-ai/providers/all", () => ({
+  getBuiltinModel: vi.fn(() => ({ provider: "openai-codex", model: "gpt-5.4" })),
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
+  SessionManager: {
+    inMemory: vi.fn(() => ({ getSessionId: () => "019f5a00-0000-7000-8000-000000000001" })),
+  },
   AuthStorage: { create: vi.fn(() => ({ auth: true })) },
   ModelRegistry: {
     create: vi.fn(() => ({
@@ -170,12 +182,30 @@ describe("mem::summarize with pi-agent-sdk provider", () => {
 
     const summarizeResult = (await sdk.trigger("mem::summarize", {
       sessionId,
-    })) as { success: boolean; error?: string };
+    })) as { success: boolean; error?: string; telemetry?: Array<Record<string, unknown>> };
     expect(summarizeResult.success).toBe(true);
+    expect(summarizeResult.telemetry).toEqual([
+      expect.objectContaining({
+        operation: "summarize",
+        callRole: "single",
+        callIndex: 0,
+        metadataStatus: "supported",
+        metadata: expect.objectContaining({
+          inputTokens: 17,
+          outputTokens: 9,
+          totalTokens: 26,
+          maxOutputTokens: 4096,
+          responseModel: "gpt-5.4-response",
+        }),
+      }),
+    ]);
     expect(streamCalls).toHaveLength(1);
     expect(streamCalls[0]).toMatchObject({
       context: { messages: [{ role: "user", content: expect.any(String) }] },
-      options: { transport: "sse" },
+      options: {
+        transport: "auto",
+        sessionId: "019f5a00-0000-7000-8000-000000000001",
+      },
     });
   });
 });

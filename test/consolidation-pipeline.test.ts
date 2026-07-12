@@ -24,6 +24,7 @@ import {
 } from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled, resolveStageModelCallOptions, resolveStageModelMetadata } from "../src/config.js";
 import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
+import { ProviderCallError } from "../src/providers/provider-call-result.js";
 import { logger } from "../src/logger.js";
 
 function mockKV() {
@@ -108,6 +109,8 @@ describe("Consolidation Pipeline", () => {
 
   afterEach(() => {
     delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
+    delete process.env.AGENTMEMORY_EVALUATION_MODE;
+    delete process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY;
   });
 
   it("fails fast for unsupported output language instead of returning success with tier errors", async () => {
@@ -178,7 +181,7 @@ describe("Consolidation Pipeline", () => {
       name: "test",
       compress: vi.fn(),
       summarize: vi.fn().mockResolvedValue(
-        `<facts><fact confidence="0.9">TypeScript is the primary language</fact></facts>`,
+        `<facts><fact confidence="0.9">TypeScript 是主要语言</fact></facts>`,
       ),
     };
     registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
@@ -192,12 +195,23 @@ describe("Consolidation Pipeline", () => {
     })) as { success: boolean; results: Record<string, unknown> };
 
     expect(result.success).toBe(true);
-    const semantic = result.results.semantic as { newFacts: number };
+    const semantic = result.results.semantic as {
+      newFacts: number;
+      telemetry: Array<Record<string, unknown>>;
+    };
     expect(semantic.newFacts).toBe(1);
+    expect(semantic.telemetry).toEqual([
+      expect.objectContaining({
+        operation: "summarize",
+        callRole: "window",
+        callIndex: 0,
+        metadataStatus: "unsupported",
+      }),
+    ]);
 
     const stored = await kv.list<SemanticMemory>("mem:semantic");
     expect(stored.length).toBe(1);
-    expect(stored[0].fact).toBe("TypeScript is the primary language");
+    expect(stored[0].fact).toBe("TypeScript 是主要语言");
     expect(stored[0].confidence).toBe(0.9);
     expect(provider.summarize).toHaveBeenCalledWith(
       expect.stringContaining("AgentMemory Output Language Policy"),
@@ -222,14 +236,53 @@ describe("Consolidation Pipeline", () => {
 
     const result = (await sdk.trigger("mem::consolidate-pipeline", {
       tier: "semantic",
-    })) as { success: boolean; results: { semantic: { languageViolations?: string[] } } };
+    })) as {
+      success: boolean;
+      results: {
+        semantic: {
+          languageViolations?: string[];
+          telemetry: Array<Record<string, unknown>>;
+        };
+      };
+    };
 
     expect(result.success).toBe(true);
     expect(result.results.semantic.languageViolations).toBeUndefined();
     const stored = await kv.list<SemanticMemory>("mem:semantic");
     expect(stored).toHaveLength(1);
     expect(stored[0].fact).toBe("这是中文事实。");
+    expect(result.results.semantic.telemetry.map((item) => item.callIndex)).toEqual([0, 1]);
+    expect(result.results.semantic.telemetry.every((item) => item.metadataStatus === "unsupported")).toBe(true);
     expect(logger.warn).toHaveBeenCalled();
+  });
+
+  it("keeps the first semantic extraction when strict retry fails and records both attempts", async () => {
+    process.env.AGENTMEMORY_OUTPUT_LANGUAGE = "zh-CN";
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn()
+        .mockResolvedValueOnce("<facts><fact confidence=\"0.88\">This is English only.</fact></facts>")
+        .mockRejectedValueOnce(new Error("strict retry failed")),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as {
+      success: boolean;
+      results: { semantic: { telemetry: Array<Record<string, unknown>> } };
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.results.semantic.telemetry.map((item) => item.callIndex)).toEqual([0, 1]);
+    const stored = await kv.list<SemanticMemory>("mem:semantic");
+    expect(stored).toHaveLength(1);
+    expect(stored[0].fact).toBe("This is English only.");
   });
 
   it("keeps non-Chinese semantic facts with warning when retry also violates language contract", async () => {
@@ -249,14 +302,72 @@ describe("Consolidation Pipeline", () => {
 
     const result = (await sdk.trigger("mem::consolidate-pipeline", {
       tier: "semantic",
-    })) as { success: boolean; results: { semantic: { languageViolations?: string[] } } };
+    })) as {
+      success: boolean;
+      results: {
+        semantic: {
+          languageViolations?: string[];
+          telemetry: Array<Record<string, unknown>>;
+        };
+      };
+    };
 
     expect(result.success).toBe(true);
     expect(result.results.semantic.languageViolations).toEqual(["Still English after retry."]);
     const stored = await kv.list<SemanticMemory>("mem:semantic");
     expect(stored).toHaveLength(1);
     expect(stored[0].fact).toBe("Still English after retry.");
+    expect(result.results.semantic.telemetry.map((item) => item.callIndex)).toEqual([0, 1]);
     expect(logger.warn).toHaveBeenCalled();
+  });
+
+  it("keeps ProviderCallError metadata on the first semantic attempt", async () => {
+    const metadata = {
+      inputTokens: 7,
+      outputTokens: 0,
+      totalTokens: 7,
+      maxOutputTokens: 4096,
+      stopReason: "error" as const,
+      responseModel: "semantic-error-model",
+    };
+    const provider = {
+      name: "pi-agent-sdk",
+      compress: vi.fn(),
+      summarize: vi.fn().mockRejectedValue(new Error("legacy summarize should not be used")),
+      summarizeWithMetadata: vi.fn(async () => {
+        throw new ProviderCallError("pi_stream_failed", metadata);
+      }),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+
+    for (let i = 0; i < 6; i++) {
+      await kv.set("mem:summaries", `ses_${i}`, makeSummary(i));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "semantic",
+    })) as {
+      success: boolean;
+      results: {
+        semantic: {
+          error: string;
+          telemetry: Array<Record<string, unknown>>;
+        };
+      };
+    };
+
+    expect(result.success).toBe(true);
+    expect(result.results.semantic.error).toBe("pi_stream_failed");
+    expect(result.results.semantic.telemetry).toEqual([
+      expect.objectContaining({
+        operation: "summarize",
+        callRole: "window",
+        callIndex: 0,
+        metadataStatus: "supported",
+        metadata,
+      }),
+    ]);
+    expect(JSON.stringify(result.results.semantic.telemetry)).not.toContain("pi_stream_failed");
   });
 
   it("with enough patterns, creates procedural memories from provider response", async () => {
@@ -291,6 +402,126 @@ describe("Consolidation Pipeline", () => {
       expect.stringContaining("AgentMemory Output Language Policy"),
       expect.any(String),
     );
+  });
+
+  it("returns procedural summarize telemetry and keeps the compress path unused", async () => {
+    const provider = {
+      name: "pi-agent-sdk",
+      compress: vi.fn(() => {
+        throw new Error("compress must not be used for procedural extraction");
+      }),
+      summarize: vi.fn(() => {
+        throw new Error("legacy summarize path should not be used");
+      }),
+      summarizeWithMetadata: vi.fn(async () => ({
+        text: '<procedures><procedure name="Telemetry Workflow" trigger="when observing"><step>Observe</step><step>Record</step></procedure></procedures>',
+        metadata: {
+          inputTokens: 14,
+          outputTokens: 8,
+          totalTokens: 22,
+          maxOutputTokens: 4096,
+          stopReason: "stop" as const,
+          responseModel: "procedural-model",
+        },
+      })),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    for (let i = 0; i < 3; i++) {
+      await kv.set("mem:memories", `mem_${i}`, makePattern(i));
+    }
+
+    const result = (await sdk.trigger("mem::consolidate-pipeline", {
+      tier: "procedural",
+    })) as any;
+
+    expect(result.success).toBe(true);
+    expect(provider.summarize).not.toHaveBeenCalled();
+    expect(provider.compress).not.toHaveBeenCalled();
+    expect(result.results.procedural.telemetry).toEqual([
+      expect.objectContaining({
+        operation: "summarize",
+        callRole: "window",
+        callIndex: 0,
+        metadataStatus: "supported",
+        metadata: expect.objectContaining({
+          inputTokens: 14,
+          totalTokens: 22,
+          maxOutputTokens: 4096,
+        }),
+      }),
+    ]);
+    expect(JSON.stringify(result.results.procedural.telemetry)).not.toContain("Telemetry Workflow");
+  });
+
+  it("keeps ProviderCallError metadata on a procedural window failure", async () => {
+    const metadata = {
+      inputTokens: 3,
+      outputTokens: 0,
+      totalTokens: 3,
+      maxOutputTokens: 4096,
+      stopReason: "error" as const,
+      responseModel: "procedural-error-model",
+    };
+    const provider = {
+      name: "pi-agent-sdk",
+      compress: vi.fn(),
+      summarize: vi.fn(),
+      summarizeWithMetadata: vi.fn(async () => {
+        throw new ProviderCallError("pi_stream_failed", metadata);
+      }),
+    };
+    await kv.set("mem:memories", "mem_1", makePattern(1));
+    await kv.set("mem:memories", "mem_2", makePattern(2));
+
+    const result = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["mem_1", "mem_2"],
+    });
+
+    expect(result.success).toBe(false);
+    expect(result.telemetry).toEqual([
+      expect.objectContaining({ metadataStatus: "supported", metadata }),
+    ]);
+  });
+
+  it("blocks procedural extraction before the provider", async () => {
+    process.env.AGENTMEMORY_EVALUATION_MODE = "context-strategy";
+    process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY = JSON.stringify({
+      schemaVersion: 1,
+      expectedProvider: "pi-agent-sdk",
+      expectedModel: "gpt-5.4",
+      worstTokensPerChar: 0.5,
+      fixedTokens: 1,
+      proportionalReserve: 0,
+      contextWindow: 1,
+      modelMaxTokens: 8192,
+      maxOutputTokens: 128,
+      reasoningReserve: 0,
+      safetyMargin: 0,
+      calibrationHash: `sha256:${"d".repeat(64)}`,
+    });
+    const provider = {
+      name: "pi-agent-sdk",
+      model: "gpt-5.4",
+      compress: vi.fn(),
+      summarize: vi.fn(),
+      summarizeWithMetadata: vi.fn(async () => ({ text: "unexpected" })),
+    };
+    await kv.set("mem:memories", "mem_preflight_1", { ...makePattern(1), id: "mem_preflight_1" });
+    await kv.set("mem:memories", "mem_preflight_2", { ...makePattern(2), id: "mem_preflight_2" });
+
+    const result: any = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["mem_preflight_1", "mem_preflight_2"],
+    });
+
+    expect(result).toMatchObject({ success: false, status: "infeasible", error: "infeasible" });
+    expect(provider.summarizeWithMetadata).not.toHaveBeenCalled();
+    expect(result.telemetry).toEqual([
+      expect.objectContaining({ providerInvoked: false, preflightBlocked: true }),
+    ]);
   });
 
   it("full procedural window only uses latest recurring pattern memories", async () => {

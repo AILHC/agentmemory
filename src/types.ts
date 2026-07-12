@@ -207,10 +207,67 @@ export interface MemoryProviderCallOptions {
   modelSource?: string;
 }
 
+export type ProviderStopReason =
+  | "stop"
+  | "max_tokens"
+  | "tool_use"
+  | "error"
+  | "aborted";
+
+export type ProviderErrorCode =
+  | "model_not_found"
+  | "rate_limited"
+  | "timeout"
+  | "provider_rejected"
+  | "unknown";
+
+export interface ProviderCallMetadata {
+  inputTokens?: number;
+  inputUncachedTokens?: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  maxOutputTokens?: number;
+  stopReason?: ProviderStopReason;
+  responseModel?: string;
+  contextWindow?: number;
+  modelMaxTokens?: number;
+  providerErrorCode?: ProviderErrorCode;
+}
+
+export interface ContextPreflightPolicy {
+  schemaVersion: 1;
+  expectedProvider: "pi-agent-sdk";
+  expectedModel: string;
+  worstTokensPerChar: number;
+  fixedTokens: number;
+  proportionalReserve: number;
+  contextWindow: number;
+  modelMaxTokens: number;
+  maxOutputTokens: number;
+  reasoningReserve: number;
+  safetyMargin: number;
+  calibrationHash: string;
+}
+
+export interface ProviderCallResult {
+  text: string;
+  metadata?: ProviderCallMetadata;
+}
+
+export interface ModelCapabilities {
+  contextWindow?: number;
+  modelMaxTokens?: number;
+}
+
 export interface MemoryProvider {
   name: string;
   compress(systemPrompt: string, userPrompt: string, options?: MemoryProviderCallOptions): Promise<string>;
   summarize(systemPrompt: string, userPrompt: string, options?: MemoryProviderCallOptions): Promise<string>;
+  compressWithMetadata?(systemPrompt: string, userPrompt: string, options?: MemoryProviderCallOptions): Promise<ProviderCallResult>;
+  summarizeWithMetadata?(systemPrompt: string, userPrompt: string, options?: MemoryProviderCallOptions): Promise<ProviderCallResult>;
+  resolveModelCapabilities?(options?: MemoryProviderCallOptions): Promise<ModelCapabilities>;
   describeImage?(imageData: string, mimeType: string, prompt: string): Promise<string>;
 }
 

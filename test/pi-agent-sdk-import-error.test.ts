@@ -10,10 +10,10 @@ describe("pi-agent-sdk import failure", () => {
         create: vi.fn(),
       },
     }));
-    vi.doMock("@earendil-works/pi-ai", () => ({
-      getModel: vi.fn(),
+    vi.doMock("@earendil-works/pi-ai/providers/all", () => ({
+      getBuiltinModel: vi.fn(),
     }));
-    vi.doMock("@earendil-works/pi-ai/openai-codex-responses", () => {
+    vi.doMock("@earendil-works/pi-ai/compat", () => {
       throw new Error("real import failure should be hidden");
     });
 

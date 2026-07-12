@@ -32,6 +32,13 @@ import {
   resolveStageModelMetadata,
 } from "../config.js";
 import { logger } from "../logger.js";
+import {
+  callProviderWithTelemetry,
+  isProviderPreflightError,
+  providerPreflightStatus,
+  sortProviderCallTelemetry,
+  type ProviderCallTelemetry,
+} from "../providers/provider-call-result.js";
 
 export interface ConsolidationProceduralWindow {
   windowId: string;
@@ -61,17 +68,6 @@ function buildSemanticRetryContractPrompt(): string {
     SEMANTIC_MERGE_OUTPUT_CONTRACT.semantic?.[0] ?? "每个 <fact> 内容必须使用简体中文。",
     "若仍有非中文 fact，先保留语义与关键技术名词，再补充可读中文句子；保持 XML 与属性不变。",
   ].join("\n");
-}
-
-function summarizeWithOptions(
-  provider: MemoryProvider,
-  systemPrompt: string,
-  userPrompt: string,
-  callOptions?: MemoryProviderCallOptions,
-): Promise<string> {
-  return callOptions
-    ? provider.summarize(systemPrompt, userPrompt, callOptions)
-    : provider.summarize(systemPrompt, userPrompt);
 }
 
 function applyDecay(
@@ -141,14 +137,25 @@ async function extractProceduralMemories(
   provider: MemoryProvider,
   patterns: Array<{ content: string; frequency: number }>,
   callOptions?: MemoryProviderCallOptions,
-): Promise<{ newProcedures: number; patternsAnalyzed: number; proceduralMemoryIds: string[] }> {
+  telemetry: ProviderCallTelemetry[] = [],
+  callIndex = 0,
+): Promise<{
+  newProcedures: number;
+  patternsAnalyzed: number;
+  proceduralMemoryIds: string[];
+  telemetry: ProviderCallTelemetry[];
+}> {
   const prompt = buildProceduralExtractionPrompt(patterns);
-  const response = await summarizeWithOptions(
+  const response = await callProviderWithTelemetry({
     provider,
-    withOutputLanguagePolicy(PROCEDURAL_EXTRACTION_SYSTEM),
-    prompt,
+    operation: "summarize",
+    callRole: "window",
+    callIndex,
+    systemPrompt: withOutputLanguagePolicy(PROCEDURAL_EXTRACTION_SYSTEM),
+    userPrompt: prompt,
     callOptions,
-  );
+    telemetry,
+  });
 
   const procRegex =
     /<procedure\s+name="([^"]+)"\s+trigger="([^"]+)">([\s\S]*?)<\/procedure>/g;
@@ -197,18 +204,25 @@ async function extractProceduralMemories(
     }
   }
 
-  return { newProcedures: newProcs, patternsAnalyzed: patterns.length, proceduralMemoryIds };
+  return {
+    newProcedures: newProcs,
+    patternsAnalyzed: patterns.length,
+    proceduralMemoryIds,
+    telemetry: sortProviderCallTelemetry(telemetry),
+  };
 }
 
 export async function runConsolidationProceduralWindow(
   options: ConsolidationProceduralWindowOptions,
 ): Promise<Record<string, unknown>> {
   const startMs = Date.now();
+  const telemetry: ProviderCallTelemetry[] = [];
   const stageMetadata = resolveStageModelMetadata("procedural", options.provider, options.model);
   const responseMetadata = (status: string, extra: Record<string, unknown> = {}) => ({
     status,
     ...stageMetadata,
     durationMs: Date.now() - startMs,
+    telemetry: sortProviderCallTelemetry(telemetry),
     ...extra,
   });
   try {
@@ -246,6 +260,8 @@ export async function runConsolidationProceduralWindow(
       options.provider,
       patterns,
       resolveStageModelCallOptions("procedural", options.model),
+      telemetry,
+      0,
     );
     return {
       success: true,
@@ -256,6 +272,10 @@ export async function runConsolidationProceduralWindow(
       }),
     };
   } catch (err) {
+    if (isProviderPreflightError(err)) {
+      const status = providerPreflightStatus(err);
+      return { success: false, error: status, ...responseMetadata(status) };
+    }
     const msg = err instanceof Error ? err.message : String(err);
     logger.error("Full procedural extraction failed", { error: msg });
     return { success: false, error: msg, ...responseMetadata("failed") };
@@ -322,6 +342,7 @@ export function registerConsolidationPipelineFunction(
               concepts: s.concepts,
             })),
           );
+          const semanticTelemetry: ProviderCallTelemetry[] = [];
 
           try {
             const outputLanguage = resolveOutputLanguage();
@@ -339,7 +360,16 @@ export function registerConsolidationPipelineFunction(
             };
 
             let parsedResult = parseResponse(
-              await summarizeWithOptions(provider, baseSystem, prompt, callOptions),
+              await callProviderWithTelemetry({
+                provider,
+                operation: "summarize",
+                callRole: "window",
+                callIndex: 0,
+                systemPrompt: baseSystem,
+                userPrompt: prompt,
+                callOptions,
+                telemetry: semanticTelemetry,
+              }),
             );
 
             if (outputLanguage === "zh-CN" && parsedResult.languageViolations.length > 0) {
@@ -358,7 +388,16 @@ export function registerConsolidationPipelineFunction(
               );
               try {
                 parsedResult = parseResponse(
-                  await summarizeWithOptions(provider, strictSystem, prompt, callOptions),
+                  await callProviderWithTelemetry({
+                    provider,
+                    operation: "summarize",
+                    callRole: "window",
+                    callIndex: 1,
+                    systemPrompt: strictSystem,
+                    userPrompt: prompt,
+                    callOptions,
+                    telemetry: semanticTelemetry,
+                  }),
                 );
               } catch (retryErr) {
                 logger.warn("Semantic merge retry failed; keep first extraction", {
@@ -404,6 +443,7 @@ export function registerConsolidationPipelineFunction(
               newFacts,
               totalSummaries: summaries.length,
               ...(languageViolations.length > 0 ? { languageViolations } : {}),
+              telemetry: sortProviderCallTelemetry(semanticTelemetry),
             };
             if (languageViolations.length > 0) {
               logger.warn("Semantic merge kept non-Chinese facts after retry", {
@@ -413,7 +453,12 @@ export function registerConsolidationPipelineFunction(
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Semantic consolidation failed", { error: msg });
-            results.semantic = { error: msg };
+            const status = isProviderPreflightError(err) ? providerPreflightStatus(err) : "failed";
+            results.semantic = {
+              error: msg,
+              status,
+              telemetry: sortProviderCallTelemetry(semanticTelemetry),
+            };
           }
         } else {
           results.semantic = {
@@ -445,17 +490,32 @@ export function registerConsolidationPipelineFunction(
         }));
 
         if (patterns.length >= 2) {
+          const proceduralTelemetry: ProviderCallTelemetry[] = [];
           try {
             results.procedural = await extractProceduralMemories(
               kv,
               provider,
               patterns,
               proceduralCallOptions,
+              proceduralTelemetry,
+              0,
             );
           } catch (err) {
+            if (isProviderPreflightError(err)) {
+              const status = providerPreflightStatus(err);
+              return {
+                success: false,
+                error: status,
+                status,
+                telemetry: sortProviderCallTelemetry(proceduralTelemetry),
+              };
+            }
             const msg = err instanceof Error ? err.message : String(err);
             logger.error("Procedural extraction failed", { error: msg });
-            results.procedural = { error: msg };
+            results.procedural = {
+              error: msg,
+              telemetry: sortProviderCallTelemetry(proceduralTelemetry),
+            };
           }
         } else {
           results.procedural = {

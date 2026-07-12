@@ -10,6 +10,7 @@ import type {
   ClaudeBridgeConfig,
   TeamConfig,
   MemoryProviderCallOptions,
+  ContextPreflightPolicy,
 } from "./types.js";
 
 function safeParseInt(value: string | undefined, fallback: number): number {
@@ -490,6 +491,123 @@ function getMergedEnv(
 
 export function getEnvVar(key: string): string | undefined {
   return getMergedEnv()[key];
+}
+
+export function getContextPreflightPolicy(
+  env: Record<string, string | undefined> = process.env,
+): ContextPreflightPolicy | undefined {
+  if (env.AGENTMEMORY_EVALUATION_MODE !== "context-strategy") return undefined;
+  const raw = env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY;
+  if (!raw) throw new Error("policy_missing");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("policy_invalid_json");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("policy_invalid");
+  }
+  const value = parsed as Record<string, unknown>;
+  const integerFields = [
+    "fixedTokens",
+    "contextWindow",
+    "modelMaxTokens",
+    "maxOutputTokens",
+    "reasoningReserve",
+    "safetyMargin",
+  ];
+  if (value.schemaVersion !== 1 || value.expectedProvider !== "pi-agent-sdk"
+    || typeof value.expectedModel !== "string" || value.expectedModel.length === 0
+    || typeof value.calibrationHash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(value.calibrationHash)
+    || typeof value.worstTokensPerChar !== "number" || !Number.isFinite(value.worstTokensPerChar) || value.worstTokensPerChar <= 0
+    || typeof value.proportionalReserve !== "number" || !Number.isFinite(value.proportionalReserve)
+    || value.proportionalReserve < 0 || value.proportionalReserve > 1) {
+    throw new Error("policy_invalid");
+  }
+  for (const field of integerFields) {
+    const number = value[field];
+    if (!Number.isSafeInteger(number) || number < 0 || (field !== "reasoningReserve" && field !== "safetyMargin" && number <= 0)) {
+      throw new Error("policy_invalid");
+    }
+  }
+  return value as ContextPreflightPolicy;
+}
+
+export type SummaryExperimentBoundaryPolicy =
+  | "current-turn-aware"
+  | "atomic-turn";
+
+export type SummaryExperimentInputTarget =
+  | { kind: "observation-count"; targetObservations: number }
+  | { kind: "token-target"; targetInputTokens: number };
+
+export interface SummaryExperimentTreatment {
+  boundaryPolicy: SummaryExperimentBoundaryPolicy;
+  inputTarget: SummaryExperimentInputTarget;
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
+export function getSummaryExperimentTreatment(
+  env: Record<string, string | undefined> = process.env,
+): SummaryExperimentTreatment | undefined {
+  if (env.AGENTMEMORY_EVALUATION_MODE !== "context-strategy") return undefined;
+  if (env.AGENTMEMORY_CONTEXT_STRATEGY_TARGET_STAGE !== "summary") return undefined;
+
+  const raw = env.AGENTMEMORY_SUMMARY_CONTEXT_TREATMENT;
+  if (!raw) throw new Error("summary_treatment_missing");
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("summary_treatment_invalid_json");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("summary_treatment_invalid");
+  }
+  const value = parsed as Record<string, unknown>;
+  const keys = Object.keys(value);
+  if (keys.length !== 2 || !keys.includes("boundaryPolicy") || !keys.includes("inputTarget")) {
+    throw new Error("summary_treatment_invalid");
+  }
+  if (value.boundaryPolicy !== "current-turn-aware" && value.boundaryPolicy !== "atomic-turn") {
+    throw new Error("summary_boundary_policy_invalid");
+  }
+  if (!value.inputTarget || typeof value.inputTarget !== "object" || Array.isArray(value.inputTarget)) {
+    throw new Error("summary_input_target_invalid");
+  }
+  const inputTarget = value.inputTarget as Record<string, unknown>;
+  if (inputTarget.kind === "observation-count") {
+    if (Object.keys(inputTarget).length !== 2 || !isPositiveSafeInteger(inputTarget.targetObservations)) {
+      throw new Error("summary_target_observations_invalid");
+    }
+    return {
+      boundaryPolicy: value.boundaryPolicy,
+      inputTarget: {
+        kind: "observation-count",
+        targetObservations: inputTarget.targetObservations,
+      },
+    };
+  }
+  if (inputTarget.kind === "token-target") {
+    if (Object.keys(inputTarget).length !== 2 || !isPositiveSafeInteger(inputTarget.targetInputTokens)) {
+      throw new Error("summary_targetInputTokens_invalid");
+    }
+    if (value.boundaryPolicy !== "atomic-turn") {
+      throw new Error("summary_token_target_requires_atomic_turn");
+    }
+    return {
+      boundaryPolicy: "atomic-turn",
+      inputTarget: {
+        kind: "token-target",
+        targetInputTokens: inputTarget.targetInputTokens,
+      },
+    };
+  }
+  throw new Error("summary_input_target_invalid");
 }
 
 export const SUMMARIZE_CHUNK_SIZE_DEFAULT = 400;
