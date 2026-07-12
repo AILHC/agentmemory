@@ -1749,14 +1749,14 @@ export function registerApiTriggers(
       const filtered = filterAgentId
         ? sessions.filter((s) => s.agentId === filterAgentId)
         : sessions;
-      const summaries = await Promise.all(
-        filtered.map((s) =>
-          kv.get<SessionSummary>(KV.summaries, s.id).catch(() => null),
-        ),
+      const summaries = await kv.list<SessionSummary>(KV.summaries);
+      const summariesBySessionId = new Map(
+        summaries.map((summary) => [summary.sessionId, summary]),
       );
-      const withSummary = filtered.map((s, i) =>
-        summaries[i] ? { ...s, summary: summaries[i] } : s,
-      );
+      const withSummary = filtered.map((session) => {
+        const summary = summariesBySessionId.get(session.id);
+        return summary ? { ...session, summary } : session;
+      });
       return { status_code: 200, body: { sessions: withSummary } };
     },
   );
