@@ -64,6 +64,7 @@ export const KV = {
   lessons: "mem:lessons",
   insights: "mem:insights",
   extractionRuns: "mem:extraction-runs",
+  extractionOperationReceipts: "mem:extraction-operation-receipts",
   graphEdgeHistory: "mem:graph:edge-history",
   lessonExtractionRuns: "mem:lesson-extraction:runs",
   lessonExtractionChunks: (runId: string) => `mem:lesson-extraction:chunks:${runId}`,

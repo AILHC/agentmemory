@@ -203,7 +203,7 @@ describe("mem::summarize with pi-agent-sdk provider", () => {
     expect(streamCalls[0]).toMatchObject({
       context: { messages: [{ role: "user", content: expect.any(String) }] },
       options: {
-        transport: "auto",
+        transport: "sse",
         sessionId: "019f5a00-0000-7000-8000-000000000001",
       },
     });

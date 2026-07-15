@@ -168,6 +168,54 @@ export interface ResumableSummaryPartial {
   createdAt: string;
 }
 
+export type StageFailureClass =
+  | "transient_provider"
+  | "transient_runtime"
+  | "unit"
+  | "hard";
+
+export interface StageFailure {
+  class: StageFailureClass;
+  cause: string;
+  diagnostics?: StageFailureDiagnostics;
+}
+
+export type ExtractionOperationStage =
+  | "memory_consolidate"
+  | "semantic_rollup"
+  | "skill_extract"
+  | "crystal"
+  | "consolidation_procedural"
+  | "reflect_insight";
+
+export interface ExtractionOperationIdentity {
+  runId: string;
+  stage: ExtractionOperationStage;
+  unitId: string;
+  inputHash: string;
+}
+
+export interface ExtractionOperationReceipt<T = unknown>
+  extends ExtractionOperationIdentity {
+  key: string;
+  status: "running" | "succeeded" | "failed";
+  startedAt: string;
+  completedAt?: string;
+  response?: T;
+  failure?: StageFailure;
+}
+
+export type SummaryAdvanceKind = "completed" | "skipped" | "reduced" | "none";
+
+export interface SummaryAdvance {
+  status: "in_progress" | "succeeded" | "failed" | "infeasible" | "preflight_unavailable";
+  advanced: SummaryAdvanceKind;
+  failure?: StageFailure;
+  completedChunks: number;
+  skippedChunks: number;
+  totalChunks: number;
+}
+
 export type HookType =
   | "session_start"
   | "prompt_submit"
@@ -219,9 +267,28 @@ export type ProviderErrorCode =
   | "rate_limited"
   | "timeout"
   | "provider_rejected"
+  | "auth_failed"
+  | "network_error"
+  | "server_error"
   | "unknown";
 
-export interface ProviderCallMetadata {
+export interface ProviderFailureDiagnostics {
+  providerErrorCode: ProviderErrorCode;
+  statusCode?: number;
+  retryAfterMs?: number;
+  elapsedMs: number;
+  inputChars: number;
+  maxOutputTokens: number;
+  responseStarted: boolean;
+  responseModel?: string;
+  stopReason?: ProviderStopReason;
+}
+
+export interface StageFailureDiagnostics extends ProviderFailureDiagnostics {
+  requestPhase: "chunk" | "reduce";
+}
+
+export interface ProviderCallMetadata extends Partial<ProviderFailureDiagnostics> {
   inputTokens?: number;
   inputUncachedTokens?: number;
   cacheReadTokens?: number;
@@ -233,7 +300,6 @@ export interface ProviderCallMetadata {
   responseModel?: string;
   contextWindow?: number;
   modelMaxTokens?: number;
-  providerErrorCode?: ProviderErrorCode;
 }
 
 export interface ContextPreflightPolicy {
@@ -1051,6 +1117,7 @@ export interface LessonExtractionRun {
   replacedLessonIds: string[];
   skippedReason?: string;
   lastError?: string;
+  failureDiagnostics?: StageFailureDiagnostics;
   provider?: string;
   model?: string;
   modelSource?: string;

@@ -17,16 +17,33 @@ const state = vi.hoisted(() => ({
   apiKey: "pi-key",
   credentialsHeaders: { "x-test": "1" },
   throwStream: false,
+  streamError: null as Error | null,
+  providerResponses: [] as Array<{ status: number; headers: Record<string, string> }>,
   missingModel: false,
   modelFallback: null as unknown,
   getCredentialsThrows: false,
   streamForPrompt: null as ((context: unknown) => unknown[]) | null,
+  cleanupCalls: [] as string[],
+  sessionCounter: 0,
+}));
+
+vi.mock("@earendil-works/pi-ai", () => ({
+  cleanupSessionResources: vi.fn((sessionId: string) => {
+    state.cleanupCalls.push(sessionId);
+  }),
 }));
 
 vi.mock("@earendil-works/pi-ai/compat", () => ({
   streamSimple: vi.fn(
     async function* (_model: unknown, context: unknown, options: unknown) {
       state.codexCalls.push({ model: _model, context, options });
+      const onResponse = (options as {
+        onResponse?: (response: { status: number; headers: Record<string, string> }, model: unknown) => unknown;
+      }).onResponse;
+      for (const response of state.providerResponses) {
+        await onResponse?.(response, _model);
+      }
+      if (state.streamError) throw state.streamError;
       if (state.throwStream) {
         throw new Error("network failed");
       }
@@ -47,7 +64,11 @@ vi.mock("@earendil-works/pi-ai/providers/all", () => ({
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
   SessionManager: {
-    inMemory: vi.fn(() => ({ getSessionId: () => "019f5a00-0000-7000-8000-000000000001" })),
+    inMemory: vi.fn(() => {
+      state.sessionCounter += 1;
+      const suffix = String(state.sessionCounter).padStart(12, "0");
+      return { getSessionId: () => `019f5a00-0000-7000-8000-${suffix}` };
+    }),
   },
   AuthStorage: {
     create: vi.fn(() => {
@@ -126,10 +147,14 @@ describe("PiAgentSDKProvider", () => {
     state.apiKey = "pi-key";
     state.credentialsHeaders = { "x-test": "1" };
     state.throwStream = false;
+    state.streamError = null;
+    state.providerResponses = [];
     state.missingModel = false;
     state.modelFallback = null;
     state.getCredentialsThrows = false;
     state.streamForPrompt = null;
+    state.cleanupCalls.length = 0;
+    state.sessionCounter = 0;
     delete process.env.HTTPS_PROXY;
     delete process.env.HTTP_PROXY;
     delete process.env.ALL_PROXY;
@@ -176,11 +201,21 @@ describe("PiAgentSDKProvider", () => {
       apiKey: "pi-key",
       headers: { "x-test": "1" },
       maxTokens: 512,
-      transport: "auto",
+      transport: "sse",
       sessionId: "019f5a00-0000-7000-8000-000000000001",
     });
     expect((call.options as Record<string, unknown>).reasoning).toBeUndefined();
     expect((call.context as Record<string, unknown>).sessionId).toBeUndefined();
+    expect(state.cleanupCalls).toEqual(["019f5a00-0000-7000-8000-000000000001"]);
+  });
+
+  it("cleans up the independent pi session when streaming fails", async () => {
+    state.throwStream = true;
+    const provider = new PiAgentSDKProvider("gpt-5.4");
+
+    await expect(provider.summarize("sys", "prompt")).rejects.toThrow("pi_stream_failed");
+
+    expect(state.cleanupCalls).toEqual(["019f5a00-0000-7000-8000-000000000001"]);
   });
 
   it("reuses the same call flow for compress and summarize", async () => {
@@ -417,19 +452,23 @@ describe("PiAgentSDKProvider", () => {
   it("keeps concurrent detailed results isolated", async () => {
     state.streamForPrompt = (context) => {
       const prompt = (context as { messages: Array<{ content: string }> }).messages[0].content;
-      const isFirst = prompt === "first";
+      const route = {
+        first: { text: "one", model: "model-one", input: 1, cacheRead: 10, cacheWrite: 100, output: 3 },
+        second: { text: "two", model: "model-two", input: 2, cacheRead: 20, cacheWrite: 200, output: 4 },
+        third: { text: "three", model: "model-three", input: 3, cacheRead: 30, cacheWrite: 300, output: 5 },
+      }[prompt as "first" | "second" | "third"];
       return [
-        { type: "text_delta", text_delta: isFirst ? "one" : "two" },
+        { type: "text_delta", text_delta: route.text },
         {
           type: "done",
           reason: "stop",
           message: {
-            model: isFirst ? "model-one" : "model-two",
+            model: route.model,
             usage: {
-              input: isFirst ? 1 : 2,
-              cacheRead: isFirst ? 10 : 20,
-              cacheWrite: isFirst ? 100 : 200,
-              output: isFirst ? 3 : 4,
+              input: route.input,
+              cacheRead: route.cacheRead,
+              cacheWrite: route.cacheWrite,
+              output: route.output,
             },
           },
         },
@@ -440,6 +479,7 @@ describe("PiAgentSDKProvider", () => {
     await expect(Promise.all([
       provider.summarizeWithMetadata("sys", "first"),
       provider.summarizeWithMetadata("sys", "second"),
+      provider.summarizeWithMetadata("sys", "third"),
     ])).resolves.toEqual([
       {
         text: "one",
@@ -463,7 +503,21 @@ describe("PiAgentSDKProvider", () => {
           responseModel: "model-two",
         }),
       },
+      {
+        text: "three",
+        metadata: expect.objectContaining({
+          inputTokens: 333,
+          cacheReadTokens: 30,
+          cacheWriteTokens: 300,
+          outputTokens: 5,
+          totalTokens: 338,
+          responseModel: "model-three",
+        }),
+      },
     ]);
+    const sessionIds = state.codexCalls.map((call) => (call.options as { sessionId: string }).sessionId);
+    expect(new Set(sessionIds).size).toBe(3);
+    expect([...state.cleanupCalls].sort()).toEqual([...sessionIds].sort());
   });
 
   it("maps error events to the existing stream error while preserving error telemetry", async () => {
@@ -491,13 +545,10 @@ describe("PiAgentSDKProvider", () => {
     expect(error).toMatchObject({
       message: "pi_stream_failed",
       metadata: {
-        inputTokens: 13,
-        inputUncachedTokens: 1,
-        cacheReadTokens: 10,
-        cacheWriteTokens: 2,
-        outputTokens: 0,
-        totalTokens: 13,
+        providerErrorCode: "unknown",
         maxOutputTokens: 256,
+        inputChars: 9,
+        responseStarted: false,
         stopReason: "error",
         responseModel: "actual-model",
       },
@@ -557,6 +608,131 @@ describe("PiAgentSDKProvider", () => {
     expect(JSON.stringify(error.metadata)).not.toContain(errorMessage);
   });
 
+  it.each([
+    {
+      name: "rate limit",
+      response: {
+        status: 429,
+        headers: {
+          "retry-after-ms": "2500",
+          authorization: "credential-marker",
+          "x-provider-error": "header-marker",
+        },
+      },
+      errorMessage: "rate limited raw-error-marker prompt-marker",
+      expected: { providerErrorCode: "rate_limited", statusCode: 429, retryAfterMs: 2500 },
+    },
+    {
+      name: "upstream server error",
+      response: { status: 503, headers: { "retry-after": "2" } },
+      errorMessage: "upstream body raw-error-marker",
+      expected: { providerErrorCode: "server_error", statusCode: 503, retryAfterMs: 2000 },
+    },
+    {
+      name: "provider rejection",
+      response: { status: 400, headers: {} },
+      errorMessage: "rejected raw-error-marker",
+      expected: { providerErrorCode: "provider_rejected", statusCode: 400 },
+    },
+  ])("captures allowlisted diagnostics for $name", async ({ response, errorMessage, expected }) => {
+    state.providerResponses = [response];
+    state.textEvents = [{
+      type: "error",
+      reason: "error",
+      error: {
+        model: "requested-model",
+        responseModel: "actual-model",
+        stopReason: "error",
+        errorMessage,
+        rawError: "raw-object-marker",
+        prompt: "prompt-marker",
+        headers: { authorization: "credential-marker" },
+      },
+    }];
+    const provider = new PiAgentSDKProvider("requested-model", 321);
+
+    const error = await provider.summarizeWithMetadata("system", "user-input").catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error.metadata).toEqual({
+      ...expected,
+      elapsedMs: expect.any(Number),
+      inputChars: 16,
+      maxOutputTokens: 321,
+      responseStarted: false,
+      responseModel: "actual-model",
+      stopReason: "error",
+    });
+    expect(error.metadata.elapsedMs).toBeGreaterThanOrEqual(0);
+    const serialized = JSON.stringify(error.metadata);
+    for (const marker of [
+      "raw-error-marker",
+      "raw-object-marker",
+      "prompt-marker",
+      "header-marker",
+      "credential-marker",
+    ]) {
+      expect(serialized).not.toContain(marker);
+    }
+  });
+
+  it.each([
+    [new Error("Request timed out raw-error-marker"), "timeout"],
+    [new TypeError("fetch failed credential-marker"), "network_error"],
+    [new TypeError("internal invariant failed raw-error-marker"), "unknown"],
+    [new Error("unclassified raw-error-marker"), "unknown"],
+  ])("normalizes thrown stream errors without retaining their message", async (streamError, providerErrorCode) => {
+    state.streamError = streamError;
+    const provider = new PiAgentSDKProvider("requested-model", 222);
+
+    const error = await provider.summarizeWithMetadata("system", "user-input").catch((caught) => caught);
+
+    expect(error).toMatchObject({
+      message: "pi_stream_failed",
+      metadata: {
+        providerErrorCode,
+        elapsedMs: expect.any(Number),
+        inputChars: 16,
+        maxOutputTokens: 222,
+        responseStarted: false,
+      },
+    });
+    expect(JSON.stringify(error.metadata)).not.toContain(streamError.message);
+  });
+
+  it("marks responseStarted after partial text without retaining the interrupted response", async () => {
+    state.providerResponses = [{ status: 200, headers: { "x-secret": "header-marker" } }];
+    state.textEvents = [
+      { type: "text_delta", text_delta: "partial prompt-marker" },
+      {
+        type: "error",
+        reason: "error",
+        error: {
+          responseModel: "actual-model",
+          stopReason: "error",
+          errorMessage: "stream ended raw-error-marker",
+        },
+      },
+    ];
+    const provider = new PiAgentSDKProvider("requested-model", 333);
+
+    const error = await provider.summarizeWithMetadata("system", "user-input").catch((caught) => caught);
+
+    expect(error.metadata).toEqual({
+      providerErrorCode: "unknown",
+      statusCode: 200,
+      elapsedMs: expect.any(Number),
+      inputChars: 16,
+      maxOutputTokens: 333,
+      responseStarted: true,
+      responseModel: "actual-model",
+      stopReason: "error",
+    });
+    expect(JSON.stringify(error.metadata)).not.toContain("partial prompt-marker");
+    expect(JSON.stringify(error.metadata)).not.toContain("raw-error-marker");
+    expect(JSON.stringify(error.metadata)).not.toContain("header-marker");
+  });
+
   it("maps aborted error events with a message stopReason fallback", async () => {
     state.textEvents = [
       {
@@ -574,10 +750,11 @@ describe("PiAgentSDKProvider", () => {
     expect(error).toMatchObject({
       message: "pi_stream_failed",
       metadata: {
-        inputTokens: 5,
-        outputTokens: 2,
-        totalTokens: 7,
+        providerErrorCode: "unknown",
+        elapsedMs: expect.any(Number),
+        inputChars: 9,
         maxOutputTokens: 99,
+        responseStarted: false,
         stopReason: "aborted",
         responseModel: "gpt-5.4",
       },

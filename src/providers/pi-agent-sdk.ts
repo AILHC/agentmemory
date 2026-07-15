@@ -5,17 +5,20 @@ import type {
   ModelCapabilities,
   ProviderCallMetadata,
   ProviderErrorCode,
+  ProviderFailureDiagnostics,
   ProviderCallResult,
 } from "../types.js";
 import { getEnvVar } from "../config.js";
 import { ProviderCallError } from "./provider-call-result.js";
 
 type OpenAICodexResponsesModule = typeof import("@earendil-works/pi-ai/compat");
+type PiAiCoreModule = typeof import("@earendil-works/pi-ai");
 type PiAiModule = typeof import("@earendil-works/pi-ai/providers/all");
 type PiCodingAgentModule = typeof import("@earendil-works/pi-coding-agent");
 
 type ModuleBundle = {
   codex: OpenAICodexResponsesModule;
+  core: PiAiCoreModule;
   ai: PiAiModule;
   codingAgent: PiCodingAgentModule;
 };
@@ -38,9 +41,13 @@ type StreamOptions = {
   headers?: Record<string, string>;
   env: NodeJS.ProcessEnv;
   maxTokens: number;
-  transport: "auto";
+  transport: "sse";
   sessionId: string;
   timeoutMs?: number;
+  onResponse?: (
+    response: { status: number; headers: Record<string, string> },
+    model: unknown,
+  ) => void | Promise<void>;
 };
 
 type CodexEvent = Record<string, unknown>;
@@ -76,22 +83,103 @@ function optionalNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
-function providerErrorCode(event: CodexEvent): ProviderErrorCode {
-  const detail = isObject(event["error"])
-    ? event["error"]
-    : isObject(event["message"])
-      ? event["message"]
-      : {};
-  const message = typeof detail["errorMessage"] === "string"
-    ? detail["errorMessage"]
-    : "";
+function providerErrorCode(error: unknown, statusCode?: number): ProviderErrorCode {
+  const detail = isObject(error) ? error : {};
+  const message = error instanceof Error
+    ? error.message
+    : typeof detail["errorMessage"] === "string"
+      ? detail["errorMessage"]
+      : "";
   if (/model not found/i.test(message)) return "model_not_found";
+  if (statusCode === 429) return "rate_limited";
+  if (statusCode === 401 || statusCode === 403) return "auth_failed";
+  if (statusCode !== undefined && statusCode >= 500) return "server_error";
+  if (statusCode !== undefined && statusCode >= 400) return "provider_rejected";
   if (/rate limit|too many requests/i.test(message)) return "rate_limited";
-  if (/timed out|timeout/i.test(message)) return "timeout";
+  if (/timed out|timeout|request was aborted/i.test(message)) return "timeout";
+  if (/fetch failed|network|econnreset|socket|connection/i.test(message)) {
+    return "network_error";
+  }
   if (/rejected|unsupported|forbidden|not available|invalid request/i.test(message)) {
     return "provider_rejected";
   }
   return "unknown";
+}
+
+function safeInteger(value: unknown, minimum = 0): number | undefined {
+  return Number.isSafeInteger(value) && Number(value) >= minimum
+    ? Number(value)
+    : undefined;
+}
+
+function responseHeader(headers: Record<string, string>, name: string): string | undefined {
+  const entry = Object.entries(headers).find(([key]) => key.toLowerCase() === name);
+  return typeof entry?.[1] === "string" ? entry[1] : undefined;
+}
+
+function retryAfterMs(headers: Record<string, string>): number | undefined {
+  const direct = responseHeader(headers, "retry-after-ms");
+  if (direct !== undefined) {
+    const parsed = Number(direct);
+    if (Number.isSafeInteger(parsed) && parsed >= 0) return parsed;
+  }
+  const retryAfter = responseHeader(headers, "retry-after");
+  if (retryAfter === undefined) return undefined;
+  const seconds = Number(retryAfter);
+  if (Number.isFinite(seconds) && seconds >= 0) {
+    return safeInteger(seconds * 1000);
+  }
+  const date = Date.parse(retryAfter);
+  return Number.isFinite(date) ? safeInteger(Math.max(0, date - Date.now())) : undefined;
+}
+
+function responseModel(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+function providerStopReason(value: unknown): ProviderFailureDiagnostics["stopReason"] {
+  if (value === "length") return "max_tokens";
+  if (value === "toolUse") return "tool_use";
+  if (["stop", "error", "aborted"].includes(String(value))) {
+    return value as ProviderFailureDiagnostics["stopReason"];
+  }
+  return undefined;
+}
+
+type ResponseEvidence = {
+  statusCode?: number;
+  retryAfterMs?: number;
+};
+
+function failureDiagnostics(options: {
+  error: unknown;
+  evidence: ResponseEvidence;
+  startedAt: number;
+  inputChars: number;
+  maxOutputTokens: number;
+  responseStarted: boolean;
+  responseModel?: unknown;
+  stopReason?: unknown;
+}): ProviderFailureDiagnostics {
+  const statusCode = safeInteger(options.evidence.statusCode);
+  const retryMs = safeInteger(options.evidence.retryAfterMs);
+  const model = responseModel(options.responseModel);
+  const stopReason = providerStopReason(options.stopReason);
+  return {
+    providerErrorCode: providerErrorCode(options.error, statusCode),
+    ...(statusCode === undefined ? {} : { statusCode }),
+    ...(retryMs === undefined ? {} : { retryAfterMs: retryMs }),
+    elapsedMs: Math.max(0, Date.now() - options.startedAt),
+    inputChars: options.inputChars,
+    maxOutputTokens: options.maxOutputTokens,
+    responseStarted: options.responseStarted,
+    ...(model ? { responseModel: model } : {}),
+    ...(stopReason ? { stopReason } : {}),
+  };
 }
 
 function modelCapabilities(model: unknown): ModelCapabilities {
@@ -154,7 +242,6 @@ function eventMetadata(
           : undefined,
     responseModel,
     ...modelCapabilities(model),
-    ...(event["type"] === "error" ? { providerErrorCode: providerErrorCode(event) } : {}),
   };
 }
 
@@ -304,6 +391,7 @@ export class PiAgentSDKProvider implements MemoryProvider {
     this.configureProxy();
 
     const credentials = await this.loadCredentials(registry, model);
+    const sessionId = SessionManager.inMemory().getSessionId();
     const context: StreamContext = {
       systemPrompt,
       messages: [{ role: "user", content: userPrompt }],
@@ -314,39 +402,79 @@ export class PiAgentSDKProvider implements MemoryProvider {
       headers: credentials.headers,
       env: process.env,
       maxTokens,
-      transport: "auto",
-      sessionId: SessionManager.inMemory().getSessionId(),
+      transport: "sse",
+      sessionId,
       timeoutMs: getTimeoutMs(),
     };
 
-    let output = "";
-    let metadata: ProviderCallMetadata | undefined;
     try {
-      const stream = await modules.codex.streamSimple(
-        model,
-        context,
-        streamOptions,
-      );
-      for await (const rawEvent of stream as AsyncIterable<unknown>) {
-        if (!isObject(rawEvent)) continue;
-        if (rawEvent["type"] === "error") {
-          throw new ProviderCallError(
-            "pi_stream_failed",
-            eventMetadata(rawEvent, model, maxTokens),
-          );
+      let output = "";
+      let metadata: ProviderCallMetadata | undefined;
+      let responseStarted = false;
+      const inputChars = systemPrompt.length + userPrompt.length;
+      const startedAt = Date.now();
+      const evidence: ResponseEvidence = {};
+      streamOptions.onResponse = (response) => {
+        const statusCode = safeInteger(response.status);
+        evidence.statusCode = statusCode;
+        evidence.retryAfterMs = retryAfterMs(response.headers);
+      };
+      try {
+        const stream = await modules.codex.streamSimple(
+          model,
+          context,
+          streamOptions,
+        );
+        for await (const rawEvent of stream as AsyncIterable<unknown>) {
+          if (!isObject(rawEvent)) continue;
+          if (rawEvent["type"] === "error") {
+            const message = isObject(rawEvent["error"])
+              ? rawEvent["error"]
+              : isObject(rawEvent["message"])
+                ? rawEvent["message"]
+                : {};
+            throw new ProviderCallError(
+              "pi_stream_failed",
+              failureDiagnostics({
+                error: message,
+                evidence,
+                startedAt,
+                inputChars,
+                maxOutputTokens: maxTokens,
+                responseStarted,
+                responseModel: message["responseModel"] ?? message["model"],
+                stopReason: rawEvent["reason"] ?? message["stopReason"],
+              }),
+            );
+          }
+          if (rawEvent["type"] === "done") {
+            metadata = eventMetadata(rawEvent, model, maxTokens);
+          }
+          const text = getEventText(rawEvent as CodexEvent);
+          if (text.length > 0) responseStarted = true;
+          output += text;
         }
-        if (rawEvent["type"] === "done") {
-          metadata = eventMetadata(rawEvent, model, maxTokens);
-        }
-        output += getEventText(rawEvent as CodexEvent);
+      } catch (err) {
+        if (err instanceof ProviderCallError) throw err;
+        throw new ProviderCallError(
+          "pi_stream_failed",
+          failureDiagnostics({
+            error: err,
+            evidence,
+            startedAt,
+            inputChars,
+            maxOutputTokens: maxTokens,
+            responseStarted,
+          }),
+        );
       }
-    } catch (err) {
-      throw mapStreamError(err);
+      if (!output.trim()) {
+        throw new Error("pi_empty_response");
+      }
+      return metadata ? { text: output, metadata } : { text: output };
+    } finally {
+      modules.core.cleanupSessionResources(sessionId);
     }
-    if (!output.trim()) {
-      throw new Error("pi_empty_response");
-    }
-    return metadata ? { text: output, metadata } : { text: output };
   }
 
   private configureProxy(): void {
@@ -366,12 +494,13 @@ export class PiAgentSDKProvider implements MemoryProvider {
     if (this.modulesPromise) return this.modulesPromise;
     this.modulesPromise = (async () => {
       try {
-        const [ai, codex, codingAgent] = await Promise.all([
+        const [core, ai, codex, codingAgent] = await Promise.all([
+          import("@earendil-works/pi-ai"),
           import("@earendil-works/pi-ai/providers/all"),
           import("@earendil-works/pi-ai/compat"),
           import("@earendil-works/pi-coding-agent"),
         ]);
-        return { ai, codex, codingAgent };
+        return { core, ai, codex, codingAgent };
       } catch {
         throw new Error("pi_sdk_import_failed");
       }

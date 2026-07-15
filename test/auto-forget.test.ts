@@ -154,6 +154,50 @@ describe("Auto-Forget Function", () => {
     expect(result.lowValueObs).toContain("obs_old");
   });
 
+  it("processes each observation batch before loading the next batch", async () => {
+    for (let index = 1; index <= 11; index++) {
+      const sessionId = `ses_${index}`;
+      await kv.set("mem:sessions", sessionId, {
+        id: sessionId,
+        project: "my-project",
+        cwd: "/tmp",
+        startedAt: "2025-01-01T00:00:00Z",
+        status: "completed",
+        observationCount: 1,
+      } satisfies Session);
+      await kv.set(`mem:obs:${sessionId}`, `obs_${index}`, {
+        id: `obs_${index}`,
+        sessionId,
+        timestamp: "2025-01-01T00:00:00Z",
+        type: "other",
+        title: "trivial event",
+        facts: [],
+        narrative: "nothing important",
+        concepts: [],
+        files: [],
+        importance: 1,
+      } satisfies CompressedObservation);
+    }
+
+    const events: string[] = [];
+    const originalList = kv.list;
+    const originalDelete = kv.delete;
+    kv.list = async <T>(scope: string): Promise<T[]> => {
+      if (scope.startsWith("mem:obs:")) events.push(`list:${scope}`);
+      return originalList<T>(scope);
+    };
+    kv.delete = async (scope: string, key: string): Promise<void> => {
+      if (scope.startsWith("mem:obs:")) events.push(`delete:${scope}:${key}`);
+      return originalDelete(scope, key);
+    };
+
+    await sdk.trigger("mem::auto-forget", {});
+
+    expect(events.indexOf("delete:mem:obs:ses_1:obs_1")).toBeLessThan(
+      events.indexOf("list:mem:obs:ses_11"),
+    );
+  });
+
   it("dryRun mode identifies but does not delete anything", async () => {
     const expired = makeMemory({
       id: "mem_expired",

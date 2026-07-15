@@ -23,6 +23,19 @@ function mockSdk() {
   };
 }
 
+function mockKV() {
+  const store = new Map<string, Map<string, unknown>>();
+  return {
+    get: async <T>(scope: string, key: string): Promise<T | null> =>
+      (store.get(scope)?.get(key) as T) ?? null,
+    set: async <T>(scope: string, key: string, value: T): Promise<T> => {
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, value);
+      return value;
+    },
+  };
+}
+
 describe("semantic rollup REST wrappers", () => {
   it("rejects unsupported semantic-rollup fields", async () => {
     const sdk = mockSdk();
@@ -47,13 +60,16 @@ describe("semantic rollup REST wrappers", () => {
 
   it("validates and sends only sanitized semantic-rollup payload fields", async () => {
     const sdk = mockSdk();
-    registerApiTriggers(sdk as never, {} as never, "");
+    registerApiTriggers(sdk as never, mockKV() as never, "");
     const handler = sdk.getFunction("api::semantic-rollup");
 
     const response = await handler({
       headers: {},
       body: {
         runId: " run-1 ",
+        stage: "semantic_rollup",
+        unitId: " win-1 ",
+        inputHash: " input-1 ",
         windowId: " win-1 ",
         mark: " full ",
         kind: "window",

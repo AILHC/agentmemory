@@ -145,45 +145,44 @@ export function registerAutoForgetFunction(sdk: ISdk, kv: StateKV): void {
       }
 
       const sessions = await kv.list<Session>(KV.sessions);
-      const obsPerSession: CompressedObservation[][] = [];
       for (let batch = 0; batch < sessions.length; batch += 10) {
         const chunk = sessions.slice(batch, batch + 10);
-        const results = await Promise.all(
+        const observationsBySession = await Promise.all(
           chunk.map((s) =>
             kv
               .list<CompressedObservation>(KV.observations(s.id))
               .catch(() => [] as CompressedObservation[]),
           ),
         );
-        obsPerSession.push(...results);
-      }
-      for (let i = 0; i < sessions.length; i++) {
-        for (const obs of obsPerSession[i]) {
-          if (!obs.timestamp) continue;
-          const age = now - new Date(obs.timestamp).getTime();
-          if (age > 180 * MS_PER_DAY && (obs.importance ?? 5) <= 2) {
-            result.lowValueObs.push(obs.id);
-            if (!dryRun) {
-              let deletedOk = false;
-              try {
-                await kv.delete(KV.observations(sessions[i].id), obs.id);
-                deletedOk = true;
-              } catch {
-                deletedOk = false;
-              }
-              if (deletedOk) {
-                if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
-                if (obs.imageRef && obs.imageRef !== obs.imageData) {
-                  await decrementImageRef(kv, sdk, obs.imageRef);
+        for (let index = 0; index < chunk.length; index++) {
+          const session = chunk[index];
+          for (const obs of observationsBySession[index]) {
+            if (!obs.timestamp) continue;
+            const age = now - new Date(obs.timestamp).getTime();
+            if (age > 180 * MS_PER_DAY && (obs.importance ?? 5) <= 2) {
+              result.lowValueObs.push(obs.id);
+              if (!dryRun) {
+                let deletedOk = false;
+                try {
+                  await kv.delete(KV.observations(session.id), obs.id);
+                  deletedOk = true;
+                } catch {
+                  deletedOk = false;
                 }
-                await recordAudit(kv, "delete", "mem::auto-forget", [obs.id], {
-                  resource: "observation",
-                  reason: "auto-forget low-value observation",
-                  sessionId: sessions[i].id,
-                  timestamp: obs.timestamp,
-                });
-                getSearchIndex().remove(obs.id);
-                vectorIndexRemove(obs.id);
+                if (deletedOk) {
+                  if (obs.imageData) await decrementImageRef(kv, sdk, obs.imageData);
+                  if (obs.imageRef && obs.imageRef !== obs.imageData) {
+                    await decrementImageRef(kv, sdk, obs.imageRef);
+                  }
+                  await recordAudit(kv, "delete", "mem::auto-forget", [obs.id], {
+                    resource: "observation",
+                    reason: "auto-forget low-value observation",
+                    sessionId: session.id,
+                    timestamp: obs.timestamp,
+                  });
+                  getSearchIndex().remove(obs.id);
+                  vectorIndexRemove(obs.id);
+                }
               }
             }
           }

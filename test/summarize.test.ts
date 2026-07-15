@@ -23,7 +23,7 @@ vi.mock("../src/eval/schemas.js", () => ({
 }));
 
 vi.mock("../src/eval/validator.js", () => ({
-  validateOutput: () => ({ valid: true, result: { errors: [] } }),
+  validateOutput: vi.fn(() => ({ valid: true, result: { errors: [] } })),
 }));
 
 vi.mock("../src/eval/quality.js", () => ({
@@ -39,7 +39,11 @@ import {
   buildTurnAwareSummaryChunks,
   registerSummarizeFunction,
 } from "../src/functions/summarize.js";
-import { ProviderCallError } from "../src/providers/provider-call-result.js";
+import {
+  ProviderCallError,
+  ProviderPreflightError,
+} from "../src/providers/provider-call-result.js";
+import { validateOutput } from "../src/eval/validator.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 import type {
   CompressedObservation,
@@ -113,7 +117,7 @@ function makeCompressedObservation(
   };
 }
 
-function makeProvider(responses: string[]): MemoryProvider & {
+function makeProvider(responses: Array<string | Error>): MemoryProvider & {
   calls: Array<{ system: string; user: string; options: unknown }>;
 } {
   const calls: Array<{ system: string; user: string; options: unknown }> = [];
@@ -126,6 +130,7 @@ function makeProvider(responses: string[]): MemoryProvider & {
       calls.push({ system, user, options });
       const r = responses[i] ?? responses[responses.length - 1];
       i += 1;
+      if (r instanceof Error) throw r;
       return r;
     },
   };
@@ -234,9 +239,10 @@ async function seedSummarySession(
 function setupResumableHandler(
   kv: ReturnType<typeof mockKV>,
   provider: MemoryProvider,
+  retryOptions?: unknown,
 ): { handler: Function; sdk: ReturnType<typeof mockSdk> } {
   const sdk = mockSdk();
-  registerSummarizeFunction(sdk as any, kv as any, provider);
+  (registerSummarizeFunction as any)(sdk, kv, provider, undefined, retryOptions);
   return {
     handler: sdk.functions.get("mem::summarize-resumable")!,
     sdk,
@@ -1179,12 +1185,460 @@ describe("mem::summarize-resumable", () => {
 
   beforeEach(() => {
     process.env.SUMMARIZE_CHUNK_SIZE = "100";
+    vi.mocked(validateOutput).mockReset().mockReturnValue({
+      valid: true,
+      result: { errors: [] },
+    } as any);
     delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
     delete process.env.AGENTMEMORY_SUMMARY_MODEL;
     delete process.env.AGENTMEMORY_EVALUATION_MODE;
     delete process.env.AGENTMEMORY_CONTEXT_STRATEGY_TARGET_STAGE;
     delete process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY;
     delete process.env.AGENTMEMORY_SUMMARY_CONTEXT_TREATMENT;
+  });
+
+  it("does not retry a parse failure as a network failure", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_parse_no_network_retry", 1);
+    const provider = makeProvider([
+      "unparseable response",
+      "still unparseable",
+      summaryXml({ title: "must not be used" }),
+    ]);
+    const cooldowns: number[] = [];
+    const { handler } = setupResumableHandler(kv, provider, {
+      sleep: async (delayMs: number) => { cooldowns.push(delayMs); },
+      cooldownMs: () => 0,
+    });
+
+    const result = await handler({ sessionId: "ses_parse_no_network_retry" });
+
+    expect(result).toMatchObject({
+      success: false,
+      status: "failed",
+      failureCause: "parse_failed",
+    });
+    expect(result.error).toMatch(/^too_many_chunks_skipped:/);
+    expect(provider.calls).toHaveLength(2);
+    expect(cooldowns).toEqual([]);
+  });
+
+  it.each([
+    ["pi_stream_failed", "pi_stream_failed", 1],
+    ["circuit_breaker_open", "circuit_breaker_open", 1],
+    ["fetch failed", "network_error", 1],
+    ["provider rejected token=must-not-persist", "provider_failure", 0],
+  ])("preserves sanitized failure cause for %s", async (message, expectedCause, expectedCooldowns) => {
+    const kv = mockKV();
+    await seedSummarySession(kv, `ses_failure_${expectedCause}`, 1);
+    const calls: string[] = [];
+    const provider: MemoryProvider = {
+      name: "test",
+      compress: async () => "",
+      summarize: async () => {
+        calls.push(message);
+        throw new Error(message);
+      },
+    };
+    const cooldowns: number[] = [];
+    const { handler } = setupResumableHandler(kv, provider, {
+      sleep: async (delayMs: number) => { cooldowns.push(delayMs); },
+      cooldownMs: () => 9,
+    });
+
+    const result = await handler({ sessionId: `ses_failure_${expectedCause}` });
+
+    expect(result.failureCause).toBe(expectedCause);
+    expect(result.error).toMatch(/^too_many_chunks_skipped:/);
+    expect(result.error).not.toContain("must-not-persist");
+    expect(calls).toHaveLength(2);
+    expect(cooldowns).toHaveLength(expectedCooldowns);
+    if (expectedCooldowns > 0) expect(cooldowns).toEqual([9]);
+  });
+
+  it.each([
+    ["pi_stream_failed", "pi_stream_failed"],
+    ["fetch failed", "network_error"],
+  ])("keeps the first transient cause when retry encounters an open breaker", async (firstError, expectedCause) => {
+    const kv = mockKV();
+    const sessionId = `ses_first_cause_${expectedCause}`;
+    await seedSummarySession(kv, sessionId, 1);
+    const provider = makeProvider([
+      new Error(firstError),
+      new Error("circuit_breaker_open"),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider, {
+      sleep: async () => {},
+      cooldownMs: () => 0,
+    });
+
+    const result = await handler({ sessionId });
+
+    expect(result).toMatchObject({
+      success: false,
+      status: "failed",
+      failureCause: expectedCause,
+    });
+    expect(result.error).toContain(`failure_cause=${expectedCause}`);
+  });
+
+  it("uses a stable post-breaker cooldown above 30 seconds with session staggering", async () => {
+    const sessionIds = ["ses_cooldown_1", "ses_cooldown_2", "ses_cooldown_3"];
+    const firstDelays = new Map<string, number>();
+
+    for (const sessionId of sessionIds) {
+      const kv = mockKV();
+      await seedSummarySession(kv, sessionId, 1);
+      const provider = makeProvider([
+        new Error("pi_stream_failed"),
+        summaryXml({ title: `recovered-${sessionId}` }),
+      ]);
+      const { handler } = setupResumableHandler(kv, provider, {
+        sleep: async (delayMs: number) => { firstDelays.set(sessionId, delayMs); },
+      });
+      const result = await handler({ sessionId });
+      expect(result.status).toBe("succeeded");
+    }
+
+    const delays = [...firstDelays.values()];
+    expect(delays).toHaveLength(3);
+    expect(delays.every((delayMs) => delayMs >= 31_000 && delayMs <= 36_000)).toBe(true);
+    expect(new Set(delays).size).toBeGreaterThan(1);
+
+    const kv = mockKV();
+    await seedSummarySession(kv, sessionIds[0], 1);
+    const repeatDelays: number[] = [];
+    const provider = makeProvider([
+      new Error("network timeout"),
+      summaryXml({ title: "recovered-repeat" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider, {
+      sleep: async (delayMs: number) => { repeatDelays.push(delayMs); },
+    });
+    await handler({ sessionId: sessionIds[0] });
+    expect(repeatDelays).toEqual([firstDelays.get(sessionIds[0])]);
+  });
+
+  it("cools down and recovers three concurrent transient failures", async () => {
+    const kv = mockKV();
+    const sessionIds = ["ses_transient_1", "ses_transient_2", "ses_transient_3"];
+    for (const sessionId of sessionIds) await seedSummarySession(kv, sessionId, 1);
+    let calls = 0;
+    const cooldowns: number[] = [];
+    const provider: MemoryProvider = {
+      name: "test",
+      compress: async () => "",
+      summarize: async () => {
+        calls += 1;
+        if (calls <= 3) throw new Error("pi_stream_failed");
+        return summaryXml({ title: `recovered-${calls}` });
+      },
+    };
+    const { handler } = setupResumableHandler(kv, provider, {
+      sleep: async (delayMs: number) => { cooldowns.push(delayMs); },
+      cooldownMs: () => 7,
+    });
+
+    const results = await Promise.all(
+      sessionIds.map((sessionId) => handler({ sessionId })),
+    );
+
+    expect(results.every((result) => result.status === "succeeded")).toBe(true);
+    expect(calls).toBe(6);
+    expect(cooldowns).toEqual([7, 7, 7]);
+  });
+
+  it("reports one completed advance for a 22 chunk summary step", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_22_chunks", 22);
+    const provider = makeProvider([summaryXml({ title: "chunk-1" })]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    const result = await handler({ sessionId: "ses_22_chunks" });
+
+    expect(provider.calls).toHaveLength(1);
+    expect(result).toMatchObject({
+      status: "in_progress",
+      advanced: "completed",
+      completedChunks: 1,
+      skippedChunks: 0,
+      totalChunks: 22,
+    });
+    expect(result.failure).toBeUndefined();
+  });
+
+  it("reports the current transient failure when one 22 chunk step is skipped", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_22_transient", 22);
+    const provider = makeProvider([
+      new Error("pi_stream_failed"),
+      new Error("pi_stream_failed"),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider, {
+      sleep: async () => {},
+      cooldownMs: () => 0,
+    });
+
+    const result = await handler({ sessionId: "ses_22_transient" });
+
+    expect(provider.calls).toHaveLength(2);
+    expect(result).toMatchObject({
+      status: "in_progress",
+      advanced: "skipped",
+      failure: { class: "transient_provider", cause: "pi_stream_failed" },
+      completedChunks: 0,
+      skippedChunks: 1,
+      totalChunks: 22,
+    });
+  });
+
+  it("keeps the first chunk failure cause and its matching diagnostics atomically", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_chunk_diagnostics", 1);
+    const first = new ProviderCallError("pi_stream_failed", {
+      providerErrorCode: "rate_limited",
+      statusCode: 429,
+      retryAfterMs: 1000,
+      elapsedMs: 11,
+      inputChars: 101,
+      maxOutputTokens: 4096,
+      responseStarted: false,
+      responseModel: "model-first",
+      stopReason: "error",
+    });
+    const current = new ProviderCallError("circuit_breaker_open", {
+      providerErrorCode: "server_error",
+      elapsedMs: 22,
+      inputChars: 102,
+      maxOutputTokens: 4096,
+      responseStarted: true,
+      responseModel: "model-current",
+      stopReason: "error",
+    });
+    const provider = makeProvider([first, current]);
+    const { handler } = setupResumableHandler(kv, provider, {
+      sleep: async () => {},
+      cooldownMs: () => 0,
+    });
+
+    const result = await handler({ sessionId: "ses_chunk_diagnostics" });
+
+    expect(result.failure).toEqual({
+      class: "transient_provider",
+      cause: "pi_stream_failed",
+      diagnostics: {
+        requestPhase: "chunk",
+        providerErrorCode: "rate_limited",
+        statusCode: 429,
+        retryAfterMs: 1000,
+        elapsedMs: 11,
+        inputChars: 101,
+        maxOutputTokens: 4096,
+        responseStarted: false,
+        responseModel: "model-first",
+        stopReason: "error",
+      },
+    });
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("narrative for obs");
+  });
+
+  it("does not attach later provider diagnostics to an earlier parse failure", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_parse_then_provider", 1);
+    const providerFailure = new ProviderCallError("pi_stream_failed", {
+      providerErrorCode: "timeout",
+      elapsedMs: 22,
+      inputChars: 102,
+      maxOutputTokens: 4096,
+      responseStarted: false,
+      responseModel: "model-provider",
+      stopReason: "error",
+    });
+    const provider = makeProvider(["<garbage/>", providerFailure]);
+    const { handler } = setupResumableHandler(kv, provider, {
+      sleep: async () => {},
+      cooldownMs: () => 0,
+    });
+
+    const result = await handler({ sessionId: "ses_parse_then_provider" });
+
+    expect(result.failure).toEqual({
+      class: "unit",
+      cause: "parse_failed",
+    });
+  });
+
+  it("does not reuse the previous invocation failure when retrying a skipped chunk", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_current_failure", 22);
+    const provider = makeProvider([
+      new Error("pi_stream_failed"),
+      new Error("pi_stream_failed"),
+      new Error("pi_auth_failed"),
+      new Error("pi_auth_failed"),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider, {
+      sleep: async () => {},
+      cooldownMs: () => 0,
+    });
+
+    const first = await handler({ sessionId: "ses_current_failure" });
+    const second = await handler({ sessionId: "ses_current_failure" });
+
+    expect(first.failure).toEqual({ class: "transient_provider", cause: "pi_stream_failed" });
+    expect(second).toMatchObject({
+      advanced: "skipped",
+      failure: { class: "hard", cause: "pi_auth_failed" },
+    });
+  });
+
+  it("reports reduced once and none when an already succeeded run is read again", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_reduce_advance", 2);
+    const provider = makeProvider([
+      summaryXml({ title: "chunk-1" }),
+      summaryXml({ title: "chunk-2" }),
+      summaryXml({ title: "reduced" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId: "ses_reduce_advance" });
+    await handler({ sessionId: "ses_reduce_advance" });
+    const reduced = await handler({ sessionId: "ses_reduce_advance" });
+    const repeated = await handler({ sessionId: "ses_reduce_advance" });
+
+    expect(reduced).toMatchObject({ status: "succeeded", advanced: "reduced" });
+    expect(repeated).toMatchObject({ status: "succeeded", advanced: "none" });
+    expect(provider.calls).toHaveLength(3);
+  });
+
+  it("classifies the current reduce failure without claiming an advance", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_reduce_failure", 2);
+    const provider = makeProvider([
+      summaryXml({ title: "chunk-1" }),
+      summaryXml({ title: "chunk-2" }),
+      new Error("pi_stream_failed"),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId: "ses_reduce_failure" });
+    await handler({ sessionId: "ses_reduce_failure" });
+    const failed = await handler({ sessionId: "ses_reduce_failure" });
+
+    expect(failed).toMatchObject({
+      status: "failed",
+      advanced: "none",
+      failure: { class: "transient_provider", cause: "pi_stream_failed" },
+    });
+  });
+
+  it("marks a provider failure from the final merge as reduce diagnostics", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_reduce_diagnostics", 2);
+    const reduceError = new ProviderCallError("pi_stream_failed", {
+      providerErrorCode: "server_error",
+      statusCode: 503,
+      retryAfterMs: 2000,
+      elapsedMs: 33,
+      inputChars: 103,
+      maxOutputTokens: 4096,
+      responseStarted: false,
+      responseModel: "model-reduce",
+      stopReason: "error",
+    });
+    const provider = makeProvider([
+      summaryXml({ title: "chunk-1" }),
+      summaryXml({ title: "chunk-2" }),
+      reduceError,
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId: "ses_reduce_diagnostics" });
+    await handler({ sessionId: "ses_reduce_diagnostics" });
+    const failed = await handler({ sessionId: "ses_reduce_diagnostics" });
+
+    expect(failed.failure).toEqual({
+      class: "transient_provider",
+      cause: "pi_stream_failed",
+      diagnostics: {
+        requestPhase: "reduce",
+        providerErrorCode: "server_error",
+        statusCode: 503,
+        retryAfterMs: 2000,
+        elapsedMs: 33,
+        inputChars: 103,
+        maxOutputTokens: 4096,
+        responseStarted: false,
+        responseModel: "model-reduce",
+        stopReason: "error",
+      },
+    });
+    expect(JSON.stringify(failed)).not.toContain("narrative for obs");
+  });
+
+  it("returns a structured hard failure for a real map preflight error", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_map_preflight", 1);
+    const provider = makeProvider([new ProviderPreflightError({
+      operation: "summarize",
+      callRole: "map",
+      callIndex: 0,
+      durationMs: 0,
+      metadataStatus: "unsupported",
+      providerInvoked: false,
+      preflightBlocked: true,
+      reason: "context_window_exceeded",
+      promptChars: 500,
+    })]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    const result = await handler({ sessionId: "ses_map_preflight" });
+
+    expect(result).toMatchObject({
+      status: "infeasible",
+      advanced: "none",
+      failure: { class: "hard", cause: "context_window_exceeded" },
+    });
+  });
+
+  it("returns a structured hard failure for a real reduce preflight error", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_reduce_preflight", 2);
+    const provider = makeProvider([
+      summaryXml({ title: "chunk-1" }),
+      summaryXml({ title: "chunk-2" }),
+      new ProviderPreflightError({
+        operation: "summarize",
+        callRole: "reduce",
+        callIndex: 2,
+        durationMs: 0,
+        metadataStatus: "unsupported",
+        providerInvoked: false,
+        preflightBlocked: true,
+        reason: "provider_drift",
+        promptChars: 500,
+      }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId: "ses_reduce_preflight" });
+    await handler({ sessionId: "ses_reduce_preflight" });
+    const result = await handler({ sessionId: "ses_reduce_preflight" });
+
+    expect(result).toMatchObject({
+      status: "preflight_unavailable",
+      advanced: "none",
+      failure: { class: "hard", cause: "provider_drift" },
+    });
   });
 
   afterEach(() => {
@@ -1203,6 +1657,7 @@ describe("mem::summarize-resumable", () => {
     expect(result).toEqual({
       success: true,
       status: "in_progress",
+      advanced: "completed",
       completedChunks: 1,
       totalChunks: 3,
       skippedChunks: 0,
@@ -1427,6 +1882,7 @@ describe("mem::summarize-resumable", () => {
       },
     });
     expect(Object.keys(result).sort()).toEqual([
+      "advanced",
       "completedChunks",
       "skippedChunks",
       "status",
@@ -1578,6 +2034,79 @@ describe("mem::summarize-resumable", () => {
     expect(
       await kv.get<any>("summaries", "ses_single_partial"),
     ).toMatchObject({ title: "Persisted single partial" });
+  });
+
+  it("regenerates a single-chunk summary after final validation fails", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_single_validation_retry", 1);
+    const provider = makeProvider([
+      summaryXml({ title: "Invalid single partial" }),
+      summaryXml({ title: "Recovered single partial" }),
+    ]);
+    vi.mocked(validateOutput)
+      .mockReturnValueOnce({
+        valid: false,
+        result: { errors: [{ message: "invalid summary" }] },
+      } as any)
+      .mockReturnValue({ valid: true, result: { errors: [] } } as any);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    const failed = await handler({ sessionId: "ses_single_validation_retry" });
+    const resumed = await handler({ sessionId: "ses_single_validation_retry" });
+
+    expect(failed).toMatchObject({
+      success: false,
+      status: "failed",
+      failureCause: "parse_failed",
+    });
+    expect(resumed).toMatchObject({
+      success: true,
+      status: "succeeded",
+      summary: { title: "Recovered single partial" },
+    });
+    expect(provider.calls).toHaveLength(2);
+  });
+
+  it("repairs a persisted single-chunk validation failure before retrying", async () => {
+    const kv = mockKV();
+    await seedSummarySession(kv, "ses_legacy_single_validation", 1);
+    const provider = makeProvider([
+      summaryXml({ title: "Legacy invalid partial" }),
+      summaryXml({ title: "Recovered legacy partial" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+    const originalSet = kv.set;
+    let interruptRunCompletion = true;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (
+        scope === "summary-resumable-runs" &&
+        (data as { status?: string }).status === "succeeded" &&
+        interruptRunCompletion
+      ) {
+        interruptRunCompletion = false;
+        throw new Error("run completion interrupted");
+      }
+      return originalSet(scope, key, data);
+    };
+
+    await handler({ sessionId: "ses_legacy_single_validation" }).catch(() => undefined);
+    const [run] = await kv.list<any>("summary-resumable-runs");
+    await kv.set("summary-resumable-runs", run.id, {
+      ...run,
+      status: "failed",
+      completedChunks: 1,
+      skippedChunks: 0,
+      lastError: "validation_failed",
+    });
+
+    const resumed = await handler({ sessionId: "ses_legacy_single_validation" });
+
+    expect(resumed).toMatchObject({
+      success: true,
+      status: "succeeded",
+      summary: { title: "Recovered legacy partial" },
+    });
+    expect(provider.calls).toHaveLength(2);
   });
 
   it("retries a skipped multi-chunk partial before advancing", async () => {

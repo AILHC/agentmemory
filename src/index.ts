@@ -62,6 +62,7 @@ import { registerGraphBuildTaskFunctions } from "./functions/graph-build-tasks.j
 import { registerConsolidationPipelineFunction } from "./functions/consolidation-pipeline.js";
 import { registerSemanticRollupFunction } from "./functions/semantic-rollup.js";
 import { registerExtractionRunIndexFunction } from "./functions/extraction-run-index.js";
+import { registerExtractionOperationReceiptFunctions } from "./functions/extraction-operation-receipts.js";
 import { registerTeamFunction } from "./functions/team.js";
 import { registerGovernanceFunction } from "./functions/governance.js";
 import { registerSnapshotFunction } from "./functions/snapshot.js";
@@ -279,6 +280,7 @@ async function main() {
   registerConsolidationPipelineFunction(sdk, kv, provider);
   registerSemanticRollupFunction(sdk, kv, provider);
   registerExtractionRunIndexFunction(sdk, kv);
+  registerExtractionOperationReceiptFunctions(sdk, kv);
   bootLog(`Consolidation pipeline: registered (CONSOLIDATION_ENABLED=${isConsolidationEnabled() ? "true" : "false"})`);
 
   if (isAutoCompressEnabled()) {

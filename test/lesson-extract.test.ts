@@ -9,9 +9,12 @@ import {
   buildTurnAwareLessonChunks,
   extractHeuristicLessonCandidates,
   extractLlmLessonCandidates,
+  extractLlmLessonsFromObservations,
   extractLessonsFromReplay,
   resolveReplayLessonExtractionConfig,
 } from "../src/functions/lesson-extract.js";
+import { ProviderCallError } from "../src/providers/provider-call-result.js";
+import { logger } from "../src/logger.js";
 import {
   buildLessonExtractionPrompt,
   parseLessonExtractionXml,
@@ -462,6 +465,171 @@ describe("lesson extraction end-to-end", () => {
     expect(result.candidates).toHaveLength(1);
     expect((provider.compress as any).mock.calls).toHaveLength(2);
     expect(result.errors).toHaveLength(0);
+  });
+
+  it("returns sanitized provider diagnostics without retrying a transport failure", async () => {
+    const sensitive = "sensitive-provider-error-marker";
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => {});
+    const provider: MemoryProvider = {
+      name: "pi-agent-sdk",
+      compress: vi.fn().mockRejectedValue(new ProviderCallError(
+        `pi_stream_failed ${sensitive}`,
+        {
+          providerErrorCode: "rate_limited",
+          statusCode: 429,
+          retryAfterMs: 2500,
+          elapsedMs: 1200,
+          inputChars: 38000,
+          maxOutputTokens: 4096,
+          responseStarted: false,
+          rawError: sensitive,
+          authorization: sensitive,
+        } as never,
+      )),
+      summarize: vi.fn().mockResolvedValue(""),
+    };
+
+    const result = await extractLlmLessonsFromObservations({
+      kv: mockKV(),
+      provider,
+      sessionId: "provider-failure-session",
+      project: "/repo",
+      rawObservations: [rawObservation({
+        sessionId: "provider-failure-session",
+        userPrompt: "Always validate import keys before writing duplicate observations.",
+      })],
+      compressedObservations: [],
+      firstPrompt: "first",
+      config: {
+        providerName: "pi-agent-sdk",
+        textLimit: 1200,
+        saveLimit: 50,
+        chunkSize: 20,
+        chunkConcurrency: 1,
+        timeoutMs: 60000,
+      },
+      sourceRunId: "run-provider-failure",
+    });
+
+    expect(provider.compress).toHaveBeenCalledTimes(1);
+    expect(result.failureDiagnostics).toEqual({
+      requestPhase: "chunk",
+      providerErrorCode: "rate_limited",
+      statusCode: 429,
+      retryAfterMs: 2500,
+      elapsedMs: 1200,
+      inputChars: 38000,
+      maxOutputTokens: 4096,
+      responseStarted: false,
+    });
+    expect(result.errors).toEqual(["pi_stream_failed"]);
+    expect(JSON.stringify(result)).not.toContain(sensitive);
+    expect(JSON.stringify(warn.mock.calls)).not.toContain(sensitive);
+    warn.mockRestore();
+  });
+
+  it("stops starting later chunk batches after a transport failure", async () => {
+    const provider: MemoryProvider = {
+      name: "pi-agent-sdk",
+      compress: vi.fn().mockRejectedValue(new ProviderCallError(
+        "pi_stream_failed",
+        {
+          providerErrorCode: "timeout",
+          elapsedMs: 60000,
+          inputChars: 100,
+          maxOutputTokens: 4096,
+          responseStarted: false,
+        },
+      )),
+      summarize: vi.fn().mockResolvedValue(""),
+    };
+
+    const result = await extractLlmLessonCandidates({
+      provider,
+      rawObservations: [
+        rawObservation({ id: "raw-a", userPrompt: "First independent turn." }),
+        rawObservation({ id: "raw-b", userPrompt: "Second independent turn." }),
+        rawObservation({ id: "raw-c", userPrompt: "Third independent turn." }),
+      ],
+      compressedObservations: [],
+      config: {
+        ...resolveReplayLessonExtractionConfig({}, {}),
+        chunkSize: 1,
+        chunkConcurrency: 1,
+      },
+      project: "/repo",
+      sessionId: "transport-stops-later-batches",
+    });
+
+    expect(provider.compress).toHaveBeenCalledTimes(1);
+    expect(result.errors).toEqual(["pi_stream_failed"]);
+    expect(result.failureDiagnostics?.providerErrorCode).toBe("timeout");
+  });
+
+  it("retries an ordinary pi_empty_response as an invalid response", async () => {
+    const validXml = `
+<lessons>
+  <lesson confidence="0.72">
+    <content>Retry an empty Pi response once before failing the chunk.</content>
+    <context>replay session</context>
+    <tags><tag>agentmemory</tag></tags>
+  </lesson>
+</lessons>`;
+    const provider: MemoryProvider = {
+      name: "pi-agent-sdk",
+      compress: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("pi_empty_response"))
+        .mockResolvedValueOnce(validXml),
+      summarize: vi.fn().mockResolvedValue(""),
+    };
+
+    const result = await extractLlmLessonCandidates({
+      provider,
+      rawObservations: [rawObservation({
+        userPrompt: "Always validate import keys before writing duplicate observations.",
+      })],
+      compressedObservations: [],
+      config: resolveReplayLessonExtractionConfig({}, {}),
+      firstPrompt: "first",
+      project: "/repo",
+      sessionId: "pi-empty-response-retry",
+    });
+
+    expect(provider.compress).toHaveBeenCalledTimes(2);
+    expect(result.candidates).toHaveLength(1);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("preserves allowlisted causes from ordinary provider errors without retrying", async () => {
+    const sensitive = "sensitive-ordinary-error-marker";
+    for (const [message, expectedCause] of [
+      [`circuit_breaker_open ${sensitive}`, "circuit_breaker_open"],
+      [`pi_auth_failed ${sensitive}`, "pi_auth_failed"],
+      [`opaque provider failure ${sensitive}`, "provider_failure"],
+    ] as const) {
+      const provider: MemoryProvider = {
+        name: "resilient(pi-agent-sdk)",
+        compress: vi.fn().mockRejectedValue(new Error(message)),
+        summarize: vi.fn().mockResolvedValue(""),
+      };
+
+      const result = await extractLlmLessonCandidates({
+        provider,
+        rawObservations: [rawObservation({
+          userPrompt: "Always validate import keys before writing duplicate observations.",
+        })],
+        compressedObservations: [],
+        config: resolveReplayLessonExtractionConfig({}, {}),
+        firstPrompt: "first",
+        project: "/repo",
+        sessionId: "ordinary-provider-error-session",
+      });
+
+      expect(provider.compress).toHaveBeenCalledTimes(1);
+      expect(result.errors).toEqual([expectedCause]);
+      expect(JSON.stringify(result)).not.toContain(sensitive);
+    }
   });
 
   it("strips private data before calling provider.compress", async () => {

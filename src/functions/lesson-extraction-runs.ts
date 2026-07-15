@@ -199,6 +199,9 @@ export async function saveRunStatus(
         : undefined,
     finishedAt: isFinalState ? now : run.finishedAt,
   };
+  if (status === "running" || !patch.failureDiagnostics) {
+    delete next.failureDiagnostics;
+  }
 
   await kv.set(KV.lessonExtractionRuns, next.id, next);
   return next;
@@ -303,6 +306,7 @@ export async function enqueueLlmLessonExtractionRun(
         skippedReason: "failed run exists and retryFailed is false",
         updatedAt: now,
       };
+      delete skipped.failureDiagnostics;
       await kv.set(KV.lessonExtractionRuns, runId, skipped);
       return skipped;
     }
@@ -396,6 +400,7 @@ export async function processLlmLessonExtractionRun(
   if (extraction.errors.length > 0) {
     return saveRunStatus(kv, runningPatch, "retryable", {
       lastError: extraction.errors.join("\n"),
+      failureDiagnostics: extraction.failureDiagnostics,
       createdLessonIds: extraction.lessonIds,
       replacedLessonIds: [],
       ...extractionMetadata,

@@ -4,6 +4,7 @@ import type {
   MemoryProvider,
   MemoryProviderCallOptions,
   RawObservation,
+  StageFailureDiagnostics,
 } from "../types.js";
 import { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
@@ -23,6 +24,8 @@ import { stripPrivateData } from "./privacy.js";
 import { logger } from "../logger.js";
 import type { LlmLessonExtractionRuntimeConfig } from "./lesson-extraction-runs.js";
 import { resolveStageModelCallOptions } from "../config.js";
+import { ProviderCallError } from "../providers/provider-call-result.js";
+import { sanitizeStageFailureDiagnostics } from "./summarize.js";
 
 export interface ReplayLessonExtractionConfig {
   enabled: boolean;
@@ -88,6 +91,7 @@ export interface ExtractLlmLessonsResult {
   errors: string[];
   promptChars?: number;
   parseFailures?: number;
+  failureDiagnostics?: StageFailureDiagnostics;
 }
 
 export interface ExtractLessonsInput {
@@ -179,7 +183,7 @@ async function callWithTimeout(
   let timer: ReturnType<typeof setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
-      reject(new Error(`provider.compress timeout after ${timeoutMs}ms`));
+      reject(new Error("network_error"));
     }, timeoutMs);
   });
 
@@ -563,6 +567,33 @@ interface LessonChunkResult {
   errors: string[];
   promptChars: number;
   parseFailures: number;
+  transportFailed?: boolean;
+  failureDiagnostics?: StageFailureDiagnostics;
+}
+
+function safeProviderFailureCause(error: unknown): string {
+  if (error instanceof Error) {
+    for (const cause of [
+      "pi_auth_missing",
+      "pi_auth_failed",
+      "pi_model_not_found",
+      "pi_sdk_import_failed",
+      "circuit_breaker_open",
+      "pi_stream_failed",
+      "network_error",
+    ]) {
+      if (error.message.includes(cause)) return cause;
+    }
+  }
+  return "provider_failure";
+}
+
+function safeLessonResponseError(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  if (/No <lesson> blocks/i.test(message)) return "No <lesson> blocks";
+  if (message === "empty LLM response") return "empty_response";
+  if (message.startsWith("lesson extraction invalid payload:")) return "lesson_validation_failed";
+  return "lesson_parse_failed";
 }
 
 export function buildTurnAwareLessonChunks(
@@ -627,8 +658,9 @@ async function extractLlmChunkWithRetry(
 ): Promise<LessonChunkResult> {
   let parseFailures = 0;
   for (let attempt = 1; attempt <= 2; attempt++) {
+    let xml: string;
     try {
-      const xml = await callWithTimeout(
+      xml = await callWithTimeout(
         () =>
           compressWithOptions(
             provider,
@@ -642,6 +674,49 @@ async function extractLlmChunkWithRetry(
           ),
         timeoutMs,
       );
+    } catch (error) {
+      if (error instanceof Error && error.message === "pi_empty_response") {
+        const safeError = "empty_response";
+        logger.warn("Lesson extraction response invalid", {
+          sessionId,
+          chunk: chunkIndex,
+          attempt,
+          error: safeError,
+        });
+        parseFailures++;
+        if (attempt === 2) {
+          return {
+            chunkIndex,
+            candidates: [],
+            errors: [safeError],
+            promptChars: prompt.length,
+            parseFailures,
+          };
+        }
+        continue;
+      }
+      const failureCause = safeProviderFailureCause(error);
+      const failureDiagnostics = error instanceof ProviderCallError
+        ? sanitizeStageFailureDiagnostics(error.metadata, "chunk")
+        : undefined;
+      logger.warn("Lesson extraction provider call failed", {
+        sessionId,
+        chunk: chunkIndex,
+        attempt,
+        error: failureCause,
+      });
+      return {
+        chunkIndex,
+        candidates: [],
+        errors: [failureCause],
+        promptChars: prompt.length,
+        parseFailures,
+        transportFailed: true,
+        ...(failureDiagnostics ? { failureDiagnostics } : {}),
+      };
+    }
+
+    try {
       if (!xml || !xml.trim()) throw new Error("empty LLM response");
       const parsed = parseLessonExtractionXml(xml);
       const validation = validateOutput(
@@ -672,19 +747,20 @@ async function extractLlmChunkWithRetry(
             .filter((candidate): candidate is ExtractedLessonCandidate => candidate !== null),
           errors: [],
       };
-    } catch (err) {
-      logger.warn("Lesson extraction chunk failed", {
+    } catch (error) {
+      const safeError = safeLessonResponseError(error);
+      logger.warn("Lesson extraction response invalid", {
         sessionId,
         chunk: chunkIndex,
         attempt,
-        error: err instanceof Error ? err.message : String(err),
+        error: safeError,
       });
       parseFailures++;
       if (attempt === 2) {
         return {
           chunkIndex,
           candidates: [],
-          errors: [err instanceof Error ? err.message : String(err)],
+          errors: [safeError],
           promptChars: prompt.length,
           parseFailures,
         };
@@ -696,7 +772,13 @@ async function extractLlmChunkWithRetry(
 
 export async function extractLlmLessonCandidates(
   input: LlmExtractionInput,
-): Promise<{ candidates: ExtractedLessonCandidate[]; errors: string[]; promptChars: number; parseFailures: number }> {
+): Promise<{
+  candidates: ExtractedLessonCandidate[];
+  errors: string[];
+  promptChars: number;
+  parseFailures: number;
+  failureDiagnostics?: StageFailureDiagnostics;
+}> {
   const {
     provider,
     rawObservations,
@@ -733,6 +815,8 @@ export async function extractLlmLessonCandidates(
   const errors: string[] = [];
   let promptChars = 0;
   let parseFailures = 0;
+  let transportFailed = false;
+  let failureDiagnostics: StageFailureDiagnostics | undefined;
 
   for (let batchStart = 0; batchStart < chunks.length; batchStart += concurrency) {
     const batch = chunks.slice(batchStart, batchStart + concurrency);
@@ -746,7 +830,7 @@ export async function extractLlmLessonCandidates(
           items: chunks[chunkIndex],
         });
         promptChars += chunkText.length;
-        chunkResults[chunkIndex] = await extractLlmChunkWithRetry(
+        const result = await extractLlmChunkWithRetry(
           provider,
           chunkText,
           chunkIndex,
@@ -754,8 +838,11 @@ export async function extractLlmLessonCandidates(
           timeoutMs,
           callOptions,
         );
+        chunkResults[chunkIndex] = result;
+        if (result.transportFailed) transportFailed = true;
       }),
     );
+    if (transportFailed) break;
   }
 
   const ordered = chunkResults
@@ -766,13 +853,20 @@ export async function extractLlmLessonCandidates(
   for (const result of ordered) {
     parseFailures += result.parseFailures;
     if (result.errors.length > 0) {
+      failureDiagnostics ??= result.failureDiagnostics;
       errors.push(...result.errors);
       continue;
     }
     candidates.push(...result.candidates);
   }
 
-  return { candidates, errors, promptChars, parseFailures };
+  return {
+    candidates,
+    errors,
+    promptChars,
+    parseFailures,
+    ...(failureDiagnostics ? { failureDiagnostics } : {}),
+  };
 }
 
 function sortLlmCandidates(
@@ -808,6 +902,7 @@ export async function extractLlmLessonsFromObservations(
     errors: extractionErrors,
     promptChars,
     parseFailures,
+    failureDiagnostics,
   } = await extractLlmLessonCandidates({
     provider,
     rawObservations,
@@ -828,6 +923,7 @@ export async function extractLlmLessonsFromObservations(
       errors,
       promptChars,
       parseFailures,
+      ...(failureDiagnostics ? { failureDiagnostics } : {}),
     };
   }
 
@@ -890,10 +986,8 @@ export async function extractLlmLessonsFromObservations(
       await kv.set(KV.lessons, lessonId, lesson);
       lessonIds.push(lessonId);
       created += 1;
-    } catch (err) {
-      errors.push(
-        err instanceof Error ? err.message : `failed to save lesson candidate: ${String(err)}`,
-      );
+    } catch {
+      errors.push("lesson_persist_failed");
     }
   }
 
@@ -905,6 +999,7 @@ export async function extractLlmLessonsFromObservations(
     errors,
     promptChars,
     parseFailures,
+    ...(failureDiagnostics ? { failureDiagnostics } : {}),
   };
 }
 

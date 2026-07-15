@@ -9,6 +9,9 @@ import type {
   ResumableSummaryRun,
   ResumableSummaryPartial,
   ResumableSummaryActiveRun,
+  StageFailure,
+  StageFailureDiagnostics,
+  SummaryAdvanceKind,
 } from "../types.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -41,6 +44,7 @@ import {
   isProviderPreflightError,
   providerPreflightStatus,
   sortProviderCallTelemetry,
+  type ProviderPreflightError,
   type ProviderCallIndex,
   type ProviderCallRole,
   type ProviderCallTelemetry,
@@ -49,6 +53,108 @@ import {
 // Bail on the merged summary if more than this fraction of chunks fail
 // to parse — a half-blind narrative is worse than a clean error.
 const MAX_SKIP_RATIO = 0.5;
+const TRANSIENT_RETRY_BASE_DELAY_MS = 31_000;
+const TRANSIENT_RETRY_JITTER_MS = 5_000;
+
+type SummaryFailureCause =
+  | "parse_failed"
+  | "pi_stream_failed"
+  | "circuit_breaker_open"
+  | "network_error"
+  | "provider_failure"
+  | "pi_auth_missing"
+  | "pi_auth_failed"
+  | "pi_model_not_found"
+  | "pi_sdk_import_failed";
+
+type SummaryRetryOptions = {
+  sleep?: (delayMs: number) => Promise<void>;
+  cooldownMs?: (sessionId: string) => number;
+};
+
+const PROVIDER_ERROR_CODES = new Set([
+  "model_not_found",
+  "rate_limited",
+  "timeout",
+  "provider_rejected",
+  "auth_failed",
+  "network_error",
+  "server_error",
+  "unknown",
+]);
+const PROVIDER_STOP_REASONS = new Set([
+  "stop",
+  "max_tokens",
+  "tool_use",
+  "error",
+  "aborted",
+]);
+
+function safeNonNegativeInteger(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && Number(value) >= 0
+    ? Number(value)
+    : undefined;
+}
+
+function safeResponseModel(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const normalized = value.trim();
+  return /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(normalized)
+    ? normalized
+    : undefined;
+}
+
+export function sanitizeStageFailureDiagnostics(
+  value: unknown,
+  requestPhase?: StageFailureDiagnostics["requestPhase"],
+): StageFailureDiagnostics | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const source = value as Record<string, unknown>;
+  const phase = requestPhase ?? source.requestPhase;
+  const elapsedMs = safeNonNegativeInteger(source.elapsedMs);
+  const inputChars = safeNonNegativeInteger(source.inputChars);
+  const maxOutputTokens = safeNonNegativeInteger(source.maxOutputTokens);
+  if (
+    (phase !== "chunk" && phase !== "reduce")
+    || typeof source.providerErrorCode !== "string"
+    || !PROVIDER_ERROR_CODES.has(source.providerErrorCode)
+    || elapsedMs === undefined
+    || inputChars === undefined
+    || maxOutputTokens === undefined
+    || typeof source.responseStarted !== "boolean"
+  ) {
+    return undefined;
+  }
+  const statusCode = safeNonNegativeInteger(source.statusCode);
+  const retryAfterMs = safeNonNegativeInteger(source.retryAfterMs);
+  const responseModel = safeResponseModel(source.responseModel);
+  const stopReason = typeof source.stopReason === "string"
+    && PROVIDER_STOP_REASONS.has(source.stopReason)
+    ? source.stopReason as StageFailureDiagnostics["stopReason"]
+    : undefined;
+  return {
+    requestPhase: phase,
+    providerErrorCode: source.providerErrorCode as StageFailureDiagnostics["providerErrorCode"],
+    ...(statusCode === undefined ? {} : { statusCode }),
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+    elapsedMs,
+    inputChars,
+    maxOutputTokens,
+    responseStarted: source.responseStarted,
+    ...(responseModel ? { responseModel } : {}),
+    ...(stopReason ? { stopReason } : {}),
+  };
+}
+
+function diagnosticsFromProviderError(
+  error: unknown,
+  requestPhase: StageFailureDiagnostics["requestPhase"],
+): StageFailureDiagnostics | undefined {
+  return sanitizeStageFailureDiagnostics(
+    (error as { metadata?: unknown } | null)?.metadata,
+    requestPhase,
+  );
+}
 
 function resumableCallIndex(
   run: ResumableSummaryRun,
@@ -90,10 +196,80 @@ type ResumableSummaryResponse = {
   completedChunks: number;
   totalChunks: number;
   skippedChunks: number;
+  advanced: SummaryAdvanceKind;
   summary?: SessionSummary;
   error?: string;
+  failureCause?: SummaryFailureCause;
+  failure?: StageFailure;
   telemetry?: ProviderCallTelemetry[];
 };
+
+function summaryFailureCause(error: unknown): SummaryFailureCause {
+  const message = error instanceof Error ? error.message : String(error);
+  const normalized = message.toLowerCase();
+  for (const cause of [
+    "pi_auth_missing",
+    "pi_auth_failed",
+    "pi_model_not_found",
+    "pi_sdk_import_failed",
+  ] as const) {
+    if (normalized.includes(cause)) return cause;
+  }
+  const providerErrorCode = (error as { metadata?: { providerErrorCode?: unknown } } | null)
+    ?.metadata?.providerErrorCode;
+  if (["401", "403", "auth", "authentication"].includes(String(providerErrorCode).toLowerCase())) {
+    return "pi_auth_failed";
+  }
+  if (normalized.includes("circuit_breaker_open")) return "circuit_breaker_open";
+  if (normalized.includes("pi_stream_failed")) return "pi_stream_failed";
+  if (providerErrorCode === "timeout"
+    || /fetch failed|network|econnreset|etimedout|timed out|timeout|socket/.test(normalized)) {
+    return "network_error";
+  }
+  return "provider_failure";
+}
+
+function summaryStageFailure(
+  cause: SummaryFailureCause,
+  diagnostics?: StageFailureDiagnostics,
+): StageFailure {
+  const detail = diagnostics ? { diagnostics } : {};
+  if (
+    cause === "pi_auth_missing"
+    || cause === "pi_auth_failed"
+    || cause === "pi_model_not_found"
+    || cause === "pi_sdk_import_failed"
+  ) {
+    return { class: "hard", cause, ...detail };
+  }
+  if (transientSummaryFailure(cause)) {
+    return { class: "transient_provider", cause, ...detail };
+  }
+  return { class: "unit", cause, ...detail };
+}
+
+function summaryPreflightFailure(error: ProviderPreflightError): StageFailure {
+  return {
+    class: "hard",
+    cause: error.telemetry.reason?.trim() || providerPreflightStatus(error),
+  };
+}
+
+function transientSummaryFailure(cause: SummaryFailureCause): boolean {
+  return cause === "pi_stream_failed"
+    || cause === "circuit_breaker_open"
+    || cause === "network_error";
+}
+
+function defaultSummaryRetryCooldownMs(sessionId: string): number {
+  const hashPrefix = createHash("sha256").update(sessionId).digest("hex").slice(0, 8);
+  return TRANSIENT_RETRY_BASE_DELAY_MS
+    + (Number.parseInt(hashPrefix, 16) % (TRANSIENT_RETRY_JITTER_MS + 1));
+}
+
+function sleep(delayMs: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
 
 function summarizeWithOptions(
   provider: MemoryProvider,
@@ -136,6 +312,22 @@ function markChunkTelemetry(
   record.chunkObservationCount = marker.chunkObservationCount;
 }
 
+function rememberChunkFailure(
+  failure: { cause?: SummaryFailureCause; diagnostics?: StageFailureDiagnostics } | undefined,
+  cause: SummaryFailureCause,
+  diagnostics?: StageFailureDiagnostics,
+): void {
+  if (!failure) return;
+  if (!failure.cause) {
+    failure.cause = cause;
+    failure.diagnostics = diagnostics;
+    return;
+  }
+  if (failure.cause === cause && !failure.diagnostics && diagnostics) {
+    failure.diagnostics = diagnostics;
+  }
+}
+
 // One chunk call with retry-once. Returns null when both attempts fail —
 // whether by parse failure, provider 4xx (content rejected by upstream
 // filters), or transient network/5xx errors that didn't recover on retry.
@@ -155,6 +347,8 @@ async function summarizeChunkWithRetry(
   telemetry?: ProviderCallTelemetry[],
   nextCallIndex?: (attempt: number) => ProviderCallIndex,
   chunkTelemetry?: SummaryChunkTelemetryMarker,
+  retryOptions: SummaryRetryOptions = {},
+  failure?: { cause?: SummaryFailureCause; diagnostics?: StageFailureDiagnostics },
 ): Promise<SessionSummary | null> {
   for (let attempt = 1; attempt <= 2; attempt++) {
     const callIndex = nextCallIndex?.(attempt) ?? 0;
@@ -171,20 +365,33 @@ async function summarizeChunkWithRetry(
       markChunkTelemetry(telemetry, callIndex, chunkTelemetry);
       const parsed = parseSummaryXml(xml, sessionId, project, chunk.length);
       if (parsed) return parsed;
+      rememberChunkFailure(failure, "parse_failed");
       logger.warn("Summarize chunk parse failed", {
         sessionId,
         chunk: `${idx + 1}/${total}`,
         attempt,
       });
+      continue;
     } catch (err) {
       markChunkTelemetry(telemetry, callIndex, chunkTelemetry);
       if (isProviderPreflightError(err)) throw err;
+      const cause = summaryFailureCause(err);
+      rememberChunkFailure(failure, cause, diagnosticsFromProviderError(err, "chunk"));
       logger.warn("Summarize chunk LLM call failed", {
         sessionId,
         chunk: `${idx + 1}/${total}`,
         attempt,
         error: err instanceof Error ? err.message : String(err),
       });
+      if (attempt === 1) {
+        if (transientSummaryFailure(cause)) {
+          const cooldownMs = retryOptions.cooldownMs?.(sessionId)
+            ?? defaultSummaryRetryCooldownMs(sessionId);
+          await (retryOptions.sleep ?? sleep)(Math.max(0, cooldownMs));
+        }
+        continue;
+      }
+      return null;
     }
   }
   return null;
@@ -678,12 +885,18 @@ function resumableResponse(
   options: {
     summary?: SessionSummary;
     error?: string;
+    failureCause?: SummaryFailureCause;
+    failure?: StageFailure;
+    advanced?: SummaryAdvanceKind;
     telemetry?: ProviderCallTelemetry[];
   } = {},
 ): ResumableSummaryResponse {
+  const failure = options.failure
+    ?? (options.failureCause ? summaryStageFailure(options.failureCause) : undefined);
   return {
     success: status === "in_progress" || status === "succeeded",
     status,
+    advanced: options.advanced ?? "none",
     completedChunks,
     totalChunks,
     skippedChunks,
@@ -691,6 +904,8 @@ function resumableResponse(
       ? { summary: options.summary }
       : {}),
     ...(options.error ? { error: options.error } : {}),
+    ...(options.failureCause ? { failureCause: options.failureCause } : {}),
+    ...(failure ? { failure } : {}),
     ...(options.telemetry
       ? { telemetry: sortProviderCallTelemetry(options.telemetry) }
       : {}),
@@ -719,6 +934,7 @@ async function persistResumableSummary(
   completedChunks: number,
   skippedChunks: number,
   telemetry?: ProviderCallTelemetry[],
+  advanced: SummaryAdvanceKind = "none",
 ): Promise<ResumableSummaryResponse> {
   const updatedAt = new Date().toISOString();
   const succeededRun: ResumableSummaryRun = {
@@ -743,7 +959,7 @@ async function persistResumableSummary(
     completedChunks,
     run.totalChunks,
     skippedChunks,
-    { summary, ...(telemetry ? { telemetry } : {}) },
+    { summary, advanced, ...(telemetry ? { telemetry } : {}) },
   );
 }
 
@@ -751,6 +967,7 @@ async function runResumableSummaryStep(
   data: { sessionId: string; model?: string } | undefined,
   kv: StateKV,
   provider: MemoryProvider,
+  retryOptions: SummaryRetryOptions = {},
 ): Promise<ResumableSummaryResponse> {
   if (!data || typeof data.sessionId !== "string" || !data.sessionId.trim()) {
     return resumableResponse("failed", 0, 0, 0, {
@@ -941,6 +1158,23 @@ async function runResumableSummaryStep(
         await kv.set(KV.summaryResumableRuns, runId, run);
       }
 
+      if (
+        run.status === "failed" &&
+        run.totalChunks === 1 &&
+        run.lastError === "validation_failed"
+      ) {
+        await kv.delete(KV.summaryResumablePartials(runId), "0");
+        run = {
+          ...run,
+          status: "in_progress",
+          completedChunks: 0,
+          skippedChunks: 0,
+          lastError: undefined,
+          updatedAt: now,
+        };
+        await kv.set(KV.summaryResumableRuns, runId, run);
+      }
+
       if (run.status !== "succeeded") {
         const activeRun: ResumableSummaryActiveRun = {
           sessionId,
@@ -1041,11 +1275,12 @@ async function runResumableSummaryStep(
           persistedSinglePartial.summary,
         );
         if (validationError) {
+          await kv.delete(KV.summaryResumablePartials(runId), "0");
           run = {
             ...run,
-            status: "failed",
-            completedChunks,
-            skippedChunks,
+            status: "in_progress",
+            completedChunks: 0,
+            skippedChunks: 0,
             lastError: validationError,
             updatedAt: new Date().toISOString(),
           };
@@ -1055,7 +1290,11 @@ async function runResumableSummaryStep(
             completedChunks,
             totalChunks,
             skippedChunks,
-            { error: validationError, telemetry },
+            {
+              error: validationError,
+              failureCause: "parse_failed",
+              telemetry,
+            },
           );
         }
         return persistResumableSummary(
@@ -1078,6 +1317,10 @@ async function runResumableSummaryStep(
         const previousPartial = partialByIndex.get(nextChunkIndex);
         const callOptions = resolveStageModelCallOptions("summary", data.model);
         const invocationMarker = resumableInvocationMarker(run);
+        const failure: {
+          cause?: SummaryFailureCause;
+          diagnostics?: StageFailureDiagnostics;
+        } = {};
         const summary = await summarizeChunkWithRetry(
           provider,
           chunks[nextChunkIndex],
@@ -1105,7 +1348,34 @@ async function runResumableSummaryStep(
               chunkObservationCount: chunks[nextChunkIndex].length,
             }
             : undefined,
+          retryOptions,
+          failure,
         );
+        if (totalChunks === 1 && summary) {
+          const validationError = validateFinalSummary(summary);
+          if (validationError) {
+            run = {
+              ...run,
+              status: "in_progress",
+              completedChunks,
+              skippedChunks,
+              lastError: validationError,
+              updatedAt: new Date().toISOString(),
+            };
+            await kv.set(KV.summaryResumableRuns, runId, run);
+            return resumableResponse(
+              "failed",
+              completedChunks,
+              totalChunks,
+              skippedChunks,
+              {
+                error: validationError,
+                failureCause: "parse_failed",
+                telemetry,
+              },
+            );
+          }
+        }
         const partial: ResumableSummaryPartial = {
           runId,
           chunkIndex: nextChunkIndex,
@@ -1124,7 +1394,8 @@ async function runResumableSummaryStep(
         skippedChunks += summary ? 0 : 1;
 
         if (skippedChunks > Math.floor(totalChunks * MAX_SKIP_RATIO)) {
-          const error = `too_many_chunks_skipped: ${skippedChunks}/${totalChunks} chunks failed to parse after retry`;
+          const failureCause = failure.cause ?? "provider_failure";
+          const error = `too_many_chunks_skipped: ${skippedChunks}/${totalChunks} chunks unavailable after retry; failure_cause=${failureCause}`;
           run = {
             ...run,
             status: "in_progress",
@@ -1139,30 +1410,17 @@ async function runResumableSummaryStep(
             completedChunks,
             totalChunks,
             skippedChunks,
-            { error, telemetry },
+            {
+              error,
+              failureCause,
+              failure: summaryStageFailure(failureCause, failure.diagnostics),
+              advanced: "skipped",
+              telemetry,
+            },
           );
         }
 
         if (totalChunks === 1 && summary) {
-          const validationError = validateFinalSummary(summary);
-          if (validationError) {
-            run = {
-              ...run,
-              status: "failed",
-              completedChunks,
-              skippedChunks,
-              lastError: validationError,
-              updatedAt: new Date().toISOString(),
-            };
-            await kv.set(KV.summaryResumableRuns, runId, run);
-            return resumableResponse(
-              "failed",
-              completedChunks,
-              totalChunks,
-              skippedChunks,
-              { error: validationError, telemetry },
-            );
-          }
           return persistResumableSummary(
             kv,
             run,
@@ -1170,6 +1428,7 @@ async function runResumableSummaryStep(
             completedChunks,
             skippedChunks,
             telemetry,
+            "completed",
           );
         }
 
@@ -1186,7 +1445,16 @@ async function runResumableSummaryStep(
           completedChunks,
           totalChunks,
           skippedChunks,
-          { telemetry },
+          {
+            advanced: summary ? "completed" : "skipped",
+            ...(!summary && failure.cause
+              ? {
+                failureCause: failure.cause,
+                failure: summaryStageFailure(failure.cause, failure.diagnostics),
+              }
+              : {}),
+            telemetry,
+          },
         );
       }
 
@@ -1217,6 +1485,8 @@ async function runResumableSummaryStep(
 
       const persistReduceFailure = async (
         message: string,
+        failureCause: SummaryFailureCause,
+        diagnostics?: StageFailureDiagnostics,
       ): Promise<ResumableSummaryResponse> => {
         run = {
           ...run,
@@ -1232,7 +1502,12 @@ async function runResumableSummaryStep(
           completedChunks,
           totalChunks,
           skippedChunks,
-          { error: message, telemetry },
+          {
+            error: message,
+            failureCause,
+            failure: summaryStageFailure(failureCause, diagnostics),
+            telemetry,
+          },
         );
       };
 
@@ -1265,14 +1540,18 @@ async function runResumableSummaryStep(
             completedChunks,
             totalChunks,
             skippedChunks,
-            { error: status, telemetry },
+            { error: status, failure: summaryPreflightFailure(error), telemetry },
           );
         }
-        const message = error instanceof Error ? error.message : String(error);
-        return persistReduceFailure(message);
+        const failureCause = summaryFailureCause(error);
+        return persistReduceFailure(
+          failureCause,
+          failureCause,
+          diagnosticsFromProviderError(error, "reduce"),
+        );
       }
       if (!response || !response.trim()) {
-        return persistReduceFailure("empty_provider_response");
+        return persistReduceFailure("empty_provider_response", "provider_failure");
       }
       const summary = parseSummaryXml(
         response,
@@ -1280,9 +1559,9 @@ async function runResumableSummaryStep(
         session.project,
         compressed.length,
       );
-      if (!summary) return persistReduceFailure("parse_failed");
+      if (!summary) return persistReduceFailure("parse_failed", "parse_failed");
       const validationError = validateFinalSummary(summary);
-      if (validationError) return persistReduceFailure(validationError);
+      if (validationError) return persistReduceFailure(validationError, "parse_failed");
       return await persistResumableSummary(
         kv,
         run,
@@ -1290,6 +1569,7 @@ async function runResumableSummaryStep(
         completedChunks,
         skippedChunks,
         telemetry,
+        "reduced",
       );
     } catch (error) {
       if (isProviderPreflightError(error)) {
@@ -1299,7 +1579,7 @@ async function runResumableSummaryStep(
           completedChunks,
           totalChunks,
           skippedChunks,
-          { error: status, telemetry },
+          { error: status, failure: summaryPreflightFailure(error), telemetry },
         );
       }
       const message = error instanceof Error ? error.message : String(error);
@@ -1323,6 +1603,7 @@ export function registerSummarizeFunction(
   kv: StateKV,
   provider: MemoryProvider,
   metricsStore?: MetricsStore,
+  retryOptions: SummaryRetryOptions = {},
 ): void {
   sdk.registerFunction("mem::summarize", 
     async (data: { sessionId: string; model?: string } | undefined) => {
@@ -1557,6 +1838,6 @@ export function registerSummarizeFunction(
   sdk.registerFunction(
     "mem::summarize-resumable",
     async (data: { sessionId: string; model?: string } | undefined) =>
-      runResumableSummaryStep(data, kv, provider),
+      runResumableSummaryStep(data, kv, provider, retryOptions),
   );
 }

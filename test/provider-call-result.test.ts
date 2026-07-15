@@ -45,6 +45,7 @@ import {
 import type { MemoryProvider } from "../src/types.js";
 import { createProvider } from "../src/providers/index.js";
 import { callProviderWithTelemetry } from "../src/providers/provider-call-result.js";
+import { ResilientProvider } from "../src/providers/resilient.js";
 
 describe("provider call results", () => {
   afterEach(() => {
@@ -222,6 +223,76 @@ describe("provider call results", () => {
     expect(telemetry).toHaveLength(4);
     expect(telemetry[3]).toMatchObject({ metadataStatus: "unsupported" });
   });
+
+  it.each(["rate_limited", "timeout", "network_error", "server_error"] as const)(
+    "counts %s provider diagnostics toward the circuit breaker",
+    async (providerErrorCode) => {
+      const inner: MemoryProvider = {
+        name: "classified-provider",
+        summarize: vi.fn(async () => {
+          throw new ProviderCallError("pi_stream_failed", { providerErrorCode });
+        }),
+        compress: vi.fn(async () => "unused"),
+      };
+      const provider = new ResilientProvider(inner);
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await expect(provider.summarize("system", "user")).rejects.toThrow(
+          "pi_stream_failed",
+        );
+      }
+
+      await expect(provider.summarize("system", "user")).rejects.toThrow(
+        "circuit_breaker_open",
+      );
+      expect(inner.summarize).toHaveBeenCalledTimes(3);
+      expect(provider.circuitState.state).toBe("open");
+    },
+  );
+
+  it.each(["provider_rejected", "unknown"] as const)(
+    "does not count %s provider diagnostics toward the circuit breaker",
+    async (providerErrorCode) => {
+      const inner: MemoryProvider = {
+        name: "classified-provider",
+        summarize: vi.fn(async () => {
+          throw new ProviderCallError("pi_stream_failed", { providerErrorCode });
+        }),
+        compress: vi.fn(async () => "unused"),
+      };
+      const provider = new ResilientProvider(inner);
+
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        await expect(provider.summarize("system", "user")).rejects.toThrow(
+          "pi_stream_failed",
+        );
+      }
+
+      expect(inner.summarize).toHaveBeenCalledTimes(4);
+      expect(provider.circuitState).toMatchObject({ state: "closed", failures: 0 });
+    },
+  );
+
+  it.each(["pi_auth_failed", "pi_model_not_found"])(
+    "does not count hard %s errors toward the circuit breaker",
+    async (cause) => {
+      const inner: MemoryProvider = {
+        name: "classified-provider",
+        summarize: vi.fn(async () => {
+          throw new Error(cause);
+        }),
+        compress: vi.fn(async () => "unused"),
+      };
+      const provider = new ResilientProvider(inner);
+
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        await expect(provider.summarize("system", "user")).rejects.toThrow(cause);
+      }
+
+      expect(inner.summarize).toHaveBeenCalledTimes(4);
+      expect(provider.circuitState).toMatchObject({ state: "closed", failures: 0 });
+    },
+  );
 
   it("blocks before Resilient/provider and returns redacted preflight telemetry", async () => {
     enablePolicy();

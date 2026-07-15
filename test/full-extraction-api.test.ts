@@ -44,6 +44,191 @@ function mockSdk(triggerImpl?: (input: { function_id: string; payload: unknown }
 }
 
 describe("full extraction REST wrappers", () => {
+  it("allows only structured summary failure diagnostics through the REST boundary", async () => {
+    const sdk = mockSdk(async () => ({
+      success: false,
+      status: "failed",
+      failure: {
+        class: "transient_provider",
+        cause: "pi_stream_failed",
+        diagnostics: {
+          requestPhase: "chunk",
+          providerErrorCode: "rate_limited",
+          statusCode: 429,
+          retryAfterMs: 2500,
+          elapsedMs: 12,
+          inputChars: 345,
+          maxOutputTokens: 4096,
+          responseStarted: false,
+          responseModel: "safe-model",
+          stopReason: "error",
+          prompt: "prompt-marker",
+          rawError: "raw-error-marker",
+          headers: { authorization: "credential-marker" },
+          token: "token-marker",
+        },
+      },
+    }));
+    registerApiTriggers(sdk as never, mockKV() as never, "");
+
+    const response = await sdk.getFunction("api::summarize-resumable")({
+      headers: {},
+      body: { sessionId: "session-1" },
+    });
+
+    expect(response.body).toEqual({
+      success: false,
+      status: "failed",
+      failure: {
+        class: "transient_provider",
+        cause: "pi_stream_failed",
+        diagnostics: {
+          requestPhase: "chunk",
+          providerErrorCode: "rate_limited",
+          statusCode: 429,
+          retryAfterMs: 2500,
+          elapsedMs: 12,
+          inputChars: 345,
+          maxOutputTokens: 4096,
+          responseStarted: false,
+          responseModel: "safe-model",
+          stopReason: "error",
+        },
+      },
+    });
+    const serialized = JSON.stringify(response.body);
+    for (const marker of ["prompt-marker", "raw-error-marker", "credential-marker", "token-marker"]) {
+      expect(serialized).not.toContain(marker);
+    }
+  });
+
+  it("drops an invalid summary failure object instead of passing unsafe diagnostics through", async () => {
+    const sdk = mockSdk(async () => ({
+      success: false,
+      status: "failed",
+      failure: {
+        class: 42,
+        cause: "pi_stream_failed",
+        diagnostics: {
+          prompt: "prompt-marker",
+          rawError: "raw-error-marker",
+          headers: { authorization: "credential-marker" },
+          token: "token-marker",
+        },
+      },
+    }));
+    registerApiTriggers(sdk as never, mockKV() as never, "");
+
+    const response = await sdk.getFunction("api::summarize-resumable")({
+      headers: {},
+      body: { sessionId: "session-1" },
+    });
+
+    expect(response.body).toEqual({ success: false, status: "failed" });
+    const serialized = JSON.stringify(response.body);
+    for (const marker of ["prompt-marker", "raw-error-marker", "credential-marker", "token-marker"]) {
+      expect(serialized).not.toContain(marker);
+    }
+  });
+
+  it("replays each formal write endpoint from a succeeded operation receipt", async () => {
+    const sdk = mockSdk(async (input) => ({
+      success: true,
+      functionId: input.function_id,
+      memoryIds: ["result-1"],
+    }));
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    const cases = [
+      {
+        api: "api::full-memory-consolidate-window",
+        body: {
+          runId: "formal-run",
+          stage: "memory_consolidate",
+          unitId: "mcw-1",
+          inputHash: "input-1",
+          concept: "retries",
+          sourceObservationIds: ["obs-1"],
+        },
+        functionId: "mem::full-memory-consolidate-window",
+      },
+      {
+        api: "api::semantic-rollup",
+        body: {
+          runId: "formal-run",
+          stage: "semantic_rollup",
+          unitId: "w0001",
+          inputHash: "input-1",
+          windowId: "w0001",
+          mark: "full",
+          kind: "window",
+          sessionIds: ["ses-1"],
+        },
+        functionId: "mem::semantic-rollup",
+      },
+      {
+        api: "api::full-skill-extract",
+        body: {
+          runId: "formal-run",
+          stage: "skill_extract",
+          unitId: "ses-1",
+          inputHash: "input-1",
+          sessionId: "ses-1",
+        },
+        functionId: "mem::skill-extract",
+      },
+      {
+        api: "api::full-crystals-auto",
+        body: {
+          runId: "formal-run",
+          stage: "crystal",
+          unitId: "auto",
+          inputHash: "input-1",
+          dryRun: false,
+        },
+        functionId: "mem::full-crystals-auto",
+      },
+      {
+        api: "api::full-consolidation-procedural-window",
+        body: {
+          runId: "formal-run",
+          stage: "consolidation_procedural",
+          unitId: "cpw-1",
+          inputHash: "input-1",
+          memoryIds: ["mem-1"],
+        },
+        functionId: "mem::full-consolidation-procedural-window",
+      },
+      {
+        api: "api::full-reflect-insight-window",
+        body: {
+          runId: "formal-run",
+          stage: "reflect_insight",
+          unitId: "riw-1",
+          inputHash: "input-1",
+          useGraph: false,
+          semanticMemoryIds: ["sem-1"],
+        },
+        functionId: "mem::full-reflect-insight-window",
+      },
+    ];
+
+    for (const entry of cases) {
+      sdk.trigger.mockClear();
+      const handler = sdk.getFunction(entry.api);
+      const first = await handler({ headers: {}, body: entry.body });
+      const replay = await handler({ headers: {}, body: entry.body });
+
+      expect(first.status_code).toBe(200);
+      expect(replay.status_code).toBe(200);
+      expect(sdk.trigger).toHaveBeenCalledTimes(1);
+      expect(sdk.trigger).toHaveBeenCalledWith(expect.objectContaining({
+        function_id: entry.functionId,
+      }));
+      expect(replay.body).toEqual(first.body);
+    }
+  });
+
   it("full skill-extract sends only sessionId to mem::skill-extract", async () => {
     const sdk = mockSdk(async () => ({ success: true, skill: { id: "proc-a" } }));
     const kv = mockKV();
@@ -52,7 +237,13 @@ describe("full extraction REST wrappers", () => {
 
     const response = await handler({
       headers: {},
-      body: { sessionId: " ses-a " },
+      body: {
+        runId: "formal-run",
+        stage: "skill_extract",
+        unitId: "ses-a",
+        inputHash: "input-a",
+        sessionId: " ses-a ",
+      },
     });
 
     expect(response.status_code).toBe(200);
@@ -66,19 +257,25 @@ describe("full extraction REST wrappers", () => {
     });
   });
 
-  it("full extraction wrappers trigger mem::full functions without reading KV directly", async () => {
+  it("full skill-extract whitelist error names operation identity fields", async () => {
     const sdk = mockSdk();
-    const kv = {
-      get: vi.fn(async () => {
-        throw new Error("REST wrapper must not read KV");
-      }),
-      set: vi.fn(async () => {
-        throw new Error("REST wrapper must not write KV");
-      }),
-      list: vi.fn(async () => {
-        throw new Error("REST wrapper must not list KV");
-      }),
-    };
+    registerApiTriggers(sdk as never, mockKV() as never, "");
+    const response = await sdk.getFunction("api::full-skill-extract")({
+      headers: {},
+      body: { sessionId: "ses-a", unexpected: true },
+    });
+
+    expect(response).toEqual({
+      status_code: 400,
+      body: {
+        error: "Only runId, stage, unitId, inputHash, sessionId, and model are accepted",
+      },
+    });
+  });
+
+  it("full extraction wrappers send only business fields to mem::full functions", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
     registerApiTriggers(sdk as never, kv as never, "");
 
     const cases = [
@@ -90,7 +287,15 @@ describe("full extraction REST wrappers", () => {
       },
       {
         api: "api::full-memory-consolidate-window",
-        body: { project: " repo ", concept: " Full ", sourceObservationIds: [" obs-a ", ""] },
+        body: {
+          runId: "formal-run",
+          stage: "memory_consolidate",
+          unitId: "mcw-1",
+          inputHash: "input-1",
+          project: " repo ",
+          concept: " Full ",
+          sourceObservationIds: [" obs-a ", ""],
+        },
         function_id: "mem::full-memory-consolidate-window",
         payload: { project: "repo", concept: "Full", observationIds: ["obs-a"] },
       },
@@ -102,7 +307,15 @@ describe("full extraction REST wrappers", () => {
       },
       {
         api: "api::full-consolidation-procedural-window",
-        body: { project: " repo ", memoryIds: [" mem-a ", ""], model: " memory-model " },
+        body: {
+          runId: "formal-run",
+          stage: "consolidation_procedural",
+          unitId: "cpw-1",
+          inputHash: "input-1",
+          project: " repo ",
+          memoryIds: [" mem-a ", ""],
+          model: " memory-model ",
+        },
         function_id: "mem::full-consolidation-procedural-window",
         payload: { project: "repo", memoryIds: ["mem-a"], model: "memory-model" },
       },
@@ -114,7 +327,16 @@ describe("full extraction REST wrappers", () => {
       },
       {
         api: "api::full-reflect-insight-window",
-        body: { project: " repo ", semanticMemoryIds: [" sem-a "], lessonIds: [" lsn-a "], crystalIds: [" crys-a "] },
+        body: {
+          runId: "formal-run",
+          stage: "reflect_insight",
+          unitId: "riw-1",
+          inputHash: "input-1",
+          project: " repo ",
+          semanticMemoryIds: [" sem-a "],
+          lessonIds: [" lsn-a "],
+          crystalIds: [" crys-a "],
+        },
         function_id: "mem::full-reflect-insight-window",
         payload: { project: "repo", useGraph: false, semanticMemoryIds: ["sem-a"], lessonIds: ["lsn-a"], crystalIds: ["crys-a"] },
       },
@@ -137,10 +359,6 @@ describe("full extraction REST wrappers", () => {
         payload: entry.payload,
       });
     }
-
-    expect(kv.get).not.toHaveBeenCalled();
-    expect(kv.set).not.toHaveBeenCalled();
-    expect(kv.list).not.toHaveBeenCalled();
   });
 
   it("full reflect insight wrappers reject useGraph true with a 400 response", async () => {

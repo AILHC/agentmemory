@@ -1,5 +1,13 @@
 import { TriggerAction, type ISdk, type ApiRequest } from "iii-sdk";
-import type { Session, CompressedObservation, HookPayload, CommitLink, SessionSummary } from "../types.js";
+import type {
+  Session,
+  CompressedObservation,
+  HookPayload,
+  CommitLink,
+  SessionSummary,
+  ExtractionOperationIdentity,
+  ExtractionOperationStage,
+} from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
@@ -37,12 +45,96 @@ import {
   type StageModelKey,
 } from "../config.js";
 import { resolveOutputLanguage } from "../prompts/output-language.js";
+import { withExtractionOperationReceipt } from "../functions/extraction-operation-receipts.js";
+import { sanitizeStageFailureDiagnostics } from "../functions/summarize.js";
+
+const SUMMARY_FAILURE_CLASSES = new Set([
+  "transient_provider",
+  "transient_runtime",
+  "unit",
+  "hard",
+]);
 
 type Response = {
   status_code: number;
   headers?: Record<string, string>;
   body: unknown;
 };
+
+function sanitizeSummaryApiResult(result: unknown): unknown {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const response = result as Record<string, unknown>;
+  const failure = response.failure;
+  if (failure === undefined) return result;
+  const { failure: _failure, ...responseWithoutFailure } = response;
+  if (!failure || typeof failure !== "object" || Array.isArray(failure)) {
+    return responseWithoutFailure;
+  }
+  const source = failure as Record<string, unknown>;
+  if (
+    typeof source.class !== "string"
+    || !SUMMARY_FAILURE_CLASSES.has(source.class)
+    || typeof source.cause !== "string"
+  ) {
+    return responseWithoutFailure;
+  }
+  const diagnostics = sanitizeStageFailureDiagnostics(source.diagnostics);
+  return {
+    ...response,
+    failure: {
+      class: source.class,
+      cause: source.cause,
+      ...(diagnostics ? { diagnostics } : {}),
+    },
+  };
+}
+
+const LESSON_API_ERROR_CAUSES = [
+  "pi_auth_missing",
+  "pi_auth_failed",
+  "pi_model_not_found",
+  "pi_sdk_import_failed",
+  "circuit_breaker_open",
+  "pi_stream_failed",
+  "network_error",
+  "provider_failure",
+  "lesson_parse_failed",
+  "lesson_validation_failed",
+  "lesson_persist_failed",
+  "empty_response",
+];
+
+function sanitizeLessonApiLastError(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  if (/No <lesson> blocks/i.test(value)) return "No <lesson> blocks";
+  for (const cause of LESSON_API_ERROR_CAUSES) {
+    if (value.includes(cause)) return cause;
+  }
+  if (/session .* not found/i.test(value)) return "session_not_found";
+  return undefined;
+}
+
+function sanitizeLessonRunApiResult(result: unknown): unknown {
+  if (!result || typeof result !== "object" || Array.isArray(result)) return result;
+  const response = result as Record<string, unknown>;
+  if (!response.run || typeof response.run !== "object" || Array.isArray(response.run)) {
+    return result;
+  }
+  const run = response.run as Record<string, unknown>;
+  const diagnostics = sanitizeStageFailureDiagnostics(run.failureDiagnostics);
+  const lastError = sanitizeLessonApiLastError(run.lastError);
+  const safeRun = { ...run };
+  delete safeRun.failureDiagnostics;
+  delete safeRun.lastError;
+  return {
+    ...response,
+    run: {
+      ...safeRun,
+      ...(lastError ? { lastError } : {}),
+      ...(diagnostics ? { failureDiagnostics: diagnostics } : {}),
+    },
+  };
+}
 
 function parseOptionalInt(raw: unknown): number | undefined {
   if (raw === undefined || raw === null || raw === "") return undefined;
@@ -272,6 +364,9 @@ const allowedGraphBuildCreateKeys = new Set(["batchSize", "maxSessions"]);
 const allowedGraphBuildProcessKeys = new Set(["taskId", "maxBatches"]);
 const allowedSemanticRollupKeys = new Set([
   "runId",
+  "stage",
+  "unitId",
+  "inputHash",
   "windowId",
   "mark",
   "kind",
@@ -279,7 +374,12 @@ const allowedSemanticRollupKeys = new Set([
   "semanticMemoryIds",
   "model",
 ]);
-const allowedFullSkillExtractKeys = new Set(["sessionId", "model"]);
+const extractionOperationIdentityKeys = ["runId", "stage", "unitId", "inputHash"] as const;
+const allowedFullSkillExtractKeys = new Set([
+  ...extractionOperationIdentityKeys,
+  "sessionId",
+  "model",
+]);
 const allowedFullConsolidatePlanKeys = new Set([
   "project",
   "minImportance",
@@ -289,6 +389,7 @@ const allowedFullConsolidatePlanKeys = new Set([
   "minObservations",
 ]);
 const allowedFullConsolidateWindowKeys = new Set([
+  ...extractionOperationIdentityKeys,
   "windowId",
   "project",
   "concept",
@@ -300,6 +401,7 @@ const allowedFullConsolidateWindowKeys = new Set([
 ]);
 const allowedFullProceduralPlanKeys = new Set(["project", "maxItemsPerWindow"]);
 const allowedFullProceduralWindowKeys = new Set([
+  ...extractionOperationIdentityKeys,
   "windowId",
   "project",
   "memoryIds",
@@ -313,6 +415,7 @@ const allowedFullReflectPlanKeys = new Set([
   "charBudget",
 ]);
 const allowedFullReflectWindowKeys = new Set([
+  ...extractionOperationIdentityKeys,
   "windowId",
   "project",
   "useGraph",
@@ -324,6 +427,7 @@ const allowedFullReflectWindowKeys = new Set([
   "model",
 ]);
 const allowedFullCrystalAutoKeys = new Set([
+  ...extractionOperationIdentityKeys,
   "olderThanDays",
   "project",
   "dryRun",
@@ -343,6 +447,44 @@ const allowedExtractionRunRecordKeys = new Set([
   "semanticWindowId",
 ]);
 const extractionRunStatuses = new Set(["running", "succeeded", "skipped", "failed", "partial"]);
+
+function extractionOperationIdentity(
+  body: Record<string, unknown>,
+  expectedStage: ExtractionOperationStage,
+): ExtractionOperationIdentity | null {
+  const runId = asNonEmptyString(body.runId);
+  const stage = asNonEmptyString(body.stage);
+  const unitId = asNonEmptyString(body.unitId);
+  const inputHash = asNonEmptyString(body.inputHash);
+  if (!runId || stage !== expectedStage || !unitId || !inputHash) return null;
+  return { runId, stage: expectedStage, unitId, inputHash };
+}
+
+function invalidExtractionOperationIdentityResponse(stage: ExtractionOperationStage): Response {
+  return {
+    status_code: 400,
+    body: {
+      success: false,
+      failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+      error: `runId, stage=${stage}, unitId, and inputHash are required`,
+    },
+  };
+}
+
+async function executeExtractionOperation<T>(
+  kv: StateKV,
+  identity: ExtractionOperationIdentity,
+  execute: () => Promise<T>,
+): Promise<Response> {
+  const result = await withExtractionOperationReceipt(kv, identity, execute);
+  if (result.response !== undefined) {
+    return { status_code: 200, body: result.response };
+  }
+  return {
+    status_code: result.failure?.class === "hard" ? 409 : 503,
+    body: { success: false, failure: result.failure },
+  };
+}
 
 function hasOnlyKeys(body: Record<string, unknown>, allowed: Set<string>): boolean {
   return Object.keys(body).every((key) => allowed.has(key));
@@ -650,15 +792,17 @@ export function registerApiTriggers(
         };
       }
 
+      const identity = extractionOperationIdentity(body, "semantic_rollup");
+      if (!identity) return invalidExtractionOperationIdentityResponse("semantic_rollup");
+
       const payload: Record<string, unknown> = { runId, windowId, mark, kind };
       if (sessionIds) payload.sessionIds = sessionIds;
       if (semanticMemoryIds) payload.semanticMemoryIds = semanticMemoryIds;
       if (model) payload.model = model;
-      const result = await sdk.trigger({
+      return executeExtractionOperation(kv, identity, () => sdk.trigger({
         function_id: "mem::semantic-rollup",
         payload,
-      });
-      return { status_code: 200, body: result };
+      }));
     },
   );
   sdk.registerTrigger({
@@ -677,31 +821,35 @@ export function registerApiTriggers(
     const body = requirePlainBody(req.body);
     if (!body) return { status_code: 400, body: { error: "request body is required" } };
     if (!hasOnlyKeys(body, allowedFullSkillExtractKeys)) {
-      return { status_code: 400, body: { error: "invalid full skill extraction payload: only sessionId, model are allowed" } };
+      return {
+        status_code: 400,
+        body: { error: "Only runId, stage, unitId, inputHash, sessionId, and model are accepted" },
+      };
     }
     const sessionId = asNonEmptyString(body.sessionId);
     if (!sessionId) return { status_code: 400, body: { error: "sessionId is required" } };
     const model = optionalModelString(body);
     if (model === null) return invalidModelResponse();
-    const result = await sdk.trigger({
-      function_id: "mem::skill-extract",
-      payload: { sessionId, ...(model ? { model } : {}) },
-    });
-    const bodyResult = result && typeof result === "object"
-      ? (result as Record<string, unknown>)
-      : {};
-    const skillId = bodyResult.skill
-      && typeof bodyResult.skill === "object"
-      && typeof (bodyResult.skill as { id?: unknown }).id === "string"
-      ? (bodyResult.skill as { id: string }).id
-      : undefined;
-    return {
-      status_code: 200,
-      body: {
+    const identity = extractionOperationIdentity(body, "skill_extract");
+    if (!identity) return invalidExtractionOperationIdentityResponse("skill_extract");
+    return executeExtractionOperation(kv, identity, async () => {
+      const result = await sdk.trigger({
+        function_id: "mem::skill-extract",
+        payload: { sessionId, ...(model ? { model } : {}) },
+      });
+      const bodyResult = result && typeof result === "object"
+        ? (result as Record<string, unknown>)
+        : {};
+      const skillId = bodyResult.skill
+        && typeof bodyResult.skill === "object"
+        && typeof (bodyResult.skill as { id?: unknown }).id === "string"
+        ? (bodyResult.skill as { id: string }).id
+        : undefined;
+      return {
         ...bodyResult,
         proceduralMemoryIds: skillId ? [skillId] : [],
-      },
-    };
+      };
+    });
   });
   sdk.registerTrigger({
     type: "http",
@@ -790,6 +938,8 @@ export function registerApiTriggers(
     }
     const model = optionalModelString(body);
     if (model === null) return invalidModelResponse();
+    const identity = extractionOperationIdentity(body, "memory_consolidate");
+    if (!identity) return invalidExtractionOperationIdentityResponse("memory_consolidate");
     const payload: Record<string, unknown> = {};
     if (project !== undefined) payload.project = project;
     if (concept !== undefined) payload.concept = concept;
@@ -797,11 +947,10 @@ export function registerApiTriggers(
     if (minObservations !== undefined) payload.minObservations = minObservations;
     if (charBudget !== undefined) payload.charBudget = charBudget;
     if (model) payload.model = model;
-    const result = await sdk.trigger({
+    return executeExtractionOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-memory-consolidate-window",
       payload,
-    });
-    return { status_code: 200, body: result };
+    }));
   });
   sdk.registerTrigger({
     type: "http",
@@ -864,16 +1013,17 @@ export function registerApiTriggers(
     if (model === null) return invalidModelResponse();
     if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
     if (memoryIds === null) return { status_code: 400, body: { error: "memoryIds must be a string array" } };
+    const identity = extractionOperationIdentity(body, "consolidation_procedural");
+    if (!identity) return invalidExtractionOperationIdentityResponse("consolidation_procedural");
     const payload: Record<string, unknown> = {};
     if (project !== undefined) payload.project = project;
     if (memoryIds !== undefined) payload.memoryIds = memoryIds;
     if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
     if (model) payload.model = model;
-    const result = await sdk.trigger({
+    return executeExtractionOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-consolidation-procedural-window",
       payload,
-    });
-    return { status_code: 200, body: result };
+    }));
   });
   sdk.registerTrigger({
     type: "http",
@@ -953,6 +1103,8 @@ export function registerApiTriggers(
     }
     const model = optionalModelString(body);
     if (model === null) return invalidModelResponse();
+    const identity = extractionOperationIdentity(body, "reflect_insight");
+    if (!identity) return invalidExtractionOperationIdentityResponse("reflect_insight");
     const payload: Record<string, unknown> = { useGraph: false };
     if (project !== undefined) payload.project = project;
     if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
@@ -961,11 +1113,10 @@ export function registerApiTriggers(
     if (lessonIds !== undefined) payload.lessonIds = lessonIds;
     if (crystalIds !== undefined) payload.crystalIds = crystalIds;
     if (model) payload.model = model;
-    const result = await sdk.trigger({
+    return executeExtractionOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-reflect-insight-window",
       payload,
-    });
-    return { status_code: 200, body: result };
+    }));
   });
   sdk.registerTrigger({
     type: "http",
@@ -1000,11 +1151,19 @@ export function registerApiTriggers(
     if (project !== undefined) payload.project = project;
     if (dryRun !== undefined) payload.dryRun = dryRun;
     if (model !== undefined) payload.model = model;
-    const result = await sdk.trigger({
+    if (dryRun === true) {
+      const result = await sdk.trigger({
+        function_id: "mem::full-crystals-auto",
+        payload,
+      });
+      return { status_code: 200, body: result };
+    }
+    const identity = extractionOperationIdentity(body, "crystal");
+    if (!identity) return invalidExtractionOperationIdentityResponse("crystal");
+    return executeExtractionOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-crystals-auto",
       payload,
-    });
-    return { status_code: 200, body: result };
+    }));
   });
   sdk.registerTrigger({
     type: "http",
@@ -1589,7 +1748,7 @@ export function registerApiTriggers(
         function_id: "mem::summarize-resumable",
         payload: { sessionId, ...(model ? { model } : {}) },
       });
-      return { status_code: 200, body: result };
+      return { status_code: 200, body: sanitizeSummaryApiResult(result) };
     },
   );
   sdk.registerTrigger({
@@ -4312,11 +4471,11 @@ export function registerApiTriggers(
         function_id: "mem::lessons::extract-run-get",
         payload: { runId },
       });
-      return { status_code: 200, body: result };
-    } catch (error) {
+      return { status_code: 200, body: sanitizeLessonRunApiResult(result) };
+    } catch {
       return {
         status_code: 500,
-        body: { error: error instanceof Error ? error.message : "internal error" },
+        body: { error: "internal error" },
       };
     }
   });

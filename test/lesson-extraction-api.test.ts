@@ -249,7 +249,75 @@ describe("api::lesson-extract-run-get", () => {
 
     expect(response).toMatchObject({
       status_code: 500,
-      body: { error: "downstream failure" },
+      body: { error: "internal error" },
     });
+  });
+
+  it("returns only sanitized run diagnostics and compact errors", async () => {
+    const sensitive = "sensitive-api-error-marker";
+    const kv = {} as never;
+    const sdk = {
+      registerFunction: (id: string, handler: unknown) => {
+        if (id === "api::lesson-extract-run-get") sdk.apiLessonExtractRunGet = handler;
+      },
+      registerTrigger: vi.fn(),
+      trigger: vi.fn(async () => ({
+        success: true,
+        run: {
+          id: "run-provider-failure",
+          status: "retryable",
+          lastError: `pi_stream_failed ${sensitive}`,
+          failureDiagnostics: {
+            requestPhase: "chunk",
+            providerErrorCode: "rate_limited",
+            statusCode: 429,
+            retryAfterMs: 2500,
+            elapsedMs: 1200,
+            inputChars: 38000,
+            maxOutputTokens: 4096,
+            responseStarted: false,
+            rawError: sensitive,
+            authorization: sensitive,
+          },
+        },
+        chunks: [],
+      })),
+      apiLessonExtractRunGet: undefined as undefined | Function,
+    } as {
+      registerFunction: (id: string, handler: unknown) => void;
+      registerTrigger: () => void;
+      trigger: () => Promise<unknown>;
+      apiLessonExtractRunGet?: Function;
+    };
+
+    registerApiTriggers(sdk as never, kv, "");
+    const response = await sdk.apiLessonExtractRunGet!({
+      query_params: { runId: "run-provider-failure" },
+      headers: {},
+    });
+
+    expect(response).toEqual({
+      status_code: 200,
+      body: {
+        success: true,
+        run: {
+          id: "run-provider-failure",
+          status: "retryable",
+          lastError: "pi_stream_failed",
+          failureDiagnostics: {
+            requestPhase: "chunk",
+            providerErrorCode: "rate_limited",
+            statusCode: 429,
+            retryAfterMs: 2500,
+            elapsedMs: 1200,
+            inputChars: 38000,
+            maxOutputTokens: 4096,
+            responseStarted: false,
+          },
+        },
+        chunks: [],
+      },
+    });
+    expect(JSON.stringify(response)).not.toContain(sensitive);
   });
 });

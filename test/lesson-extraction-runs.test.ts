@@ -12,6 +12,7 @@ import {
   replaceSessionHeuristicLessons,
   stableHash,
 } from "../src/functions/lesson-extraction-runs.js";
+import { ProviderCallError } from "../src/providers/provider-call-result.js";
 
 function lesson(overrides: Partial<Lesson>): Lesson {
   return {
@@ -162,6 +163,49 @@ describe("lesson extraction run helpers", () => {
     expect(runs.map((item) => item.id)).toEqual(["run-1", "run-3", "run-4"]);
   });
 
+  it("clears stale provider diagnostics when an existing failed run is skipped", async () => {
+    const kv = mockKV();
+    await kv.set(KV.sessions, "session-skipped", session({ id: "session-skipped" }));
+    await kv.set(KV.observations("session-skipped"), "obs-1", rawObservation({
+      sessionId: "session-skipped",
+      id: "obs-1",
+      sourceEventIndex: 1,
+    }));
+    const provider: MemoryProvider = {
+      name: "pi-agent-sdk",
+      compress: vi.fn(),
+      summarize: vi.fn(),
+    };
+    const config = resolveLlmLessonExtractionRuntimeConfig(provider, {});
+    const pending = await enqueueLlmLessonExtractionRun({
+      kv,
+      sessionId: "session-skipped",
+      config,
+    });
+    await kv.set(KV.lessonExtractionRuns, pending.id, {
+      ...pending,
+      status: "failed",
+      failureDiagnostics: {
+        requestPhase: "chunk",
+        providerErrorCode: "timeout",
+        elapsedMs: 1,
+        inputChars: 2,
+        maxOutputTokens: 3,
+        responseStarted: false,
+      },
+    });
+
+    const skipped = await enqueueLlmLessonExtractionRun({
+      kv,
+      sessionId: "session-skipped",
+      retryFailed: false,
+      config,
+    });
+
+    expect(skipped.status).toBe("skipped");
+    expect(Object.hasOwn(skipped, "failureDiagnostics")).toBe(false);
+  });
+
   it("replaces only heuristic lessons created by replay import for a session", async () => {
     const kv = mockKV();
     await kv.set(KV.lessons, "shared", lesson({
@@ -271,13 +315,123 @@ describe("lesson extraction run helpers", () => {
       runId: pending.id,
     });
     expect(run.status).toBe("retryable");
-    expect(run.lastError).toContain("provider.compress timeout");
+    expect(run.lastError).toBe("network_error");
+    expect(provider.compress).toHaveBeenCalledTimes(1);
+    expect(run.failureDiagnostics).toBeUndefined();
 
     const lessons = await kv.list<Lesson>(KV.lessons);
     const heuristic = lessons.find((item) => item.id === "heuristic-session");
     expect(heuristic?.sourceIds).toEqual(["session-timeout"]);
     expect(heuristic?.deleted).toBeUndefined();
     expect(lessons.filter((item) => item.source === "llm")).toHaveLength(0);
+  });
+
+  it("atomically persists sanitized provider diagnostics on a retryable run", async () => {
+    const sensitive = "sensitive-run-error-marker";
+    const kv = mockKV();
+    await kv.set(KV.sessions, "session-provider-failure", session({
+      id: "session-provider-failure",
+      project: "/repo",
+    }));
+    await kv.set(KV.observations("session-provider-failure"), "obs-1", rawObservation({
+      sessionId: "session-provider-failure",
+      id: "obs-1",
+      sourceEventIndex: 1,
+      userPrompt: "Always validate source before running shell commands.",
+    }));
+    const provider: MemoryProvider = {
+      name: "pi-agent-sdk",
+      compress: vi.fn().mockRejectedValue(new ProviderCallError(
+        `pi_stream_failed ${sensitive}`,
+        {
+          providerErrorCode: "rate_limited",
+          statusCode: 429,
+          retryAfterMs: 2500,
+          elapsedMs: 1200,
+          inputChars: 38000,
+          maxOutputTokens: 4096,
+          responseStarted: false,
+          rawError: sensitive,
+        } as never,
+      )),
+      summarize: vi.fn().mockResolvedValue(""),
+    };
+    const config = resolveLlmLessonExtractionRuntimeConfig(provider, {
+      textLimit: 1200,
+      saveLimit: 10,
+      chunkSize: 10,
+      chunkConcurrency: 1,
+      timeoutMs: 60000,
+    });
+    const pending = await enqueueLlmLessonExtractionRun({
+      kv,
+      sessionId: "session-provider-failure",
+      config,
+    });
+
+    const processed = await processLlmLessonExtractionRun({
+      kv,
+      provider,
+      runId: pending.id,
+    });
+    const persisted = await kv.get<LessonExtractionRun>(KV.lessonExtractionRuns, pending.id);
+
+    expect(processed.status).toBe("retryable");
+    expect(processed.lastError).toBe("pi_stream_failed");
+    expect(processed.failureDiagnostics).toEqual({
+      requestPhase: "chunk",
+      providerErrorCode: "rate_limited",
+      statusCode: 429,
+      retryAfterMs: 2500,
+      elapsedMs: 1200,
+      inputChars: 38000,
+      maxOutputTokens: 4096,
+      responseStarted: false,
+    });
+    expect(persisted).toEqual(processed);
+    expect(JSON.stringify(persisted)).not.toContain(sensitive);
+  });
+
+  it("clears stale provider diagnostics when the next attempt only has a parse failure", async () => {
+    const kv = mockKV();
+    await kv.set(KV.sessions, "session-parse-failure", session({
+      id: "session-parse-failure",
+      project: "/repo",
+    }));
+    await kv.set(KV.observations("session-parse-failure"), "obs-1", rawObservation({
+      sessionId: "session-parse-failure",
+      id: "obs-1",
+      sourceEventIndex: 1,
+      userPrompt: "Always validate source before running shell commands.",
+    }));
+    const provider: MemoryProvider = {
+      name: "pi-agent-sdk",
+      compress: vi.fn().mockResolvedValue("<root />"),
+      summarize: vi.fn().mockResolvedValue(""),
+    };
+    const config = resolveLlmLessonExtractionRuntimeConfig(provider, {});
+    const pending = await enqueueLlmLessonExtractionRun({
+      kv,
+      sessionId: "session-parse-failure",
+      config,
+    });
+    await kv.set(KV.lessonExtractionRuns, pending.id, {
+      ...pending,
+      failureDiagnostics: {
+        requestPhase: "chunk",
+        providerErrorCode: "timeout",
+        elapsedMs: 1,
+        inputChars: 2,
+        maxOutputTokens: 3,
+        responseStarted: false,
+      },
+    });
+
+    const processed = await processLlmLessonExtractionRun({ kv, provider, runId: pending.id });
+
+    expect(processed.status).toBe("retryable");
+    expect(provider.compress).toHaveBeenCalledTimes(2);
+    expect(Object.hasOwn(processed, "failureDiagnostics")).toBe(false);
   });
 
   it("saves llm provenance and replaces only target replay-import-heuristic heuristics on success", async () => {
