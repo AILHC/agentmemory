@@ -55,6 +55,14 @@ export default defineConfig([
     sourcemap: false,
   },
   {
+    entry: ["src/worker-supervisor.ts"],
+    outDir: "dist",
+    ...shared,
+    clean: false,
+    sourcemap: true,
+    banner: { js: "#!/usr/bin/env node" },
+  },
+  {
     entry: ["src/mcp/standalone.ts"],
     outDir: "dist",
     ...shared,

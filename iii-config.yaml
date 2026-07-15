@@ -55,7 +55,5 @@ workers:
       logs_console_output: false
   - name: iii-exec
     config:
-      watch:
-        - src/**/*.ts
       exec:
-        - node dist/index.mjs
+        - node dist/worker-supervisor.mjs --instance-id formal --worker-entry dist/index.mjs

@@ -104,9 +104,13 @@ import { registerHealthMonitor } from "./health/monitor.js";
 import { initMetrics, OTEL_CONFIG } from "./telemetry/setup.js";
 import { VERSION } from "./version.js";
 import { bootLog } from "./logger.js";
-import { mkdirSync, writeFileSync, unlinkSync } from "node:fs";
-import { dirname, join } from "node:path";
 import { agentMemoryHome } from "./paths.js";
+import {
+  acquireWorkerLifecycleLock,
+  createWorkerShutdownCoordinator,
+  resolveWorkerLifecycleIdentity,
+  type WorkerLifecycleLock,
+} from "./worker-lifecycle-lock";
 
 // #640 + #474: the worker process (this file) is spawned by iii-exec
 // inside the engine. When `agentmemory stop` kills only the engine pid,
@@ -117,19 +121,57 @@ import { agentMemoryHome } from "./paths.js";
 function workerPidfilePath(): string {
   return agentMemoryHome("worker.pid");
 }
+let workerLifecycleLock: WorkerLifecycleLock | null = null;
 function writeWorkerPidfile(): void {
-  try {
-    const p = workerPidfilePath();
-    mkdirSync(dirname(p), { recursive: true });
-    writeFileSync(p, `${process.pid}\n`, { encoding: "utf-8" });
-  } catch {
-    // best-effort; stop still has the engine pidfile + port scan fallback
-  }
+  void workerPidfilePath();
+  const identity = resolveWorkerLifecycleIdentity(process.env, process.ppid);
+  workerLifecycleLock = acquireWorkerLifecycleLock({
+    home: agentMemoryHome(),
+    workerPid: process.pid,
+    parentPid: process.ppid,
+    identity,
+  });
 }
 function clearWorkerPidfile(): void {
-  try {
-    unlinkSync(workerPidfilePath());
-  } catch {}
+  workerLifecycleLock?.release();
+  workerLifecycleLock = null;
+}
+
+type WorkerShutdownCleanup = () => Promise<void>;
+let resolveWorkerShutdownCleanup!: (cleanup: WorkerShutdownCleanup) => void;
+let workerShutdownCleanupAssigned = false;
+const workerShutdownCleanupReady = new Promise<WorkerShutdownCleanup>((resolveCleanup) => {
+  resolveWorkerShutdownCleanup = resolveCleanup;
+});
+const workerShutdownCoordinator = createWorkerShutdownCoordinator(async () => {
+  const cleanup = await workerShutdownCleanupReady;
+  await cleanup();
+});
+
+function setWorkerShutdownCleanup(cleanup: WorkerShutdownCleanup): void {
+  if (workerShutdownCleanupAssigned) return;
+  workerShutdownCleanupAssigned = true;
+  resolveWorkerShutdownCleanup(cleanup);
+}
+
+function requestWorkerShutdown(): void {
+  void workerShutdownCoordinator.request();
+}
+
+function installWorkerShutdownHandlers(): void {
+  process.on("SIGINT", requestWorkerShutdown);
+  process.on("SIGTERM", requestWorkerShutdown);
+  if (process.platform === "win32") process.on("SIGBREAK", requestWorkerShutdown);
+  process.on("message", (message: unknown) => {
+    if (
+      typeof message === "object" &&
+      message !== null &&
+      "type" in message &&
+      message.type === "agentmemory:shutdown"
+    ) {
+      requestWorkerShutdown();
+    }
+  });
 }
 
 function hasGetMeter(
@@ -163,6 +205,8 @@ process.on("unhandledRejection", (reason) => {
 });
 
 async function main() {
+  writeWorkerPidfile();
+  installWorkerShutdownHandlers();
   const config = loadConfig();
   const embeddingConfig = loadEmbeddingConfig();
   const fallbackConfig = loadFallbackConfig();
@@ -218,8 +262,6 @@ async function main() {
       framework: "iii-sdk",
     },
   });
-
-  writeWorkerPidfile();
 
   const kv = new StateKV(sdk);
   const secret = getEnvVar("AGENTMEMORY_SECRET");
@@ -598,7 +640,7 @@ async function main() {
     bootLog(`Auto-consolidation: enabled (every ${consolidationIntervalMs / 60000}m)`);
   }
 
-  const shutdown = async () => {
+  setWorkerShutdownCleanup(async () => {
     console.log(`\n[agentmemory] Shutting down...`);
     healthMonitor.stop();
     dedupMap.stop();
@@ -610,12 +652,14 @@ async function main() {
     await sdk.shutdown();
     clearWorkerPidfile();
     process.exit(0);
-  };
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
+  });
 }
 
 main().catch((err) => {
+  setWorkerShutdownCleanup(async () => {
+    clearWorkerPidfile();
+  });
+  clearWorkerPidfile();
   console.error(`[agentmemory] Fatal:`, err);
   process.exit(1);
 });
