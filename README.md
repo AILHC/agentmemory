@@ -1567,7 +1567,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-151 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+153 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1620,6 +1620,10 @@ summarize status to query.
 
 Full extraction orchestration uses narrow REST endpoints:
 
+- `POST /agentmemory/full/memory-consolidate-window/prepare` performs the
+  provider call and stores an idempotent proposal without changing memories.
+  `POST /agentmemory/full/memory-consolidate-window/commit` applies that
+  proposal with deterministic memory and audit identifiers.
 - `GET /agentmemory/runtime-config` returns only redacted runtime facts:
   `summarizeChunkConcurrency`, `summarizeChunkSize`, `providerName`,
   `outputLanguageConfigured`, `outputLanguage`, and `modelRouting`.

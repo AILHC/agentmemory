@@ -1,15 +1,21 @@
 import type { ISdk } from "iii-sdk";
 import { createHash } from "node:crypto";
 import type {
+  AuditEntry,
   CompressedObservation,
+  ExtractionOperationIdentity,
+  ExtractionOperationReceipt,
   Memory,
+  MemoryConsolidationProposal,
   Session,
   MemoryProvider,
   MemoryProviderCallOptions,
 } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import { KV, fingerprintId, generateId } from "../state/schema.js";
 import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
+import { buildExtractionOperationKey } from "./extraction-operation-receipts.js";
 import {
   resolveOutputLanguage,
   withOutputLanguagePolicy,
@@ -77,6 +83,7 @@ export interface ConsolidateObservationWindowOptions {
   maxObservationsPerWindow?: number;
   charBudget?: number;
   model?: string;
+  operationIdentity?: ExtractionOperationIdentity;
 }
 
 export interface ConsolidationObservationDescriptor {
@@ -847,6 +854,170 @@ async function persistConsolidatedMemory(
   return { action: "created", memoryId: memory.id };
 }
 
+function proposalKey(identity: ExtractionOperationIdentity): string {
+  return fingerprintId("mcp", JSON.stringify([
+    identity.runId,
+    identity.stage,
+    identity.unitId,
+  ]));
+}
+
+function proposalResponse(proposal: MemoryConsolidationProposal): Record<string, unknown> {
+  return {
+    success: true,
+    status: proposal.status,
+    preparedHandle: proposal.handle,
+    proposalHash: proposal.proposalHash,
+    inputHash: proposal.inputHash,
+    totalObservations: proposal.totalObservations,
+    promptChars: proposal.promptChars,
+    ...(proposal.charBudget === undefined ? {} : { charBudget: proposal.charBudget }),
+    ...(proposal.response || {}),
+  };
+}
+
+async function storeMemoryConsolidationProposal(
+  options: ConsolidateObservationWindowOptions,
+  parsed: Omit<Memory, "id" | "createdAt" | "updatedAt">,
+  concept: string,
+  sourceObservationIds: string[],
+  totalObservations: number,
+  promptChars: number,
+): Promise<Record<string, unknown>> {
+  const identity = options.operationIdentity!;
+  const key = proposalKey(identity);
+  const existing = await options.kv.get<MemoryConsolidationProposal>(
+    KV.memoryConsolidationProposals,
+    key,
+  );
+  if (existing) {
+    if (existing.inputHash !== identity.inputHash) {
+      return {
+        success: false,
+        status: "failed",
+        failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+      };
+    }
+    return proposalResponse(existing);
+  }
+  const proposalHash = createHash("sha256")
+    .update(JSON.stringify([parsed, sourceObservationIds, options.project, concept]))
+    .digest("hex");
+  const proposal: MemoryConsolidationProposal = {
+    ...identity,
+    key,
+    handle: fingerprintId("mcph", `${key}:${proposalHash}`),
+    proposalHash,
+    status: "prepared",
+    preparedAt: new Date().toISOString(),
+    ...(options.project === undefined ? {} : { project: options.project }),
+    concept,
+    sourceObservationIds,
+    parsed,
+    totalObservations,
+    promptChars,
+    ...(options.charBudget === undefined ? {} : { charBudget: options.charBudget }),
+  };
+  await options.kv.set(KV.memoryConsolidationProposals, key, proposal);
+  return proposalResponse(proposal);
+}
+
+export async function commitMemoryConsolidationProposal(options: {
+  kv: StateKV;
+  identity: ExtractionOperationIdentity;
+  preparedHandle: string;
+}): Promise<Record<string, unknown>> {
+  const key = proposalKey(options.identity);
+  return withKeyedLock("memory-consolidate-commit", async () => {
+    const proposal = await options.kv.get<MemoryConsolidationProposal>(
+      KV.memoryConsolidationProposals,
+      key,
+    );
+    if (!proposal) {
+      return { success: false, status: "failed", failure: { class: "hard", cause: "proposal_not_found" } };
+    }
+    if (
+      proposal.inputHash !== options.identity.inputHash
+      || proposal.handle !== options.preparedHandle
+      || proposal.stage !== "memory_consolidate"
+    ) {
+      return { success: false, status: "failed", failure: { class: "hard", cause: "proposal_identity_conflict" } };
+    }
+    if (proposal.status === "committed" && proposal.response) return proposalResponse(proposal);
+
+    let intent = proposal.commitIntent;
+    if (!intent) {
+      const existingMemories = await options.kv.list<Memory>(KV.memories);
+      const parent = existingMemories.find(
+        (memory) =>
+          memory.title.toLowerCase() === proposal.parsed.title.toLowerCase()
+          && (!proposal.project || !memory.project || memory.project === proposal.project),
+      );
+      const createdAt = new Date().toISOString();
+      intent = {
+        resultId: fingerprintId("mem", JSON.stringify([key, proposal.proposalHash, parent?.id || null])),
+        ...(parent ? { parentId: parent.id } : {}),
+        auditId: fingerprintId("aud", JSON.stringify([key, proposal.proposalHash, parent?.id || null])),
+        createdAt,
+      };
+      proposal.status = "committing";
+      proposal.commitIntent = intent;
+      await options.kv.set(KV.memoryConsolidationProposals, key, proposal);
+    }
+
+    const parent = intent.parentId
+      ? await options.kv.get<Memory>(KV.memories, intent.parentId)
+      : null;
+    if (parent?.isLatest) {
+      parent.isLatest = false;
+      parent.updatedAt = intent.createdAt;
+      await options.kv.set(KV.memories, parent.id, parent);
+    }
+    const memory: Memory = {
+      id: intent.resultId,
+      createdAt: intent.createdAt,
+      updatedAt: intent.createdAt,
+      ...proposal.parsed,
+      version: parent ? (parent.version || 1) + 1 : 1,
+      ...(parent ? {
+        parentId: parent.id,
+        supersedes: [parent.id, ...(parent.supersedes || [])],
+      } : {}),
+      sourceObservationIds: proposal.sourceObservationIds,
+      isLatest: true,
+      ...(proposal.project === undefined ? {} : { project: proposal.project }),
+    };
+    await options.kv.set(KV.memories, memory.id, memory);
+    const audit: AuditEntry = {
+      id: intent.auditId,
+      timestamp: intent.createdAt,
+      operation: parent ? "evolve" : "remember",
+      functionId: "mem::full-memory-consolidate-window-commit",
+      targetIds: [memory.id],
+      details: {
+        action: parent ? "evolve_memory" : "create_memory",
+        ...(parent ? { oldId: parent.id } : {}),
+        newId: memory.id,
+        concept: proposal.concept,
+      },
+    };
+    await options.kv.set(KV.audit, audit.id, audit);
+    proposal.status = "committed";
+    proposal.response = {
+      success: true,
+      status: "succeeded",
+      consolidated: 1,
+      totalObservations: proposal.totalObservations,
+      memoryIds: [memory.id],
+      action: parent ? "evolved" : "created",
+      memoryId: memory.id,
+      ...(parent ? { parentId: parent.id } : {}),
+    };
+    await options.kv.set(KV.memoryConsolidationProposals, key, proposal);
+    return proposalResponse(proposal);
+  });
+}
+
 export async function runConsolidateObservationWindow(
   options: ConsolidateObservationWindowOptions,
 ): Promise<Record<string, unknown>> {
@@ -865,6 +1036,57 @@ export async function runConsolidateObservationWindow(
     resolveOutputLanguage();
     if (!options.provider?.compress) {
       return { success: false, error: "provider.compress is required", ...responseMetadata("failed") };
+    }
+    if (options.operationIdentity) {
+      const receipt = await options.kv.get<ExtractionOperationReceipt<Record<string, unknown>>>(
+        KV.extractionOperationReceipts,
+        buildExtractionOperationKey(options.operationIdentity),
+      );
+      if (receipt && receipt.inputHash !== options.operationIdentity.inputHash) {
+        return {
+          success: false,
+          status: "failed",
+          failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+        };
+      }
+      if (receipt?.status === "running") {
+        return {
+          success: false,
+          status: "failed",
+          failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" },
+        };
+      }
+      if (receipt?.status === "failed") {
+        return {
+          success: false,
+          status: "failed",
+          failure: receipt.failure ?? { class: "unit", cause: "extraction_operation_failed" },
+        };
+      }
+      if (receipt?.status === "succeeded" && receipt.response) {
+        return {
+          ...receipt.response,
+          success: true,
+          status: typeof receipt.response.status === "string"
+            ? receipt.response.status
+            : "succeeded",
+          replayed: true,
+        };
+      }
+      const existing = await options.kv.get<MemoryConsolidationProposal>(
+        KV.memoryConsolidationProposals,
+        proposalKey(options.operationIdentity),
+      );
+      if (existing) {
+        if (existing.inputHash !== options.operationIdentity.inputHash) {
+          return {
+            success: false,
+            status: "failed",
+            failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+          };
+        }
+        return proposalResponse(existing);
+      }
     }
 
     const hasExplicitObservationIds = (options.observationIds?.length ?? 0) > 0;
@@ -915,6 +1137,35 @@ export async function runConsolidateObservationWindow(
     const sorted = [...obsGroup].sort((a, b) => b.importance - a.importance);
     const sessionIds = [...new Set(sorted.map((o) => o.sid))];
     const prompt = serializeConsolidationObservationPrompt(sorted);
+    if (options.operationIdentity) {
+      const sourceObservationIds = sorted.map((observation) => observation.id);
+      const plannedInputHash = stableHash([
+        "memory-consolidate",
+        concept ?? "observation-window",
+        sourceObservationIds,
+        sessionIds,
+        prompt.length,
+      ]);
+      const splitInputHash = stableHash({
+        unitId: options.operationIdentity.unitId,
+        sourceIds: sourceObservationIds,
+      });
+      if (
+        options.operationIdentity.inputHash !== plannedInputHash
+        && options.operationIdentity.inputHash !== splitInputHash
+      ) {
+        return {
+          success: false,
+          error: "memory_consolidate_input_hash_conflict",
+          failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+          ...responseMetadata("failed", {
+            promptChars: prompt.length,
+            charBudget: options.charBudget,
+            parseFailures: 0,
+          }),
+        };
+      }
+    }
     if (options.charBudget !== undefined && prompt.length > options.charBudget) {
       return {
         success: false,
@@ -973,6 +1224,16 @@ export async function runConsolidateObservationWindow(
       };
     }
 
+    if (options.operationIdentity) {
+      return storeMemoryConsolidationProposal(
+        options,
+        parsed,
+        concept ?? "observation-window",
+        [...new Set(sorted.map((o) => o.id))],
+        sorted.length,
+        prompt.length,
+      );
+    }
     const existingMemories = await options.kv.list<Memory>(KV.memories);
     const persisted = await persistConsolidatedMemory(
       options.kv,
@@ -1050,7 +1311,40 @@ export function registerConsolidateFunction(
       minObservations?: number;
       charBudget?: number;
       model?: string;
-    }) => runConsolidateObservationWindow({ kv, provider, ...data }),
+    }) => withKeyedLock(
+      "memory-consolidate-commit",
+      () => runConsolidateObservationWindow({ kv, provider, ...data }),
+    ),
+  );
+
+  sdk.registerFunction(
+    "mem::full-memory-consolidate-window-prepare",
+    async (data: {
+      identity: ExtractionOperationIdentity;
+      project?: string;
+      concept?: string;
+      observationIds?: string[];
+      observationSessionIds?: Record<string, string>;
+      minObservations?: number;
+      charBudget?: number;
+      model?: string;
+    }) => withKeyedLock(
+      `memory-consolidate-prepare:${proposalKey(data.identity)}`,
+      () => runConsolidateObservationWindow({
+        kv,
+        provider,
+        ...data,
+        operationIdentity: data.identity,
+      }),
+    ),
+  );
+
+  sdk.registerFunction(
+    "mem::full-memory-consolidate-window-commit",
+    async (data: {
+      identity: ExtractionOperationIdentity;
+      preparedHandle: string;
+    }) => commitMemoryConsolidationProposal({ kv, ...data }),
   );
 
   sdk.registerFunction("mem::consolidate", 

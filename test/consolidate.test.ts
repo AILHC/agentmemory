@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 
 vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -6,6 +7,7 @@ vi.mock("../src/logger.js", () => ({
 
 import {
   collectConsolidationObservationDescriptorPage,
+  commitMemoryConsolidationProposal,
   planConsolidateObservationWindows,
   runConsolidateObservationWindow,
   registerConsolidateFunction,
@@ -14,7 +16,7 @@ import {
   getMemoryConsolidateCompressTimeoutMs,
   getWorkerInvocationTimeoutMs,
 } from "../src/config.js";
-import { KV } from "../src/state/schema.js";
+import { fingerprintId, KV } from "../src/state/schema.js";
 import type { CompressedObservation, MemoryProvider, Session } from "../src/types.js";
 
 function mockKV() {
@@ -68,6 +70,208 @@ describe("consolidate full window helpers", () => {
     delete process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY;
     delete process.env.PI_AGENT_MODEL;
     vi.useRealTimers();
+  });
+
+  it("commits a prepared proposal idempotently with deterministic memory and audit ids", async () => {
+    const kv = mockKV();
+    const identity = {
+      runId: "formal-run",
+      stage: "memory_consolidate" as const,
+      unitId: "mcw-1",
+      inputHash: "input-1",
+    };
+    const key = fingerprintId("mcp", JSON.stringify([
+      identity.runId,
+      identity.stage,
+      identity.unitId,
+    ]));
+    const proposalHash = "proposal-hash";
+    const handle = "mcph-handle";
+    await kv.set(KV.memoryConsolidationProposals, key, {
+      ...identity,
+      key,
+      handle,
+      proposalHash,
+      status: "prepared",
+      preparedAt: "2026-07-18T00:00:00.000Z",
+      concept: "windows",
+      sourceObservationIds: ["obs-1"],
+      parsed: {
+        type: "workflow",
+        title: "Stable workflow",
+        content: "Use a stable workflow.",
+        concepts: ["windows"],
+        files: [],
+        sessionIds: ["ses-1"],
+        strength: 8,
+        version: 1,
+        isLatest: true,
+      },
+      totalObservations: 1,
+      promptChars: 120,
+    });
+
+    const first = await commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: handle,
+    });
+    const second = await commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: handle,
+    });
+    expect(first).toEqual(second);
+    expect(first).toMatchObject({ success: true, status: "succeeded" });
+    expect(await kv.list(KV.memories)).toHaveLength(1);
+    expect(await kv.list(KV.audit)).toHaveLength(1);
+  });
+
+  it("prepares once, replays the same handle, and rejects a server-recomputed hash conflict", async () => {
+    const kv = mockKV();
+    await kv.set(KV.sessions, "ses-a", session("ses-a"));
+    const obs = observation("obs-1", 7);
+    await kv.set(KV.observations("ses-a"), obs.id, obs);
+    const prompt = `[${obs.type}] ${obs.title}\n${obs.narrative}\nFiles: ${obs.files.join(", ")}\nImportance: ${obs.importance}`;
+    const inputHash = createHash("sha256").update(JSON.stringify([
+      "memory-consolidate",
+      "windows",
+      [obs.id],
+      ["ses-a"],
+      prompt.length,
+    ])).digest("hex");
+    const compress = vi.fn(async () => `
+      <memory>
+        <type>workflow</type>
+        <title>Stable workflow</title>
+        <content>Use a stable workflow.</content>
+        <concepts><concept>windows</concept></concepts>
+        <files></files>
+        <strength>8</strength>
+      </memory>
+    `);
+    const base = {
+      kv: kv as never,
+      provider: { compress } as never,
+      concept: "windows",
+      observationIds: [obs.id],
+      observationSessionIds: { [obs.id]: "ses-a" },
+      operationIdentity: {
+        runId: "formal-run",
+        stage: "memory_consolidate" as const,
+        unitId: "mcw-1",
+        inputHash,
+      },
+    };
+
+    const first = await runConsolidateObservationWindow(base);
+    const second = await runConsolidateObservationWindow(base);
+    expect(first).toMatchObject({ success: true, status: "prepared" });
+    expect(second).toEqual(first);
+    expect(compress).toHaveBeenCalledTimes(1);
+
+    const conflict = await runConsolidateObservationWindow({
+      ...base,
+      operationIdentity: { ...base.operationIdentity, inputHash: "wrong" },
+    });
+    expect(conflict).toMatchObject({
+      success: false,
+      failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+    });
+  });
+
+  it("replays a succeeded legacy receipt without another provider call and blocks a running receipt", async () => {
+    const kv = mockKV();
+    const identity = {
+      runId: "formal-run",
+      stage: "memory_consolidate" as const,
+      unitId: "mcw-legacy",
+      inputHash: "legacy-input",
+    };
+    const receiptKey = `xop_${createHash("sha256")
+      .update(JSON.stringify([identity.runId, identity.stage, identity.unitId]))
+      .digest("hex")
+      .slice(0, 32)}`;
+    const provider = { compress: vi.fn() };
+    await kv.set(KV.extractionOperationReceipts, receiptKey, {
+      ...identity,
+      key: receiptKey,
+      status: "succeeded",
+      startedAt: "2026-07-18T00:00:00.000Z",
+      completedAt: "2026-07-18T00:01:00.000Z",
+      response: { success: true, status: "succeeded", memoryIds: ["mem_legacy"] },
+    });
+
+    const replayed = await runConsolidateObservationWindow({
+      kv: kv as never,
+      provider: provider as never,
+      operationIdentity: identity,
+    });
+    expect(replayed).toMatchObject({
+      success: true,
+      status: "succeeded",
+      replayed: true,
+      memoryIds: ["mem_legacy"],
+    });
+    expect(provider.compress).not.toHaveBeenCalled();
+
+    await kv.set(KV.extractionOperationReceipts, receiptKey, {
+      ...identity,
+      key: receiptKey,
+      status: "succeeded",
+      startedAt: "2026-07-18T00:01:00.000Z",
+      completedAt: "2026-07-18T00:01:30.000Z",
+      response: { success: true, status: "skipped", consolidated: 0, memoryIds: [] },
+    });
+    const skipped = await runConsolidateObservationWindow({
+      kv: kv as never,
+      provider: provider as never,
+      operationIdentity: identity,
+    });
+    expect(skipped).toMatchObject({
+      success: true,
+      status: "skipped",
+      replayed: true,
+      consolidated: 0,
+      memoryIds: [],
+    });
+    expect(provider.compress).not.toHaveBeenCalled();
+
+    await kv.set(KV.extractionOperationReceipts, receiptKey, {
+      ...identity,
+      key: receiptKey,
+      status: "running",
+      startedAt: "2026-07-18T00:02:00.000Z",
+    });
+    const blocked = await runConsolidateObservationWindow({
+      kv: kv as never,
+      provider: provider as never,
+      operationIdentity: identity,
+    });
+    expect(blocked).toMatchObject({
+      success: false,
+      failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" },
+    });
+
+    await kv.set(KV.extractionOperationReceipts, receiptKey, {
+      ...identity,
+      key: receiptKey,
+      status: "failed",
+      startedAt: "2026-07-18T00:03:00.000Z",
+      completedAt: "2026-07-18T00:03:30.000Z",
+      failure: { class: "hard", cause: "legacy_commit_audit_failed" },
+    });
+    const failed = await runConsolidateObservationWindow({
+      kv: kv as never,
+      provider: provider as never,
+      operationIdentity: identity,
+    });
+    expect(failed).toMatchObject({
+      success: false,
+      status: "failed",
+      failure: { class: "hard", cause: "legacy_commit_audit_failed" },
+    });
+    expect(provider.compress).not.toHaveBeenCalled();
   });
 
   it("plans all eligible concept windows", async () => {

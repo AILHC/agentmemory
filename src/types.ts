@@ -205,6 +205,37 @@ export interface ExtractionOperationReceipt<T = unknown>
   failure?: StageFailure;
 }
 
+export interface MemoryConsolidationProposal extends ExtractionOperationIdentity {
+  key: string;
+  handle: string;
+  proposalHash: string;
+  status: "prepared" | "committing" | "committed";
+  preparedAt: string;
+  project?: string;
+  concept: string;
+  sourceObservationIds: string[];
+  parsed: Omit<Memory, "id" | "createdAt" | "updatedAt">;
+  totalObservations: number;
+  promptChars: number;
+  charBudget?: number;
+  commitIntent?: {
+    resultId: string;
+    parentId?: string;
+    auditId: string;
+    createdAt: string;
+  };
+  response?: {
+    success: true;
+    status: "succeeded";
+    consolidated: 1;
+    totalObservations: number;
+    memoryIds: string[];
+    action: "created" | "evolved";
+    memoryId: string;
+    parentId?: string;
+  };
+}
+
 export type SummaryAdvanceKind = "completed" | "skipped" | "reduced" | "none";
 
 export interface SummaryAdvance {

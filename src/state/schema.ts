@@ -65,6 +65,7 @@ export const KV = {
   insights: "mem:insights",
   extractionRuns: "mem:extraction-runs",
   extractionOperationReceipts: "mem:extraction-operation-receipts",
+  memoryConsolidationProposals: "mem:memory-consolidation-proposals",
   graphEdgeHistory: "mem:graph:edge-history",
   lessonExtractionRuns: "mem:lesson-extraction:runs",
   lessonExtractionChunks: (runId: string) => `mem:lesson-extraction:chunks:${runId}`,

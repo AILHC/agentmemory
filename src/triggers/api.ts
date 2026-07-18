@@ -419,6 +419,10 @@ const allowedFullConsolidateWindowKeys = new Set([
   "minObservations",
   "model",
 ]);
+const allowedFullConsolidateCommitKeys = new Set([
+  ...extractionOperationIdentityKeys,
+  "preparedHandle",
+]);
 const allowedFullProceduralPlanKeys = new Set(["project", "maxItemsPerWindow"]);
 const allowedFullProceduralWindowKeys = new Set([
   ...extractionOperationIdentityKeys,
@@ -1061,6 +1065,84 @@ export function registerApiTriggers(
     function_id: "api::full-memory-consolidate-window",
     config: {
       api_path: "/agentmemory/full/memory-consolidate-window",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::full-memory-consolidate-window-prepare", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body || !hasOnlyKeys(body, allowedFullConsolidateWindowKeys)) {
+      return { status_code: 400, body: { error: "invalid full memory consolidate prepare payload" } };
+    }
+    const identity = extractionOperationIdentity(body, "memory_consolidate");
+    if (!identity) return invalidExtractionOperationIdentityResponse("memory_consolidate");
+    const project = optionalNonEmptyString(body, "project");
+    const concept = optionalNonEmptyString(body, "concept");
+    const observationIds = body.sourceObservationIds === undefined
+      ? (body.observationIds === undefined ? undefined : parseStringArray(body.observationIds))
+      : parseStringArray(body.sourceObservationIds);
+    const observationSessionIds = body.observationSessionIds === undefined
+      ? undefined
+      : parseStringRecord(body.observationSessionIds);
+    const minObservations = parseOptionalPositiveInt(body.minObservations);
+    const charBudget = parseOptionalPositiveInt(body.charBudget);
+    const model = optionalModelString(body);
+    if (
+      project === null || concept === null || observationIds === null || observationSessionIds === null
+      || minObservations === null || charBudget === null || model === null
+    ) {
+      return { status_code: 400, body: { error: "invalid full memory consolidate prepare fields" } };
+    }
+    const payload: Record<string, unknown> = { identity };
+    if (project !== undefined) payload.project = project;
+    if (concept !== undefined) payload.concept = concept;
+    if (observationIds !== undefined) payload.observationIds = observationIds;
+    if (observationSessionIds !== undefined) payload.observationSessionIds = observationSessionIds;
+    if (minObservations !== undefined) payload.minObservations = minObservations;
+    if (charBudget !== undefined) payload.charBudget = charBudget;
+    if (model) payload.model = model;
+    const result = await sdk.trigger({
+      function_id: "mem::full-memory-consolidate-window-prepare",
+      payload,
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-memory-consolidate-window-prepare",
+    config: {
+      api_path: "/agentmemory/full/memory-consolidate-window/prepare",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::full-memory-consolidate-window-commit", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body || !hasOnlyKeys(body, allowedFullConsolidateCommitKeys)) {
+      return { status_code: 400, body: { error: "invalid full memory consolidate commit payload" } };
+    }
+    const identity = extractionOperationIdentity(body, "memory_consolidate");
+    const preparedHandle = optionalNonEmptyString(body, "preparedHandle");
+    if (!identity || !preparedHandle) {
+      return { status_code: 400, body: { error: "invalid memory consolidate commit identity or handle" } };
+    }
+    const result = await sdk.trigger({
+      function_id: "mem::full-memory-consolidate-window-commit",
+      payload: { identity, preparedHandle },
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-memory-consolidate-window-commit",
+    config: {
+      api_path: "/agentmemory/full/memory-consolidate-window/commit",
       http_method: "POST",
       middleware_function_ids: ["middleware::api-auth"],
     },
