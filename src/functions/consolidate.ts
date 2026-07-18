@@ -87,6 +87,19 @@ export interface ConsolidationObservationDescriptor {
   estimatedChars: number;
 }
 
+interface ConsolidationPlanBuffer {
+  descriptors: ConsolidationObservationDescriptor[];
+  sessionInventoryHash: string;
+  totalSessions: number;
+  nextSessionOffset: number | null;
+  plannerInputHash: string;
+  updatedAt: number;
+}
+
+const CONSOLIDATION_PLAN_BUFFER_TTL_MS = 2 * 60 * 60 * 1000;
+const CONSOLIDATION_PLAN_BUFFER_MAX_DESCRIPTORS = 2_000_000;
+const consolidationPlanBuffers = new Map<string, ConsolidationPlanBuffer>();
+
 function stableHash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
@@ -321,6 +334,112 @@ export async function collectConsolidationObservationDescriptorPage(options: {
     totalSessions: filtered.length,
     sessionInventoryHash: stableHash(filtered.map((session) => session.id)),
   };
+}
+
+function cleanExpiredConsolidationPlanBuffers(now = Date.now()): void {
+  for (const [plannerId, buffer] of consolidationPlanBuffers.entries()) {
+    if (now - buffer.updatedAt > CONSOLIDATION_PLAN_BUFFER_TTL_MS) {
+      consolidationPlanBuffers.delete(plannerId);
+    }
+  }
+}
+
+async function collectBufferedConsolidationObservationDescriptorPage(options: {
+  kv: StateKV;
+  plannerId: string;
+  project?: string;
+  minImportance?: number;
+  sessionOffset?: number;
+  sessionLimit?: number;
+}): Promise<Record<string, unknown>> {
+  cleanExpiredConsolidationPlanBuffers();
+  const page = await collectConsolidationObservationDescriptorPage(options);
+  const plannerInputHash = stableHash({
+    project: options.project?.trim() || null,
+    minImportance: options.minImportance ?? 5,
+  });
+  const existing = consolidationPlanBuffers.get(options.plannerId);
+  if (page.sessionOffset === 0) {
+    consolidationPlanBuffers.set(options.plannerId, {
+      descriptors: [...page.descriptors],
+      sessionInventoryHash: page.sessionInventoryHash,
+      totalSessions: page.totalSessions,
+      nextSessionOffset: page.nextSessionOffset,
+      plannerInputHash,
+      updatedAt: Date.now(),
+    });
+  } else {
+    if (
+      !existing
+      || existing.nextSessionOffset !== page.sessionOffset
+      || existing.sessionInventoryHash !== page.sessionInventoryHash
+      || existing.totalSessions !== page.totalSessions
+      || existing.plannerInputHash !== plannerInputHash
+    ) {
+      consolidationPlanBuffers.delete(options.plannerId);
+      return {
+        success: false,
+        error: "invalid_consolidation_plan_cursor",
+        failure: { class: "hard", cause: "invalid_consolidation_plan_cursor" },
+      };
+    }
+    existing.descriptors.push(...page.descriptors);
+    existing.nextSessionOffset = page.nextSessionOffset;
+    existing.updatedAt = Date.now();
+  }
+  const buffer = consolidationPlanBuffers.get(options.plannerId)!;
+  if (buffer.descriptors.length > CONSOLIDATION_PLAN_BUFFER_MAX_DESCRIPTORS) {
+    consolidationPlanBuffers.delete(options.plannerId);
+    return {
+      success: false,
+      error: "consolidation_plan_descriptor_limit_exceeded",
+      failure: { class: "hard", cause: "consolidation_plan_descriptor_limit_exceeded" },
+    };
+  }
+  return {
+    ...page,
+    plannerId: options.plannerId,
+    descriptors: [],
+    descriptorCount: page.descriptors.length,
+    accumulatedDescriptorCount: buffer.descriptors.length,
+  };
+}
+
+async function finalizeBufferedConsolidationObservationPlan(options: {
+  kv: StateKV;
+  plannerId: string;
+  project?: string;
+  minObservations?: number;
+  minImportance?: number;
+  minObservationsPerConcept?: number;
+  maxObservationsPerWindow?: number;
+  charBudget?: number;
+}): Promise<Record<string, unknown>> {
+  cleanExpiredConsolidationPlanBuffers();
+  const buffer = consolidationPlanBuffers.get(options.plannerId);
+  const plannerInputHash = stableHash({
+    project: options.project?.trim() || null,
+    minImportance: options.minImportance ?? 5,
+  });
+  if (
+    !buffer
+    || buffer.nextSessionOffset !== null
+    || buffer.plannerInputHash !== plannerInputHash
+  ) {
+    consolidationPlanBuffers.delete(options.plannerId);
+    return {
+      success: false,
+      error: "incomplete_consolidation_plan_buffer",
+      failure: { class: "hard", cause: "incomplete_consolidation_plan_buffer" },
+    };
+  }
+  consolidationPlanBuffers.delete(options.plannerId);
+  const { plannerId: _plannerId, ...planOptions } = options;
+  void _plannerId;
+  return planConsolidateObservationWindows({
+    ...planOptions,
+    descriptors: buffer.descriptors,
+  });
 }
 
 function descriptorChunksByBudget(
@@ -750,23 +869,29 @@ export function registerConsolidateFunction(
   sdk.registerFunction(
     "mem::full-memory-consolidate-windows-plan",
     async (data: {
+      plannerId?: string;
       project?: string;
       descriptors?: ConsolidationObservationDescriptor[];
       minImportance?: number;
       minObservationsPerConcept?: number;
       maxObservationsPerWindow?: number;
       charBudget?: number;
-    }) => planConsolidateObservationWindows({ kv, ...data }),
+    }) => data.plannerId
+      ? finalizeBufferedConsolidationObservationPlan({ kv, ...data, plannerId: data.plannerId })
+      : planConsolidateObservationWindows({ kv, ...data }),
   );
 
   sdk.registerFunction(
     "mem::full-memory-consolidate-observations-page",
     async (data: {
+      plannerId?: string;
       project?: string;
       minImportance?: number;
       sessionOffset?: number;
       sessionLimit?: number;
-    }) => collectConsolidationObservationDescriptorPage({ kv, ...data }),
+    }) => data.plannerId
+      ? collectBufferedConsolidationObservationDescriptorPage({ kv, ...data, plannerId: data.plannerId })
+      : collectConsolidationObservationDescriptorPage({ kv, ...data }),
   );
 
   sdk.registerFunction(

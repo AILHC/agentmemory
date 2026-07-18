@@ -501,7 +501,12 @@ describe("full extraction REST wrappers", () => {
 
     const page = await handler({
       headers: {},
-      body: { project: "repo", sessionOffset: 0, sessionLimit: 1 },
+      body: {
+        project: "repo",
+        plannerId: "formal-plan",
+        sessionOffset: 0,
+        sessionLimit: 1,
+      },
     });
     expect(page.status_code).toBe(200);
     expect(page.body).toMatchObject({
@@ -509,27 +514,76 @@ describe("full extraction REST wrappers", () => {
       nextSessionOffset: 1,
       totalSessions: 2,
       sessionInventoryHash: expect.stringMatching(/^[a-f0-9]{64}$/),
-      descriptors: [{
-        id: "obs-0",
-        sid: "ses-0",
-        concepts: ["windows"],
-        importance: 6,
-      }],
+      plannerId: "formal-plan",
+      descriptors: [],
+      descriptorCount: 1,
+      accumulatedDescriptorCount: 1,
     });
     expect(JSON.stringify(page.body)).not.toContain("private narrative");
+
+    const secondPage = await handler({
+      headers: {},
+      body: {
+        project: "repo",
+        plannerId: "formal-plan",
+        sessionOffset: 1,
+        sessionLimit: 1,
+      },
+    });
+    expect(secondPage.body).toMatchObject({
+      nextSessionOffset: null,
+      descriptorCount: 1,
+      accumulatedDescriptorCount: 2,
+    });
+
+    const mismatchedFinalization = await handler({
+      headers: {},
+      body: {
+        project: "other-repo",
+        plannerId: "formal-plan",
+        minObservations: 1,
+      },
+    });
+    expect(mismatchedFinalization.body).toMatchObject({
+      success: false,
+      error: "incomplete_consolidation_plan_buffer",
+      failure: { class: "hard", cause: "incomplete_consolidation_plan_buffer" },
+    });
+
+    await handler({
+      headers: {},
+      body: {
+        project: "repo",
+        plannerId: "formal-plan",
+        sessionOffset: 0,
+        sessionLimit: 1,
+      },
+    });
+    await handler({
+      headers: {},
+      body: {
+        project: "repo",
+        plannerId: "formal-plan",
+        sessionOffset: 1,
+        sessionLimit: 1,
+      },
+    });
 
     const finalized = await handler({
       headers: {},
       body: {
         project: "repo",
+        plannerId: "formal-plan",
         minObservations: 1,
-        descriptors: page.body.descriptors,
       },
     });
     expect(finalized.status_code).toBe(200);
     expect(finalized.body.windows[0]).toMatchObject({
-      sourceObservationIds: ["obs-0"],
-      observationSessionIds: { "obs-0": "ses-0" },
+      sourceObservationIds: ["obs-0", "obs-1"],
+      observationSessionIds: {
+        "obs-0": "ses-0",
+        "obs-1": "ses-1",
+      },
     });
   });
 });

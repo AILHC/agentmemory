@@ -403,6 +403,7 @@ const allowedFullConsolidatePlanKeys = new Set([
   "sessionOffset",
   "sessionLimit",
   "descriptors",
+  "plannerId",
 ]);
 const allowedFullConsolidateWindowKeys = new Set([
   ...extractionOperationIdentityKeys,
@@ -937,6 +938,7 @@ export function registerApiTriggers(
     const descriptors = body.descriptors === undefined
       ? undefined
       : parseConsolidationDescriptors(body.descriptors);
+    const plannerId = optionalNonEmptyString(body, "plannerId");
     if (
       minImportance === null
       || minObservationsPerConcept === null
@@ -945,8 +947,11 @@ export function registerApiTriggers(
       || sessionOffset === null
       || sessionLimit === null
       || descriptors === null
+      || plannerId === null
+      || (plannerId !== undefined && plannerId.length > 128)
       || (sessionLimit !== undefined && sessionOffset === undefined)
       || (sessionOffset !== undefined && descriptors !== undefined)
+      || (plannerId !== undefined && descriptors !== undefined)
     ) {
       return {
         status_code: 400,
@@ -960,6 +965,7 @@ export function registerApiTriggers(
     const payload: Record<string, unknown> = {};
     if (project !== undefined) payload.project = project;
     if (minImportance !== undefined) payload.minImportance = minImportance;
+    if (plannerId !== undefined) payload.plannerId = plannerId;
     if (sessionOffset !== undefined) {
       payload.sessionOffset = sessionOffset;
       payload.sessionLimit = sessionLimit ?? 8;
