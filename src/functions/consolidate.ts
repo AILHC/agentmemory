@@ -93,8 +93,16 @@ interface ConsolidationPlanBuffer {
   totalSessions: number;
   nextSessionOffset: number | null;
   plannerInputHash: string;
+  finalizeInputHash?: string;
+  planSummary?: Omit<ConsolidationObservationPlan, "windows">;
+  windows?: ConsolidateObservationWindow[];
+  totalWindows?: number;
+  windowBaseOffset?: number;
+  nextWindowOffset?: number | null;
   updatedAt: number;
 }
+
+type ConsolidationObservationPlan = Awaited<ReturnType<typeof planConsolidateObservationWindows>>;
 
 const CONSOLIDATION_PLAN_BUFFER_TTL_MS = 2 * 60 * 60 * 1000;
 const CONSOLIDATION_PLAN_BUFFER_MAX_DESCRIPTORS = 2_000_000;
@@ -414,6 +422,8 @@ async function finalizeBufferedConsolidationObservationPlan(options: {
   minObservationsPerConcept?: number;
   maxObservationsPerWindow?: number;
   charBudget?: number;
+  windowOffset?: number;
+  windowLimit?: number;
 }): Promise<Record<string, unknown>> {
   cleanExpiredConsolidationPlanBuffers();
   const buffer = consolidationPlanBuffers.get(options.plannerId);
@@ -421,10 +431,19 @@ async function finalizeBufferedConsolidationObservationPlan(options: {
     project: options.project?.trim() || null,
     minImportance: options.minImportance ?? 5,
   });
+  const finalizeInputHash = stableHash({
+    project: options.project?.trim() || null,
+    minObservations: options.minObservations ?? null,
+    minImportance: options.minImportance ?? 5,
+    minObservationsPerConcept: options.minObservationsPerConcept ?? null,
+    maxObservationsPerWindow: options.maxObservationsPerWindow ?? null,
+    charBudget: options.charBudget ?? null,
+  });
   if (
     !buffer
     || buffer.nextSessionOffset !== null
     || buffer.plannerInputHash !== plannerInputHash
+    || (buffer.finalizeInputHash !== undefined && buffer.finalizeInputHash !== finalizeInputHash)
   ) {
     consolidationPlanBuffers.delete(options.plannerId);
     return {
@@ -433,13 +452,127 @@ async function finalizeBufferedConsolidationObservationPlan(options: {
       failure: { class: "hard", cause: "incomplete_consolidation_plan_buffer" },
     };
   }
-  consolidationPlanBuffers.delete(options.plannerId);
-  const { plannerId: _plannerId, ...planOptions } = options;
-  void _plannerId;
-  return planConsolidateObservationWindows({
-    ...planOptions,
-    descriptors: buffer.descriptors,
-  });
+  const windowOffset = options.windowOffset ?? 0;
+  const windowLimit = options.windowLimit ?? 8;
+  if (!buffer.planSummary || !buffer.windows) {
+    if (windowOffset !== 0) {
+      return {
+        success: false,
+        error: "invalid_consolidation_plan_window_cursor",
+        failure: { class: "hard", cause: "invalid_consolidation_plan_window_cursor" },
+      };
+    }
+    const {
+      plannerId: _plannerId,
+      windowOffset: _windowOffset,
+      windowLimit: _windowLimit,
+      ...planOptions
+    } = options;
+    void _plannerId;
+    void _windowOffset;
+    void _windowLimit;
+    const plan = await planConsolidateObservationWindows({
+      ...planOptions,
+      descriptors: buffer.descriptors,
+    });
+    const { windows, ...planSummary } = plan;
+    buffer.descriptors = [];
+    buffer.finalizeInputHash = finalizeInputHash;
+    buffer.planSummary = planSummary;
+    buffer.windows = windows;
+    buffer.totalWindows = windows.length;
+    buffer.windowBaseOffset = 0;
+    buffer.nextWindowOffset = null;
+    buffer.updatedAt = Date.now();
+  }
+
+  const baseOffset = buffer.windowBaseOffset ?? 0;
+  const expectedNextOffset = buffer.nextWindowOffset;
+  if (
+    windowOffset < baseOffset
+    || (windowOffset !== baseOffset && windowOffset !== expectedNextOffset)
+    || windowOffset > (buffer.totalWindows ?? 0)
+  ) {
+    return {
+      success: false,
+      error: "invalid_consolidation_plan_window_cursor",
+      failure: { class: "hard", cause: "invalid_consolidation_plan_window_cursor" },
+    };
+  }
+  if (windowOffset > baseOffset) {
+    buffer.windows = buffer.windows.slice(windowOffset - baseOffset);
+    buffer.windowBaseOffset = windowOffset;
+  }
+  const windows = buffer.windows.slice(0, windowLimit);
+  const consumed = windowOffset + windows.length;
+  const nextWindowOffset = consumed < (buffer.totalWindows ?? 0) ? consumed : null;
+  buffer.nextWindowOffset = nextWindowOffset;
+  buffer.updatedAt = Date.now();
+  return {
+    ...buffer.planSummary,
+    plannerId: options.plannerId,
+    windows,
+    windowOffset,
+    nextWindowOffset,
+    totalWindows: buffer.totalWindows,
+  };
+}
+
+function yieldToConsolidationEventLoop(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+async function groupItemsByConceptCooperatively<T extends { concepts: string[] }>(
+  allObs: T[],
+  minGroupSize: number,
+): Promise<Map<string, T[]>> {
+  const conceptGroups = new Map<string, T[]>();
+  for (let index = 0; index < allObs.length; index++) {
+    const obs = allObs[index];
+    for (const concept of obs.concepts) {
+      const key = concept.toLowerCase();
+      if (!conceptGroups.has(key)) conceptGroups.set(key, []);
+      conceptGroups.get(key)!.push(obs);
+    }
+    if ((index + 1) % 4_096 === 0) await yieldToConsolidationEventLoop();
+  }
+  await yieldToConsolidationEventLoop();
+  return new Map(
+    [...conceptGroups.entries()]
+      .filter(([, group]) => group.length >= minGroupSize)
+      .sort((a, b) => b[1].length - a[1].length),
+  );
+}
+
+async function descriptorChunksByBudgetCooperatively(
+  descriptors: ConsolidationObservationDescriptor[],
+  maxObservationsPerWindow: number,
+  charBudget?: number,
+): Promise<ConsolidationObservationDescriptor[][]> {
+  const chunks: ConsolidationObservationDescriptor[][] = [];
+  let current: ConsolidationObservationDescriptor[] = [];
+  let currentChars = 0;
+  const maxCount = Math.max(1, maxObservationsPerWindow);
+  for (let index = 0; index < descriptors.length; index++) {
+    const descriptor = descriptors[index];
+    const descriptorChars = descriptor.estimatedChars
+      + (current.length > 0 ? CONSOLIDATION_OBSERVATION_SEPARATOR.length : 0);
+    const wouldExceedCount = current.length >= maxCount;
+    const wouldExceedBudget =
+      charBudget !== undefined
+      && current.length > 0
+      && currentChars + descriptorChars > charBudget;
+    if (wouldExceedCount || wouldExceedBudget) {
+      chunks.push(current);
+      current = [];
+      currentChars = 0;
+    }
+    current.push(descriptor);
+    currentChars += descriptorChars;
+    if ((index + 1) % 4_096 === 0) await yieldToConsolidationEventLoop();
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
 }
 
 function descriptorChunksByBudget(
@@ -584,28 +717,38 @@ export async function planConsolidateObservationWindows(options: {
     };
   }
 
-  const groups = groupItemsByConcept(descriptors, minObs);
+  const groups = await groupItemsByConceptCooperatively(descriptors, minObs);
   const windows: ConsolidateObservationWindow[] = [];
   const coveredObservationIds = new Set<string>();
   for (const [concept, obsGroup] of groups.entries()) {
-    const sorted = [...obsGroup]
-      .sort((a, b) => b.importance - a.importance)
-      .filter((obs) => !coveredObservationIds.has(obs.id));
+    const candidates = [...obsGroup].sort((a, b) => b.importance - a.importance);
+    const sorted: ConsolidationObservationDescriptor[] = [];
+    for (let index = 0; index < candidates.length; index++) {
+      const obs = candidates[index];
+      if (!coveredObservationIds.has(obs.id)) sorted.push(obs);
+      if ((index + 1) % 4_096 === 0) await yieldToConsolidationEventLoop();
+    }
     const chunkSize = Math.max(1, options.maxObservationsPerWindow ?? sorted.length);
-    const chunks = descriptorChunksByBudget(sorted, chunkSize, charBudget);
+    const chunks = await descriptorChunksByBudgetCooperatively(sorted, chunkSize, charBudget);
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       if (chunk.length === 0) continue;
       for (const obs of chunk) coveredObservationIds.add(obs.id);
       windows.push(consolidateWindowFromDescriptors(concept, chunk, i, charBudget));
+      if ((i + 1) % 256 === 0) await yieldToConsolidationEventLoop();
     }
+    await yieldToConsolidationEventLoop();
   }
-  const remaining = descriptors
-    .filter((obs) => !coveredObservationIds.has(obs.id))
-    .sort((a, b) => b.importance - a.importance);
+  const remaining: ConsolidationObservationDescriptor[] = [];
+  for (let index = 0; index < descriptors.length; index++) {
+    const obs = descriptors[index];
+    if (!coveredObservationIds.has(obs.id)) remaining.push(obs);
+    if ((index + 1) % 4_096 === 0) await yieldToConsolidationEventLoop();
+  }
+  remaining.sort((a, b) => b.importance - a.importance);
   if (remaining.length > 0) {
     const chunkSize = Math.max(1, options.maxObservationsPerWindow ?? remaining.length);
-    const chunks = descriptorChunksByBudget(remaining, chunkSize, charBudget);
+    const chunks = await descriptorChunksByBudgetCooperatively(remaining, chunkSize, charBudget);
     for (let i = 0; i < chunks.length; i++) {
       windows.push(consolidateWindowFromDescriptors(
         "remaining-observations",
@@ -614,6 +757,7 @@ export async function planConsolidateObservationWindows(options: {
         charBudget,
         "remaining",
       ));
+      if ((i + 1) % 256 === 0) await yieldToConsolidationEventLoop();
     }
   }
   const maxWindowEstimatedChars = windows.reduce(
@@ -876,6 +1020,8 @@ export function registerConsolidateFunction(
       minObservationsPerConcept?: number;
       maxObservationsPerWindow?: number;
       charBudget?: number;
+      windowOffset?: number;
+      windowLimit?: number;
     }) => data.plannerId
       ? finalizeBufferedConsolidationObservationPlan({ kv, ...data, plannerId: data.plannerId })
       : planConsolidateObservationWindows({ kv, ...data }),

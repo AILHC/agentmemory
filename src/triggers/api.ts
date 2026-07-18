@@ -402,6 +402,8 @@ const allowedFullConsolidatePlanKeys = new Set([
   "minObservations",
   "sessionOffset",
   "sessionLimit",
+  "windowOffset",
+  "windowLimit",
   "descriptors",
   "plannerId",
 ]);
@@ -935,6 +937,8 @@ export function registerApiTriggers(
     const charBudget = parseOptionalPositiveInt(body.charBudget);
     const sessionOffset = parseOptionalNonNegativeInt(body.sessionOffset);
     const sessionLimit = parseOptionalBoundedPositiveInt(body.sessionLimit, 8);
+    const windowOffset = parseOptionalNonNegativeInt(body.windowOffset);
+    const windowLimit = parseOptionalBoundedPositiveInt(body.windowLimit, 8);
     const descriptors = body.descriptors === undefined
       ? undefined
       : parseConsolidationDescriptors(body.descriptors);
@@ -946,11 +950,17 @@ export function registerApiTriggers(
       || charBudget === null
       || sessionOffset === null
       || sessionLimit === null
+      || windowOffset === null
+      || windowLimit === null
       || descriptors === null
       || plannerId === null
       || (plannerId !== undefined && plannerId.length > 128)
       || (sessionLimit !== undefined && sessionOffset === undefined)
+      || (windowLimit !== undefined && windowOffset === undefined)
+      || (windowOffset !== undefined && plannerId === undefined)
+      || (sessionOffset !== undefined && windowOffset !== undefined)
       || (sessionOffset !== undefined && descriptors !== undefined)
+      || (windowOffset !== undefined && descriptors !== undefined)
       || (plannerId !== undefined && descriptors !== undefined)
     ) {
       return {
@@ -979,6 +989,10 @@ export function registerApiTriggers(
     if (minObservationsPerConcept !== undefined) payload.minObservationsPerConcept = minObservationsPerConcept;
     if (maxObservationsPerWindow !== undefined) payload.maxObservationsPerWindow = maxObservationsPerWindow;
     if (charBudget !== undefined) payload.charBudget = charBudget;
+    if (windowOffset !== undefined) {
+      payload.windowOffset = windowOffset;
+      payload.windowLimit = windowLimit ?? 8;
+    }
     const result = await sdk.trigger({
       function_id: "mem::full-memory-consolidate-windows-plan",
       payload,

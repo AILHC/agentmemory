@@ -542,6 +542,8 @@ describe("full extraction REST wrappers", () => {
         project: "other-repo",
         plannerId: "formal-plan",
         minObservations: 1,
+        windowOffset: 0,
+        windowLimit: 1,
       },
     });
     expect(mismatchedFinalization.body).toMatchObject({
@@ -575,15 +577,46 @@ describe("full extraction REST wrappers", () => {
         project: "repo",
         plannerId: "formal-plan",
         minObservations: 1,
+        charBudget: 1,
+        windowOffset: 0,
+        windowLimit: 1,
       },
     });
     expect(finalized.status_code).toBe(200);
+    expect(finalized.body).toMatchObject({
+      plannerId: "formal-plan",
+      windowOffset: 0,
+      nextWindowOffset: 1,
+      totalWindows: 2,
+    });
     expect(finalized.body.windows[0]).toMatchObject({
-      sourceObservationIds: ["obs-0", "obs-1"],
+      sourceObservationIds: ["obs-0"],
       observationSessionIds: {
         "obs-0": "ses-0",
-        "obs-1": "ses-1",
       },
+    });
+
+    const finalPage = await handler({
+      headers: {},
+      body: {
+        project: "repo",
+        plannerId: "formal-plan",
+        minObservations: 1,
+        charBudget: 1,
+        windowOffset: 1,
+        windowLimit: 1,
+      },
+    });
+    expect(finalPage.body).toMatchObject({
+      windowOffset: 1,
+      nextWindowOffset: null,
+      totalWindows: 2,
+      windows: [{
+        sourceObservationIds: ["obs-1"],
+        observationSessionIds: {
+          "obs-1": "ses-1",
+        },
+      }],
     });
   });
 });
