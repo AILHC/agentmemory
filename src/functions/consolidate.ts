@@ -56,6 +56,7 @@ export interface ConsolidateObservationWindow {
   observationCount: number;
   estimatedChars: number;
   observationEstimatedChars?: Record<string, number>;
+  observationSessionIds?: Record<string, string>;
   charBudget?: number;
   budgetApplied?: boolean;
   overBudget?: boolean;
@@ -69,12 +70,21 @@ export interface ConsolidateObservationWindowOptions {
   project?: string;
   concept?: string;
   observationIds?: string[];
+  observationSessionIds?: Record<string, string>;
   minObservations?: number;
   minImportance?: number;
   minObservationsPerConcept?: number;
   maxObservationsPerWindow?: number;
   charBudget?: number;
   model?: string;
+}
+
+export interface ConsolidationObservationDescriptor {
+  id: string;
+  sid: string;
+  concepts: string[];
+  importance: number;
+  estimatedChars: number;
 }
 
 function stableHash(value: unknown): string {
@@ -180,11 +190,39 @@ async function collectConsolidationObservations(
   return allObs;
 }
 
-function groupObservationsByConcept(
-  allObs: Array<CompressedObservation & { sid: string }>,
+async function collectConsolidationObservationsById(
+  kv: StateKV,
+  observationIds: string[],
+  observationSessionIds: Record<string, string>,
+  minImportance: number,
+): Promise<Array<CompressedObservation & { sid: string }>> {
+  const collected: Array<CompressedObservation & { sid: string }> = [];
+  const readConcurrency = 8;
+  for (let offset = 0; offset < observationIds.length; offset += readConcurrency) {
+    const batch = observationIds.slice(offset, offset + readConcurrency);
+    const observations = await Promise.all(
+      batch.map((observationId) => {
+        const sessionId = observationSessionIds[observationId];
+        return kv
+          .get<CompressedObservation>(KV.observations(sessionId), observationId)
+          .catch(() => null);
+      }),
+    );
+    for (let index = 0; index < batch.length; index++) {
+      const obs = observations[index];
+      if (obs?.title && obs.importance >= minImportance) {
+        collected.push({ ...obs, sid: observationSessionIds[batch[index]] });
+      }
+    }
+  }
+  return collected;
+}
+
+function groupItemsByConcept<T extends { concepts: string[] }>(
+  allObs: T[],
   minGroupSize: number,
-): Map<string, Array<CompressedObservation & { sid: string }>> {
-  const conceptGroups = new Map<string, Array<CompressedObservation & { sid: string }>>();
+): Map<string, T[]> {
+  const conceptGroups = new Map<string, T[]>();
   for (const obs of allObs) {
     for (const concept of obs.concepts) {
       const key = concept.toLowerCase();
@@ -197,6 +235,13 @@ function groupObservationsByConcept(
       .filter(([, group]) => group.length >= minGroupSize)
       .sort((a, b) => b[1].length - a[1].length),
   );
+}
+
+function groupObservationsByConcept(
+  allObs: Array<CompressedObservation & { sid: string }>,
+  minGroupSize: number,
+): Map<string, Array<CompressedObservation & { sid: string }>> {
+  return groupItemsByConcept(allObs, minGroupSize);
 }
 
 const CONSOLIDATION_OBSERVATION_SEPARATOR = "\n\n";
@@ -213,45 +258,122 @@ function estimateObservationChars(obs: CompressedObservation): number {
   return serializeObservationForConsolidation(obs).length;
 }
 
-function windowChunksByBudget<T extends CompressedObservation>(
-  observations: T[],
+function observationDescriptor(
+  obs: CompressedObservation,
+  sid: string,
+): ConsolidationObservationDescriptor {
+  return {
+    id: obs.id,
+    sid,
+    concepts: obs.concepts,
+    importance: obs.importance,
+    estimatedChars: estimateObservationChars(obs),
+  };
+}
+
+export async function collectConsolidationObservationDescriptorPage(options: {
+  kv: StateKV;
+  project?: string;
+  minImportance?: number;
+  sessionOffset?: number;
+  sessionLimit?: number;
+}): Promise<{
+  success: true;
+  descriptors: ConsolidationObservationDescriptor[];
+  sessionOffset: number;
+  nextSessionOffset: number | null;
+  totalSessions: number;
+  sessionInventoryHash: string;
+}> {
+  const sessions = await options.kv.list<Session>(KV.sessions);
+  const scopedProject =
+    typeof options.project === "string" && options.project.trim().length > 0
+      ? options.project.trim()
+      : undefined;
+  const filtered = scopedProject
+    ? sessions.filter((session) => session.project === scopedProject)
+    : sessions;
+  const sessionOffset = Math.max(0, options.sessionOffset ?? 0);
+  const sessionLimit = Math.min(8, Math.max(1, options.sessionLimit ?? 8));
+  const page = filtered.slice(sessionOffset, sessionOffset + sessionLimit);
+  const observations = await Promise.all(
+    page.map((session) =>
+      options.kv
+        .list<CompressedObservation>(KV.observations(session.id))
+        .catch(() => [] as CompressedObservation[]),
+    ),
+  );
+  const minImportance = options.minImportance ?? 5;
+  const descriptors: ConsolidationObservationDescriptor[] = [];
+  for (let index = 0; index < page.length; index++) {
+    for (const obs of observations[index]) {
+      if (obs.title && obs.importance >= minImportance) {
+        descriptors.push(observationDescriptor(obs, page[index].id));
+      }
+    }
+  }
+  const consumed = sessionOffset + page.length;
+  return {
+    success: true,
+    descriptors,
+    sessionOffset,
+    nextSessionOffset: consumed < filtered.length ? consumed : null,
+    totalSessions: filtered.length,
+    sessionInventoryHash: stableHash(filtered.map((session) => session.id)),
+  };
+}
+
+function descriptorChunksByBudget(
+  descriptors: ConsolidationObservationDescriptor[],
   maxObservationsPerWindow: number,
   charBudget?: number,
-): T[][] {
-  const chunks: T[][] = [];
-  let current: T[] = [];
+): ConsolidationObservationDescriptor[][] {
+  const chunks: ConsolidationObservationDescriptor[][] = [];
+  let current: ConsolidationObservationDescriptor[] = [];
   let currentChars = 0;
   const maxCount = Math.max(1, maxObservationsPerWindow);
-
-  for (const obs of observations) {
-    const obsChars = estimateObservationChars(obs)
+  for (const descriptor of descriptors) {
+    const descriptorChars = descriptor.estimatedChars
       + (current.length > 0 ? CONSOLIDATION_OBSERVATION_SEPARATOR.length : 0);
     const wouldExceedCount = current.length >= maxCount;
     const wouldExceedBudget =
-      charBudget !== undefined && current.length > 0 && currentChars + obsChars > charBudget;
+      charBudget !== undefined
+      && current.length > 0
+      && currentChars + descriptorChars > charBudget;
     if (wouldExceedCount || wouldExceedBudget) {
       chunks.push(current);
       current = [];
       currentChars = 0;
     }
-    current.push(obs);
-    currentChars += obsChars;
+    current.push(descriptor);
+    currentChars += descriptorChars;
   }
   if (current.length > 0) chunks.push(current);
   return chunks;
 }
 
-function consolidateWindowFromChunk(
+function consolidateWindowFromDescriptors(
   concept: string,
-  chunk: Array<CompressedObservation & { sid: string }>,
+  descriptors: ConsolidationObservationDescriptor[],
   index: number,
   charBudget?: number,
   windowKey = concept,
 ): ConsolidateObservationWindow {
-  const observationIds = chunk.map((o) => o.id);
-  const sessionIds = [...new Set(chunk.map((o) => o.sid))];
-  const observationEstimatedChars = Object.fromEntries(chunk.map((o) => [o.id, estimateObservationChars(o)]));
-  const estimatedChars = serializeConsolidationObservationPrompt(chunk).length;
+  const observationIds = descriptors.map((descriptor) => descriptor.id);
+  const sessionIds = [...new Set(descriptors.map((descriptor) => descriptor.sid))];
+  const observationEstimatedChars = Object.fromEntries(
+    descriptors.map((descriptor) => [descriptor.id, descriptor.estimatedChars]),
+  );
+  const observationSessionIds = Object.fromEntries(
+    descriptors.map((descriptor) => [descriptor.id, descriptor.sid]),
+  );
+  const estimatedChars = descriptors.reduce(
+    (total, descriptor, descriptorIndex) =>
+      total
+      + descriptor.estimatedChars
+      + (descriptorIndex > 0 ? CONSOLIDATION_OBSERVATION_SEPARATOR.length : 0),
+    0,
+  );
   const budgetApplied = charBudget !== undefined;
   const overBudget = budgetApplied && estimatedChars > charBudget;
   return {
@@ -261,11 +383,12 @@ function consolidateWindowFromChunk(
     sourceObservationIds: observationIds,
     sessionIds,
     sourceSessionIds: sessionIds,
-    observationCount: chunk.length,
+    observationCount: descriptors.length,
     estimatedChars,
     observationEstimatedChars,
+    observationSessionIds,
     ...(budgetApplied ? { charBudget, budgetApplied } : {}),
-    ...(overBudget && chunk.length === 1
+    ...(overBudget && descriptors.length === 1
       ? { overBudget: true, overBudgetReason: "single_observation" as const }
       : {}),
     inputHash: stableHash(["memory-consolidate", concept, observationIds, sessionIds, estimatedChars]),
@@ -274,6 +397,7 @@ function consolidateWindowFromChunk(
 
 export async function planConsolidateObservationWindows(options: {
   kv: StateKV;
+  descriptors?: ConsolidationObservationDescriptor[];
   project?: string;
   minObservations?: number;
   minImportance?: number;
@@ -309,11 +433,27 @@ export async function planConsolidateObservationWindows(options: {
       ? {}
       : { maxObservationsPerWindow: Math.max(1, options.maxObservationsPerWindow) }),
   };
-  const allObs = await collectConsolidationObservations(options.kv, options.project, minImportance);
-  if (allObs.length < minObs) {
+  const descriptors = options.descriptors ?? (await (async () => {
+    const collected: ConsolidationObservationDescriptor[] = [];
+    let sessionOffset = 0;
+    while (true) {
+      const page = await collectConsolidationObservationDescriptorPage({
+        kv: options.kv,
+        project: options.project,
+        minImportance,
+        sessionOffset,
+        sessionLimit: 8,
+      });
+      collected.push(...page.descriptors);
+      if (page.nextSessionOffset === null) break;
+      sessionOffset = page.nextSessionOffset;
+    }
+    return collected;
+  })());
+  if (descriptors.length < minObs) {
     return {
       success: true,
-      totalObservations: allObs.length,
+      totalObservations: descriptors.length,
       windows: [],
       reason: "insufficient_observations",
       ...(budgetApplied ? { charBudget } : {}),
@@ -325,7 +465,7 @@ export async function planConsolidateObservationWindows(options: {
     };
   }
 
-  const groups = groupObservationsByConcept(allObs, minObs);
+  const groups = groupItemsByConcept(descriptors, minObs);
   const windows: ConsolidateObservationWindow[] = [];
   const coveredObservationIds = new Set<string>();
   for (const [concept, obsGroup] of groups.entries()) {
@@ -333,22 +473,28 @@ export async function planConsolidateObservationWindows(options: {
       .sort((a, b) => b.importance - a.importance)
       .filter((obs) => !coveredObservationIds.has(obs.id));
     const chunkSize = Math.max(1, options.maxObservationsPerWindow ?? sorted.length);
-    const chunks = windowChunksByBudget(sorted, chunkSize, charBudget);
+    const chunks = descriptorChunksByBudget(sorted, chunkSize, charBudget);
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       if (chunk.length === 0) continue;
       for (const obs of chunk) coveredObservationIds.add(obs.id);
-      windows.push(consolidateWindowFromChunk(concept, chunk, i, charBudget));
+      windows.push(consolidateWindowFromDescriptors(concept, chunk, i, charBudget));
     }
   }
-  const remaining = allObs
+  const remaining = descriptors
     .filter((obs) => !coveredObservationIds.has(obs.id))
     .sort((a, b) => b.importance - a.importance);
   if (remaining.length > 0) {
     const chunkSize = Math.max(1, options.maxObservationsPerWindow ?? remaining.length);
-    const chunks = windowChunksByBudget(remaining, chunkSize, charBudget);
+    const chunks = descriptorChunksByBudget(remaining, chunkSize, charBudget);
     for (let i = 0; i < chunks.length; i++) {
-      windows.push(consolidateWindowFromChunk("remaining-observations", chunks[i], i, charBudget, "remaining"));
+      windows.push(consolidateWindowFromDescriptors(
+        "remaining-observations",
+        chunks[i],
+        i,
+        charBudget,
+        "remaining",
+      ));
     }
   }
   const maxWindowEstimatedChars = windows.reduce(
@@ -364,7 +510,7 @@ export async function planConsolidateObservationWindows(options: {
   );
   return {
     success: true,
-    totalObservations: allObs.length,
+    totalObservations: descriptors.length,
     windows,
     ...(budgetApplied ? { charBudget } : {}),
     budgetApplied,
@@ -464,8 +610,25 @@ export async function runConsolidateObservationWindow(
       typeof options.project === "string" && options.project.trim().length > 0
         ? options.project.trim()
         : undefined;
-    const allObs = await collectConsolidationObservations(options.kv, scopedProject, options.minImportance ?? 5);
     const selectedIds = new Set(options.observationIds ?? []);
+    const hasCompleteSessionMap =
+      selectedIds.size > 0
+      && options.observationSessionIds !== undefined
+      && [...selectedIds].every((observationId) =>
+        typeof options.observationSessionIds?.[observationId] === "string"
+        && options.observationSessionIds[observationId].trim().length > 0);
+    const allObs = hasCompleteSessionMap
+      ? await collectConsolidationObservationsById(
+        options.kv,
+        [...selectedIds],
+        options.observationSessionIds!,
+        options.minImportance ?? 5,
+      )
+      : await collectConsolidationObservations(
+        options.kv,
+        scopedProject,
+        options.minImportance ?? 5,
+      );
     let obsGroup = selectedIds.size > 0
       ? allObs.filter((obs) => selectedIds.has(obs.id))
       : [];
@@ -588,6 +751,7 @@ export function registerConsolidateFunction(
     "mem::full-memory-consolidate-windows-plan",
     async (data: {
       project?: string;
+      descriptors?: ConsolidationObservationDescriptor[];
       minImportance?: number;
       minObservationsPerConcept?: number;
       maxObservationsPerWindow?: number;
@@ -596,11 +760,22 @@ export function registerConsolidateFunction(
   );
 
   sdk.registerFunction(
+    "mem::full-memory-consolidate-observations-page",
+    async (data: {
+      project?: string;
+      minImportance?: number;
+      sessionOffset?: number;
+      sessionLimit?: number;
+    }) => collectConsolidationObservationDescriptorPage({ kv, ...data }),
+  );
+
+  sdk.registerFunction(
     "mem::full-memory-consolidate-window",
     async (data: {
       project?: string;
       concept?: string;
       observationIds?: string[];
+      observationSessionIds?: Record<string, string>;
       minObservations?: number;
       charBudget?: number;
       model?: string;

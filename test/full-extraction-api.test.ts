@@ -295,9 +295,15 @@ describe("full extraction REST wrappers", () => {
           project: " repo ",
           concept: " Full ",
           sourceObservationIds: [" obs-a ", ""],
+          observationSessionIds: { "obs-a": " ses-a " },
         },
         function_id: "mem::full-memory-consolidate-window",
-        payload: { project: "repo", concept: "Full", observationIds: ["obs-a"] },
+        payload: {
+          project: "repo",
+          concept: "Full",
+          observationIds: ["obs-a"],
+          observationSessionIds: { "obs-a": "ses-a" },
+        },
       },
       {
         api: "api::full-consolidation-procedural-windows-plan",
@@ -456,5 +462,74 @@ describe("full extraction REST wrappers", () => {
         expect(window.estimatedChars).toBeLessThanOrEqual(250);
       }
     }
+  });
+
+  it("pages compact consolidation descriptors before finalizing a plan", async () => {
+    let sdk: ReturnType<typeof mockSdk>;
+    sdk = mockSdk(async (input) => sdk.getFunction(input.function_id)(input.payload));
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    registerConsolidateFunction(sdk as never, kv as never, {
+      name: "test",
+      summarize: vi.fn(),
+      compress: vi.fn(),
+    });
+    for (let sessionIndex = 0; sessionIndex < 2; sessionIndex++) {
+      const sessionId = `ses-${sessionIndex}`;
+      await kv.set(KV.sessions, sessionId, {
+        id: sessionId,
+        project: "repo",
+        cwd: "/repo",
+        startedAt: "2026-07-01T00:00:00.000Z",
+        status: "completed",
+        observationCount: 1,
+      });
+      await kv.set(KV.observations(sessionId), `obs-${sessionIndex}`, {
+        id: `obs-${sessionIndex}`,
+        sessionId,
+        timestamp: "2026-07-01T00:00:00.000Z",
+        type: "decision",
+        title: `Observation ${sessionIndex}`,
+        facts: [],
+        narrative: "private narrative must not be returned by the page",
+        concepts: ["windows"],
+        files: ["file.ts"],
+        importance: 6,
+      });
+    }
+    const handler = sdk.getFunction("api::full-memory-consolidate-windows-plan");
+
+    const page = await handler({
+      headers: {},
+      body: { project: "repo", sessionOffset: 0, sessionLimit: 1 },
+    });
+    expect(page.status_code).toBe(200);
+    expect(page.body).toMatchObject({
+      sessionOffset: 0,
+      nextSessionOffset: 1,
+      totalSessions: 2,
+      sessionInventoryHash: expect.stringMatching(/^[a-f0-9]{64}$/),
+      descriptors: [{
+        id: "obs-0",
+        sid: "ses-0",
+        concepts: ["windows"],
+        importance: 6,
+      }],
+    });
+    expect(JSON.stringify(page.body)).not.toContain("private narrative");
+
+    const finalized = await handler({
+      headers: {},
+      body: {
+        project: "repo",
+        minObservations: 1,
+        descriptors: page.body.descriptors,
+      },
+    });
+    expect(finalized.status_code).toBe(200);
+    expect(finalized.body.windows[0]).toMatchObject({
+      sourceObservationIds: ["obs-0"],
+      observationSessionIds: { "obs-0": "ses-0" },
+    });
   });
 });

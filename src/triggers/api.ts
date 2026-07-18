@@ -345,6 +345,13 @@ function parseOptionalPositiveInt(value: unknown): number | undefined | null {
   return parsed;
 }
 
+function parseOptionalNonNegativeInt(value: unknown): number | undefined | null {
+  const parsed = parseOptionalFiniteNumber(value);
+  if (parsed === undefined || parsed === null) return parsed;
+  if (!Number.isInteger(parsed) || parsed < 0) return null;
+  return parsed;
+}
+
 function parseOptionalBoundedPositiveInt(
   value: unknown,
   max: number,
@@ -393,6 +400,9 @@ const allowedFullConsolidatePlanKeys = new Set([
   "maxObservationsPerWindow",
   "charBudget",
   "minObservations",
+  "sessionOffset",
+  "sessionLimit",
+  "descriptors",
 ]);
 const allowedFullConsolidateWindowKeys = new Set([
   ...extractionOperationIdentityKeys,
@@ -401,6 +411,7 @@ const allowedFullConsolidateWindowKeys = new Set([
   "concept",
   "sourceObservationIds",
   "observationIds",
+  "observationSessionIds",
   "charBudget",
   "minObservations",
   "model",
@@ -510,6 +521,46 @@ function parseStringArray(value: unknown): string[] | null {
     if (trimmed && !out.includes(trimmed)) out.push(trimmed);
   }
   return out;
+}
+
+function parseStringRecord(value: unknown): Record<string, string> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const parsed: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (!key.trim() || typeof item !== "string" || !item.trim()) return null;
+    parsed[key.trim()] = item.trim();
+  }
+  return parsed;
+}
+
+function parseConsolidationDescriptors(value: unknown): Array<{
+  id: string;
+  sid: string;
+  concepts: string[];
+  importance: number;
+  estimatedChars: number;
+}> | null {
+  if (!Array.isArray(value) || value.length > 1_000_000) return null;
+  const parsed = [];
+  for (const item of value) {
+    const descriptor = requirePlainBody(item);
+    if (
+      !descriptor
+      || !hasOnlyKeys(
+        descriptor,
+        new Set(["id", "sid", "concepts", "importance", "estimatedChars"]),
+      )
+    ) return null;
+    const id = asNonEmptyString(descriptor.id);
+    const sid = asNonEmptyString(descriptor.sid);
+    const concepts = parseStringArray(descriptor.concepts);
+    const importance = parseOptionalFiniteNumber(descriptor.importance);
+    const estimatedChars = parseOptionalPositiveInt(descriptor.estimatedChars);
+    if (!id || !sid || concepts === null || importance === undefined || importance === null
+      || estimatedChars === undefined || estimatedChars === null) return null;
+    parsed.push({ id, sid, concepts, importance, estimatedChars });
+  }
+  return parsed;
 }
 
 function providerNameFrom(provider: unknown): string {
@@ -881,16 +932,26 @@ export function registerApiTriggers(
     );
     const maxObservationsPerWindow = parseOptionalPositiveInt(body.maxObservationsPerWindow);
     const charBudget = parseOptionalPositiveInt(body.charBudget);
+    const sessionOffset = parseOptionalNonNegativeInt(body.sessionOffset);
+    const sessionLimit = parseOptionalBoundedPositiveInt(body.sessionLimit, 8);
+    const descriptors = body.descriptors === undefined
+      ? undefined
+      : parseConsolidationDescriptors(body.descriptors);
     if (
       minImportance === null
       || minObservationsPerConcept === null
       || maxObservationsPerWindow === null
       || charBudget === null
+      || sessionOffset === null
+      || sessionLimit === null
+      || descriptors === null
+      || (sessionLimit !== undefined && sessionOffset === undefined)
+      || (sessionOffset !== undefined && descriptors !== undefined)
     ) {
       return {
         status_code: 400,
         body: {
-          error: "minImportance, minObservationsPerConcept, maxObservationsPerWindow, and charBudget must be positive integers",
+          error: "invalid full memory consolidate plan pagination or descriptor payload",
         },
       };
     }
@@ -899,6 +960,16 @@ export function registerApiTriggers(
     const payload: Record<string, unknown> = {};
     if (project !== undefined) payload.project = project;
     if (minImportance !== undefined) payload.minImportance = minImportance;
+    if (sessionOffset !== undefined) {
+      payload.sessionOffset = sessionOffset;
+      payload.sessionLimit = sessionLimit ?? 8;
+      const result = await sdk.trigger({
+        function_id: "mem::full-memory-consolidate-observations-page",
+        payload,
+      });
+      return { status_code: 200, body: result };
+    }
+    if (descriptors !== undefined) payload.descriptors = descriptors;
     if (minObservationsPerConcept !== undefined) payload.minObservationsPerConcept = minObservationsPerConcept;
     if (maxObservationsPerWindow !== undefined) payload.maxObservationsPerWindow = maxObservationsPerWindow;
     if (charBudget !== undefined) payload.charBudget = charBudget;
@@ -936,11 +1007,17 @@ export function registerApiTriggers(
     const observationIds = body.sourceObservationIds === undefined
       ? (body.observationIds === undefined ? undefined : parseStringArray(body.observationIds))
       : parseStringArray(body.sourceObservationIds);
+    const observationSessionIds = body.observationSessionIds === undefined
+      ? undefined
+      : parseStringRecord(body.observationSessionIds);
     if (project === null || concept === null) {
       return { status_code: 400, body: { error: "project and concept must be non-empty strings when present" } };
     }
-    if (observationIds === null) {
-      return { status_code: 400, body: { error: "observationIds must be a string array" } };
+    if (observationIds === null || observationSessionIds === null) {
+      return {
+        status_code: 400,
+        body: { error: "observationIds must be a string array and observationSessionIds a string map" },
+      };
     }
     const model = optionalModelString(body);
     if (model === null) return invalidModelResponse();
@@ -950,6 +1027,7 @@ export function registerApiTriggers(
     if (project !== undefined) payload.project = project;
     if (concept !== undefined) payload.concept = concept;
     if (observationIds !== undefined) payload.observationIds = observationIds;
+    if (observationSessionIds !== undefined) payload.observationSessionIds = observationSessionIds;
     if (minObservations !== undefined) payload.minObservations = minObservations;
     if (charBudget !== undefined) payload.charBudget = charBudget;
     if (model) payload.model = model;

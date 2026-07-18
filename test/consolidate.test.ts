@@ -5,6 +5,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import {
+  collectConsolidationObservationDescriptorPage,
   planConsolidateObservationWindows,
   runConsolidateObservationWindow,
   registerConsolidateFunction,
@@ -95,13 +96,15 @@ describe("consolidate full window helpers", () => {
     expect(result.eligibleWindowMaxObservationCount).toBe(4);
   });
 
-  it("bounds concurrent observation bucket reads for large formal plans", async () => {
+  it("reads only one bounded session page for large formal plans", async () => {
     const sessions = Array.from({ length: 40 }, (_, index) => session(`ses-${index}`));
     let activeReads = 0;
     let maxActiveReads = 0;
+    let observationBucketReads = 0;
     const kv = {
       list: async <T>(scope: string): Promise<T[]> => {
         if (scope === KV.sessions) return sessions as T[];
+        observationBucketReads += 1;
         activeReads += 1;
         maxActiveReads = Math.max(maxActiveReads, activeReads);
         await new Promise((resolve) => setTimeout(resolve, 1));
@@ -111,13 +114,51 @@ describe("consolidate full window helpers", () => {
       },
     };
 
-    const result = await planConsolidateObservationWindows({
+    const result = await collectConsolidationObservationDescriptorPage({
       kv: kv as never,
-      minObservations: 1,
+      sessionOffset: 8,
+      sessionLimit: 8,
     });
 
-    expect(result.totalObservations).toBe(40);
+    expect(result.descriptors).toHaveLength(8);
+    expect(result.sessionOffset).toBe(8);
+    expect(result.nextSessionOffset).toBe(16);
+    expect(result.sessionInventoryHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(observationBucketReads).toBe(8);
     expect(maxActiveReads).toBeLessThanOrEqual(8);
+  });
+
+  it("finalizes a full plan from compact descriptors without reading state buckets", async () => {
+    const descriptors = Array.from({ length: 4 }, (_, index) => ({
+      id: `obs-${index}`,
+      sid: `ses-${index}`,
+      concepts: ["windows"],
+      importance: 10 - index,
+      estimatedChars: 40,
+    }));
+    const kv = {
+      list: vi.fn(() => {
+        throw new Error("finalize must not read state");
+      }),
+    };
+
+    const result = await planConsolidateObservationWindows({
+      kv: kv as never,
+      descriptors,
+      minObservations: 3,
+      charBudget: 100,
+    });
+
+    expect(kv.list).not.toHaveBeenCalled();
+    expect(result.windows).toHaveLength(2);
+    expect(result.windows[0]).toMatchObject({
+      sourceObservationIds: ["obs-0", "obs-1"],
+      observationSessionIds: {
+        "obs-0": "ses-0",
+        "obs-1": "ses-1",
+      },
+      estimatedChars: 82,
+    });
   });
 
   it("bounds AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS config", () => {
@@ -364,6 +405,51 @@ describe("consolidate full window helpers", () => {
     );
     const stored = await kv.list(KV.memories);
     expect(stored).toHaveLength(1);
+  });
+
+  it("loads explicit window observations by id instead of scanning every session bucket", async () => {
+    const observations = new Map([
+      ["obs-a", observation("obs-a", 8)],
+      ["obs-b", observation("obs-b", 7)],
+    ]);
+    const kv = {
+      get: vi.fn(async <T>(_scope: string, key: string): Promise<T | null> =>
+        (observations.get(key) as T | undefined) ?? null),
+      list: vi.fn(async <T>(scope: string): Promise<T[]> => {
+        if (scope === KV.memories) return [];
+        throw new Error(`unexpected full bucket scan: ${scope}`);
+      }),
+      set: vi.fn(async <T>(_scope: string, _key: string, value: T): Promise<T> => value),
+    };
+    const provider: MemoryProvider = {
+      name: "test",
+      summarize: vi.fn(),
+      compress: vi.fn().mockResolvedValue(`
+<memory>
+  <type>pattern</type>
+  <title>Targeted Window</title>
+  <content>Loaded only selected observations.</content>
+  <concepts><concept>windows</concept></concepts>
+  <files><file>file.ts</file></files>
+  <strength>8</strength>
+</memory>`),
+    };
+
+    const result = await runConsolidateObservationWindow({
+      kv: kv as never,
+      provider,
+      observationIds: ["obs-a", "obs-b"],
+      observationSessionIds: {
+        "obs-a": "ses-a",
+        "obs-b": "ses-b",
+      },
+      minObservations: 1,
+    });
+
+    expect(result.success).toBe(true);
+    expect(kv.get).toHaveBeenCalledTimes(2);
+    expect(kv.list).toHaveBeenCalledTimes(1);
+    expect(kv.list).toHaveBeenCalledWith(KV.memories);
   });
 
   it("uses compress detailed results and returns one sanitized telemetry record", async () => {
