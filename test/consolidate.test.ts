@@ -95,6 +95,31 @@ describe("consolidate full window helpers", () => {
     expect(result.eligibleWindowMaxObservationCount).toBe(4);
   });
 
+  it("bounds concurrent observation bucket reads for large formal plans", async () => {
+    const sessions = Array.from({ length: 40 }, (_, index) => session(`ses-${index}`));
+    let activeReads = 0;
+    let maxActiveReads = 0;
+    const kv = {
+      list: async <T>(scope: string): Promise<T[]> => {
+        if (scope === KV.sessions) return sessions as T[];
+        activeReads += 1;
+        maxActiveReads = Math.max(maxActiveReads, activeReads);
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        activeReads -= 1;
+        const sessionId = scope.split(":").at(-1) ?? "unknown";
+        return [{ ...observation(`obs-${sessionId}`, 6), sessionId }] as T[];
+      },
+    };
+
+    const result = await planConsolidateObservationWindows({
+      kv: kv as never,
+      minObservations: 1,
+    });
+
+    expect(result.totalObservations).toBe(40);
+    expect(maxActiveReads).toBeLessThanOrEqual(8);
+  });
+
   it("bounds AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS config", () => {
     expect(getMemoryConsolidateCompressTimeoutMs({
       AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS: "not-a-number",

@@ -158,19 +158,22 @@ async function collectConsolidationObservations(
     ? sessions.filter((s) => s.project === scopedProject)
     : sessions;
 
-  const obsPerSession = await Promise.all(
-    filtered.map((s) =>
-      kv
-        .list<CompressedObservation>(KV.observations(s.id))
-        .catch(() => [] as CompressedObservation[]),
-    ),
-  );
-
   const allObs: Array<CompressedObservation & { sid: string }> = [];
-  for (let i = 0; i < filtered.length; i++) {
-    for (const obs of obsPerSession[i]) {
-      if (obs.title && obs.importance >= minImportance) {
-        allObs.push({ ...obs, sid: filtered[i].id });
+  const readConcurrency = 8;
+  for (let offset = 0; offset < filtered.length; offset += readConcurrency) {
+    const batch = filtered.slice(offset, offset + readConcurrency);
+    const observations = await Promise.all(
+      batch.map((session) =>
+        kv
+          .list<CompressedObservation>(KV.observations(session.id))
+          .catch(() => [] as CompressedObservation[]),
+      ),
+    );
+    for (let index = 0; index < batch.length; index++) {
+      for (const obs of observations[index]) {
+        if (obs.title && obs.importance >= minImportance) {
+          allObs.push({ ...obs, sid: batch[index].id });
+        }
       }
     }
   }
