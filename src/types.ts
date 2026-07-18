@@ -236,6 +236,42 @@ export interface MemoryConsolidationProposal extends ExtractionOperationIdentity
   };
 }
 
+export interface SkillExtractionProposal extends ExtractionOperationIdentity {
+  key: string;
+  handle: string;
+  proposalHash: string;
+  status: "prepared" | "committing" | "committed";
+  preparedAt: string;
+  sessionId: string;
+  parsed: {
+    trigger: string;
+    title: string;
+    steps: string[];
+    expectedOutcome: string;
+    tags: string[];
+  } | null;
+  concepts: string[];
+  sourceObservationIds: string[];
+  promptChars: number;
+  responseMetadata: Record<string, unknown>;
+  commitIntent?: {
+    resultId: string;
+    auditId: string;
+    createdAt: string;
+  };
+  response?: {
+    success: true;
+    status: "succeeded" | "skipped";
+    extracted: boolean;
+    reinforced?: boolean;
+    proceduralMemoryIds: string[];
+    skill?: ProceduralMemory;
+    reason?: string;
+    promptChars: number;
+    parseFailures: number;
+  };
+}
+
 export type SummaryAdvanceKind = "completed" | "skipped" | "reduced" | "none";
 
 export interface SummaryAdvance {

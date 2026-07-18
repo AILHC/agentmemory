@@ -925,6 +925,63 @@ export function registerApiTriggers(
     },
   });
 
+  sdk.registerFunction("api::full-skill-extract-prepare", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body || !hasOnlyKeys(body, allowedFullSkillExtractKeys)) {
+      return { status_code: 400, body: { error: "invalid full skill extract prepare payload" } };
+    }
+    const identity = extractionOperationIdentity(body, "skill_extract");
+    const sessionId = asNonEmptyString(body.sessionId);
+    const model = optionalModelString(body);
+    if (!identity || !sessionId || model === null) {
+      return { status_code: 400, body: { error: "invalid skill extract prepare identity or payload" } };
+    }
+    const result = await sdk.trigger({
+      function_id: "mem::full-skill-extract-prepare",
+      payload: { identity, sessionId, ...(model ? { model } : {}) },
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-skill-extract-prepare",
+    config: {
+      api_path: "/agentmemory/full/skill-extract/prepare",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::full-skill-extract-commit", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    if (!body || !hasOnlyKeys(body, allowedFullConsolidateCommitKeys)) {
+      return { status_code: 400, body: { error: "invalid full skill extract commit payload" } };
+    }
+    const identity = extractionOperationIdentity(body, "skill_extract");
+    const preparedHandle = optionalNonEmptyString(body, "preparedHandle");
+    if (!identity || !preparedHandle) {
+      return { status_code: 400, body: { error: "invalid skill extract commit identity or handle" } };
+    }
+    const result = await sdk.trigger({
+      function_id: "mem::full-skill-extract-commit",
+      payload: { identity, preparedHandle },
+    });
+    return { status_code: 200, body: result };
+  });
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::full-skill-extract-commit",
+    config: {
+      api_path: "/agentmemory/full/skill-extract/commit",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
   sdk.registerFunction("api::full-memory-consolidate-windows-plan", async (req: ApiRequest): Promise<Response> => {
     const denied = checkAuth(req, secret);
     if (denied) return denied;

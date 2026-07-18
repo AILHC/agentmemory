@@ -1567,7 +1567,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-153 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+155 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1624,6 +1624,10 @@ Full extraction orchestration uses narrow REST endpoints:
   provider call and stores an idempotent proposal without changing memories.
   `POST /agentmemory/full/memory-consolidate-window/commit` applies that
   proposal with deterministic memory and audit identifiers.
+- `POST /agentmemory/full/skill-extract/prepare` preserves the existing skill
+  prompt and model call while storing an idempotent proposal.
+  `POST /agentmemory/full/skill-extract/commit` applies proposals in runner
+  order and reinforces a procedural skill at most once per source session.
 - `GET /agentmemory/runtime-config` returns only redacted runtime facts:
   `summarizeChunkConcurrency`, `summarizeChunkSize`, `providerName`,
   `outputLanguageConfigured`, `outputLanguage`, and `modelRouting`.

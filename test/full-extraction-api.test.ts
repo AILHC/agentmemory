@@ -257,6 +257,48 @@ describe("full extraction REST wrappers", () => {
     });
   });
 
+  it("full skill prepare and commit whitelist identity and handle fields", async () => {
+    const sdk = mockSdk(async (input) => ({
+      success: true,
+      functionId: input.function_id,
+      payload: input.payload,
+    }));
+    registerApiTriggers(sdk as never, mockKV() as never, "");
+    const identity = {
+      runId: "formal-run",
+      stage: "skill_extract",
+      unitId: "skill-0001",
+      inputHash: "input-1",
+    };
+
+    const prepared = await sdk.getFunction("api::full-skill-extract-prepare")({
+      headers: {},
+      body: { ...identity, sessionId: " ses-1 ", model: " skill-model " },
+    });
+    expect(prepared.status_code).toBe(200);
+    expect(sdk.trigger).toHaveBeenLastCalledWith({
+      function_id: "mem::full-skill-extract-prepare",
+      payload: {
+        identity,
+        sessionId: "ses-1",
+        model: "skill-model",
+      },
+    });
+
+    const committed = await sdk.getFunction("api::full-skill-extract-commit")({
+      headers: {},
+      body: { ...identity, preparedHandle: " prepared-1 " },
+    });
+    expect(committed.status_code).toBe(200);
+    expect(sdk.trigger).toHaveBeenLastCalledWith({
+      function_id: "mem::full-skill-extract-commit",
+      payload: {
+        identity,
+        preparedHandle: "prepared-1",
+      },
+    });
+  });
+
   it("full skill-extract whitelist error names operation identity fields", async () => {
     const sdk = mockSdk();
     registerApiTriggers(sdk as never, mockKV() as never, "");
