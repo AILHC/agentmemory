@@ -320,4 +320,65 @@ describe("api::lesson-extract-run-get", () => {
     });
     expect(JSON.stringify(response)).not.toContain(sensitive);
   });
+
+  it("returns allowlisted lesson parse diagnostics without raw response data", async () => {
+    const sensitive = "sensitive-parse-response-marker";
+    const kv = {} as never;
+    const sdk = {
+      registerFunction: (id: string, handler: unknown) => {
+        if (id === "api::lesson-extract-run-get") sdk.apiLessonExtractRunGet = handler;
+      },
+      registerTrigger: vi.fn(),
+      trigger: vi.fn(async () => ({
+        success: true,
+        run: {
+          id: "run-parse-failure",
+          status: "retryable",
+          lastError: `lesson_missing_root ${sensitive}`,
+          failureDiagnostics: {
+            requestPhase: "chunk",
+            parseErrorCode: "lesson_missing_root",
+            chunkIndex: 0,
+            attempt: 2,
+            responseChars: 412,
+            rawResponse: sensitive,
+          },
+        },
+        chunks: [],
+      })),
+      apiLessonExtractRunGet: undefined as undefined | Function,
+    } as {
+      registerFunction: (id: string, handler: unknown) => void;
+      registerTrigger: () => void;
+      trigger: () => Promise<unknown>;
+      apiLessonExtractRunGet?: Function;
+    };
+
+    registerApiTriggers(sdk as never, kv, "");
+    const response = await sdk.apiLessonExtractRunGet!({
+      query_params: { runId: "run-parse-failure" },
+      headers: {},
+    });
+
+    expect(response).toEqual({
+      status_code: 200,
+      body: {
+        success: true,
+        run: {
+          id: "run-parse-failure",
+          status: "retryable",
+          lastError: "lesson_missing_root",
+          failureDiagnostics: {
+            requestPhase: "chunk",
+            parseErrorCode: "lesson_missing_root",
+            chunkIndex: 0,
+            attempt: 2,
+            responseChars: 412,
+          },
+        },
+        chunks: [],
+      },
+    });
+    expect(JSON.stringify(response)).not.toContain(sensitive);
+  });
 });

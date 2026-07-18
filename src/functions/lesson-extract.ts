@@ -4,7 +4,8 @@ import type {
   MemoryProvider,
   MemoryProviderCallOptions,
   RawObservation,
-  StageFailureDiagnostics,
+  LessonFailureDiagnostics,
+  LessonParseErrorCode,
 } from "../types.js";
 import { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
@@ -17,7 +18,7 @@ import {
   LESSON_EXTRACTION_OUTPUT_CONTRACT,
   type LessonPromptItem,
   buildLessonExtractionPrompt,
-  parseLessonExtractionXml,
+  parseLessonExtractionXmlWithRootRecovery,
   truncateForLessonPrompt,
 } from "../prompts/lesson-extraction.js";
 import { stripPrivateData } from "./privacy.js";
@@ -25,7 +26,10 @@ import { logger } from "../logger.js";
 import type { LlmLessonExtractionRuntimeConfig } from "./lesson-extraction-runs.js";
 import { resolveStageModelCallOptions } from "../config.js";
 import { ProviderCallError } from "../providers/provider-call-result.js";
-import { sanitizeStageFailureDiagnostics } from "./summarize.js";
+import {
+  sanitizeLessonFailureDiagnostics,
+  sanitizeStageFailureDiagnostics,
+} from "./summarize.js";
 
 export interface ReplayLessonExtractionConfig {
   enabled: boolean;
@@ -91,7 +95,7 @@ export interface ExtractLlmLessonsResult {
   errors: string[];
   promptChars?: number;
   parseFailures?: number;
-  failureDiagnostics?: StageFailureDiagnostics;
+  failureDiagnostics?: LessonFailureDiagnostics;
 }
 
 export interface ExtractLessonsInput {
@@ -568,7 +572,7 @@ interface LessonChunkResult {
   promptChars: number;
   parseFailures: number;
   transportFailed?: boolean;
-  failureDiagnostics?: StageFailureDiagnostics;
+  failureDiagnostics?: LessonFailureDiagnostics;
 }
 
 function safeProviderFailureCause(error: unknown): string {
@@ -588,12 +592,49 @@ function safeProviderFailureCause(error: unknown): string {
   return "provider_failure";
 }
 
-function safeLessonResponseError(error: unknown): string {
+function safeLessonResponseError(error: unknown): LessonParseErrorCode {
   const message = error instanceof Error ? error.message : "";
-  if (/No <lesson> blocks/i.test(message)) return "No <lesson> blocks";
+  if (message === "Missing <lessons> root") return "lesson_missing_root";
+  if (/No <lesson> blocks/i.test(message)) return "lesson_no_blocks";
+  if (message === "No valid lessons found") return "lesson_no_valid_items";
   if (message === "empty LLM response") return "empty_response";
   if (message.startsWith("lesson extraction invalid payload:")) return "lesson_validation_failed";
   return "lesson_parse_failed";
+}
+
+function lessonParseFailureDiagnostics(
+  parseErrorCode: LessonParseErrorCode,
+  chunkIndex: number,
+  attempt: number,
+  responseChars: number,
+): LessonFailureDiagnostics {
+  return {
+    requestPhase: "chunk",
+    parseErrorCode,
+    chunkIndex,
+    attempt,
+    responseChars,
+  };
+}
+
+function lessonExtractionRequest(prompt: string, attempt: number): {
+  system: string;
+  prompt: string;
+} {
+  if (attempt === 1) {
+    return {
+      system: LESSON_EXTRACTION_SYSTEM,
+      prompt,
+    };
+  }
+  return {
+    system: `${LESSON_EXTRACTION_SYSTEM}
+
+FORMAT REPAIR ONLY: Regenerate the answer from the same extraction input. Keep the lesson selection rules unchanged and return only XML that satisfies the output contract.`,
+    prompt: `Format-repair retry. Use the same source material and selection rules; emit only a valid <lessons> XML document.
+
+${prompt}`,
+  };
 }
 
 export function buildTurnAwareLessonChunks(
@@ -657,19 +698,21 @@ async function extractLlmChunkWithRetry(
   callOptions?: MemoryProviderCallOptions,
 ): Promise<LessonChunkResult> {
   let parseFailures = 0;
+  const safePrompt = stripPrivateData(prompt);
   for (let attempt = 1; attempt <= 2; attempt++) {
     let xml: string;
     try {
+      const request = lessonExtractionRequest(safePrompt, attempt);
       xml = await callWithTimeout(
         () =>
           compressWithOptions(
             provider,
             withOutputLanguagePolicy(
-              LESSON_EXTRACTION_SYSTEM,
+              request.system,
               undefined,
               LESSON_EXTRACTION_OUTPUT_CONTRACT,
             ),
-            stripPrivateData(prompt),
+            request.prompt,
             callOptions,
           ),
         timeoutMs,
@@ -691,6 +734,12 @@ async function extractLlmChunkWithRetry(
             errors: [safeError],
             promptChars: prompt.length,
             parseFailures,
+            failureDiagnostics: lessonParseFailureDiagnostics(
+              safeError,
+              chunkIndex,
+              attempt,
+              0,
+            ),
           };
         }
         continue;
@@ -718,7 +767,7 @@ async function extractLlmChunkWithRetry(
 
     try {
       if (!xml || !xml.trim()) throw new Error("empty LLM response");
-      const parsed = parseLessonExtractionXml(xml);
+      const parsed = parseLessonExtractionXmlWithRootRecovery(xml);
       const validation = validateOutput(
         LessonExtractionOutputSchema,
         parsed,
@@ -763,6 +812,12 @@ async function extractLlmChunkWithRetry(
           errors: [safeError],
           promptChars: prompt.length,
           parseFailures,
+          failureDiagnostics: lessonParseFailureDiagnostics(
+            safeError,
+            chunkIndex,
+            attempt,
+            xml.length,
+          ),
         };
       }
     }
@@ -777,7 +832,7 @@ export async function extractLlmLessonCandidates(
   errors: string[];
   promptChars: number;
   parseFailures: number;
-  failureDiagnostics?: StageFailureDiagnostics;
+  failureDiagnostics?: LessonFailureDiagnostics;
 }> {
   const {
     provider,
@@ -816,7 +871,7 @@ export async function extractLlmLessonCandidates(
   let promptChars = 0;
   let parseFailures = 0;
   let transportFailed = false;
-  let failureDiagnostics: StageFailureDiagnostics | undefined;
+  let failureDiagnostics: LessonFailureDiagnostics | undefined;
 
   for (let batchStart = 0; batchStart < chunks.length; batchStart += concurrency) {
     const batch = chunks.slice(batchStart, batchStart + concurrency);
@@ -853,7 +908,7 @@ export async function extractLlmLessonCandidates(
   for (const result of ordered) {
     parseFailures += result.parseFailures;
     if (result.errors.length > 0) {
-      failureDiagnostics ??= result.failureDiagnostics;
+      failureDiagnostics ??= sanitizeLessonFailureDiagnostics(result.failureDiagnostics);
       errors.push(...result.errors);
       continue;
     }

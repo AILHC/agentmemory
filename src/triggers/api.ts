@@ -46,7 +46,10 @@ import {
 } from "../config.js";
 import { resolveOutputLanguage } from "../prompts/output-language.js";
 import { withExtractionOperationReceipt } from "../functions/extraction-operation-receipts.js";
-import { sanitizeStageFailureDiagnostics } from "../functions/summarize.js";
+import {
+  sanitizeLessonFailureDiagnostics,
+  sanitizeStageFailureDiagnostics,
+} from "../functions/summarize.js";
 
 const SUMMARY_FAILURE_CLASSES = new Set([
   "transient_provider",
@@ -98,6 +101,9 @@ const LESSON_API_ERROR_CAUSES = [
   "pi_stream_failed",
   "network_error",
   "provider_failure",
+  "lesson_missing_root",
+  "lesson_no_blocks",
+  "lesson_no_valid_items",
   "lesson_parse_failed",
   "lesson_validation_failed",
   "lesson_persist_failed",
@@ -121,7 +127,7 @@ function sanitizeLessonRunApiResult(result: unknown): unknown {
     return result;
   }
   const run = response.run as Record<string, unknown>;
-  const diagnostics = sanitizeStageFailureDiagnostics(run.failureDiagnostics);
+  const diagnostics = sanitizeLessonFailureDiagnostics(run.failureDiagnostics);
   const lastError = sanitizeLessonApiLastError(run.lastError);
   const safeRun = { ...run };
   delete safeRun.failureDiagnostics;

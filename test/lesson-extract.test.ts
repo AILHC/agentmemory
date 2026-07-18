@@ -601,6 +601,74 @@ describe("lesson extraction end-to-end", () => {
     expect(result.errors).toEqual([]);
   });
 
+  it("repairs complete lesson blocks that only miss the lessons root without another provider call", async () => {
+    const provider: MemoryProvider = {
+      name: "mock-llm",
+      compress: vi.fn().mockResolvedValue(`
+<lesson confidence="0.72">
+  <content>Wrap a complete lesson block before asking the provider again.</content>
+  <context>lesson format recovery</context>
+  <tags><tag>agentmemory</tag></tags>
+</lesson>`),
+      summarize: vi.fn().mockResolvedValue(""),
+    };
+
+    const result = await extractLlmLessonCandidates({
+      provider,
+      rawObservations: [rawObservation({
+        userPrompt: "Preserve valid lesson content while repairing only its XML envelope.",
+      })],
+      compressedObservations: [],
+      config: resolveReplayLessonExtractionConfig({}, {}),
+      firstPrompt: "first",
+      project: "/repo",
+      sessionId: "lesson-root-recovery",
+    });
+
+    expect(provider.compress).toHaveBeenCalledTimes(1);
+    expect(result.candidates).toHaveLength(1);
+    expect(result.errors).toEqual([]);
+  });
+
+  it("uses a distinct format-repair request and keeps only allowlisted parse diagnostics", async () => {
+    const sensitive = "sensitive-response-marker";
+    const calls: Array<{ system: string; prompt: string }> = [];
+    const provider: MemoryProvider = {
+      name: "mock-llm",
+      compress: vi.fn(async (system, prompt) => {
+        calls.push({ system, prompt });
+        return `not valid lesson xml ${sensitive}`;
+      }),
+      summarize: vi.fn().mockResolvedValue(""),
+    };
+
+    const result = await extractLlmLessonCandidates({
+      provider,
+      rawObservations: [rawObservation({
+        userPrompt: "Return a lesson using the required XML contract.",
+      })],
+      compressedObservations: [],
+      config: resolveReplayLessonExtractionConfig({}, {}),
+      firstPrompt: "first",
+      project: "/repo",
+      sessionId: "lesson-format-repair",
+    });
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.system).not.toBe(calls[0]?.system);
+    expect(calls[1]?.prompt).not.toBe(calls[0]?.prompt);
+    expect(calls[1]?.system).toMatch(/format/i);
+    expect(result.errors).toEqual(["lesson_missing_root"]);
+    expect(result.failureDiagnostics).toEqual({
+      requestPhase: "chunk",
+      parseErrorCode: "lesson_missing_root",
+      chunkIndex: 0,
+      attempt: 2,
+      responseChars: `not valid lesson xml ${sensitive}`.length,
+    });
+    expect(JSON.stringify(result)).not.toContain(sensitive);
+  });
+
   it("preserves allowlisted causes from ordinary provider errors without retrying", async () => {
     const sensitive = "sensitive-ordinary-error-marker";
     for (const [message, expectedCause] of [

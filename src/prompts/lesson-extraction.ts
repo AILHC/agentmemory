@@ -249,8 +249,20 @@ export function parseLessonExtractionXml(raw: string): ParsedLessonExtraction {
     "mem::replay::lesson-extract",
   );
   if (!validation.valid) {
-    throw new Error(validation.result.errors.join("; "));
+    throw new Error(`lesson extraction invalid payload: ${validation.result.errors.join("; ")}`);
   }
 
   return validation.data;
+}
+
+export function parseLessonExtractionXmlWithRootRecovery(raw: string): ParsedLessonExtraction {
+  try {
+    return parseLessonExtractionXml(raw);
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "Missing <lessons> root") throw error;
+    const xml = stripXmlWrappers(raw);
+    const lessonBlocks = xml.match(/<lesson\b[^>]*>[\s\S]*?<\/lesson>/gi) ?? [];
+    if (lessonBlocks.length === 0) throw error;
+    return parseLessonExtractionXml(`<lessons>${lessonBlocks.join("\n")}</lessons>`);
+  }
 }

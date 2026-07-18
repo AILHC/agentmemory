@@ -288,6 +288,26 @@ export interface StageFailureDiagnostics extends ProviderFailureDiagnostics {
   requestPhase: "chunk" | "reduce";
 }
 
+export type LessonParseErrorCode =
+  | "lesson_missing_root"
+  | "lesson_no_blocks"
+  | "lesson_no_valid_items"
+  | "lesson_validation_failed"
+  | "lesson_parse_failed"
+  | "empty_response";
+
+export interface LessonParseFailureDiagnostics {
+  requestPhase: "chunk";
+  parseErrorCode: LessonParseErrorCode;
+  chunkIndex: number;
+  attempt: number;
+  responseChars: number;
+}
+
+export type LessonFailureDiagnostics =
+  | StageFailureDiagnostics
+  | LessonParseFailureDiagnostics;
+
 export interface ProviderCallMetadata extends Partial<ProviderFailureDiagnostics> {
   inputTokens?: number;
   inputUncachedTokens?: number;
@@ -1117,7 +1137,7 @@ export interface LessonExtractionRun {
   replacedLessonIds: string[];
   skippedReason?: string;
   lastError?: string;
-  failureDiagnostics?: StageFailureDiagnostics;
+  failureDiagnostics?: LessonFailureDiagnostics;
   provider?: string;
   model?: string;
   modelSource?: string;

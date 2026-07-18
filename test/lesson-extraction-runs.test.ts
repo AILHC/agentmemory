@@ -392,7 +392,7 @@ describe("lesson extraction run helpers", () => {
     expect(JSON.stringify(persisted)).not.toContain(sensitive);
   });
 
-  it("clears stale provider diagnostics when the next attempt only has a parse failure", async () => {
+  it("replaces stale provider diagnostics with safe parse diagnostics", async () => {
     const kv = mockKV();
     await kv.set(KV.sessions, "session-parse-failure", session({
       id: "session-parse-failure",
@@ -431,7 +431,13 @@ describe("lesson extraction run helpers", () => {
 
     expect(processed.status).toBe("retryable");
     expect(provider.compress).toHaveBeenCalledTimes(2);
-    expect(Object.hasOwn(processed, "failureDiagnostics")).toBe(false);
+    expect(processed.failureDiagnostics).toEqual({
+      requestPhase: "chunk",
+      parseErrorCode: "lesson_missing_root",
+      chunkIndex: 0,
+      attempt: 2,
+      responseChars: 8,
+    });
   });
 
   it("saves llm provenance and replaces only target replay-import-heuristic heuristics on success", async () => {

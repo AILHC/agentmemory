@@ -9,6 +9,8 @@ import type {
   ResumableSummaryRun,
   ResumableSummaryPartial,
   ResumableSummaryActiveRun,
+  LessonFailureDiagnostics,
+  LessonParseFailureDiagnostics,
   StageFailure,
   StageFailureDiagnostics,
   SummaryAdvanceKind,
@@ -143,6 +145,45 @@ export function sanitizeStageFailureDiagnostics(
     responseStarted: source.responseStarted,
     ...(responseModel ? { responseModel } : {}),
     ...(stopReason ? { stopReason } : {}),
+  };
+}
+
+const LESSON_PARSE_ERROR_CODES = new Set([
+  "lesson_missing_root",
+  "lesson_no_blocks",
+  "lesson_no_valid_items",
+  "lesson_validation_failed",
+  "lesson_parse_failed",
+  "empty_response",
+]);
+
+export function sanitizeLessonFailureDiagnostics(
+  value: unknown,
+): LessonFailureDiagnostics | undefined {
+  const providerDiagnostics = sanitizeStageFailureDiagnostics(value);
+  if (providerDiagnostics) return providerDiagnostics;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const source = value as Record<string, unknown>;
+  const chunkIndex = safeNonNegativeInteger(source.chunkIndex);
+  const attempt = safeNonNegativeInteger(source.attempt);
+  const responseChars = safeNonNegativeInteger(source.responseChars);
+  if (
+    source.requestPhase !== "chunk"
+    || typeof source.parseErrorCode !== "string"
+    || !LESSON_PARSE_ERROR_CODES.has(source.parseErrorCode)
+    || chunkIndex === undefined
+    || attempt === undefined
+    || attempt < 1
+    || responseChars === undefined
+  ) {
+    return undefined;
+  }
+  return {
+    requestPhase: "chunk",
+    parseErrorCode: source.parseErrorCode as LessonParseFailureDiagnostics["parseErrorCode"],
+    chunkIndex,
+    attempt,
+    responseChars,
   };
 }
 
