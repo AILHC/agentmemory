@@ -63,7 +63,22 @@ export const KV = {
   crystals: "mem:crystals",
   lessons: "mem:lessons",
   insights: "mem:insights",
+  // Legacy read-only aggregate. New writes use the bounded scopes below.
   extractionRuns: "mem:extraction-runs",
+  extractionRunCatalogControl: "mem:extraction-run-catalog-control",
+  extractionRunCatalogPage: (page: number) =>
+    `mem:extraction-run-catalog:${page}`,
+  extractionRunMetadata: (runToken: string) =>
+    `mem:extraction-run-metadata:${runToken}`,
+  extractionRunManifest: (runToken: string, page: number) =>
+    `mem:extraction-run-manifest:${runToken}:${page}`,
+  extractionRunRecord: (recordToken: string) =>
+    `mem:extraction-run-record:${recordToken}`,
+  extractionRunAuditControl: "mem:extraction-run-audit-control",
+  extractionRunAuditManifestPage: (page: number) =>
+    `mem:extraction-run-audit-manifest:${page}`,
+  extractionRunAuditEvent: (eventToken: string) =>
+    `mem:extraction-run-audit-event:${eventToken}`,
   extractionOperationReceipts: "mem:extraction-operation-receipts",
   memoryConsolidationProposals: "mem:memory-consolidation-proposals",
   skillExtractionProposals: "mem:skill-extraction-proposals",

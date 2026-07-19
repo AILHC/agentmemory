@@ -5,6 +5,7 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerExportImportFunction } from "../src/functions/export-import.js";
+import { ExtractionRunStore } from "../src/functions/extraction-run-store.js";
 import type {
   Session,
   CompressedObservation,
@@ -110,7 +111,32 @@ const testExtractionRun: ExtractionRunIndex = {
   summarySessionIds: ["ses_1"],
   lessonRunIds: ["lesson_1"],
   semanticWindowIds: ["win_1"],
-  corpusWindowIds: ["corpus_1"],
+  stageRecords: [
+    {
+      stage: "summary",
+      unitId: "ses_1",
+      sourceIds: ["ses_1"],
+      resultIds: ["ses_1"],
+      resultType: "summary",
+      updatedAt: "2026-02-01T01:00:00Z",
+    },
+    {
+      stage: "lessons",
+      unitId: "lesson_1",
+      sourceIds: [],
+      resultIds: ["lesson_1"],
+      resultType: "lesson",
+      updatedAt: "2026-02-01T01:00:00Z",
+    },
+    {
+      stage: "semantic_rollup",
+      unitId: "win_1",
+      sourceIds: [],
+      resultIds: ["win_1"],
+      resultType: "semantic",
+      updatedAt: "2026-02-01T01:00:00Z",
+    },
+  ],
   createdAt: "2026-02-01T00:00:00Z",
   updatedAt: "2026-02-01T01:00:00Z",
 };
@@ -247,10 +273,16 @@ describe("Export/Import Functions", () => {
 
   it("exports and imports extraction run indexes", async () => {
     await kv.set(KV.extractionRuns, testExtractionRun.id, testExtractionRun);
+    const boundedRun = {
+      ...testExtractionRun,
+      id: "run_bounded",
+      mark: "full-bounded",
+    };
+    await new ExtractionRunStore(kv).replace(boundedRun);
 
     const exported = (await sdk.trigger("mem::export", {})) as ExportData;
 
-    expect(exported.extractionRuns).toEqual([testExtractionRun]);
+    expect(exported.extractionRuns).toEqual([testExtractionRun, boundedRun]);
 
     const freshKv = mockKV();
     const freshSdk = mockSdk();
@@ -262,7 +294,10 @@ describe("Export/Import Functions", () => {
     })) as { success: boolean };
 
     expect(importResult.success).toBe(true);
-    expect(await freshKv.get(KV.extractionRuns, testExtractionRun.id)).toEqual(testExtractionRun);
+    expect(await new ExtractionRunStore(freshKv).get(testExtractionRun.id))
+      .toEqual(testExtractionRun);
+    expect(await new ExtractionRunStore(freshKv).get(boundedRun.id))
+      .toEqual(boundedRun);
   });
 
   it("replace import clears existing extraction run indexes", async () => {
@@ -287,8 +322,9 @@ describe("Export/Import Functions", () => {
     })) as { success: boolean };
 
     expect(result.success).toBe(true);
-    expect(await kv.get(KV.extractionRuns, "old-run")).toBeNull();
-    expect(await kv.get(KV.extractionRuns, "new-run")).toEqual(newRun);
+    const runStore = new ExtractionRunStore(kv);
+    expect(await runStore.get("old-run")).toBeNull();
+    expect(await runStore.get("new-run")).toEqual(newRun);
   });
 
   it("import rejects unsupported version", async () => {

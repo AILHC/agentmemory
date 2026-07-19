@@ -5,6 +5,8 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerExtractionRunIndexFunction } from "../src/functions/extraction-run-index.js";
+import { ExtractionRunStore } from "../src/functions/extraction-run-store.js";
+import { queryAudit } from "../src/functions/audit.js";
 import { KV } from "../src/state/schema.js";
 import type { ExtractionRunIndex } from "../src/types.js";
 
@@ -19,11 +21,21 @@ function mockKV() {
       store.get(scope)!.set(key, data);
       return data;
     },
+    delete: async (scope: string, key: string): Promise<void> => {
+      store.get(scope)?.delete(key);
+    },
     list: async <T>(scope: string): Promise<T[]> => {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
     },
   };
+}
+
+async function readRun(
+  kv: ReturnType<typeof mockKV>,
+  runId: string,
+): Promise<ExtractionRunIndex | null> {
+  return new ExtractionRunStore(kv).get(runId);
 }
 
 function mockSdk() {
@@ -95,7 +107,7 @@ describe("mem::extraction-run-record", () => {
         status: "succeeded",
       },
     });
-    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, runId);
+    const stored = await readRun(kv, runId);
     expect(stored?.stageRecords).toHaveLength(2);
   });
 
@@ -124,7 +136,7 @@ describe("mem::extraction-run-record", () => {
       status: "partial",
     });
 
-    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-1");
+    const stored = await readRun(kv, "run-1");
     expect(stored).toMatchObject({
       summarySessionIds: ["ses-a"],
       lessonRunIds: ["lesson-a"],
@@ -155,12 +167,12 @@ describe("mem::extraction-run-record", () => {
       },
     ]);
 
-    const audits = await kv.list<{ operation: string; targetIds: string[] }>(KV.audit);
-    expect(audits.map((entry) => entry.operation)).toEqual([
-      "extraction_run_record",
-      "extraction_run_record",
-    ]);
-    expect(audits[1].targetIds).toEqual(["run-1"]);
+    expect(await kv.list(KV.audit)).toEqual([]);
+    const audits = await queryAudit(kv as never, {
+      operation: "extraction_run_record",
+    });
+    expect(audits).toHaveLength(2);
+    expect(audits.every((entry) => entry.targetIds[0] === "run-1")).toBe(true);
   });
 
   it("serializes concurrent legacy updates for the same run id without corpus fields", async () => {
@@ -182,7 +194,7 @@ describe("mem::extraction-run-record", () => {
       }),
     ]);
 
-    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-concurrent");
+    const stored = await readRun(kv, "run-concurrent");
     expect(stored).toMatchObject({
       id: "run-concurrent",
       summarySessionIds: ["ses-a"],
@@ -209,7 +221,7 @@ describe("mem::extraction-run-record", () => {
       error: "unsupported extraction run record field: corpusWindowId",
     });
 
-    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-corpus");
+    const stored = await readRun(kv, "run-corpus");
     expect(stored).toBeNull();
   });
 
@@ -222,7 +234,7 @@ describe("mem::extraction-run-record", () => {
     })) as { success: boolean; run: Pick<ExtractionRunIndex, "id" | "mark" | "status"> };
 
     expect(result.success).toBe(true);
-    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-runtime-meta");
+    const stored = await readRun(kv, "run-runtime-meta");
     expect(stored?.summarySessionIds).toEqual(["ses-a"]);
   });
 
@@ -248,7 +260,7 @@ describe("mem::extraction-run-record", () => {
     })) as { success: boolean; run: Pick<ExtractionRunIndex, "id" | "mark" | "status"> };
 
     expect(result.success).toBe(true);
-    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-stages");
+    const stored = await readRun(kv, "run-stages");
     expect(stored?.stageRecords).toHaveLength(1);
     expect(stored?.stageRecords[0]).toMatchObject({
       stage: "memory_consolidate",
@@ -276,5 +288,64 @@ describe("mem::extraction-run-record", () => {
         resultType: "corpus",
       }),
     ).resolves.toEqual({ success: false, error: "resultType is invalid" });
+  });
+
+  it("rejects an oversized record before touching iii state", async () => {
+    await expect(
+      sdk.trigger("mem::extraction-run-record", {
+        runId: "run-oversized",
+        mark: "full-v1",
+        stage: "memory_consolidate",
+        unitId: "unit-a",
+        sourceIds: ["x".repeat(1024 * 1024)],
+        resultIds: ["memory-a"],
+      }),
+    ).resolves.toEqual({
+      success: false,
+      error: "extraction run record exceeds 1048576 bytes",
+    });
+
+    expect(await readRun(kv, "run-oversized")).toBeNull();
+  });
+
+  it("writes one deterministic audit event for a status-only retry", async () => {
+    const input = {
+      runId: "run-status-only",
+      mark: "full-v1",
+      status: "succeeded",
+    };
+
+    await sdk.trigger("mem::extraction-run-record", input);
+    await sdk.trigger("mem::extraction-run-record", input);
+
+    const audits = await queryAudit(kv as never, {
+      operation: "extraction_run_record",
+    });
+    expect(audits).toHaveLength(1);
+    expect(audits[0]).toMatchObject({
+      targetIds: [input.runId],
+      details: { mark: input.mark, status: input.status, recordCount: 0 },
+    });
+  });
+
+  it("deduplicates an exact stage retry despite a new updatedAt timestamp", async () => {
+    const payload = {
+      runId: "run-stage-audit-retry",
+      mark: "full-v1",
+      status: "running",
+      stage: "memory_consolidate",
+      unitId: "unit-a",
+      sourceIds: ["source-a"],
+      resultIds: ["memory-a"],
+      resultType: "memory",
+    };
+    await sdk.trigger("mem::extraction-run-record", payload);
+    await new Promise((resolve) => setTimeout(resolve, 2));
+    await sdk.trigger("mem::extraction-run-record", payload);
+
+    const audits = await queryAudit(kv as never, {
+      operation: "extraction_run_record",
+    });
+    expect(audits).toHaveLength(1);
   });
 });

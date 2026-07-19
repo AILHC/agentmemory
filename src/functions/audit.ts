@@ -1,7 +1,67 @@
-import type { AuditEntry } from "../types.js";
+import { createHash } from "node:crypto";
+
+import type {
+  AuditEntry,
+  ExtractionRunAuditLocator,
+  ExtractionRunAuditState,
+  ExtractionRunStoredAuditEvent,
+} from "../types.js";
 import { KV, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { logger } from "../logger.js";
+
+const EXTRACTION_AUDIT_STATE_KEY = "audit";
+const EXTRACTION_AUDIT_EVENT_KEY = "event";
+const EXTRACTION_AUDIT_PAGE_CAPACITY = 128;
+const EXTRACTION_AUDIT_MAX_EVENT_BYTES = 64 * 1024;
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+async function listExtractionAuditEntries(kv: StateKV): Promise<AuditEntry[]> {
+  const state = await kv.get<ExtractionRunAuditState>(
+    KV.extractionRunAuditControl,
+    EXTRACTION_AUDIT_STATE_KEY,
+  );
+  if (!state) return [];
+  const pages = await Promise.all(
+    Array.from({ length: state.pageCount }, (_, page) =>
+      kv.list<ExtractionRunAuditLocator>(
+        KV.extractionRunAuditManifestPage(page),
+      )),
+  );
+  const locators = pages.flat();
+  const entries: AuditEntry[] = [];
+  for (let offset = 0; offset < locators.length; offset += 16) {
+    const batch = await Promise.all(
+      locators.slice(offset, offset + 16).map((locator) =>
+        kv.get<ExtractionRunStoredAuditEvent>(
+          KV.extractionRunAuditEvent(locator.eventToken),
+          EXTRACTION_AUDIT_EVENT_KEY,
+        )),
+    );
+    for (let index = 0; index < batch.length; index++) {
+      const stored = batch[index];
+      if (!stored) {
+        throw new Error(
+          `extraction run audit manifest references missing event: ${locators[offset + index].eventToken}`,
+        );
+      }
+      const { page: _page, ...entry } = stored;
+      entries.push(entry);
+    }
+  }
+  return entries;
+}
 
 // Audit coverage policy (issue #125).
 //
@@ -77,6 +137,76 @@ export async function safeAudit(
   }
 }
 
+export async function recordExtractionRunAudit(
+  kv: StateKV,
+  runId: string,
+  details: Record<string, unknown>,
+  eventIdentity: unknown = details,
+): Promise<AuditEntry> {
+  const eventToken = createHash("sha256")
+    .update(stableJson([runId, eventIdentity]))
+    .digest("hex");
+  const id = `aud_extraction_${eventToken.slice(0, 24)}`;
+  return withKeyedLock("extraction-run-audit", async () => {
+    const eventScope = KV.extractionRunAuditEvent(eventToken);
+    const existing = await kv.get<ExtractionRunStoredAuditEvent>(
+      eventScope,
+      EXTRACTION_AUDIT_EVENT_KEY,
+    );
+    if (existing) {
+      await kv.set(
+        KV.extractionRunAuditManifestPage(existing.page),
+        eventToken,
+        { eventToken },
+      );
+      const { page: _page, ...entry } = existing;
+      return entry;
+    }
+
+    const storedState = await kv.get<ExtractionRunAuditState>(
+      KV.extractionRunAuditControl,
+      EXTRACTION_AUDIT_STATE_KEY,
+    );
+    const state = storedState ?? { currentPage: 0, pageCount: 1 };
+    let page = state.currentPage;
+    const entries = await kv.list<ExtractionRunAuditLocator>(
+      KV.extractionRunAuditManifestPage(page),
+    );
+    let nextState = state;
+    if (entries.length >= EXTRACTION_AUDIT_PAGE_CAPACITY) {
+      page += 1;
+      nextState = { currentPage: page, pageCount: page + 1 };
+    }
+    await kv.set(
+      KV.extractionRunAuditControl,
+      EXTRACTION_AUDIT_STATE_KEY,
+      nextState,
+    );
+    const entry: ExtractionRunStoredAuditEvent = {
+      id,
+      timestamp: new Date().toISOString(),
+      operation: "extraction_run_record",
+      functionId: "mem::extraction-run-record",
+      targetIds: [runId],
+      details,
+      page,
+    };
+    if (Buffer.byteLength(JSON.stringify(entry)) > EXTRACTION_AUDIT_MAX_EVENT_BYTES) {
+      throw new Error(
+        `extraction run audit exceeds ${EXTRACTION_AUDIT_MAX_EVENT_BYTES} bytes`,
+      );
+    }
+    await kv.set(eventScope, EXTRACTION_AUDIT_EVENT_KEY, entry);
+    await kv.set(
+      KV.extractionRunAuditManifestPage(page),
+      eventToken,
+      { eventToken },
+    );
+    const { page: _page, ...result } = entry;
+    return result;
+  });
+}
+
 export async function queryAudit(
   kv: StateKV,
   filter?: {
@@ -86,7 +216,15 @@ export async function queryAudit(
     limit?: number;
   },
 ): Promise<AuditEntry[]> {
-  const all = await kv.list<AuditEntry>(KV.audit);
+  const includeGlobal = true;
+  const includeExtraction = (
+    filter?.operation === undefined
+    || filter.operation === "extraction_run_record"
+  );
+  const all = [
+    ...(includeGlobal ? await kv.list<AuditEntry>(KV.audit) : []),
+    ...(includeExtraction ? await listExtractionAuditEntries(kv) : []),
+  ];
   let entries = [...all].sort(
     (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime(),
   );

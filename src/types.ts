@@ -863,6 +863,49 @@ export interface ExtractionRunIndex {
   updatedAt: string;
 }
 
+export interface ExtractionRunCatalogState {
+  currentPage: number;
+  pageCount: number;
+}
+
+export interface ExtractionRunCatalogEntry {
+  runId: string;
+}
+
+export interface ExtractionRunMetadata {
+  id: string;
+  mark: string;
+  status: ExtractionRunStatus;
+  catalogPage: number;
+  currentManifestPage: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ExtractionRunRecordLocator {
+  recordId: string;
+}
+
+export interface ExtractionRunStoredRecord extends ExtractionRunStageRecord {
+  recordId: string;
+  runId: string;
+  manifestPage: number;
+  compatibilityId?: string;
+}
+
+export interface ExtractionRunAuditState {
+  currentPage: number;
+  pageCount: number;
+}
+
+export interface ExtractionRunAuditLocator {
+  eventToken: string;
+}
+
+export interface ExtractionRunStoredAuditEvent extends AuditEntry {
+  page: number;
+}
+
 export interface ProceduralMemory {
   id: string;
   name: string;
