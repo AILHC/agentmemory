@@ -24,12 +24,14 @@ test('ordered commit preserves input order when prepare finishes out of order', 
 });
 
 test('provider failures reduce only their route bucket', () => {
-  const limiter = new AdaptiveProviderLimiter();
+  const limiter = new AdaptiveProviderLimiter({ initial: 3 });
   const a = { provider: 'pi', model: 'a', endpointClass: 'memory' };
   const b = { provider: 'pi', model: 'b', endpointClass: 'memory' };
+  const c = { provider: 'pi', model: 'a', endpointClass: 'skill' };
   limiter.recordFailure(a, { class: 'transient_provider', cause: 'pi_stream_failed' });
-  assert.equal(limiter.state(a).concurrency, 1);
-  assert.equal(limiter.state(b).concurrency, 2);
+  assert.equal(limiter.state(a).concurrency, 2);
+  assert.equal(limiter.state(b).concurrency, 3);
+  assert.equal(limiter.state(c).concurrency, 3);
   limiter.recordFailure(b, { class: 'unit', cause: 'parse_failed' });
-  assert.equal(limiter.state(b).concurrency, 2);
+  assert.equal(limiter.state(b).concurrency, 3);
 });

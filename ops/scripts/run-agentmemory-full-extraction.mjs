@@ -707,6 +707,14 @@ export async function runStageWorkQueue(stage, state, statePath, work, options =
     sanitizeFailureDiagnostics(failure?.diagnostics)?.retryAfterMs || 0,
   );
 
+  const configuredProviderRetryAt = () => {
+    const value = typeof options.getProviderRetryAt === 'function'
+      ? options.getProviderRetryAt()
+      : null;
+    const parsed = Date.parse(value || '');
+    return Number.isFinite(parsed) ? parsed : Number.NaN;
+  };
+
   const scheduleProviderRetry = (failure, options = {}) => {
     const attempt = Number(scheduler.provider_attempt || 0);
     const baseDelayMs = nextProviderBackoffMs(attempt);
@@ -726,6 +734,8 @@ export async function runStageWorkQueue(stage, state, statePath, work, options =
       retryAt = Math.max(current, nowMs() + providerRetryAfterMs(failure));
       providerRetryReady = retryAt <= nowMs();
     }
+    const limiterRetryAt = configuredProviderRetryAt();
+    if (Number.isFinite(limiterRetryAt)) retryAt = Math.max(retryAt, limiterRetryAt);
     scheduler.retry_kind = 'provider';
     scheduler.next_retry_at = new Date(retryAt).toISOString();
   };
@@ -827,7 +837,14 @@ export async function runStageWorkQueue(stage, state, statePath, work, options =
   const settleProbe = async (item) => {
     const settled = await settleCall(item, true);
     if (settled.status === 'rejected') throw settled.reason;
-    return normalizeStageOutcome(settled.value);
+    const outcome = normalizeStageOutcome(settled.value);
+    if (typeof options.onOutcome === 'function') {
+      await options.onOutcome(item, outcome, {
+        probe: true,
+        settledAt: settled.settledAt,
+      });
+    }
+    return outcome;
   };
 
   const waitForGate = async (kind, attempt, failureCause) => {
@@ -863,6 +880,12 @@ export async function runStageWorkQueue(stage, state, statePath, work, options =
     if (settled.status === 'rejected') throw settled.reason;
     const outcome = normalizeStageOutcome(settled.value);
     recordProviderSignal(item, outcome, { probe: true, settledAt: settled.settledAt });
+    if (typeof options.onOutcome === 'function') {
+      await options.onOutcome(item, outcome, {
+        probe: true,
+        settledAt: settled.settledAt,
+      });
+    }
     if (outcome.failure?.class === 'transient_provider') {
       scheduler.provider_attempt = Number(scheduler.provider_attempt || 0) + 1;
       state.last_failure_cause = outcome.failure.cause;
@@ -883,6 +906,9 @@ export async function runStageWorkQueue(stage, state, statePath, work, options =
 
   while ((queue.length > 0 || providerRecovery.length > 0 || runtimeRecovery.length > 0) && !blockedFailure) {
     if (signal?.aborted) await cancelAndThrow();
+    if (typeof options.requiresProviderProbe === 'function' && options.requiresProviderProbe()) {
+      providerGateOpen = true;
+    }
     if (typeof options.shouldDrain === 'function' && await options.shouldDrain()) {
       await persistScheduler();
       return {
@@ -5690,14 +5716,19 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
             canContinue = await runQueue('memory_consolidate_prepare', chunk, {
               concurrency: 2,
               getConcurrency: () => memoryProviderLimiter.state(memoryProviderRoute).concurrency,
-              onOutcome: (unit, outcome) => {
+              requiresProviderProbe: () => memoryProviderLimiter.requiresProbe(memoryProviderRoute),
+              getProviderRetryAt: () => memoryProviderLimiter.state(memoryProviderRoute).retryAt,
+              onOutcome: (unit, outcome, context) => {
                 const current = state.memory_consolidate_windows[unit.unit_id];
                 if (outcome.failure) {
                   memoryProviderLimiter.recordFailure(memoryProviderRoute, outcome.failure, {
                     retryAfterMs: Number(outcome.failure.diagnostics?.retryAfterMs || 0),
+                    now: context.settledAt,
                   });
-                } else if (current?.status === 'prepared' && current?.proposal_hash) {
-                  memoryProviderLimiter.recordProviderSuccess(memoryProviderRoute);
+                } else if (['prepared', 'succeeded', 'skipped'].includes(current?.status)) {
+                  memoryProviderLimiter.recordProviderSuccess(memoryProviderRoute, {
+                    probe: context.probe,
+                  });
                 }
                 persistMemoryLimiter();
               },
@@ -5877,14 +5908,19 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
               prepare: async (items) => runQueue('skill_extract_prepare', items, {
                 concurrency: 2,
                 getConcurrency: () => skillProviderLimiter.state(skillProviderRoute).concurrency,
-                onOutcome: (unit, outcome) => {
+                requiresProviderProbe: () => skillProviderLimiter.requiresProbe(skillProviderRoute),
+                getProviderRetryAt: () => skillProviderLimiter.state(skillProviderRoute).retryAt,
+                onOutcome: (unit, outcome, context) => {
                   const current = state.skill_extract[unit.unit_id];
                   if (outcome.failure) {
                     skillProviderLimiter.recordFailure(skillProviderRoute, outcome.failure, {
                       retryAfterMs: Number(outcome.failure.diagnostics?.retryAfterMs || 0),
+                      now: context.settledAt,
                     });
-                  } else if (current?.status === 'prepared' && current?.proposal_hash) {
-                    skillProviderLimiter.recordProviderSuccess(skillProviderRoute);
+                  } else if (['prepared', 'succeeded', 'skipped'].includes(current?.status)) {
+                    skillProviderLimiter.recordProviderSuccess(skillProviderRoute, {
+                      probe: context.probe,
+                    });
                   }
                   persistSkillLimiter();
                 },

@@ -81,6 +81,7 @@ import {
   validateResumeState,
   writeStateAtomically,
 } from './run-agentmemory-full-extraction.mjs';
+import { AdaptiveProviderLimiter } from './lib/adaptive-provider-limiter.mjs';
 
 test('plan 404 is runtime-transient only when runtime diagnostics are unhealthy', async () => {
   const response = { status_code: 404, data: { error: 'not found' } };
@@ -920,6 +921,122 @@ test('mixed provider failure persists recovery state but lets the healthy queue 
   assert.equal(recoveryStateSeenByHealthyTail.retry_kind, 'provider');
   assert.equal(typeof recoveryStateSeenByHealthyTail.next_retry_at, 'string');
   assert.equal(result.status, 'completed');
+});
+
+test('adaptive provider cooldown blocks healthy tail work until one recovery probe succeeds', async () => {
+  let now = Date.parse('2026-07-15T00:00:00.000Z');
+  const state = backfillOrchestrationPolicy({ config: { delay_ms: 0 }, health: {} });
+  const limiter = new AdaptiveProviderLimiter({ initial: 3, cooldownMs: 60_000 });
+  const route = {
+    provider: 'pi-agent-sdk',
+    model: 'gpt-5.6-luna',
+    endpointClass: 'memory-consolidate-prepare',
+  };
+  const events = [];
+  let failedCalls = 0;
+
+  const result = await runStageWorkQueue('memory_consolidate_prepare', state, 'unused.json', [
+    'failed',
+    'healthy-1',
+    'healthy-2',
+    'tail',
+  ], {
+    concurrency: 3,
+    getConcurrency: () => limiter.state(route).concurrency,
+    requiresProviderProbe: () => limiter.requiresProbe(route),
+    getProviderRetryAt: () => limiter.state(route).retryAt,
+    now: () => now,
+    writeState: async () => {},
+    jitter: () => 0,
+    sleep: async (ms) => {
+      events.push(`sleep:${ms}`);
+      now += ms;
+    },
+    onOutcome: (_item, outcome, context) => {
+      if (outcome.failure) {
+        limiter.recordFailure(route, outcome.failure, { now: context.settledAt });
+      } else {
+        limiter.recordProviderSuccess(route, { probe: context.probe });
+      }
+    },
+    run: async (item, context) => {
+      events.push(`run:${item}:${context.probe ? 'probe' : 'normal'}`);
+      if (item === 'failed' && failedCalls++ === 0) {
+        return {
+          status: 'failed',
+          failure: { class: 'transient_provider', cause: 'timeout' },
+        };
+      }
+      return { status: 'succeeded', failure: null };
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(events, [
+    'run:failed:normal',
+    'run:healthy-1:normal',
+    'run:healthy-2:normal',
+    'sleep:60000',
+    'run:failed:probe',
+    'run:tail:normal',
+  ]);
+  assert.equal(limiter.requiresProbe(route), false);
+  assert.equal(limiter.state(route).successStreak, 2);
+});
+
+test('adaptive recovery remains a probe when provider recovery crosses the runtime gate', async () => {
+  let now = Date.parse('2026-07-15T00:00:00.000Z');
+  const state = backfillOrchestrationPolicy({ config: { delay_ms: 0 }, health: {} });
+  const limiter = new AdaptiveProviderLimiter({ initial: 1, cooldownMs: 60_000 });
+  const route = {
+    provider: 'pi-agent-sdk',
+    model: 'gpt-5.6-luna',
+    endpointClass: 'memory-consolidate-prepare',
+  };
+  const events = [];
+  let failedCalls = 0;
+
+  await runStageWorkQueue('memory_consolidate_prepare', state, 'unused.json', ['failed', 'tail'], {
+    concurrency: 1,
+    getConcurrency: () => limiter.state(route).concurrency,
+    requiresProviderProbe: () => limiter.requiresProbe(route),
+    getProviderRetryAt: () => limiter.state(route).retryAt,
+    now: () => now,
+    writeState: async () => {},
+    jitter: () => 0,
+    sleep: async (ms) => {
+      events.push(`sleep:${ms}`);
+      now += ms;
+    },
+    runtimeDiagnostics: async () => ({ runtime_healthy: true }),
+    onOutcome: (_item, outcome, context) => {
+      if (outcome.failure) {
+        limiter.recordFailure(route, outcome.failure, { now: context.settledAt });
+      } else {
+        limiter.recordProviderSuccess(route, { probe: context.probe });
+      }
+    },
+    run: async (item, context) => {
+      events.push(`run:${item}:${context.probe ? 'probe' : 'normal'}`);
+      if (item === 'failed' && failedCalls++ === 0) {
+        return { status: 'failed', failure: { class: 'transient_provider', cause: 'timeout' } };
+      }
+      if (item === 'failed' && failedCalls === 2) {
+        return { status: 'failed', failure: { class: 'transient_runtime', cause: 'request_transport_failed' } };
+      }
+      return { status: 'succeeded', failure: null };
+    },
+  });
+
+  assert.deepEqual(events, [
+    'run:failed:normal',
+    'sleep:60000',
+    'run:failed:probe',
+    'sleep:60000',
+    'run:failed:probe',
+    'run:tail:normal',
+  ]);
+  assert.equal(limiter.requiresProbe(route), false);
 });
 
 test('due provider recovery inserts at most one fair probe per healthy batch', async () => {
