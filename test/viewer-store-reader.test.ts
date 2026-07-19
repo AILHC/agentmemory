@@ -174,6 +174,92 @@ function insight(
 }
 
 describe("viewer store reader", () => {
+  it("keeps isolated reviewer KV list reads within the large-fixture budget", async () => {
+    const kv = mockKV();
+    const sessions = Array.from({ length: 4016 }, (_, index) => session(`session-${index + 1}`, index));
+    const summaries = Array.from({ length: 4016 }, (_, index) => summary(`session-${index + 1}`));
+    const lessons = Array.from({ length: 15000 }, (_, index) => lesson(`lesson-${index + 1}`, 0.9));
+    kv.store.set(KV.sessions, new Map(sessions.map((item) => [item.id, item])));
+    kv.store.set(KV.summaries, new Map(summaries.map((item) => [item.sessionId, item])));
+    kv.store.set(KV.lessons, new Map(lessons.map((item) => [item.id, item])));
+    const listSpy = vi.spyOn(kv, "list");
+
+    const sessionsPage = await listViewerStore(kv, { type: "sessions", limit: 50 });
+    const lessonsPage = await listViewerStore(kv, { type: "lessons", limit: 50 });
+    const summaryPage = await listViewerStore(kv, {
+      type: "summaries",
+      sessionId: "session-2",
+      limit: 1,
+    });
+
+    expect(sessionsPage).toMatchObject({ total: 4016, returned: 50, hasMore: true });
+    expect(lessonsPage).toMatchObject({ total: 15000, returned: 50, hasMore: true });
+    expect(summaryPage).toMatchObject({ total: 1, returned: 1, hasMore: false });
+    const scopes = listSpy.mock.calls.map(([scope]) => scope);
+    expect(scopes.filter((scope) => scope === KV.sessions)).toHaveLength(1);
+    expect(scopes.filter((scope) => scope === KV.lessons)).toHaveLength(1);
+    expect(scopes.filter((scope) => scope === KV.summaries)).toHaveLength(1);
+    [KV.semantic, KV.procedural, KV.crystals, KV.insights].forEach((scope) => {
+      expect(scopes.filter((readScope) => readScope === scope)).toHaveLength(0);
+    });
+    expect(scopes.some((scope) => scope.startsWith("mem:obs:"))).toBe(false);
+    expect(scopes).toEqual([KV.sessions, KV.lessons, KV.summaries]);
+  });
+
+  it("filters lessons by explicit reviewer fields before pagination", async () => {
+    const kv = mockKV();
+    await kv.set(KV.lessons, "lesson-a", {
+      ...lesson("lesson-a", 0.9),
+      content: "Keep the search toolbar visible",
+      context: "reviewer",
+      tags: ["viewer"],
+    });
+    await kv.set(KV.lessons, "lesson-b", {
+      ...lesson("lesson-b", 0.8),
+      content: "Unrelated",
+      context: "other",
+      tags: [],
+      sourceRunId: "hidden-toolbar-diagnostic",
+    });
+
+    const page = await listViewerStore(kv, {
+      type: "lessons",
+      limit: 50,
+      query: " toolbar ",
+    });
+
+    expect(page.items).toHaveLength(1);
+    expect((page.items[0] as Lesson).id).toBe("lesson-a");
+    expect(page.total).toBe(1);
+    expect(page.filters.query).toBe("toolbar");
+  });
+
+  it("uses the type-specific unique key as a stable secondary sort key", async () => {
+    const kv = mockKV();
+    for (const id of ["lesson-c", "lesson-a", "lesson-b"]) {
+      await kv.set(KV.lessons, id, {
+        ...lesson(id, 0.9),
+        createdAt: "2026-07-16T00:00:00Z",
+      });
+    }
+    const page = await listViewerStore(kv, { type: "lessons", limit: 2 });
+    expect((page.items as Lesson[]).map((item) => item.id)).toEqual(["lesson-a", "lesson-b"]);
+    const next = await listViewerStore(kv, {
+      type: "lessons",
+      limit: 2,
+      cursor: page.nextCursor,
+    });
+    expect((next.items as Lesson[]).map((item) => item.id)).toEqual(["lesson-c"]);
+
+    await kv.set(KV.summaries, "session-b", summary("session-b"));
+    await kv.set(KV.summaries, "session-a", summary("session-a"));
+    const summaries = await listViewerStore(kv, { type: "summaries", limit: 50 });
+    expect((summaries.items as SessionSummary[]).map((item) => item.sessionId)).toEqual([
+      "session-a",
+      "session-b",
+    ]);
+  });
+
   it("returns paginated lessons with total and deleted rows included by default", async () => {
     const kv = mockKV();
     for (let i = 1; i <= 55; i++) {
@@ -541,5 +627,37 @@ describe("api::viewer-session-stats", () => {
     });
     expect(response.status_code).toBe(400);
     expect(response.body).toMatchObject({ error: "includeDeleted must be true or false" });
+  });
+
+  it("rejects reviewer queries longer than 200 characters", async () => {
+    const sdk = registerViewerHandlers(mockKV());
+    const response = await sdk.viewerStore!({
+      query_params: { type: "lessons", query: "x".repeat(201) },
+      headers: {},
+    });
+    expect(response.status_code).toBe(400);
+  });
+
+  it("passes a normalized reviewer query to the read-only store handler", async () => {
+    const kv = mockKV();
+    await kv.set(KV.lessons, "lesson-a", { ...lesson("lesson-a", 0.9), content: "Visible toolbar" });
+    await kv.set(KV.lessons, "lesson-b", { ...lesson("lesson-b", 0.8), content: "Other" });
+    const sdk = registerViewerHandlers(kv);
+    const response = await sdk.viewerStore!({
+      query_params: { type: "lessons", query: " TOOLBAR " },
+      headers: {},
+    });
+    expect(response.status_code).toBe(200);
+    expect(response.body).toMatchObject({ total: 1, filters: { query: "toolbar" } });
+  });
+
+  it("rejects an observations query without a sessionId", async () => {
+    const sdk = registerViewerHandlers(mockKV());
+    const response = await sdk.viewerStore!({
+      query_params: { type: "observations", query: "toolbar" },
+      headers: {},
+    });
+    expect(response.status_code).toBe(400);
+    expect(response.body).toMatchObject({ error: "observations query requires sessionId" });
   });
 });

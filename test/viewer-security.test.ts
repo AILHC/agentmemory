@@ -62,7 +62,8 @@ describe("viewer document security", () => {
     expect(rendered.html).toContain("AgentMemory Data Viewer");
     expect(rendered.html).toContain("'sessions'");
     expect(rendered.html).toContain("'lessons'");
-    expect(rendered.html).toContain("viewer/stores");
+    expect(rendered.html).not.toContain("viewer/stores");
+    expect(rendered.html).not.toContain("viewer/session-stats");
     expect(rendered.html).toContain("viewer/store?");
     expect(rendered.html).toContain("'observations'");
     expect(rendered.html).toContain("<script nonce=\"");
@@ -75,7 +76,7 @@ describe("viewer document security", () => {
     expect(rendered.html).not.toContain("method: 'POST'");
     expect(rendered.html).not.toContain("method: \"DELETE\"");
     expect(rendered.html).not.toContain("method: 'DELETE'");
-    expect(rendered.html).toContain("viewer/session-stats");
+    expect(rendered.html).not.toContain("viewer/session-stats");
     expect(rendered.html).not.toContain("lessons?limit=");
     expect(rendered.html).not.toContain("crystals?limit=");
     expect(rendered.html).not.toContain("insights?limit=");

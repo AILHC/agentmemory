@@ -80,6 +80,7 @@ export interface ViewerStoreRequest {
   cursor?: string | null;
   sessionId?: string;
   includeDeleted?: boolean;
+  query?: string;
 }
 
 interface KeyValueStore {
@@ -100,6 +101,71 @@ const VIEWER_STORE_TYPES: ViewerStoreType[] = [
   "crystals",
   "insights",
 ];
+
+function strings(...values: unknown[]): string[] {
+  return values.flatMap((value) =>
+    Array.isArray(value)
+      ? value.filter((item): item is string => typeof item === "string")
+      : typeof value === "string" ? [value] : [],
+  );
+}
+
+const VIEWER_SEARCH_TEXT: Record<ViewerStoreType, (item: unknown) => string[]> = {
+  sessions: (item) => {
+    const value = item as Session;
+    return strings(value.id, value.firstPrompt, value.project, value.cwd, value.tags, value.model, value.agentId, value.sourceSessionId);
+  },
+  summaries: (item) => {
+    const value = item as SessionSummary;
+    return strings(value.sessionId, value.project, value.title, value.narrative, value.keyDecisions, value.filesModified, value.concepts);
+  },
+  observations: (item) => {
+    const value = item as CompressedObservation;
+    return strings(value.id, value.sessionId, value.type, value.title, value.subtitle, value.narrative, value.facts, value.concepts, value.files);
+  },
+  lessons: (item) => {
+    const value = item as Lesson;
+    return strings(value.id, value.content, value.context, value.project, value.tags, value.source, value.origin);
+  },
+  semantic: (item) => {
+    const value = item as SemanticMemory;
+    return strings(value.id, value.fact, value.sourceSessionIds);
+  },
+  procedural: (item) => {
+    const value = item as ProceduralMemory;
+    return strings(value.id, value.name, value.steps, value.triggerCondition, value.expectedOutcome, value.tags, value.concepts);
+  },
+  crystals: (item) => {
+    const value = item as Crystal;
+    return strings(value.id, value.narrative, value.keyOutcomes, value.filesAffected, value.lessons, value.sessionId, value.project);
+  },
+  insights: (item) => {
+    const value = item as Insight;
+    return strings(value.id, value.title, value.content, value.project, value.tags, value.sourceConceptCluster);
+  },
+};
+
+export function normalizeViewerQuery(value: string | undefined): string | undefined {
+  const normalized = value?.trim().toLowerCase();
+  return normalized || undefined;
+}
+
+export function viewerStableKey(type: ViewerStoreType, item: unknown): string {
+  return type === "summaries"
+    ? String((item as SessionSummary).sessionId || "")
+    : String((item as { id?: string }).id || "");
+}
+
+export function filterViewerStoreItems(
+  type: ViewerStoreType,
+  items: unknown[],
+  query?: string,
+): unknown[] {
+  const normalized = normalizeViewerQuery(query);
+  return normalized
+    ? items.filter((item) => VIEWER_SEARCH_TEXT[type](item).join("\n").toLowerCase().includes(normalized))
+    : items;
+}
 
 export function isViewerStoreType(value: unknown): value is ViewerStoreType {
   return typeof value === "string" && VIEWER_STORE_TYPES.includes(value as ViewerStoreType);
@@ -155,6 +221,7 @@ export async function listViewerStore(
   const offset = normalizeCursor(request.cursor);
   const includeDeleted = request.includeDeleted !== false;
   const filters = deletedFilter(includeDeleted);
+  const normalizedQuery = normalizeViewerQuery(request.query);
 
   if (request.type === "observations") {
     return pageObservations(kv, {
@@ -162,6 +229,7 @@ export async function listViewerStore(
       offset,
       cursor: request.cursor ?? null,
       sessionId: request.sessionId,
+      query: normalizedQuery,
     });
   }
 
@@ -169,11 +237,16 @@ export async function listViewerStore(
     includeDeleted,
     sessionId: request.sessionId,
   });
-  return pageItems(request.type, source, items, {
+  const filteredItems = filterViewerStoreItems(request.type, items, normalizedQuery);
+  return pageItems(request.type, source, sortViewerItems(request.type, filteredItems), {
     limit,
     offset,
     cursor: request.cursor ?? null,
-    filters: { ...filters, ...storeFilters },
+    filters: {
+      ...filters,
+      ...storeFilters,
+      ...(normalizedQuery ? { query: normalizedQuery } : {}),
+    },
   });
 }
 
@@ -463,16 +536,23 @@ async function safeCategoryStat(
 
 async function pageObservations(
   kv: KeyValueStore,
-  request: { limit: number; offset: number; cursor: string | null; sessionId?: string },
+  request: { limit: number; offset: number; cursor: string | null; sessionId?: string; query?: string },
 ): Promise<ViewerStorePage> {
   if (request.sessionId) {
     const source = KV.observations(request.sessionId);
-    const observations = sortByDateAsc(await kv.list<CompressedObservation>(source), "timestamp");
-    return pageItems("observations", source, observations, {
+    const observations = filterViewerStoreItems(
+      "observations",
+      await kv.list<CompressedObservation>(source),
+      request.query,
+    );
+    return pageItems("observations", source, sortViewerItems("observations", observations), {
       limit: request.limit,
       offset: request.offset,
       cursor: request.cursor,
-      filters: { sessionId: request.sessionId },
+      filters: {
+        sessionId: request.sessionId,
+        ...(request.query ? { query: request.query } : {}),
+      },
     });
   }
 
@@ -487,11 +567,12 @@ async function pageObservations(
     );
   }
 
-  return pageItems("observations", "mem:obs:*", observations, {
+  const filtered = filterViewerStoreItems("observations", observations, request.query);
+  return pageItems("observations", "mem:obs:*", sortViewerItems("observations", filtered), {
     limit: request.limit,
     offset: request.offset,
     cursor: request.cursor,
-    filters: {},
+    filters: request.query ? { query: request.query } : {},
   });
 }
 
@@ -578,4 +659,27 @@ function compareConfidenceDesc(
   const byConfidence = (b.confidence ?? 0) - (a.confidence ?? 0);
   if (byConfidence !== 0) return byConfidence;
   return dateValue(b.createdAt) - dateValue(a.createdAt);
+}
+
+function sortViewerItems(type: ViewerStoreType, items: unknown[]): unknown[] {
+  return [...items].sort((left, right) => {
+    let primary = 0;
+    if (type === "sessions") {
+      primary = dateValue((right as Session).startedAt) - dateValue((left as Session).startedAt);
+    } else if (type === "summaries") {
+      primary = dateValue((right as SessionSummary).createdAt) - dateValue((left as SessionSummary).createdAt);
+    } else if (type === "observations") {
+      primary = dateValue((left as CompressedObservation).timestamp) - dateValue((right as CompressedObservation).timestamp);
+    } else if (type === "lessons" || type === "insights") {
+      primary = compareConfidenceDesc(
+        left as { confidence?: number; createdAt?: string },
+        right as { confidence?: number; createdAt?: string },
+      );
+    } else if (type === "semantic" || type === "procedural") {
+      primary = dateValue((right as { updatedAt?: string }).updatedAt) - dateValue((left as { updatedAt?: string }).updatedAt);
+    } else if (type === "crystals") {
+      primary = dateValue((right as Crystal).createdAt) - dateValue((left as Crystal).createdAt);
+    }
+    return primary || viewerStableKey(type, left).localeCompare(viewerStableKey(type, right));
+  });
 }

@@ -4211,6 +4211,13 @@ export function registerApiTriggers(
       if (includeDeleted === null) {
         return { status_code: 400, body: { error: "includeDeleted must be true or false" } };
       }
+      const queryValue = typeof params.query === "string" ? params.query.trim() : undefined;
+      if (queryValue && queryValue.length > 200) {
+        return { status_code: 400, body: { error: "query must be at most 200 characters" } };
+      }
+      if (type === "observations" && queryValue && !asNonEmptyString(params.sessionId)) {
+        return { status_code: 400, body: { error: "observations query requires sessionId" } };
+      }
       try {
         const result = await listViewerStore(kv, {
           type,
@@ -4218,6 +4225,7 @@ export function registerApiTriggers(
           cursor: asNonEmptyString(params.cursor),
           sessionId: asNonEmptyString(params.sessionId) ?? undefined,
           includeDeleted,
+          ...(queryValue ? { query: queryValue } : {}),
         });
         return { status_code: 200, body: result };
       } catch (error) {

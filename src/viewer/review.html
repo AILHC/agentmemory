@@ -131,7 +131,7 @@
     }
     .pane-title { font-size: 17px; font-weight: 700; margin: 0; }
     .pane-sub { margin-top: 5px; color: var(--ink-muted); font-size: 12px; line-height: 1.35; }
-    .pane-tools { padding: 12px 20px; border-bottom: 1px solid var(--border-light); background: var(--panel); }
+    .pane-tools { padding: 12px 20px; border-bottom: 1px solid var(--border-light); background: var(--panel); flex: 0 0 auto; }
     .search {
       width: 100%;
       height: 38px;
@@ -143,6 +143,9 @@
       background: #fff;
     }
     .list { padding: 14px; overflow: auto; min-height: 0; flex: 1; }
+    .list-rows { padding: 14px; overflow: auto; min-height: 0; flex: 1 1 auto; }
+    .list-status { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+    .pane-pager { flex: 0 0 auto; background: var(--panel); border-top: 1px solid var(--border-light); }
     .row {
       width: 100%;
       text-align: left;
@@ -333,7 +336,6 @@
       'use strict';
 
       var PAGE_SIZE = 50;
-      var API_PAGE_SIZE = 500;
       var REST = window.location.origin;
       var TAB_IDS = ['sessions', 'lessons', 'summaries', 'observations', 'semantic', 'procedural', 'crystals', 'insights'];
       var TAB_CONFIG = {
@@ -359,12 +361,10 @@
         loaded: false,
         loading: false,
         error: '',
-        sessions: [],
-        meta: {},
-        cache: {},
-        observationsBySession: {},
-        sessionItemsByType: {},
-        sessionStatsById: {},
+        pageCache: {},
+        activePageKeyByScope: {},
+        requestSeqByScope: {},
+        summaryBySessionId: {},
         selected: {
           sessionId: '',
           sessionCategory: 'summary',
@@ -379,7 +379,7 @@
         },
         composingFilterKey: '',
         filters: {},
-        pages: {},
+        searchTimers: {},
       };
 
       var debug = window.__agentmemoryReviewDebug;
@@ -483,28 +483,6 @@
         }).join('&');
       }
       function getElementById(id) { return document.getElementById(id); }
-      function ensureObject(obj) {
-        if (!obj) return {};
-        return obj;
-      }
-      function sessionScopedState(type, sessionId) {
-        var bucket = ensureObject(store.sessionItemsByType[type]);
-        store.sessionItemsByType[type] = bucket;
-        var state = bucket[sessionId];
-        if (!state) {
-          state = { loading: false, error: '', items: [], total: 0 };
-          bucket[sessionId] = state;
-        }
-        return state;
-      }
-      function observationState(sessionId) {
-        var state = store.observationsBySession[sessionId];
-        if (!state) {
-          state = { loading: false, error: '', items: [], total: 0 };
-          store.observationsBySession[sessionId] = state;
-        }
-        return state;
-      }
 
       async function init() {
         store.activeTab = tabFromHash();
@@ -512,14 +490,8 @@
         render();
         await loadBaseData();
         await ensureTabData(store.activeTab);
-        if (store.activeTab === 'observations') {
-          store.selected.observationSessionId = store.selected.observationSessionId || store.selected.sessionId;
-          if (store.selected.observationSessionId) {
-            await loadObservationsForSession(store.selected.observationSessionId);
-          }
-        }
         if (store.selected.sessionId) {
-          loadSessionStats(store.selected.sessionId);
+          await loadSelectedSessionSummary(store.selected.sessionId);
         }
         render();
       }
@@ -529,18 +501,10 @@
         store.error = '';
         render();
         try {
-          var storesRes = await apiGet('viewer/stores');
-          asArray(storesRes.stores).forEach(function(meta) {
-            if (meta && meta.type) store.meta[meta.type] = meta;
-          });
-          var sessionsPage = await fetchStoreAll('sessions');
-          store.sessions = asArray(sessionsPage.items);
-          store.cache.sessions = sessionsPage;
-          var summaries = await fetchStoreAll('summaries');
-          store.cache.summaries = summaries;
-          if (!store.selected.sessionId && store.sessions.length) {
-            store.selected.sessionId = idOf(sortedSessions()[0]);
-          }
+          var result = await loadStorePage({ scope: 'tab', type: 'sessions', page: 0, queryText: store.filters.sessions || '' });
+          if (!result || !result.isActive) return;
+          if (result.state.error) throw new Error(result.state.error);
+          reconcileSessionSelectionAfterPageCommit(result.state.items, result.state.requestSeq);
           store.loaded = true;
         } catch (err) {
           store.error = err instanceof Error ? err.message : String(err);
@@ -551,34 +515,16 @@
 
       async function ensureTabData(tab) {
         if (tab === 'sessions' || tab === 'observations') return;
-        if (store.cache[tab]) return;
-        store.cache[tab] = { loading: true, items: [] };
-        try {
-          store.cache[tab] = await fetchStoreAll(tab);
-        } catch (err) {
-          store.cache[tab] = { error: err instanceof Error ? err.message : String(err), items: [] };
-        }
+        var current = activePageState('tab', tab);
+        if (current && current.loaded && current.query === String(store.filters[tab] || '')) return;
+        return loadStorePage({ scope: 'tab', type: tab, page: 0, queryText: store.filters[tab] || '' });
       }
 
       async function loadObservationsForSession(sessionId) {
         if (!sessionId) return;
-        var state = observationState(sessionId);
-        if (state.loading) return;
-        if (state.loaded) return;
-        state.loading = true;
-        state.error = '';
-        state.items = [];
-        state.total = 0;
-        try {
-          var payload = await fetchStoreAll('observations', { sessionId: sessionId });
-          state.items = asArray(payload.items);
-          state.total = Number(payload.total || payload.returned || state.items.length) || 0;
-          state.loaded = true;
-        } catch (err) {
-          state.error = err instanceof Error ? err.message : String(err);
-        } finally {
-          state.loading = false;
-        }
+        var current = activePageState('session-category', 'observations', sessionId);
+        if (current && current.loaded) return { state: current, isActive: true };
+        return loadStorePage({ scope: 'session-category', type: 'observations', sessionId: sessionId, page: 0, queryText: store.filters.observations || '' });
       }
 
       async function ensureSessionData(type, sessionId) {
@@ -587,109 +533,144 @@
           await loadObservationsForSession(sessionId);
           return;
         }
-        var state = sessionScopedState(type, sessionId);
-        if (state.loading || state.loaded) return;
-        state.loading = true;
-        state.error = '';
-        state.items = [];
-        state.total = 0;
+        var current = activePageState('session-category', type, sessionId);
+        if (current && current.loaded) return { state: current, isActive: true };
+        var key = 'session-content:' + sessionId + ':' + type;
+        return loadStorePage({ scope: 'session-category', type: type, sessionId: sessionId, page: 0, queryText: store.filters[key] || '' });
+      }
+
+      async function loadSelectedSessionSummary(sessionId) {
+        if (!sessionId) return;
+        var state = store.summaryBySessionId[sessionId];
+        if (state && (state.loading || state.loaded)) return;
+        state = { loading: true, loaded: false, value: null, error: '', requestSeq: (state && state.requestSeq || 0) + 1 };
+        store.summaryBySessionId[sessionId] = state;
+        var requestSeq = state.requestSeq;
         try {
-          var payload = await fetchStoreAll(type, { sessionId: sessionId });
-          state.items = asArray(payload.items);
-          state.total = Number(payload.total || payload.returned || state.items.length) || 0;
+          var payload = await apiGet('viewer/store?' + query({ type: 'summaries', sessionId: sessionId, limit: 1, cursor: 0 }));
+          if (state.requestSeq !== requestSeq) return;
+          state.value = asArray(payload.items)[0] || null;
           state.loaded = true;
         } catch (err) {
-          state.error = err instanceof Error ? err.message : String(err);
+          if (state.requestSeq === requestSeq) state.error = err instanceof Error ? err.message : String(err);
         } finally {
-          state.loading = false;
+          if (state.requestSeq === requestSeq) state.loading = false;
         }
-      }
-
-      async function loadSessionStats(sessionId) {
-        if (!sessionId) return;
-        var current = store.sessionStatsById[sessionId];
-        if (current && current.loading) return;
-        if (current && current.loaded && !current.error) return;
-        store.sessionStatsById[sessionId] = {
-          loading: true,
-          loaded: false,
-          error: '',
-          categories: {},
-          sessionId: sessionId,
-        };
-        try {
-          var result = await apiGet('viewer/session-stats?' + query({ sessionId: sessionId }));
-          if (result && result.success) {
-            store.sessionStatsById[sessionId] = {
-              loading: false,
-              loaded: true,
-              error: '',
-              categories: ensureObject(result.categories),
-              sessionId: sessionId,
-            };
-          } else {
-            throw new Error('session-stats response missing success flag');
-          }
-        } catch (err) {
-          store.sessionStatsById[sessionId] = {
-            loading: false,
-            loaded: true,
-            error: err instanceof Error ? err.message : String(err),
-            categories: {},
-            sessionId: sessionId,
-          };
-        }
-
         if (store.activeTab === 'sessions' && store.selected.sessionId === sessionId) {
           renderSessionCategoryPaneOnly();
-          if (store.selected.sessionCategory !== 'summary') {
-            renderSessionContentPaneOnly();
-          }
+          if (store.selected.sessionCategory === 'summary') renderSessionContentPaneOnly();
         }
       }
 
-      function sessionStat(state, category) {
-        var stat = state && state.categories && state.categories[category];
-        if (!stat) return null;
-        if (stat.status === 'failed') return -1;
-        if (typeof stat.count === 'number') return stat.count;
-        return null;
+      function reconcileSessionSelectionAfterPageCommit(items, requestSeq) {
+        var state = activePageState('tab', 'sessions');
+        if (!state || state.requestSeq !== requestSeq) return false;
+        var current = items.find(function(item) { return idOf(item) === store.selected.sessionId; });
+        store.selected.sessionId = current ? idOf(current) : (items[0] ? idOf(items[0]) : '');
+        return true;
       }
 
       function sessionCategoryCountText(session, category) {
         var sessionId = idOf(session);
-        var state = sessionId ? store.sessionStatsById[sessionId] : null;
-        var cached = sessionStat(state, category);
-        if (cached === -1) return '!';
-        if (state && state.error) return '!';
-        if (cached !== null) return String(cached);
-        return '...';
-      }
-
-      function sessionCategoryCount(session, category) {
-        var sessionId = idOf(session);
-        var state = sessionId ? store.sessionStatsById[sessionId] : null;
-        if (!state || state.loading) return null;
-        if (state.error) return -1;
-        if (sessionStat(state, category) === -1) return -1;
-        return sessionStat(state, category);
-      }
-
-      async function fetchStoreAll(type, extra) {
-        var cursor = '';
-        var items = [];
-        var last = null;
-        do {
-          var params = Object.assign({ type: type, limit: API_PAGE_SIZE }, extra || {});
-          if (cursor) params.cursor = cursor;
-          last = await apiGet('viewer/store?' + query(params));
-          items = items.concat(asArray(last.items));
-          cursor = last.nextCursor || '';
-        } while (last && last.hasMore && cursor);
-        return Object.assign({}, last || {}, { items: items, returned: items.length, hasMore: false, completeness: 'complete' });
+        if (!sessionId) return '—';
+        if (category === 'summary') {
+          var summaryState = store.summaryBySessionId[sessionId];
+          if (!summaryState || summaryState.loading) return '...';
+          if (summaryState.error) return '!';
+          return summaryState.value ? '1' : '0';
+        }
+        if (category === 'observations') return String(Number(session.observationCount) || 0);
+        var state = activePageState('session-category', category, sessionId);
+        if (!state) return '—';
+        if (state.error) return '!';
+        if (state.loading && !state.loaded) return '...';
+        return String(state.total);
       }
 
       function asArray(value) { return Array.isArray(value) ? value : []; }
+
+      function emptyPageState() {
+        return {
+          items: [], total: 0, page: 0, limit: PAGE_SIZE, hasMore: false,
+          query: '', loading: false, loaded: false, error: '', requestSeq: 0,
+        };
+      }
+
+      function viewerPageKey(request) {
+        return [
+          request.scope,
+          request.type,
+          request.sessionId || '',
+          String(request.queryText || '').trim().toLowerCase(),
+        ].join('\u001f');
+      }
+
+      function viewerScopeKey(scope, type, sessionId) {
+        return scope + ':' + type + ':' + (sessionId || '');
+      }
+
+      function activePageState(scope, type, sessionId) {
+        var cacheKey = store.activePageKeyByScope[viewerScopeKey(scope, type, sessionId)];
+        return cacheKey ? store.pageCache[cacheKey] || null : null;
+      }
+
+      function commitPageResult(request, state, requestSeq, payload) {
+        if (state.requestSeq !== requestSeq) return false;
+        state.items = asArray(payload.items);
+        state.total = Number(payload.total || 0);
+        state.page = Math.max(0, request.page);
+        state.limit = PAGE_SIZE;
+        state.hasMore = payload.hasMore === true;
+        state.query = request.queryText || '';
+        state.loaded = true;
+        return true;
+      }
+
+      async function loadStorePage(request) {
+        var cacheKey = viewerPageKey(request);
+        var scopeKey = viewerScopeKey(request.scope, request.type, request.sessionId);
+        var previousCacheKey = store.activePageKeyByScope[scopeKey];
+        var state = store.pageCache[cacheKey] || emptyPageState();
+        if (previousCacheKey && previousCacheKey !== cacheKey) delete store.pageCache[previousCacheKey];
+        store.pageCache[cacheKey] = state;
+        store.activePageKeyByScope[scopeKey] = cacheKey;
+        var requestSeq = (store.requestSeqByScope[scopeKey] || 0) + 1;
+        store.requestSeqByScope[scopeKey] = requestSeq;
+        state.requestSeq = requestSeq;
+        state.loading = true;
+        state.error = '';
+        var params = Object.assign({
+          type: request.type,
+          limit: PAGE_SIZE,
+          cursor: String(Math.max(0, request.page) * PAGE_SIZE),
+        }, request.sessionId ? { sessionId: request.sessionId } : {});
+        if (request.queryText) params.query = request.queryText;
+
+        try {
+          var payload = await apiGet('viewer/store?' + query(params));
+          if (state.requestSeq !== requestSeq || store.requestSeqByScope[scopeKey] !== requestSeq) return null;
+          commitPageResult(request, state, requestSeq, payload);
+          setStatus(statusHtml());
+        } catch (err) {
+          if (state.requestSeq === requestSeq && store.requestSeqByScope[scopeKey] === requestSeq) {
+            state.error = err instanceof Error ? err.message : String(err);
+          }
+        } finally {
+          if (state.requestSeq === requestSeq && store.requestSeqByScope[scopeKey] === requestSeq) state.loading = false;
+        }
+        return {
+          state: state,
+          cacheKey: cacheKey,
+          isActive: store.activePageKeyByScope[scopeKey] === cacheKey && store.requestSeqByScope[scopeKey] === requestSeq,
+        };
+      }
+
+      function pageRangeText(state) {
+        if (!state || state.total === 0) return '0 / 0';
+        var start = state.page * state.limit + 1;
+        var end = Math.min(start + state.items.length - 1, state.total);
+        return start + '-' + end + ' / ' + state.total;
+      }
 
       function renderTabs() {
         var tabs = getElementById('tabs');
@@ -739,7 +720,12 @@
           var sessionView = store.drill.sessions || 'sessions';
           app.innerHTML =
             '<div class="grid sessions" id="sessions-grid">' +
-            '<section class="pane' + mobileActiveClass('sessions', sessionView) + '" id="session-list-pane">' + paneHead('Sessions', 'Select a session, then inspect extracted categories.') + '<div class="list" data-scroll-key="sessions" id="session-list"></div></section>' +
+            '<section class="pane' + mobileActiveClass('sessions', sessionView) + '" id="session-list-pane">' + paneHead('Sessions', 'Select a session, then inspect extracted categories.') +
+              '<div class="pane-tools" id="session-list-tools"></div>' +
+              '<div class="list-status" id="session-list-status" aria-live="polite"></div>' +
+              '<div class="list-rows" data-scroll-key="sessions" id="session-list-rows" aria-busy="false"></div>' +
+              '<div class="pane-pager" id="session-list-pager"></div>' +
+            '</section>' +
             '<section class="pane' + mobileActiveClass('categories', sessionView) + '" id="session-category-pane">' + paneHead('Extraction Categories', 'Current session: loading', 'sessions', 'Sessions') + '<div class="list" data-scroll-key="session-categories:' + attr(sid || 'none') + '" id="session-category-list"></div></section>' +
             '<section class="pane' + mobileActiveClass('content', sessionView) + '" id="session-content-pane">' + paneHead('Content', 'Select a category.', 'categories', 'Categories') + '<div class="list" data-scroll-key="session-content:' + attr(sid || 'none') + '" id="session-content-list"></div></section>' +
             '<section class="pane' + mobileActiveClass('detail', sessionView) + '" id="session-detail-pane">' + paneHead('Detail', 'Select an item to inspect fields.', 'content', 'Content') + '<div class="list" id="session-detail"></div></section>' +
@@ -750,7 +736,12 @@
           var observationView = store.drill.observations || 'filters';
           app.innerHTML =
             '<div class="grid observations" id="observations-grid">' +
-            '<section class="pane' + mobileActiveClass('filters', observationView) + '" id="observation-filter-pane">' + paneHead('Observation Filters', 'Observations are loaded per session.') + '<div class="list" data-scroll-key="observation-sessions" id="observation-filter-list"></div></section>' +
+            '<section class="pane' + mobileActiveClass('filters', observationView) + '" id="observation-filter-pane">' + paneHead('Observation Filters', 'Observations are loaded per session.') +
+              '<div class="pane-tools" id="observation-filter-tools"></div>' +
+              '<div class="list-status" id="observation-filter-status" aria-live="polite"></div>' +
+              '<div class="list-rows" data-scroll-key="observation-sessions" id="observation-filter-list" aria-busy="false"></div>' +
+              '<div class="pane-pager" id="observation-filter-pager"></div>' +
+            '</section>' +
             '<section class="pane' + mobileActiveClass('list', observationView) + '" id="observation-list-pane">' + paneHead('Observation List', 'Current session observations.', 'filters', 'Filters') + '<div class="list" data-scroll-key="observation-list" id="observation-list"></div></section>' +
             '<section class="pane' + mobileActiveClass('detail', observationView) + '" id="observation-detail-pane">' + paneHead('Observation Detail', 'Inspect raw fields.', 'list', 'List') + '<div class="list" id="observation-detail"></div></section>' +
             '</div>';
@@ -759,19 +750,30 @@
         var tabView = tabDrillView(store.activeTab);
         app.innerHTML =
           '<div class="grid two-col" id="review-tab-grid">' +
-          '<section class="pane' + mobileActiveClass('list', tabView) + '" id="tab-list-pane">' + paneHead(TAB_CONFIG[store.activeTab].label, 'Select an item.') + '<div class="list" data-scroll-key="tab-list:' + attr(store.activeTab) + '" id="tab-list"></div></section>' +
+          '<section class="pane' + mobileActiveClass('list', tabView) + '" id="tab-list-pane">' + paneHead(TAB_CONFIG[store.activeTab].label, 'Select an item.') +
+            '<div class="pane-tools" id="tab-list-tools"></div>' +
+            '<div class="list-status" id="tab-list-status" aria-live="polite"></div>' +
+            '<div class="list-rows" data-scroll-key="tab-list:' + attr(store.activeTab) + '" id="tab-list-rows" aria-busy="false"></div>' +
+            '<div class="pane-pager" id="tab-list-pager"></div>' +
+          '</section>' +
           '<section class="pane' + mobileActiveClass('detail', tabView) + '" id="tab-detail-pane">' + paneHead(TAB_CONFIG[store.activeTab].label + ' Detail', 'Readable fields, source fields, and raw JSON.', 'list', TAB_CONFIG[store.activeTab].label) + '<div class="list" id="tab-detail"></div></section>' +
           '</div>';
       }
 
       function renderSessionListPaneOnly() {
-        var pane = getElementById('session-list');
-        if (!pane) return;
-        var sessions = filterItems('sessions', sortedSessions());
-        pane.innerHTML = renderSearch('sessions', 'Search session / prompt / project') +
-          '<div class="list" data-scroll-key="sessions" id="session-list-rows">' +
-          (sessions.length ? sessions.map(renderSessionRow).join('') : renderEmpty('No sessions')) +
-          '</div>';
+        var state = activePageState('tab', 'sessions') || emptyPageState();
+        var tools = getElementById('session-list-tools');
+        var rows = getElementById('session-list-rows');
+        var pager = getElementById('session-list-pager');
+        var status = getElementById('session-list-status');
+        if (!tools || !rows || !pager || !status) return;
+        if (!tools.querySelector('input[data-ui="filter"]')) tools.innerHTML = renderSearchInput('sessions', 'Search session / prompt / project');
+        rows.setAttribute('aria-busy', state.loading ? 'true' : 'false');
+        status.textContent = state.loading ? 'Loading' : 'Showing ' + pageRangeText(state);
+        if (state.error && !state.items.length) rows.innerHTML = '<div class="error">' + esc(state.error) + '</div>';
+        else if (state.loading && !state.items.length) rows.innerHTML = '<div class="loading">Loading sessions...</div>';
+        else rows.innerHTML = state.items.length ? state.items.map(renderSessionRow).join('') : renderEmpty('No sessions');
+        pager.innerHTML = pagePagerHtml(state, 'tab', 'sessions', '', 'sessions');
       }
       function renderSessionCategoryPaneOnly() {
         var pane = getElementById('session-category-pane');
@@ -799,54 +801,47 @@
           return;
         }
         var category = store.selected.sessionCategory || 'summary';
-          var sid = idOf(session);
-          var key = 'session-content:' + sid + ':' + category;
-        pane.innerHTML = paneHead('Content List: ' + (TAB_CONFIG[category] ? TAB_CONFIG[category].label : category), 'Summary from backend stats and session store.', 'categories', 'Categories');
+        var sid = idOf(session);
+        var key = 'session-content:' + sid + ':' + category;
+        pane.innerHTML = paneHead('Content List: ' + (TAB_CONFIG[category] ? TAB_CONFIG[category].label : category), 'Current page from the selected session.', 'categories', 'Categories');
 
         if (category === 'summary') {
-          var summary = sessionSummaryForSession(session);
-          var summaryKey = 'session-content:' + sid + ':summary';
-          store.selected.itemByTab.summaries = idOf(summary);
-          pane.innerHTML += '<div class="list" id="session-content-list"><div class="pane-sub">Count: 1</div>' +
-            renderItemList(summaryKey, [summary], 'summaries', true) + '</div>';
+          var summaryState = store.summaryBySessionId[sid];
+          if (!summaryState || summaryState.loading) {
+            pane.innerHTML += '<div class="list" id="session-content-list"><div class="loading">Loading summary...</div></div>';
+            return;
+          }
+          if (summaryState.error) {
+            pane.innerHTML += '<div class="list" id="session-content-list"><div class="error">' + esc(summaryState.error) + '</div></div>';
+            return;
+          }
+          var summary = summaryState.value;
+          if (summary) store.selected.itemByTab.summaries = idOf(summary);
+          pane.innerHTML += '<div class="list" id="session-content-list">' +
+            (summary ? renderItemList(key, [summary], 'summaries', true) : renderEmpty('No summary')) + '</div>';
           return;
         }
 
-        if (category === 'observations') {
-          var obsState = observationState(sid);
-          if (obsState.loading) {
-            pane.innerHTML += '<div class="list" id="session-content-list"><div class="loading">Loading ' + esc(category) + '...</div></div>';
-            return;
-          }
-          if (obsState.error) {
-            pane.innerHTML += '<div class="list" id="session-content-list"><div class="error">' + esc(obsState.error) + '</div></div>';
-            return;
-          }
-        } else {
-          var catState = sessionScopedState(category, sid);
-          if (catState.error) {
-            pane.innerHTML += '<div class="list" id="session-content-list"><div class="error">' + esc(catState.error) + '</div></div>';
-            return;
-          }
-          if (catState.loading && !catState.items.length) {
-            pane.innerHTML += '<div class="list" id="session-content-list"><div class="loading">Loading ' + esc(category) + '...</div></div>';
-            return;
-          }
+        var state = activePageState('session-category', category, sid) || emptyPageState();
+        if (state.error && !state.items.length) {
+          pane.innerHTML += '<div class="list" id="session-content-list"><div class="error">' + esc(state.error) + '</div></div>';
+          return;
+        }
+        if (state.loading && !state.items.length) {
+          pane.innerHTML += '<div class="list" id="session-content-list"><div class="loading">Loading ' + esc(category) + '...</div></div>';
+          return;
         }
 
-        var listItems = sessionCategoryItems(category, session);
-        var filtered = filterItems(key, listItems);
-        var selectedId = store.selected.itemByTab[category] || (filtered[0] && idOf(filtered[0])) || '';
-        if (!selectedId && filtered.length) {
-          selectedId = idOf(filtered[0]);
+        var selectedId = store.selected.itemByTab[category] || (state.items[0] && idOf(state.items[0])) || '';
+        if (!selectedId && state.items.length) {
+          selectedId = idOf(state.items[0]);
           store.selected.itemByTab[category] = selectedId;
         }
-        var countForTotal = sessionCategoryCount(session, category);
-        var countText = countForTotal === null ? '...' : countForTotal < 0 ? '!' : String(countForTotal);
-        var total = countForTotal != null && countForTotal >= 0 ? countForTotal : filtered.length;
-        pane.innerHTML += '<div class="list" id="session-content-list"><div class="pane-sub">Count: ' + esc(countText) + '</div>' + renderSearch(key, 'Filter current category') +
-          (filtered.length ? renderItemList(key, listItems, category, true) : renderEmpty('No items')) + '</div>' +
-          pagerHtml(key, total);
+        pane.innerHTML += '<div class="pane-tools">' + renderSearchInput(key, 'Search current category') + '</div>' +
+          '<div class="list-status" aria-live="polite">Showing ' + esc(pageRangeText(state)) + '</div>' +
+          '<div class="list-rows" id="session-content-list" aria-busy="' + (state.loading ? 'true' : 'false') + '">' +
+            (state.items.length ? renderItemList(key, state.items, category, true) : renderEmpty('No items')) + '</div>' +
+          '<div class="pane-pager">' + pagePagerHtml(state, 'session-category', category, sid, key) + '</div>';
       }
 
       function renderSessionDetailPaneOnly() {
@@ -869,24 +864,25 @@
       }
 
       function renderTabListPaneOnly(tab) {
-        var tabData = store.cache[tab];
-        var pane = getElementById('tab-list');
-        if (!pane) return;
-        if (tabData && tabData.loading) {
-          pane.innerHTML = '<div class="loading">Loading ' + esc(tab) + '...</div>';
-          return;
+        var state = activePageState('tab', tab) || emptyPageState();
+        var tools = getElementById('tab-list-tools');
+        var rows = getElementById('tab-list-rows');
+        var pager = getElementById('tab-list-pager');
+        var status = getElementById('tab-list-status');
+        if (!tools || !rows || !pager || !status) return;
+        if (!tools.querySelector('input[data-ui="filter"]')) tools.innerHTML = renderSearchInput(tab, 'Search ' + TAB_CONFIG[tab].label.toLowerCase());
+        rows.setAttribute('aria-busy', state.loading ? 'true' : 'false');
+        status.textContent = state.loading ? 'Loading' : 'Showing ' + pageRangeText(state);
+        if (state.error && !state.items.length) {
+          rows.innerHTML = '<div class="error">' + esc(state.error) + '</div>';
+        } else if (state.loading && !state.items.length) {
+          rows.innerHTML = '<div class="loading">Loading ' + esc(tab) + '...</div>';
+        } else {
+          var selectedId = store.selected.itemByTab[tab] || (state.items[0] && idOf(state.items[0])) || '';
+          if (!store.selected.itemByTab[tab] && selectedId) store.selected.itemByTab[tab] = selectedId;
+          rows.innerHTML = state.items.length ? renderItemList(tab, state.items, tab, true) : renderEmpty('No items');
         }
-        if (tabData && tabData.error) {
-          pane.innerHTML = '<div class="error">' + esc(tabData.error) + '</div>';
-          return;
-        }
-
-        var items = tabItems(tab);
-        var list = filterItems(tab, items);
-        var selectedId = store.selected.itemByTab[tab] || (list[0] && idOf(list[0])) || '';
-        if (!store.selected.itemByTab[tab] && selectedId) store.selected.itemByTab[tab] = selectedId;
-        pane.innerHTML = renderSearch(tab, 'Search ' + TAB_CONFIG[tab].label.toLowerCase()) +
-          (list.length ? renderItemList(tab, items, tab, true) : renderEmpty('No items'));
+        pager.innerHTML = pagePagerHtml(state, 'tab', tab, '', tab);
       }
       function renderTabDetailPaneOnly(tab) {
         var pane = getElementById('tab-detail');
@@ -905,31 +901,39 @@
         }
       }
       function renderObservationFilterPaneOnly() {
-        var pane = getElementById('observation-filter-pane');
+        var state = activePageState('tab', 'sessions') || emptyPageState();
+        var tools = getElementById('observation-filter-tools');
         var list = getElementById('observation-filter-list');
-        if (!pane || !list) return;
-        list.innerHTML = sortedSessions().map(function(s) {
+        var pager = getElementById('observation-filter-pager');
+        var status = getElementById('observation-filter-status');
+        if (!tools || !list || !pager || !status) return;
+        if (!tools.querySelector('input[data-ui="filter"]')) tools.innerHTML = renderSearchInput('observation-session-filter', 'Search sessions');
+        list.setAttribute('aria-busy', state.loading ? 'true' : 'false');
+        status.textContent = state.loading ? 'Loading' : 'Showing ' + pageRangeText(state);
+        list.innerHTML = state.items.map(function(s) {
           var id = idOf(s);
           return '<button type="button" class="row ' + (id === store.selected.observationSessionId ? 'active' : '') + '" data-ui="observation-session" data-id="' + attr(id) + '">' +
             '<div class="row-title"><span>' + esc(shortId(id)) + '</span><span>' + esc(s.observationCount || 0) + '</span></div>' +
             '<div class="row-meta">' + esc(truncate(s.firstPrompt || s.project || '', 120)) + '</div></button>';
         }).join('') || renderEmpty('No sessions');
+        pager.innerHTML = pagePagerHtml(state, 'tab', 'sessions', '', 'observation-session-filter');
       }
       function renderObservationListPaneOnly() {
         var pane = getElementById('observation-list');
         if (!pane) return;
-        var sessionId = store.selected.observationSessionId || store.selected.sessionId;
-        var items = observationState(sessionId).items || [];
+        var sessionId = store.selected.observationSessionId;
+        var state = activePageState('session-category', 'observations', sessionId) || emptyPageState();
+        var items = state.items;
         if (!sessionId) {
           pane.innerHTML = renderEmpty('No session selected');
           return;
         }
-        if (observationState(sessionId).loading) {
+        if (state.loading) {
           pane.innerHTML = renderEmpty('Loading observations...');
           return;
         }
-        if (observationState(sessionId).error) {
-          pane.innerHTML = '<div class="error">' + esc(observationState(sessionId).error) + '</div>';
+        if (state.error) {
+          pane.innerHTML = '<div class="error">' + esc(state.error) + '</div>';
           return;
         }
         var key = 'observations';
@@ -941,68 +945,40 @@
       function renderObservationDetailPaneOnly() {
         var detail = getElementById('observation-detail');
         if (!detail) return;
-        var sessionId = store.selected.observationSessionId || store.selected.sessionId;
-        var obs = observationState(sessionId).items || [];
-        var filtered = filterItems('observations', obs);
+        var sessionId = store.selected.observationSessionId;
+        var state = activePageState('session-category', 'observations', sessionId);
+        var filtered = state ? state.items : [];
         var selectedId = store.selected.itemByTab['observations'] || (filtered[0] && idOf(filtered[0])) || '';
         var selected = filtered.find(function(item) { return idOf(item) === selectedId; }) || filtered[0] || null;
         detail.innerHTML = renderDetail(selected, 'observations');
       }
 
       function statusHtml() {
-        var sessionTotal = store.meta.sessions ? store.meta.sessions.total : store.sessions.length;
-        var obsTotal = store.meta.observations ? store.meta.observations.total : store.sessions.reduce(function(sum, s) { return sum + (Number(s.observationCount) || 0); }, 0);
+        var sessionsState = activePageState('tab', 'sessions');
+        var sessionTotal = sessionsState && sessionsState.loaded ? sessionsState.total : '—';
         var pieces = [
           '<strong>' + esc(sessionTotal) + '</strong> sessions',
-          '<strong>' + esc(obsTotal) + '</strong> observations',
+          '<strong>—</strong> observations',
         ];
-        ['lessons', 'semantic', 'procedural', 'crystals', 'insights'].forEach(function(tab) {
-          var meta = store.meta[tab];
-          if (meta) pieces.push('<strong>' + esc(meta.total) + '</strong> ' + esc(tab));
+        ['lessons', 'summaries', 'semantic', 'procedural', 'crystals', 'insights'].forEach(function(tab) {
+          var state = activePageState('tab', tab);
+          pieces.push('<strong>' + esc(state && state.loaded ? state.total : '—') + '</strong> ' + esc(tab));
         });
         return pieces.join('<span>·</span>') + '<span>viewer-store paged GET API</span>';
       }
 
       function sortedSessions() {
-        return store.sessions.slice().sort(function(a, b) {
-          return String(b.startedAt || '').localeCompare(String(a.startedAt || ''));
-        });
+        var state = activePageState('tab', 'sessions');
+        return state ? state.items : [];
       }
       function selectedSession() {
-        return store.sessions.find(function(s) { return idOf(s) === store.selected.sessionId; }) || sortedSessions()[0] || null;
-      }
-      function summaryItems() {
-        var summaries = tabItems('summaries');
-        var bySession = new Map(summaries.map(function(summary) { return [String(summary.sessionId || summary.id || ''), summary]; }));
-        return store.sessions.map(function(s) {
-          var sid = idOf(s);
-          var summary = bySession.get(sid);
-          return summary ? Object.assign({ id: sid, sessionId: sid }, summary) : {
-            id: sid,
-            sessionId: sid,
-            title: firstText(s, ['firstPrompt']) || sid,
-            narrative: '',
-            observationCount: s.observationCount,
-            project: s.project,
-            startedAt: s.startedAt,
-            keyDecisions: asArray(s.keyDecisions),
-            filesModified: asArray(s.filesModified),
-          };
-        });
+        return sortedSessions().find(function(s) { return idOf(s) === store.selected.sessionId; }) || null;
       }
       function sessionSummaryForSession(session) {
         if (!session) return null;
         var sid = idOf(session);
-        var summary = summaryItems().find(function(item) { return item.sessionId === sid; });
-        return summary || {
-          id: sid,
-          sessionId: sid,
-          title: firstText(session, ['firstPrompt']) || sid,
-          narrative: '',
-          confidence: session.confidence,
-          createdAt: session.createdAt,
-          updatedAt: session.updatedAt
-        };
+        var state = store.summaryBySessionId[sid];
+        return state && state.loaded ? state.value : null;
       }
 
       function sessionCategories(session) {
@@ -1021,40 +997,22 @@
       function sessionCategoryItems(category, session) {
         var sid = idOf(session);
         if (!sid) return [];
-        if (category === 'observations') return observationState(sid).items || [];
-        if (category === 'lessons') return sessionScopedState('lessons', sid).items || [];
-        if (category === 'semantic') return sessionScopedState('semantic', sid).items || [];
-        if (category === 'procedural') return sessionScopedState('procedural', sid).items || [];
-        if (category === 'crystals') return sessionScopedState('crystals', sid).items || [];
-        if (category === 'insights') return sessionScopedState('insights', sid).items || [];
-        return [];
+        var state = activePageState('session-category', category, sid);
+        return state ? state.items : [];
       }
 
       function tabItems(tab) {
-        var data = store.cache[tab];
-        if (Array.isArray(data)) return data;
-        if (data && Array.isArray(data.items)) return data.items;
-        return [];
+        var state = activePageState('tab', tab);
+        return state ? state.items : [];
       }
       function filterItems(tab, items) {
-        var filter = String(store.filters[tab] || '').toLowerCase().trim();
-        if (!filter) return items;
-        return items.filter(function(item) {
-          return JSON.stringify(item).toLowerCase().indexOf(filter) >= 0;
-        });
+        return items;
       }
-      function pageItems(tab, items) {
-        var page = store.pages[tab] || 0;
-        var start = page * PAGE_SIZE;
-        return items.slice(start, start + PAGE_SIZE);
-      }
-      function pagerHtml(tab, total) {
-        var page = store.pages[tab] || 0;
-        var pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
-        return '<div class="pager"><button type="button" data-ui="page" data-tab="' + attr(tab) + '" data-dir="-1" ' + (page <= 0 ? 'disabled' : '') + '>Prev</button><span>Page ' + (page + 1) + ' / ' + pages + ' · ' + total + ' items</span><button type="button" data-ui="page" data-tab="' + attr(tab) + '" data-dir="1" ' + (page >= pages - 1 ? 'disabled' : '') + '>Next</button></div>';
+      function pagePagerHtml(state, scope, type, sessionId, key) {
+        return '<div class="pager"><button type="button" data-ui="page-prev" data-scope="' + attr(scope) + '" data-type="' + attr(type) + '" data-session-id="' + attr(sessionId || '') + '" data-key="' + attr(key || type) + '" aria-label="Previous page" ' + (state.page <= 0 || state.loading ? 'disabled' : '') + '>Prev</button><span>' + esc(pageRangeText(state)) + '</span><button type="button" data-ui="page-next" data-scope="' + attr(scope) + '" data-type="' + attr(type) + '" data-session-id="' + attr(sessionId || '') + '" data-key="' + attr(key || type) + '" aria-label="Next page" ' + (!state.hasMore || state.loading ? 'disabled' : '') + '>Next</button></div>';
       }
       function tabDataCountLabel(tab, fallback) {
-        var state = store.cache[tab];
+        var state = activePageState('tab', tab);
         if (state && state.total != null) return state.total;
         if (state && state.error) return 'error';
         if (store.loading) return '...';
@@ -1062,38 +1020,71 @@
       }
 
       function renderSearch(key, placeholder) {
-        return '<div class="pane-tools"><input class="search" data-ui="filter" data-key="' + attr(key) + '" type="search" placeholder="' + attr(placeholder) + '" value="' + attr(store.filters[key] || '') + '"></div>';
+        return '<div class="pane-tools">' + renderSearchInput(key, placeholder) + '</div>';
       }
-      function restoreFilterFocus(key, start, end) {
-        var inputs = document.querySelectorAll('input[data-ui="filter"]');
-        for (var i = 0; i < inputs.length; i++) {
-          var input = inputs[i];
-          if (input.getAttribute('data-key') !== key) continue;
-          if (typeof input.focus === 'function') input.focus();
-          if (typeof input.setSelectionRange === 'function' && start != null && end != null) {
-            input.setSelectionRange(start, end);
-          }
-          return;
-        }
+      function renderSearchInput(key, placeholder) {
+        return '<input class="search" data-ui="filter" data-key="' + attr(key) + '" type="search" aria-label="Search ' + attr(key === 'observation-session-filter' ? 'sessions' : key) + '" placeholder="' + attr(placeholder) + '" value="' + attr(store.filters[key === 'observation-session-filter' ? 'sessions' : key] || '') + '">';
       }
-      function renderAfterFilterChange(key, selectionStart, selectionEnd) {
-        store.pages[key] = 0;
+      function renderListForKey(key) {
         if (key === 'sessions') {
           renderSessionListPaneOnly();
-        } else if (key === 'observations' || key.indexOf('session-content:') === 0) {
-          if (store.activeTab === 'sessions') {
-            renderSessionContentPaneOnly();
-            renderSessionDetailPaneOnly();
-          }
-          if (store.activeTab === 'observations') renderObservationListPaneOnly();
-        } else if (store.activeTab === 'sessions') {
+          return;
+        }
+        if (key === 'observation-session-filter') {
+          renderObservationFilterPaneOnly();
+          return;
+        }
+        if (key === 'observations') {
+          renderObservationListPaneOnly();
+          renderObservationDetailPaneOnly();
+          return;
+        }
+        if (key.indexOf('session-content:') === 0) {
           renderSessionContentPaneOnly();
           renderSessionDetailPaneOnly();
-        } else {
-          renderTabListPaneOnly(store.activeTab);
-          renderTabDetailPaneOnly(store.activeTab);
+          return;
         }
-        restoreFilterFocus(key, selectionStart, selectionEnd);
+        renderTabListPaneOnly(key);
+        renderTabDetailPaneOnly(key);
+      }
+
+      function searchRequestForKey(key) {
+        if (key === 'observation-session-filter') {
+          return { scope: 'tab', type: 'sessions', page: 0, queryText: store.filters.sessions || '' };
+        }
+        if (key.indexOf('session-content:') === 0) {
+          var parts = key.split(':');
+          return { scope: 'session-category', type: parts[2], sessionId: parts[1], page: 0, queryText: store.filters[key] || '' };
+        }
+        if (key === 'observations') {
+          return { scope: 'session-category', type: 'observations', sessionId: store.selected.observationSessionId, page: 0, queryText: store.filters.observations || '' };
+        }
+        return { scope: 'tab', type: key, page: 0, queryText: store.filters[key] || '' };
+      }
+
+      function scheduleSearch(key) {
+        clearTimeout(store.searchTimers[key]);
+        store.searchTimers[key] = setTimeout(async function() {
+          var request = searchRequestForKey(key);
+          if (request.type === 'observations' && !request.sessionId) return;
+          var resultPromise = loadStorePage(request);
+          renderListForKey(key);
+          var result = await resultPromise;
+          if (!result || !result.isActive) return;
+          if (key === 'sessions' && !result.state.error) {
+            reconcileSessionSelectionAfterPageCommit(result.state.items, result.state.requestSeq);
+            if (store.selected.sessionId) await loadSelectedSessionSummary(store.selected.sessionId);
+          }
+          renderListForKey(key);
+          var rows = key === 'sessions'
+            ? getElementById('session-list-rows')
+            : key === 'observation-session-filter'
+              ? getElementById('observation-filter-list')
+              : key.indexOf('session-content:') === 0
+                ? getElementById('session-content-list')
+                : getElementById('tab-list-rows');
+          if (rows) rows.scrollTop = 0;
+        }, 300);
       }
       function renderSessionRow(s) {
         var id = idOf(s);
@@ -1104,10 +1095,8 @@
           '</button>';
       }
       function renderItemList(key, items, type, selectMode) {
-        var filtered = filterItems(key, items);
-        var page = pageItems(key, filtered);
-        if (!page.length) return renderEmpty('No items');
-        return page.map(function(item) {
+        if (!items.length) return renderEmpty('No items');
+        return items.map(function(item) {
           var id = idOf(item);
           var selected = selectMode && store.selected.itemByTab[type] === id;
           var expanded = !selectMode && store.selected.expandedByTab[key] === id;
@@ -1395,8 +1384,9 @@
           return selectedSessionItemFor(type, id);
         }
         if (type === 'observations') {
-          var sid = store.selected.observationSessionId || store.selected.sessionId;
-          return (observationState(sid).items || []).find(function(item) { return idOf(item) === id; }) || null;
+          var sid = store.selected.observationSessionId;
+          var observationPage = activePageState('session-category', 'observations', sid);
+          return (observationPage ? observationPage.items : []).find(function(item) { return idOf(item) === id; }) || null;
         }
         return tabItems(type).find(function(item) { return idOf(item) === id; }) || null;
       }
@@ -1424,7 +1414,7 @@
         if (key === 'sessions') return getElementById('session-list-rows');
         if (key === 'observations') return getElementById('observation-list');
         if (key.indexOf('session-content:') === 0) return getElementById('session-content-list');
-        return getElementById('tab-list');
+        return getElementById('tab-list-rows');
       }
       function updateRowActive(container, selector, activeId, dataKey) {
         if (!container || !container.querySelectorAll) return;
@@ -1457,21 +1447,10 @@
           renderTabs();
           setStatus(statusHtml());
           if (store.activeTab === 'observations') {
-            store.selected.observationSessionId = store.selected.observationSessionId || store.selected.sessionId;
             renderAppShellForActiveTab();
             renderObservationFilterPaneOnly();
             renderObservationListPaneOnly();
             renderObservationDetailPaneOnly();
-            if (store.selected.observationSessionId) {
-              var obsLoad = loadObservationsForSession(store.selected.observationSessionId);
-              renderObservationListPaneOnly();
-              renderObservationDetailPaneOnly();
-              await obsLoad;
-              if (store.activeTab === 'observations') {
-                renderObservationListPaneOnly();
-                renderObservationDetailPaneOnly();
-              }
-            }
           } else if (store.activeTab === 'sessions') {
             renderAppShellForActiveTab();
             renderSessionListPaneOnly();
@@ -1487,20 +1466,24 @@
           var sid = target.getAttribute('data-id') || '';
           store.selected.sessionId = sid;
           store.selected.sessionCategory = 'summary';
-          store.selected.observationSessionId = sid;
           store.drill.sessions = isNarrowLayout() ? 'categories' : 'sessions';
-          store.pages['session-content:summary'] = 0;
-          loadSessionStats(sid);
+          var summaryLoad = loadSelectedSessionSummary(sid);
           if (isNarrowLayout()) {
             renderAppShellForActiveTab();
             renderSessionListPaneOnly();
           } else {
-            var list = getElementById('session-list');
+            var list = getElementById('session-list-rows');
             updateRowActive(list, '[data-ui="select-session"]', sid, 'data-id');
           }
           renderSessionCategoryPaneOnly();
           renderSessionContentPaneOnly();
           renderSessionDetailPaneOnly();
+          await summaryLoad;
+          if (store.activeTab === 'sessions' && store.selected.sessionId === sid) {
+            renderSessionCategoryPaneOnly();
+            renderSessionContentPaneOnly();
+            renderSessionDetailPaneOnly();
+          }
         } else if (ui === 'session-category') {
           var cat = target.getAttribute('data-category') || 'summary';
           store.selected.sessionCategory = cat;
@@ -1569,8 +1552,6 @@
         } else if (ui === 'expand-item') {
           var exKey = target.getAttribute('data-key') || '';
           var exId = target.getAttribute('data-id') || '';
-          var exType = target.getAttribute('data-type') || '';
-          var willExpand = store.selected.expandedByTab[exKey] !== exId;
           store.selected.expandedByTab[exKey] = store.selected.expandedByTab[exKey] === exId ? '' : exId;
           var container = listContainerFromKey(exKey);
           updateRowActive(container, '[data-ui="expand-item"]', exId);
@@ -1581,20 +1562,59 @@
             renderTabListPaneOnly(store.activeTab);
             renderTabDetailPaneOnly(store.activeTab);
           }
-        } else if (ui === 'page') {
-          var pageKey = target.getAttribute('data-tab') || '';
-          var dir = Number(target.getAttribute('data-dir') || 0);
-          store.pages[pageKey] = Math.max(0, (store.pages[pageKey] || 0) + dir);
-          if (store.activeTab === 'sessions') {
+        } else if (ui === 'page-prev' || ui === 'page-next') {
+          var pageScope = target.getAttribute('data-scope') || 'tab';
+          var pageType = target.getAttribute('data-type') || '';
+          var pageSessionId = target.getAttribute('data-session-id') || '';
+          var pageFilterKey = target.getAttribute('data-key') || pageType;
+          var pageStoreFilterKey = pageFilterKey === 'observation-session-filter' ? 'sessions' : pageFilterKey;
+          var pageState = activePageState(pageScope, pageType, pageSessionId);
+          if (!pageState) return;
+          var nextPage = Math.max(0, pageState.page + (ui === 'page-next' ? 1 : -1));
+          var pageLoad = loadStorePage({
+            scope: pageScope,
+            type: pageType,
+            sessionId: pageSessionId || undefined,
+            page: nextPage,
+            queryText: store.filters[pageStoreFilterKey] || '',
+          });
+          if (pageScope === 'tab' && pageType === 'sessions') {
+            if (pageFilterKey === 'sessions') renderSessionListPaneOnly();
+            else renderObservationFilterPaneOnly();
+          } else if (pageScope === 'tab') {
+            renderTabListPaneOnly(pageType);
+          } else if (pageScope === 'session-category') {
+            renderSessionContentPaneOnly();
+          }
+          var pageResult = await pageLoad;
+          if (!pageResult || !pageResult.isActive) return;
+          if (pageScope === 'tab' && pageType === 'sessions') {
+            if (pageFilterKey === 'sessions') {
+              reconcileSessionSelectionAfterPageCommit(pageResult.state.items, pageResult.state.requestSeq);
+              if (store.selected.sessionId) await loadSelectedSessionSummary(store.selected.sessionId);
+              renderSessionListPaneOnly();
+              renderSessionCategoryPaneOnly();
+              renderSessionContentPaneOnly();
+              renderSessionDetailPaneOnly();
+            } else {
+              renderObservationFilterPaneOnly();
+            }
+          } else if (pageScope === 'tab') {
+            renderTabListPaneOnly(pageType);
+            renderTabDetailPaneOnly(pageType);
+            var pageRows = getElementById('tab-list-rows');
+            if (pageRows) pageRows.scrollTop = 0;
+          } else if (pageScope === 'session-category') {
+            renderSessionCategoryPaneOnly();
             renderSessionContentPaneOnly();
             renderSessionDetailPaneOnly();
-          } else if (store.activeTab === 'observations') {
-            renderObservationListPaneOnly();
-            renderObservationDetailPaneOnly();
-          } else {
-            renderTabListPaneOnly(store.activeTab);
-            renderTabDetailPaneOnly(store.activeTab);
           }
+          var completedPageRows = pageScope === 'tab' && pageType === 'sessions'
+            ? getElementById(pageFilterKey === 'sessions' ? 'session-list-rows' : 'observation-filter-list')
+            : pageScope === 'session-category'
+              ? getElementById('session-content-list')
+              : getElementById('tab-list-rows');
+          if (completedPageRows) completedPageRows.scrollTop = 0;
         } else if (ui === 'close-detail') {
           if (target === e.target || target.tagName === 'BUTTON') {
             closeDetailDrawer();
@@ -1629,11 +1649,10 @@
         var target = e.target instanceof Element ? e.target.closest('[data-ui="filter"]') : null;
         if (!target) return;
         var key = target.getAttribute('data-key') || '';
-        var selectionStart = target.selectionStart;
-        var selectionEnd = target.selectionEnd;
-        store.filters[key] = target.value || '';
+        var filterKey = key === 'observation-session-filter' ? 'sessions' : key;
+        store.filters[filterKey] = target.value || '';
         if (store.composingFilterKey === key || e.isComposing) return;
-        renderAfterFilterChange(key, selectionStart, selectionEnd);
+        scheduleSearch(key);
       });
       document.addEventListener('compositionstart', function(e) {
         var target = e.target instanceof Element ? e.target.closest('[data-ui="filter"]') : null;
@@ -1645,9 +1664,8 @@
         if (!target) return;
         var key = target.getAttribute('data-key') || '';
         store.composingFilterKey = '';
-        store.filters[key] = target.value || '';
-        var position = target.value ? target.value.length : 0;
-        renderAfterFilterChange(key, position, position);
+        store.filters[key === 'observation-session-filter' ? 'sessions' : key] = target.value || '';
+        scheduleSearch(key);
       });
       window.addEventListener('resize', function() {
         clearTimeout(store.resizeTimer);
