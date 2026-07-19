@@ -53,6 +53,52 @@ describe("mem::extraction-run-record", () => {
     registerExtractionRunIndexFunction(sdk as never, kv as never);
   });
 
+  it("returns a bounded acknowledgement for a large existing run index", async () => {
+    const runId = "run-large-response";
+    const timestamp = "2026-07-19T00:00:00.000Z";
+    await kv.set<ExtractionRunIndex>(KV.extractionRuns, runId, {
+      id: runId,
+      mark: "full-v1",
+      status: "running",
+      summarySessionIds: [],
+      lessonRunIds: [],
+      semanticWindowIds: [],
+      stageRecords: [{
+        stage: "memory_consolidate",
+        unitId: "existing-unit",
+        sourceIds: ["x".repeat(2 * 1024 * 1024)],
+        resultIds: ["existing-result"],
+        resultType: "memory",
+        updatedAt: timestamp,
+      }],
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    });
+
+    const result = await sdk.trigger("mem::extraction-run-record", {
+      runId,
+      mark: "full-v1",
+      status: "succeeded",
+      stage: "memory_consolidate",
+      unitId: "next-unit",
+      sourceIds: ["next-source"],
+      resultIds: ["next-result"],
+      resultType: "memory",
+    });
+
+    expect(JSON.stringify(result).length).toBeLessThan(2048);
+    expect(result).toMatchObject({
+      success: true,
+      run: {
+        id: runId,
+        mark: "full-v1",
+        status: "succeeded",
+      },
+    });
+    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, runId);
+    expect(stored?.stageRecords).toHaveLength(2);
+  });
+
   it("keeps legacy summary lesson and semantic fields while writing stage records", async () => {
     await sdk.trigger("mem::extraction-run-record", {
       runId: "run-1",
@@ -69,19 +115,23 @@ describe("mem::extraction-run-record", () => {
       summarySessionId: "ses-a",
       lessonRunId: "lesson-a",
       semanticWindowId: "win-a",
-    })) as { success: boolean; run: ExtractionRunIndex };
+    })) as { success: boolean; run: Pick<ExtractionRunIndex, "id" | "mark" | "status"> };
 
     expect(result.success).toBe(true);
     expect(result.run).toMatchObject({
       id: "run-1",
       mark: "full-2026-07",
       status: "partial",
+    });
+
+    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-1");
+    expect(stored).toMatchObject({
       summarySessionIds: ["ses-a"],
       lessonRunIds: ["lesson-a"],
       semanticWindowIds: ["win-a"],
     });
-    expect(result.run).not.toHaveProperty("corpusWindowIds");
-    expect(result.run.stageRecords).toMatchObject([
+    expect(stored).not.toHaveProperty("corpusWindowIds");
+    expect(stored?.stageRecords).toMatchObject([
       {
         stage: "summary",
         unitId: "ses-a",
@@ -105,8 +155,6 @@ describe("mem::extraction-run-record", () => {
       },
     ]);
 
-    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-1");
-    expect(stored).toEqual(result.run);
     const audits = await kv.list<{ operation: string; targetIds: string[] }>(KV.audit);
     expect(audits.map((entry) => entry.operation)).toEqual([
       "extraction_run_record",
@@ -171,10 +219,9 @@ describe("mem::extraction-run-record", () => {
       mark: "full-v1",
       summarySessionId: "ses-a",
       _caller_worker_id: "worker-a",
-    })) as { success: boolean; run: ExtractionRunIndex };
+    })) as { success: boolean; run: Pick<ExtractionRunIndex, "id" | "mark" | "status"> };
 
     expect(result.success).toBe(true);
-    expect(result.run.summarySessionIds).toEqual(["ses-a"]);
     const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-runtime-meta");
     expect(stored?.summarySessionIds).toEqual(["ses-a"]);
   });
@@ -198,11 +245,12 @@ describe("mem::extraction-run-record", () => {
       sourceIds: ["obs-b", "obs-c"],
       resultIds: ["mem-a", "mem-b"],
       resultType: "memory",
-    })) as { success: boolean; run: ExtractionRunIndex };
+    })) as { success: boolean; run: Pick<ExtractionRunIndex, "id" | "mark" | "status"> };
 
     expect(result.success).toBe(true);
-    expect(result.run.stageRecords).toHaveLength(1);
-    expect(result.run.stageRecords[0]).toMatchObject({
+    const stored = await kv.get<ExtractionRunIndex>(KV.extractionRuns, "run-stages");
+    expect(stored?.stageRecords).toHaveLength(1);
+    expect(stored?.stageRecords[0]).toMatchObject({
       stage: "memory_consolidate",
       unitId: "mem-unit-1",
       sourceIds: ["obs-a", "obs-b", "obs-c"],

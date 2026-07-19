@@ -255,7 +255,16 @@ export function registerExtractionRunIndexFunction(
         },
       );
 
-      return { success: true, run: next };
+      return {
+        success: true,
+        run: {
+          id: next.id,
+          mark: next.mark,
+          status: next.status,
+          createdAt: next.createdAt,
+          updatedAt: next.updatedAt,
+        },
+      };
     });
   });
 }
