@@ -5376,7 +5376,10 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
     const secret = requireSecret();
     state = await loadOrCreateState({ options, runId, statePath, now });
     runStateStore = new RunStateStore({ statePath, writeSnapshot: writeStateAtomically });
-    const journalEvents = await runStateStore.loadJournal();
+    const includedSeq = Number(state.orchestration_journal?.included_seq || 0);
+    const journalEvents = await runStateStore.loadJournal({
+      retainFromSeq: Math.max(1, includedSeq),
+    });
     runStateStore.replay(state, journalEvents);
     const drainRequestPresent = await fs.access(drainRequestPath).then(() => true).catch((error) => {
       if (error?.code === 'ENOENT') return false;

@@ -24,6 +24,57 @@ test('journal rejects a damaged middle line and tolerates a torn final line', as
   await assert.rejects(() => store.loadJournal(), /journal_integrity_failed/);
 });
 
+test('journal loading streams the file and retains only the snapshot boundary onward', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-state-'));
+  const statePath = path.join(dir, 'run.json');
+  const writer = new RunStateStore({
+    statePath,
+    writeSnapshot: (file, state) => fs.writeFile(file, JSON.stringify(state)),
+  });
+  await writer.append('unit_state', {
+    container_key: 'memory_consolidate_windows',
+    unit_id: 'mcw-1',
+    unit: { status: 'succeeded', payload: 'x'.repeat(70_000) },
+  }, { durable: true });
+  const boundary = await writer.append('unit_state', {
+    container_key: 'memory_consolidate_windows',
+    unit_id: 'mcw-2',
+    unit: { status: 'prepared' },
+  }, { durable: true });
+  await writer.append('unit_state', {
+    container_key: 'memory_consolidate_windows',
+    unit_id: 'mcw-3',
+    unit: { status: 'succeeded' },
+  }, { durable: true });
+
+  const boundedFs = Object.create(fs);
+  boundedFs.readFile = async (file, ...args) => {
+    if (path.resolve(file) === path.resolve(writer.journalPath)) {
+      throw new Error('unbounded_journal_read');
+    }
+    return fs.readFile(file, ...args);
+  };
+  const reader = new RunStateStore({
+    statePath,
+    writeSnapshot: (file, state) => fs.writeFile(file, JSON.stringify(state)),
+    fsApi: boundedFs,
+  });
+
+  const events = await reader.loadJournal({ retainFromSeq: boundary.seq });
+
+  assert.deepEqual(events.map((event) => event.seq), [2, 3]);
+  assert.equal(reader.seq, 3);
+  const state = {
+    orchestration_journal: {
+      included_seq: boundary.seq,
+      included_hash: boundary.hash,
+    },
+    memory_consolidate_windows: {},
+  };
+  reader.replay(state, events);
+  assert.deepEqual(Object.keys(state.memory_consolidate_windows), ['mcw-3']);
+});
+
 test('replay rejects a snapshot boundary that does not match the journal hash', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-state-'));
   const statePath = path.join(dir, 'run.json');

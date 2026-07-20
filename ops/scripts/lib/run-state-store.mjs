@@ -77,45 +77,113 @@ export class RunStateStore {
     return current;
   }
 
-  async loadJournal() {
-    const raw = await this.fs.readFile(this.journalPath, 'utf8').catch((error) => {
-      if (error?.code === 'ENOENT') return '';
+  async loadJournal({ retainFromSeq = 1 } = {}) {
+    if (!Number.isInteger(retainFromSeq) || retainFromSeq < 1) {
+      throw new Error('journal_retain_from_seq_invalid');
+    }
+    let handle;
+    try {
+      handle = await this.fs.open(this.journalPath, 'r');
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        this.seq = 0;
+        this.lastHash = null;
+        return [];
+      }
       throw error;
-    });
-    const lines = raw.split('\n');
-    if (lines.at(-1) === '') lines.pop();
+    }
+
+    const buffer = Buffer.allocUnsafe(64 * 1024);
+    let carry = Buffer.alloc(0);
+    let fileOffset = 0;
+    let validBytes = 0;
+    let lineNumber = 0;
+    let malformedFinalLine = null;
+    let expectedSeq = 0;
     let previous = null;
     const events = [];
-    for (let index = 0; index < lines.length; index += 1) {
+
+    const acceptLine = (line, endOffset) => {
+      lineNumber += 1;
+      let text = line.toString('utf8');
+      if (text.endsWith('\r')) text = text.slice(0, -1);
       let event;
       try {
-        event = JSON.parse(lines[index]);
+        event = JSON.parse(text);
       } catch (error) {
-        if (index === lines.length - 1) {
-          const validPrefix = index === 0 ? '' : `${lines.slice(0, index).join('\n')}\n`;
-          await this.fs.truncate(this.journalPath, Buffer.byteLength(validPrefix, 'utf8'));
-          break;
-        }
-        throw new Error(`journal_corrupt_at_line_${index + 1}`, { cause: error });
+        malformedFinalLine = { lineNumber, error };
+        return false;
       }
-      if (event.seq !== events.length + 1 || event.previous_hash !== previous || event.hash !== sha256(eventBody(event))) {
+      expectedSeq += 1;
+      if (event.seq !== expectedSeq || event.previous_hash !== previous || event.hash !== sha256(eventBody(event))) {
         throw new Error(`journal_integrity_failed_at_seq_${event.seq}`);
       }
-      events.push(event);
+      if (event.seq >= retainFromSeq) events.push(event);
       previous = event.hash;
+      validBytes = endOffset;
+      return true;
+    };
+
+    try {
+      while (true) {
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, null);
+        if (bytesRead === 0) break;
+        if (malformedFinalLine) {
+          throw new Error(`journal_corrupt_at_line_${malformedFinalLine.lineNumber}`, {
+            cause: malformedFinalLine.error,
+          });
+        }
+        const chunk = Buffer.from(buffer.subarray(0, bytesRead));
+        const dataStartOffset = fileOffset - carry.length;
+        fileOffset += bytesRead;
+        const data = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
+        let cursor = 0;
+        while (cursor < data.length) {
+          const newline = data.indexOf(0x0a, cursor);
+          if (newline < 0) break;
+          const accepted = acceptLine(
+            data.subarray(cursor, newline),
+            dataStartOffset + newline + 1,
+          );
+          cursor = newline + 1;
+          if (!accepted) {
+            if (cursor < data.length) {
+              throw new Error(`journal_corrupt_at_line_${malformedFinalLine.lineNumber}`, {
+                cause: malformedFinalLine.error,
+              });
+            }
+            break;
+          }
+        }
+        carry = malformedFinalLine ? Buffer.alloc(0) : Buffer.from(data.subarray(cursor));
+      }
+
+      if (!malformedFinalLine && carry.length > 0) {
+        acceptLine(carry, fileOffset);
+      }
+    } finally {
+      await handle.close();
     }
-    this.seq = events.at(-1)?.seq || 0;
-    this.lastHash = events.at(-1)?.hash || null;
+
+    if (malformedFinalLine) {
+      await this.fs.truncate(this.journalPath, validBytes);
+    }
+    this.seq = expectedSeq;
+    this.lastHash = previous;
     return events;
   }
 
   replay(state, events) {
     const includedSeq = Number(state.orchestration_journal?.included_seq || 0);
     const includedHash = state.orchestration_journal?.included_hash || null;
+    const journalSeq = Math.max(this.seq, events.at(-1)?.seq || 0);
+    const boundaryEvent = includedSeq > 0
+      ? events.find((event) => event.seq === includedSeq)
+      : null;
     if (
       includedSeq < 0
-      || includedSeq > events.length
-      || (includedSeq > 0 && events[includedSeq - 1]?.hash !== includedHash)
+      || includedSeq > journalSeq
+      || (includedSeq > 0 && boundaryEvent?.hash !== includedHash)
       || (includedSeq === 0 && includedHash !== null)
     ) {
       throw new Error('journal_snapshot_boundary_mismatch');
