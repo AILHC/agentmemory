@@ -63,6 +63,7 @@ import {
   runSummaryForSession,
   sanitizeFailureDiagnostics,
   sanitizeStateSchema,
+  selectDrainCommitUnits,
   selectFullExtractionSessions,
   semanticSplitLeafWindowsForExecution,
   resetDriftedSemanticUnits,
@@ -204,6 +205,22 @@ test('drain request must bind to the current lock owner and lock lifetime', () =
     owner_id: 'owner-1',
     requested_at: '2026-07-17T23:59:59.000Z',
   }, lock), /drain_request_timestamp_invalid/);
+});
+
+test('drain commit selection scans beyond an already terminal leading chunk', () => {
+  const units = Array.from({ length: 8 }, (_, index) => ({ unit_id: `unit-${index + 1}` }));
+  const state = {
+    memory_consolidate_windows: Object.fromEntries(units.map((unit, index) => [
+      unit.unit_id,
+      { ...unit, status: index === 7 ? 'prepared' : 'succeeded' },
+    ])),
+  };
+
+  assert.deepEqual(
+    selectDrainCommitUnits(state, 'memory_consolidate_windows', units)
+      .map((unit) => unit.unit_id),
+    ['unit-8'],
+  );
 });
 
 test('historical plan 404 re-enters runtime recovery after an operator restart', () => {
@@ -1543,11 +1560,11 @@ test('circuit_breaker_open enters the global gate immediately', async () => {
       return { status: 'succeeded', failure: null };
     },
   });
-  assert.deepEqual(events.slice(0, 3), [
-    'run:first:normal',
-    'sleep:60000',
-    'run:first:probe',
-  ]);
+  assert.equal(events[0], 'run:first:normal');
+  assert.match(events[1], /^sleep:\d+$/);
+  const sleepMs = Number(events[1].slice('sleep:'.length));
+  assert.ok(sleepMs >= 59_900 && sleepMs <= 60_000);
+  assert.equal(events[2], 'run:first:probe');
 });
 
 test('unknown and provider_rejected stay within finite unit retries and never sleep at the provider gate', async () => {

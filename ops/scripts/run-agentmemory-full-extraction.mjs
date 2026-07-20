@@ -575,6 +575,15 @@ export function validateDrainRequest(request, stateLock, now = Date.now()) {
   return true;
 }
 
+export function selectDrainCommitUnits(state, containerKey, units) {
+  return units.filter((unit) => {
+    const current = state[containerKey]?.[unit.unit_id];
+    return current?.status === 'prepared'
+      || current?.status === 'committing'
+      || current?.record_pending === true;
+  });
+}
+
 export async function runStageWorkQueue(stage, state, statePath, work, options = {}) {
   backfillOrchestrationPolicy(state);
   const signal = options.signal;
@@ -5764,18 +5773,18 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
               },
             });
             if (!canContinue) break;
-            let commitChunk = chunk.flatMap((unit) =>
+            const expandedCommitUnits = (prepareDrained ? orderedMemoryUnits : chunk)
+              .flatMap((unit) =>
               state.memory_consolidate_windows[unit.unit_id]?.status === 'split'
                 ? splitChildUnitsForContainer(state, 'memory_consolidate_windows', unit.unit_id)
                 : [unit]);
-            if (prepareDrained) {
-              commitChunk = commitChunk.filter((unit) => {
-                const current = state.memory_consolidate_windows[unit.unit_id];
-                return current?.status === 'prepared'
-                  || current?.status === 'committing'
-                  || current?.record_pending === true;
-              });
-            }
+            const commitChunk = prepareDrained
+              ? selectDrainCommitUnits(
+                  state,
+                  'memory_consolidate_windows',
+                  expandedCommitUnits,
+                )
+              : expandedCommitUnits;
             canContinue = await runQueue('memory_consolidate', commitChunk, {
               concurrency: 1,
               ignoreDrain: prepareDrained,
@@ -5955,12 +5964,7 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
               commit: async (items, prepared) => prepared === true && runQueue(
                 'skill_extract',
                 prepareDrained
-                  ? items.filter((unit) => {
-                      const current = state.skill_extract[unit.unit_id];
-                      return current?.status === 'prepared'
-                        || current?.status === 'committing'
-                        || current?.record_pending === true;
-                    })
+                  ? selectDrainCommitUnits(state, 'skill_extract', skillPlan.units)
                   : items,
                 {
                 concurrency: 1,
