@@ -212,14 +212,18 @@ test('drain commit selection scans beyond an already terminal leading chunk', ()
   const state = {
     memory_consolidate_windows: Object.fromEntries(units.map((unit, index) => [
       unit.unit_id,
-      { ...unit, status: index === 7 ? 'prepared' : 'succeeded' },
+      {
+        ...unit,
+        status: index === 5 ? 'committing' : index === 7 ? 'prepared' : 'succeeded',
+        ...(index === 6 ? { record_pending: true } : {}),
+      },
     ])),
   };
 
   assert.deepEqual(
     selectDrainCommitUnits(state, 'memory_consolidate_windows', units)
       .map((unit) => unit.unit_id),
-    ['unit-8'],
+    ['unit-6', 'unit-7', 'unit-8'],
   );
 });
 

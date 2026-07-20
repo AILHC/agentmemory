@@ -4400,17 +4400,23 @@ async function runRestMemoryCommitUnit({ state, statePath, baseUrl, secret, unit
     status,
     options,
   });
+  if (
+    existing.record_pending
+    && ['succeeded', 'skipped', 'failed'].includes(existing.status)
+  ) {
+    return persistTerminalThenRecord({
+      state,
+      statePath,
+      target: existing,
+      terminalState: { ...existing },
+      record: () => recordUnit(
+        existing.status,
+        existing.status === 'succeeded' ? existing.memory_ids || [] : [],
+      ),
+      writeState,
+    });
+  }
   if (terminalStageStatus(existing.status)) {
-    if (existing.record_pending) {
-      return persistTerminalThenRecord({
-        state,
-        statePath,
-        target: existing,
-        terminalState: { ...existing },
-        record: () => recordUnit(existing.status, existing.memory_ids || []),
-        writeState,
-      });
-    }
     return stageOutcome(existing.status);
   }
   if (!existing.prepared_handle) {
@@ -4720,17 +4726,23 @@ export async function runSkillExtractPrepareUnit({
     status,
     options,
   });
+  if (
+    existing?.record_pending
+    && ['succeeded', 'skipped', 'failed'].includes(existing.status)
+  ) {
+    return persistTerminalThenRecord({
+      state,
+      statePath,
+      target: existing,
+      terminalState: { ...existing },
+      record: () => recordSkill(
+        existing.status,
+        existing.status === 'succeeded' ? existing.skill_ids || [] : [],
+      ),
+      writeState,
+    });
+  }
   if (terminalStageStatus(existing?.status)) {
-    if (existing.record_pending) {
-      return persistTerminalThenRecord({
-        state,
-        statePath,
-        target: existing,
-        terminalState: { ...existing },
-        record: () => recordSkill(existing.status, existing.skill_ids || []),
-        writeState,
-      });
-    }
     return stageOutcome(existing.status);
   }
   if (existing?.status === 'prepared') return stageOutcome('succeeded');
@@ -5639,13 +5651,16 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
       }
 
       if (canContinue) {
-        const pendingMemoryRecordRepairs = Object.values(state.memory_consolidate_windows || {})
-          .filter((unit) =>
-            (unit?.status === 'succeeded' || unit?.status === 'skipped')
-            && unit.record_pending === true);
-        if (pendingMemoryRecordRepairs.length > 0) {
-          canContinue = await runQueue('memory_consolidate_record_repair', pendingMemoryRecordRepairs, {
+        const pendingMemoryCommitRepairs = selectDrainCommitUnits(
+          state,
+          'memory_consolidate_windows',
+          Object.values(state.memory_consolidate_windows || {}),
+        );
+        if (pendingMemoryCommitRepairs.length > 0) {
+          canContinue = await runQueue('memory_consolidate_commit_repair', pendingMemoryCommitRepairs, {
             concurrency: 1,
+            ignoreDrain: true,
+            allowUnitFailures: true,
             run: (unit, context) => runRestMemoryCommitUnit({
               state,
               statePath,
@@ -5657,6 +5672,32 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
             itemId: (unit) => unit.unit_id,
             initialOutcome: () => null,
             hasUnresolved: () => hasUnresolvedStageFailures(state, 'memory_consolidate_windows'),
+          });
+        }
+      }
+
+      if (canContinue) {
+        const pendingSkillCommitRepairs = selectDrainCommitUnits(
+          state,
+          'skill_extract',
+          Object.values(state.skill_extract || {}),
+        );
+        if (pendingSkillCommitRepairs.length > 0) {
+          canContinue = await runQueue('skill_extract_commit_repair', pendingSkillCommitRepairs, {
+            concurrency: 1,
+            ignoreDrain: true,
+            allowUnitFailures: true,
+            run: (unit, context) => runSkillExtractCommitUnit({
+              state,
+              statePath,
+              baseUrl: state.base_url,
+              secret,
+              unit,
+              options: { ...options, signal: context.signal },
+            }),
+            itemId: (unit) => unit.unit_id,
+            initialOutcome: () => null,
+            hasUnresolved: () => hasUnresolvedStageFailures(state, 'skill_extract'),
           });
         }
       }
