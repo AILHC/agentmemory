@@ -1031,6 +1031,7 @@ export async function runStageWorkQueue(stage, state, statePath, work, options =
         id,
         status: outcome.status,
         failure: outcome.failure,
+        ...(outcome.timing ? { timing: outcome.timing } : {}),
         coverage: computeCoverage(state),
       });
       await routeOutcome(item, outcome);
@@ -4473,32 +4474,64 @@ async function runRestMemoryCommitUnit({ state, statePath, baseUrl, secret, unit
 
 async function runRestFullStageUnit({ state, statePath, baseUrl, secret, containerKey, unit, options = {} }) {
   const definition = FULL_WINDOW_STAGE_DEFINITIONS[containerKey];
-  const existing = state[containerKey][unit.unit_id];
-  const recordUnit = (status, resultIds = []) => recordStageResult({
-    state,
-    baseUrl,
-    secret,
-    stage: definition.stage,
-    unitId: unit.unit_id,
-    sourceIds: unit.source_ids || [],
-    resultIds,
-    resultType: definition.resultType,
-    status,
-    options,
+  const totalStartedAt = performance.now();
+  let persistenceMs = 0;
+  let recordMs = 0;
+  const baseWriteState = options.writeState || writeStateAtomically;
+  const writeState = async (...args) => {
+    const startedAt = performance.now();
+    try {
+      return await baseWriteState(...args);
+    } finally {
+      persistenceMs += performance.now() - startedAt;
+    }
+  };
+  const finishOutcome = (outcome, responseData = {}) => ({
+    ...outcome,
+    timing: {
+      model_ms: Number.isFinite(Number(responseData.durationMs ?? responseData.duration_ms))
+        ? Number(responseData.durationMs ?? responseData.duration_ms)
+        : null,
+      persistence_ms: Math.round(persistenceMs * 100) / 100,
+      record_ms: Math.round(recordMs * 100) / 100,
+      total_ms: Math.round((performance.now() - totalStartedAt) * 100) / 100,
+    },
   });
+  const existing = state[containerKey][unit.unit_id];
+  const recordUnit = async (status, resultIds = []) => {
+    const startedAt = performance.now();
+    try {
+      return await recordStageResult({
+        state,
+        baseUrl,
+        secret,
+        stage: definition.stage,
+        unitId: unit.unit_id,
+        sourceIds: unit.source_ids || [],
+        resultIds,
+        resultType: definition.resultType,
+        status,
+        options,
+      });
+    } finally {
+      recordMs += performance.now() - startedAt;
+    }
+  };
   if (terminalStageStatus(existing?.status)) {
     if (existing.record_pending) {
-      return persistTerminalThenRecord({
+      const outcome = await persistTerminalThenRecord({
         state,
         statePath,
         target: existing,
         terminalState: { ...existing },
         record: () => recordUnit(existing.status, existing[definition.resultStateKey] || []),
+        writeState,
       });
+      return finishOutcome(outcome, existing);
     }
-    return stageOutcome(existing.status);
+    return finishOutcome(stageOutcome(existing.status), existing);
   }
-  if (existing?.status === 'split') return stageOutcome('retry_planned');
+  if (existing?.status === 'split') return finishOutcome(stageOutcome('retry_planned'), existing);
   state[containerKey][unit.unit_id] = {
     ...existing,
     ...unit,
@@ -4506,7 +4539,7 @@ async function runRestFullStageUnit({ state, statePath, baseUrl, secret, contain
     started_at: existing?.started_at || new Date().toISOString(),
     attempt_count: (existing?.attempt_count || 0) + 1,
   };
-  await writeStateAtomically(statePath, state);
+  await writeState(statePath, state);
 
   const response = await requestJson(
     baseUrl,
@@ -4541,8 +4574,8 @@ async function runRestFullStageUnit({ state, statePath, baseUrl, secret, contain
         max_prompt_chars: data.maxPromptChars || data.max_prompt_chars || null,
         split_into: splitIds,
       }, data, definition.stage);
-      await writeStateAtomically(statePath, state);
-      return stageOutcome('retry_planned');
+      await writeState(statePath, state);
+      return finishOutcome(stageOutcome('retry_planned'), data);
     }
   }
   const status = fullResponseStatus(response, data);
@@ -4558,18 +4591,20 @@ async function runRestFullStageUnit({ state, statePath, baseUrl, secret, contain
     ...(status === 'failed' ? { error: compactStateError(response.error || data.error, `${definition.stage} failed`) } : {}),
   }, data, definition.stage);
   if (status === 'succeeded' || status === 'skipped') {
-    return persistTerminalThenRecord({
+    const outcome = await persistTerminalThenRecord({
       state,
       statePath,
       target: state[containerKey][unit.unit_id],
       terminalState: { ...state[containerKey][unit.unit_id] },
       record: () => recordUnit(status, resultIds),
+      writeState,
     });
+    return finishOutcome(outcome, data);
   }
   const failure = classifyStageResponse({ ...response, data });
   applyFailureState(state[containerKey][unit.unit_id], failure);
-  await writeStateAtomically(statePath, state);
-  return stageOutcome('failed', { failure });
+  await writeState(statePath, state);
+  return finishOutcome(stageOutcome('failed', { failure }), data);
 }
 
 function completedSummarySessionIds(state) {
@@ -6105,6 +6140,47 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
       }
 
       if (canContinue) {
+        const reflectProviderRoute = {
+          provider: state.runtime?.providerName || state.runtime?.provider_name || 'unknown',
+          model: state.config.stage_models?.reflect_insight || 'service-default',
+          endpointClass: 'reflect-insight',
+        };
+        const reflectBucketKey = new AdaptiveProviderLimiter({ max: 2 }).key(reflectProviderRoute);
+        const reflectProviderLimiter = new AdaptiveProviderLimiter({
+          initial: 2,
+          max: 2,
+          buckets: state.provider_limiter?.[reflectBucketKey]
+            ? { [reflectBucketKey]: state.provider_limiter[reflectBucketKey] }
+            : {},
+        });
+        const persistReflectLimiter = () => {
+          state.provider_limiter = {
+            ...(state.provider_limiter || {}),
+            ...reflectProviderLimiter.toJSON(),
+          };
+        };
+        persistReflectLimiter();
+        const writeReflectScheduler = async () => {
+          await runStateStore.append('scheduler_state', {
+            stage_work_queues: redactJson(state.stage_work_queues),
+            last_failure_cause: state.last_failure_cause || null,
+            provider_limiter: redactJson(state.provider_limiter),
+          }, { durable: true });
+          await runStateStore.writeStatus(state);
+        };
+        const writeReflectUnit = (unit) => async () => {
+          const current = state.reflect_insight_windows[unit.unit_id];
+          state.coverage = computeCoverage(state);
+          state.updated_at = new Date().toISOString();
+          await runStateStore.append('unit_state', {
+            container_key: 'reflect_insight_windows',
+            unit_id: unit.unit_id,
+            unit: redactJson(current),
+          }, {
+            durable: terminalStageStatus(current?.status) || current?.record_pending === true,
+          });
+          await runStateStore.writeStatus(state);
+        };
         const reflectPlan = await runPlanQueue('reflect_insight', 'reflect_insight_windows', (planOptions) =>
           planRestFullStage({
             state,
@@ -6116,7 +6192,24 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
             dryRun: false,
           }));
         if (reflectPlan.ok) await runPipelineQueue('single-step', 'reflect_insight', reflectPlan.units, {
-          concurrency: 1,
+          concurrency: 2,
+          getConcurrency: () => reflectProviderLimiter.state(reflectProviderRoute).concurrency,
+          requiresProviderProbe: () => reflectProviderLimiter.requiresProbe(reflectProviderRoute),
+          getProviderRetryAt: () => reflectProviderLimiter.state(reflectProviderRoute).retryAt,
+          onOutcome: (_unit, outcome, context) => {
+            if (outcome.failure) {
+              reflectProviderLimiter.recordFailure(reflectProviderRoute, outcome.failure, {
+                retryAfterMs: Number(outcome.failure.diagnostics?.retryAfterMs || 0),
+                now: context.settledAt,
+              });
+            } else if (['succeeded', 'skipped'].includes(outcome.status)) {
+              reflectProviderLimiter.recordProviderSuccess(reflectProviderRoute, {
+                probe: context.probe,
+              });
+            }
+            persistReflectLimiter();
+          },
+          writeState: writeReflectScheduler,
           run: (unit, context) => runRestFullStageUnit({
             state,
             statePath,
@@ -6124,7 +6217,11 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
             secret,
             containerKey: 'reflect_insight_windows',
             unit,
-            options: { ...options, signal: context.signal },
+            options: {
+              ...options,
+              signal: context.signal,
+              writeState: writeReflectUnit(unit),
+            },
           }),
           itemId: (unit) => unit.unit_id,
           hasUnresolved: () => hasUnresolvedStageFailures(state, 'reflect_insight_windows'),
@@ -6135,7 +6232,8 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
     state.coverage = computeCoverage(state);
     state.stage_metrics = computeStageMetrics(state);
     state.updated_at = new Date().toISOString();
-    await writeStateAtomically(statePath, state);
+    await runStateStore.checkpoint(state);
+    await runStateStore.writeStatus(state);
     logProgress('coverage', 'final', { coverage: state.coverage });
     logProgress('metrics', 'final', { stage_metrics: state.stage_metrics });
     const finalSummary = redactJson({

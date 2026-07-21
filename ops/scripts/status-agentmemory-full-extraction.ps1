@@ -2,7 +2,9 @@ param(
   [Parameter(Mandatory = $true)]
   [ValidatePattern('^[A-Za-z0-9._-]+$')]
   [string]$RunId,
-  [string]$RuntimeRoot = ''
+  [string]$RuntimeRoot = '',
+  [ValidateRange(1, 86400)]
+  [int]$StatusStaleAfterSeconds = 900
 )
 
 $ErrorActionPreference = 'Stop'
@@ -28,6 +30,28 @@ function Get-AmStatusProperty {
   return $property.Value
 }
 
+function ConvertFrom-AmSnapshotStatus {
+  param(
+    [Parameter(Mandatory = $true)]$Snapshot,
+    $RunnerPid = $null
+  )
+  $snapshotNames = @($Snapshot.PSObject.Properties.Name)
+  $journalSeq = if ($snapshotNames -contains 'orchestration_journal' -and
+      $null -ne $Snapshot.orchestration_journal) {
+    $Snapshot.orchestration_journal.included_seq
+  } else { 0 }
+  return [pscustomobject]@{
+    run_id = $Snapshot.run_id
+    current_stage = if ($snapshotNames -contains 'current_stage') { $Snapshot.current_stage } else { $null }
+    coverage = $Snapshot.coverage
+    scheduler_epoch = if ($snapshotNames -contains 'scheduler_epoch') { $Snapshot.scheduler_epoch } else { $null }
+    next_retry_at = if ($snapshotNames -contains 'next_retry_at') { $Snapshot.next_retry_at } else { $null }
+    runner_pid = $RunnerPid
+    snapshot_at = if ($snapshotNames -contains 'updated_at') { $Snapshot.updated_at } else { $null }
+    journal_seq = $journalSeq
+  }
+}
+
 $runsPath = [System.IO.Path]::GetFullPath((Join-Path $RuntimeRoot 'extraction-runs'))
 $statePath = [System.IO.Path]::GetFullPath((Join-Path $runsPath "$RunId.json"))
 if (-not $statePath.StartsWith("$runsPath\", [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -36,26 +60,25 @@ if (-not $statePath.StartsWith("$runsPath\", [System.StringComparison]::OrdinalI
 $statusPath = $statePath -replace '\.json$', '.status.json'
 $lockPath = "$statePath.lock"
 $source = 'status_manifest'
+$statusManifestStale = $false
+$statusManifestAgeSeconds = $null
 
 if (Test-Path -LiteralPath $statusPath -PathType Leaf) {
+  $statusFile = Get-Item -LiteralPath $statusPath
+  $statusManifestAgeSeconds = [Math]::Max(
+    0,
+    [Math]::Floor(((Get-Date).ToUniversalTime() - $statusFile.LastWriteTimeUtc).TotalSeconds)
+  )
+  $statusManifestStale = $statusManifestAgeSeconds -gt $StatusStaleAfterSeconds
   $status = Get-Content -LiteralPath $statusPath -Raw | ConvertFrom-Json
+  if ($statusManifestStale -and (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+    $snapshot = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
+    $status = ConvertFrom-AmSnapshotStatus -Snapshot $snapshot -RunnerPid $status.runner_pid
+    $source = 'snapshot_fallback_stale_manifest'
+  }
 } elseif (Test-Path -LiteralPath $statePath -PathType Leaf) {
   $snapshot = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json
-  $snapshotNames = @($snapshot.PSObject.Properties.Name)
-  $journalSeq = if ($snapshotNames -contains 'orchestration_journal' -and
-      $null -ne $snapshot.orchestration_journal) {
-    $snapshot.orchestration_journal.included_seq
-  } else { 0 }
-  $status = [pscustomobject]@{
-    run_id = $snapshot.run_id
-    current_stage = if ($snapshotNames -contains 'current_stage') { $snapshot.current_stage } else { $null }
-    coverage = $snapshot.coverage
-    scheduler_epoch = if ($snapshotNames -contains 'scheduler_epoch') { $snapshot.scheduler_epoch } else { $null }
-    next_retry_at = if ($snapshotNames -contains 'next_retry_at') { $snapshot.next_retry_at } else { $null }
-    runner_pid = $null
-    snapshot_at = if ($snapshotNames -contains 'updated_at') { $snapshot.updated_at } else { $null }
-    journal_seq = $journalSeq
-  }
+  $status = ConvertFrom-AmSnapshotStatus -Snapshot $snapshot
   $source = 'snapshot_fallback'
 } else {
   throw "run status and snapshot are missing: $RunId"
@@ -79,6 +102,8 @@ if ($lockPresent) {
 
 Write-Output "run_id=$RunId"
 Write-Output "source=$source"
+Write-Output "status_manifest_stale=$($statusManifestStale.ToString().ToLowerInvariant())"
+Write-Output "status_manifest_age_seconds=$statusManifestAgeSeconds"
 Write-Output "lock_present=$($lockPresent.ToString().ToLowerInvariant())"
 Write-Output "lock_pid_alive=$($lockPidAlive.ToString().ToLowerInvariant())"
 Write-Output "current_stage=$(Get-AmStatusProperty -Object $status -Name 'current_stage')"

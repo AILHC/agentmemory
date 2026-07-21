@@ -48,6 +48,7 @@ export class RunStateStore {
     this.seq = 0;
     this.lastHash = null;
     this.tail = Promise.resolve();
+    this.statusTail = Promise.resolve();
   }
 
   async append(type, payload, { durable = false } = {}) {
@@ -114,7 +115,22 @@ export class RunStateStore {
         malformedFinalLine = { lineNumber, error };
         return false;
       }
-      expectedSeq += 1;
+      if (lineNumber === 1 && event.type === 'journal_base') {
+        const compactedFromSeq = Number(event.payload?.compacted_from_seq);
+        const compactedFromHash = event.payload?.compacted_from_hash || null;
+        if (
+          !Number.isInteger(compactedFromSeq)
+          || compactedFromSeq < 0
+          || event.seq !== compactedFromSeq + 1
+          || event.previous_hash !== compactedFromHash
+        ) {
+          throw new Error(`journal_integrity_failed_at_seq_${event.seq}`);
+        }
+        expectedSeq = event.seq;
+        previous = event.previous_hash;
+      } else {
+        expectedSeq += 1;
+      }
       if (event.seq !== expectedSeq || event.previous_hash !== previous || event.hash !== sha256(eventBody(event))) {
         throw new Error(`journal_integrity_failed_at_seq_${event.seq}`);
       }
@@ -219,20 +235,51 @@ export class RunStateStore {
 
   async checkpoint(state) {
     await this.tail;
-    const includedSeq = this.seq;
-    const includedHash = this.lastHash;
     state.orchestration_journal = {
-      included_seq: includedSeq,
-      included_hash: includedHash,
+      included_seq: 0,
+      included_hash: null,
     };
     await this.writeSnapshot(this.statePath, state);
     const snapshot = await this.fs.readFile(this.statePath);
-    await this.append('checkpoint', {
-      included_seq: includedSeq,
-      included_hash: includedHash,
-      snapshot_sha256: sha256(snapshot),
+    await this.resetJournal({
+      snapshotSha256: sha256(snapshot),
       scheduler_epoch: state.scheduler_epoch,
-    }, { durable: true });
+    });
+  }
+
+  async resetJournal({ snapshotSha256, scheduler_epoch: schedulerEpoch }) {
+    const compactedFromSeq = this.seq;
+    const compactedFromHash = this.lastHash;
+    const event = {
+      seq: compactedFromSeq + 1,
+      previous_hash: compactedFromHash,
+      at: new Date().toISOString(),
+      type: 'journal_base',
+      payload: {
+        compacted_from_seq: compactedFromSeq,
+        compacted_from_hash: compactedFromHash,
+        snapshot_sha256: snapshotSha256,
+        scheduler_epoch: schedulerEpoch,
+      },
+    };
+    event.hash = sha256(eventBody(event));
+    const temp = `${this.journalPath}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    await this.fs.mkdir(path.dirname(this.journalPath), { recursive: true });
+    const handle = await this.fs.open(temp, 'w');
+    try {
+      await handle.writeFile(`${JSON.stringify(event)}\n`, 'utf8');
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    try {
+      await this.fs.rename(temp, this.journalPath);
+    } catch (error) {
+      await this.fs.unlink(temp).catch(() => {});
+      throw error;
+    }
+    this.seq = event.seq;
+    this.lastHash = event.hash;
   }
 
   async writeStatus(state) {
@@ -247,8 +294,13 @@ export class RunStateStore {
       journal_seq: this.seq,
       in_flight_gaps: summarizeInFlightGaps(state),
     };
-    const temp = `${this.statusPath}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-    await this.fs.writeFile(temp, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
-    await this.fs.rename(temp, this.statusPath);
+    const task = async () => {
+      const temp = `${this.statusPath}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+      await this.fs.writeFile(temp, `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+      await this.fs.rename(temp, this.statusPath);
+    };
+    const current = this.statusTail.then(task);
+    this.statusTail = current.catch(() => {});
+    return current;
   }
 }

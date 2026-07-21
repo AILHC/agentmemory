@@ -4358,7 +4358,7 @@ test('Release B runs semantic windows independently and commits skills in plan o
   assert.equal(skillPreparePeak, 2);
   assert.notDeepEqual(skillPrepareCompleted, ['s1', 's2', 's3']);
   assert.deepEqual(skillCommitStarted, ['skill-0001', 'skill-0002', 'skill-0003']);
-  assert.deepEqual(singleStepPeak, { crystal: 1, procedural: 1, reflect: 1 });
+  assert.deepEqual(singleStepPeak, { crystal: 1, procedural: 1, reflect: 2 });
 });
 
 test('Release B drain commits already prepared skills and launches no later prepare', async () => {
@@ -4682,7 +4682,11 @@ test('dry-run plans semantic windows by summary char budget', async () => {
 
 test('mock REST successful run writes generic records for all full stages', async () => {
   let memoryPrepareCalls = 0;
-  await withMockAgentMemory((method, url, body) => {
+  let stateDir;
+  let reflectProgressObserved;
+  let reflectMainStateBeforeFirst;
+  let reflectMainStateUnchanged;
+  await withMockAgentMemory(async (method, url, body) => {
     if (method === 'GET' && url === '/agentmemory/runtime-config') {
       return { success: true, runtime: { summarizeChunkConcurrency: 1, summarizeChunkSize: 400, providerName: 'test' } };
     }
@@ -4826,13 +4830,35 @@ test('mock REST successful run writes generic records for all full stages', asyn
       };
     }
     if (method === 'POST' && url === '/agentmemory/full/reflect-insight-windows/plan') {
-      return { success: true, windows: [{ windowId: 'riw1', sourceIds: ['proc1'], inputHash: 'riw-hash' }] };
+      return {
+        success: true,
+        windows: [
+          { windowId: 'riw1', sourceIds: ['proc1'], inputHash: 'riw-hash-1' },
+          { windowId: 'riw2', sourceIds: ['proc1'], inputHash: 'riw-hash-2' },
+          { windowId: 'riw3', sourceIds: ['proc1'], inputHash: 'riw-hash-3' },
+        ],
+      };
     }
     if (method === 'POST' && url === '/agentmemory/full/reflect-insight-window') {
       assert.equal(body.useGraph, false);
+      const mainStateText = await fs.readFile(path.join(stateDir, 'full-test.json'), 'utf8');
+      if (body.windowId === 'riw1') reflectMainStateBeforeFirst = mainStateText;
+      if (body.windowId === 'riw3') {
+        reflectMainStateUnchanged = mainStateText === reflectMainStateBeforeFirst;
+        const statusText = await fs.readFile(path.join(stateDir, 'full-test.status.json'), 'utf8').catch(() => null);
+        const journalText = await fs.readFile(path.join(stateDir, 'full-test.journal.jsonl'), 'utf8').catch(() => '');
+        reflectProgressObserved = {
+          statusSucceeded: statusText
+            ? JSON.parse(statusText).coverage.reflect_insight_windows.succeeded
+            : null,
+          journalHasFirstTerminal: journalText.includes('"container_key":"reflect_insight_windows"')
+            && journalText.includes('"unit_id":"riw1"')
+            && journalText.includes('"status":"succeeded"'),
+        };
+      }
       return {
         success: true,
-        insightIds: ['insight1'],
+        insightIds: [`insight-${body.windowId}`],
         stage: 'reflect_insight',
         model: 'reflect-env-model',
         modelSource: 'AGENTMEMORY_REFLECT_INSIGHT_MODEL',
@@ -4851,7 +4877,7 @@ test('mock REST successful run writes generic records for all full stages', asyn
     if (fullResponse) return fullResponse;
     return { success: false, error: `unexpected ${method} ${url}` };
   }, async (baseUrl, requests) => {
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-full-run-'));
+    stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-full-run-'));
     const captured = await withSecret('test-secret', async () => captureConsole(() => mainForTest([
         '--base-url',
         baseUrl,
@@ -4874,6 +4900,24 @@ test('mock REST successful run writes generic records for all full stages', asyn
     assert.ok(captured.logs.some((line) => line.startsWith('[progress] consolidation_procedural item')));
     assert.ok(captured.logs.some((line) => line.startsWith('[progress] reflect_insight item')));
     assert.ok(captured.logs.some((line) => line.startsWith('[progress] coverage final')));
+    assert.equal(reflectMainStateUnchanged, true);
+    assert.deepEqual(reflectProgressObserved, {
+      statusSucceeded: 2,
+      journalHasFirstTerminal: true,
+    });
+    const reflectProgress = captured.logs
+      .filter((line) => line.startsWith('[progress] reflect_insight item'))
+      .map((line) => JSON.parse(line.slice(line.indexOf('{'))));
+    assert.equal(reflectProgress.length, 3);
+    assert.equal(reflectProgress[0].timing.model_ms, 88);
+    for (const timing of reflectProgress.map((entry) => entry.timing)) {
+      assert.equal(Number.isFinite(timing.persistence_ms), true);
+      assert.equal(Number.isFinite(timing.record_ms), true);
+      assert.equal(Number.isFinite(timing.total_ms), true);
+      assert.equal(timing.persistence_ms >= 0, true);
+      assert.equal(timing.record_ms >= 0, true);
+      assert.equal(timing.total_ms >= timing.persistence_ms + timing.record_ms, true);
+    }
     const recordRequests = requests.filter((request) => request.method === 'POST' && request.url === '/agentmemory/extraction-runs/record');
     assert.ok(recordRequests.some((request) => request.body.summarySessionId === 's1'));
     assert.ok(recordRequests.some((request) => request.body.lessonRunId === 'lex1'));
@@ -4882,9 +4926,23 @@ test('mock REST successful run writes generic records for all full stages', asyn
     assert.ok(recordRequests.some((request) => request.body.stage === 'skill_extract' && request.body.resultIds.includes('skill1')));
     assert.ok(recordRequests.some((request) => request.body.stage === 'crystal' && request.body.resultIds.includes('crystal1')));
     assert.ok(recordRequests.some((request) => request.body.stage === 'consolidation_procedural' && request.body.resultIds.includes('proc1')));
-    assert.ok(recordRequests.some((request) => request.body.stage === 'reflect_insight' && request.body.resultIds.includes('insight1')));
+    assert.ok(recordRequests.some((request) => request.body.stage === 'reflect_insight' && request.body.resultIds.includes('insight-riw1')));
+    assert.deepEqual(
+      recordRequests
+        .filter((request) => request.body.stage === 'reflect_insight')
+        .map((request) => request.body.unitId)
+        .sort(),
+      ['riw1', 'riw2', 'riw3'],
+    );
     const state = JSON.parse(await fs.readFile(path.join(stateDir, 'full-test.json'), 'utf8'));
+    const finalStatus = JSON.parse(await fs.readFile(path.join(stateDir, 'full-test.status.json'), 'utf8'));
+    const finalJournalEvents = (await fs.readFile(path.join(stateDir, 'full-test.journal.jsonl'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
     assert.equal(state.coverage.acceptance_ready, true);
+    assert.equal(finalStatus.coverage.acceptance_ready, true);
+    assert.deepEqual(finalJournalEvents.map((event) => event.type), ['journal_base']);
     assert.deepEqual(state.memory_consolidate_windows.mcw1.memory_ids, ['mem1']);
     assert.equal(state.memory_consolidate_windows.mcw1.model, 'memory-env-model');
     assert.equal(state.memory_consolidate_windows.mcw1.model_source, 'AGENTMEMORY_MEMORY_CONSOLIDATE_MODEL');
@@ -4912,11 +4970,17 @@ test('mock REST successful run writes generic records for all full stages', asyn
     assert.equal(state.consolidation_procedural_windows.cpw1.model, 'memory-env-model');
     assert.equal(state.consolidation_procedural_windows.cpw1.model_source, 'AGENTMEMORY_MEMORY_CONSOLIDATE_MODEL');
     assert.equal(state.consolidation_procedural_windows.cpw1.prompt_chars, 888);
-    assert.deepEqual(state.reflect_insight_windows.riw1.insight_ids, ['insight1']);
+    assert.deepEqual(state.reflect_insight_windows.riw1.insight_ids, ['insight-riw1']);
     assert.equal(state.reflect_insight_windows.riw1.model, 'reflect-env-model');
     assert.equal(state.reflect_insight_windows.riw1.model_source, 'AGENTMEMORY_REFLECT_INSIGHT_MODEL');
     assert.equal(state.reflect_insight_windows.riw1.prompt_chars, 999);
     assert.equal(state.reflect_insight_windows.riw1.char_budget, 18000);
+    const limiterKeys = Object.keys(state.provider_limiter);
+    assert.equal(limiterKeys.some((key) => key.endsWith('\u0000memory-consolidate-prepare')), true);
+    assert.equal(limiterKeys.some((key) => key.endsWith('\u0000skill-extract-prepare')), true);
+    const reflectLimiterKey = limiterKeys.find((key) => key.endsWith('\u0000reflect-insight'));
+    assert.equal(typeof reflectLimiterKey, 'string');
+    assert.equal(state.provider_limiter[reflectLimiterKey].concurrency, 2);
     const proceduralRequest = requests.find((request) =>
       request.method === 'POST' &&
       request.url === '/agentmemory/full/consolidation-procedural-window'

@@ -279,6 +279,62 @@ test('只读状态入口优先读取 manifest 并校验 lock PID', async (contex
   assert.match(result.stdout, /in_flight_gaps=0/);
 });
 
+test('只读状态入口在 manifest 陈旧时降级读取主快照', async (context) => {
+  const runtime = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-status-stale-'));
+  context.after(() => fs.rm(runtime, { recursive: true, force: true }));
+  const runs = path.join(runtime, 'extraction-runs');
+  await fs.mkdir(runs);
+  const statusPath = path.join(runs, 'formal.status.json');
+  await fs.writeFile(statusPath, `${JSON.stringify({
+    run_id: 'formal',
+    current_stage: 'reflect_insight',
+    coverage: {
+      acceptance_ready: false,
+      reflect_insight_windows: { succeeded: 1, skipped: 0, failed: 0, pending: 2, running: 0 },
+    },
+    scheduler_epoch: 3,
+    runner_pid: process.pid,
+    snapshot_at: '2026-07-21T00:00:00.000Z',
+    journal_seq: 7,
+  })}\n`);
+  const staleAt = new Date(Date.now() - 60_000);
+  await fs.utimes(statusPath, staleAt, staleAt);
+  await fs.writeFile(path.join(runs, 'formal.json'), `${JSON.stringify({
+    run_id: 'formal',
+    current_stage: 'reflect_insight',
+    coverage: {
+      acceptance_ready: false,
+      reflect_insight_windows: { succeeded: 2, skipped: 0, failed: 0, pending: 1, running: 0 },
+    },
+    scheduler_epoch: 3,
+    updated_at: new Date().toISOString(),
+    orchestration_journal: { included_seq: 8, included_hash: 'hash-8' },
+  })}\n`);
+  await fs.writeFile(path.join(runs, 'formal.json.lock'), `${JSON.stringify({
+    run_id: 'formal',
+    pid: process.pid,
+    owner_id: 'owner',
+    created_at: new Date().toISOString(),
+  })}\n`);
+
+  const result = spawnSync('powershell.exe', [
+    '-NoProfile',
+    '-File',
+    statusScript,
+    '-RunId',
+    'formal',
+    '-RuntimeRoot',
+    runtime,
+    '-StatusStaleAfterSeconds',
+    '30',
+  ], { encoding: 'utf8', windowsHide: true });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /source=snapshot_fallback_stale_manifest/);
+  assert.match(result.stdout, /status_manifest_stale=true/);
+  assert.match(result.stdout, /stage\.reflect_insight_windows=succeeded:2,skipped:0,failed:0,pending:1,running:0/);
+});
+
 test('受管 drain 超时只报告未排空且不删除活动 lock', async (context) => {
   const runtime = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-drain-entry-'));
   context.after(() => fs.rm(runtime, { recursive: true, force: true }));
