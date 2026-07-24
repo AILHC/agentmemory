@@ -12,8 +12,13 @@ import {
   listRunnableRuns,
   processLlmLessonExtractionRun,
   resolveLlmLessonExtractionRuntimeConfig,
+  stableHash as stableLessonOperationHash,
 } from "./lesson-extraction-runs.js";
 import { recordAudit } from "./audit.js";
+import {
+  completeModelOperationFromVerifiedResult,
+  withExtractionOperationReceipt,
+} from "./extraction-operation-receipts.js";
 
 function reinforceLesson(lesson: Lesson): void {
   const now = new Date().toISOString();
@@ -162,6 +167,9 @@ export function registerLessonsFunctions(
       chunkConcurrency?: unknown;
       timeoutMs?: unknown;
       model?: unknown;
+      attemptId?: unknown;
+      inputHash?: unknown;
+      requireExistingReceipt?: unknown;
     }) => {
       if (!provider) {
         return { success: false, error: "provider is required for lesson extraction" };
@@ -170,6 +178,39 @@ export function registerLessonsFunctions(
       const sessionIds = parseStringArray(data.sessionIds);
       if (!sessionIds || sessionIds.length === 0) {
         return { success: false, error: "sessionIds is required and must be a non-empty string array" };
+      }
+      const attemptId = typeof data.attemptId === "string" ? data.attemptId.trim() : "";
+      const runnerInputHash = typeof data.inputHash === "string" ? data.inputHash.trim() : "";
+      if (Boolean(attemptId) !== Boolean(runnerInputHash)) {
+        return {
+          success: false,
+          status: "failed",
+          failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+        };
+      }
+      if (
+        data.requireExistingReceipt !== undefined
+        && typeof data.requireExistingReceipt !== "boolean"
+      ) {
+        return {
+          success: false,
+          status: "failed",
+          failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+        };
+      }
+      if (data.requireExistingReceipt === true && !attemptId) {
+        return {
+          success: false,
+          status: "failed",
+          failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+        };
+      }
+      if (attemptId && sessionIds.length !== 1) {
+        return {
+          success: false,
+          status: "failed",
+          failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+        };
       }
 
       const missingOnly = parseBoolean(data.missingOnly);
@@ -197,15 +238,75 @@ export function registerLessonsFunctions(
           config,
         });
 
-        if (
-          baseRun.status === "pending" ||
-          baseRun.status === "retryable" ||
-          isExpiredRunningRun(baseRun, now)
-        ) {
-          runs.push(await processLlmLessonExtractionRun({ kv, provider, runId: baseRun.id }));
-        } else {
-          runs.push(baseRun);
+        if (!attemptId) {
+          if (
+            baseRun.status === "pending" ||
+            baseRun.status === "retryable" ||
+            isExpiredRunningRun(baseRun, now)
+          ) {
+            runs.push(await processLlmLessonExtractionRun({ kv, provider, runId: baseRun.id }));
+          } else {
+            runs.push(baseRun);
+          }
+          continue;
         }
+
+        const receiptIdentity = {
+          runId: attemptId,
+          stage: "lessons" as const,
+          unitId: sessionId,
+          inputHash: stableLessonOperationHash({
+            runnerInputHash,
+            serviceInputHash: baseRun.inputHash,
+            configHash: baseRun.configHash,
+          }),
+        };
+        const execute = async () => {
+          if (baseRun.status === "running" && !isExpiredRunningRun(baseRun, now)) {
+            throw new Error("lesson extraction is already running");
+          }
+          const run = (
+            baseRun.status === "pending" ||
+            baseRun.status === "retryable" ||
+            isExpiredRunningRun(baseRun, now)
+          )
+            ? await processLlmLessonExtractionRun({ kv, provider, runId: baseRun.id })
+            : baseRun;
+          if (run.status === "retryable" || run.status === "failed") {
+            return {
+              success: false,
+              status: "failed",
+              failure: {
+                class: "transient_provider" as const,
+                cause: "lesson_extraction_failed",
+              },
+              runs: [run],
+            };
+          }
+          return { success: true, status: run.status, runs: [run] };
+        };
+
+        let operation = await withExtractionOperationReceipt(
+          kv,
+          receiptIdentity,
+          execute,
+          { requireExisting: data.requireExistingReceipt === true },
+        );
+        if (
+          operation.failure?.cause === "extraction_operation_reconciliation_required"
+          && (baseRun.status === "succeeded" || baseRun.status === "skipped")
+        ) {
+          operation = await completeModelOperationFromVerifiedResult(
+            kv,
+            receiptIdentity,
+            { success: true, status: baseRun.status, runs: [baseRun] },
+          );
+        }
+        if (operation.failure) {
+          return { success: false, status: "failed", failure: operation.failure };
+        }
+        const response = operation.response as { runs?: LessonExtractionRun[] } | undefined;
+        runs.push(...(response?.runs ?? []));
       }
 
       return { success: true, runs };

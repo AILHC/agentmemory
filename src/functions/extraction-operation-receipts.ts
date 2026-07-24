@@ -13,7 +13,11 @@ export interface ExtractionOperationResult<T> {
   replayed: boolean;
   response?: T;
   failure?: StageFailure;
-  receipt: ExtractionOperationReceipt<T>;
+  receipt?: ExtractionOperationReceipt<T>;
+}
+
+export interface ExtractionOperationReceiptOptions {
+  requireExisting?: boolean;
 }
 
 const COMMON_RECEIPT_RESPONSE_KEYS = new Set([
@@ -24,9 +28,14 @@ const COMMON_RECEIPT_RESPONSE_KEYS = new Set([
   "duration_ms", "parseFailures", "parse_failures", "inputHash", "input_hash",
   "runId", "run_id", "windowId", "window_id", "mark", "kind", "reused", "skipped",
   "dryRun", "dry_run",
+  "attemptId", "attempt_id", "resumableRunId", "resumable_run_id",
+  "completedChunks", "completed_chunks", "totalChunks", "total_chunks",
+  "skippedChunks", "skipped_chunks", "advanced", "resultRef",
 ]);
 
 const STAGE_RECEIPT_RESPONSE_KEYS: Record<ExtractionOperationIdentity["stage"], Set<string>> = {
+  summary: new Set(),
+  lessons: new Set(["runs"]),
   semantic_rollup: new Set([
     "semanticMemoryIds", "semantic_memory_ids",
     "semanticMemoryCharSizes", "semantic_memory_char_sizes",
@@ -34,9 +43,11 @@ const STAGE_RECEIPT_RESPONSE_KEYS: Record<ExtractionOperationIdentity["stage"], 
   skill_extract: new Set([
     "skillIds", "skill_ids", "proceduralMemoryIds", "procedural_memory_ids",
     "memoryIds", "memory_ids", "extracted", "reinforced",
+    "preparedHandle", "prepared_handle", "proposalHash", "proposal_hash",
   ]),
   memory_consolidate: new Set([
     "memoryIds", "memory_ids", "consolidated", "totalObservations", "total_observations",
+    "preparedHandle", "prepared_handle", "proposalHash", "proposal_hash",
   ]),
   consolidation_procedural: new Set([
     "proceduralMemoryIds", "procedural_memory_ids", "memoryIds", "memory_ids",
@@ -51,6 +62,21 @@ const STAGE_RECEIPT_RESPONSE_KEYS: Record<ExtractionOperationIdentity["stage"], 
     "crystalIds", "crystal_ids", "groupCount", "group_count", "groups", "items",
   ]),
 };
+
+function safeLessonRun(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const projected: Record<string, unknown> = {};
+  for (const key of ["id", "sessionId", "status", "inputHash", "configHash", "attempts", "createdAt", "updatedAt", "finishedAt", "runningLeaseUntil"]) {
+    const safe = safePrimitive(record[key]);
+    if (safe !== undefined) projected[key] = safe;
+  }
+  for (const key of ["createdLessonIds", "replacedLessonIds"]) {
+    const safe = safeStringArray(record[key]);
+    if (safe !== undefined) projected[key] = safe;
+  }
+  return Object.keys(projected).length > 0 ? projected : undefined;
+}
 
 const UNIT_RECEIPT_KEYS = new Set([
   "unitId", "unit_id", "groupId", "group_id", "windowId", "window_id", "status", "stage",
@@ -81,6 +107,19 @@ function safeCharSizes(value: unknown): Record<string, number> | undefined {
   ) as Record<string, number>;
 }
 
+function safeResultRef(value: unknown): Record<string, string | number> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const scope = typeof record.scope === "string" ? record.scope.trim() : "";
+  const key = typeof record.key === "string" ? record.key.trim() : "";
+  if (!scope || !key) return undefined;
+  const projected: Record<string, string | number> = { scope, key };
+  if (typeof record.chunkIndex === "number" && Number.isSafeInteger(record.chunkIndex) && record.chunkIndex >= 0) {
+    projected.chunkIndex = record.chunkIndex;
+  }
+  return projected;
+}
+
 function safeUnitResponse(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const projected: Record<string, unknown> = {};
@@ -101,7 +140,13 @@ function safeResponse<T>(stage: ExtractionOperationIdentity["stage"], response: 
   for (const [key, raw] of Object.entries(response as Record<string, unknown>)) {
     if (!COMMON_RECEIPT_RESPONSE_KEYS.has(key) && !allowed.has(key)) continue;
     let safe: unknown;
-    if (key === "semanticMemoryCharSizes" || key === "semantic_memory_char_sizes") {
+    if (key === "resultRef") {
+      safe = safeResultRef(raw);
+    } else if (key === "runs" && stage === "lessons") {
+      safe = Array.isArray(raw)
+        ? raw.map((item) => safeLessonRun(item)).filter((item) => item !== undefined)
+        : undefined;
+    } else if (key === "semanticMemoryCharSizes" || key === "semantic_memory_char_sizes") {
       safe = safeCharSizes(raw);
     } else if (key === "groups" || key === "items") {
       safe = Array.isArray(raw)
@@ -198,11 +243,12 @@ export async function withExtractionOperationReceipt<T>(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
   execute: () => Promise<T>,
+  options: ExtractionOperationReceiptOptions = {},
 ): Promise<ExtractionOperationResult<T>> {
   const key = buildExtractionOperationKey(identity);
   return withKeyedLock(`extraction-operation:${key}`, async () => {
     const existing = await kv.get<ExtractionOperationReceipt<T>>(
-      KV.extractionOperationReceipts,
+      KV.extractionOperationReceipt(key),
       key,
     );
     if (existing && existing.inputHash !== identity.inputHash) {
@@ -215,12 +261,26 @@ export async function withExtractionOperationReceipt<T>(
     if (existing?.status === "succeeded" && existing.response !== undefined) {
       return { replayed: true, response: existing.response, receipt: existing };
     }
+    if (existing?.status === "failed") {
+      const failure = existing.failure ?? {
+        class: "unit" as const,
+        cause: "extraction_operation_failed",
+      };
+      return { replayed: true, failure, receipt: existing };
+    }
     if (existing?.status === "running") {
       const failure: StageFailure = {
         class: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
       };
       return { replayed: true, failure, receipt: existing };
+    }
+    if (options.requireExisting) {
+      const failure: StageFailure = {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      };
+      return { replayed: true, failure };
     }
 
     const startedAt = new Date().toISOString();
@@ -230,26 +290,140 @@ export async function withExtractionOperationReceipt<T>(
       status: "running",
       startedAt,
     };
-    await kv.set(KV.extractionOperationReceipts, key, running);
+    await kv.set(KV.extractionOperationReceipt(key), key, running);
     let rawResponse: T;
     try {
       rawResponse = await execute();
-    } catch (error) {
-      const failure = causeFromError(error);
-      const failed = failedReceipt<T>(identity, key, startedAt, failure);
-      await kv.set(KV.extractionOperationReceipts, key, failed);
-      return { replayed: false, failure, receipt: failed };
+    } catch {
+      const failure: StageFailure = {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      };
+      return { replayed: false, failure, receipt: running };
     }
     const responseFailure = failureFromResponse(rawResponse);
     if (responseFailure) {
       const failed = failedReceipt<T>(identity, key, startedAt, responseFailure);
-      await kv.set(KV.extractionOperationReceipts, key, failed);
+      await kv.set(KV.extractionOperationReceipt(key), key, failed);
       return { replayed: false, failure: responseFailure, receipt: failed };
     }
     const response = safeResponse(identity.stage, rawResponse);
     const succeeded = completedReceipt(identity, key, startedAt, response);
-    await kv.set(KV.extractionOperationReceipts, key, succeeded);
+    await kv.set(KV.extractionOperationReceipt(key), key, succeeded);
     return { replayed: false, response, receipt: succeeded };
+  });
+}
+
+export async function completeModelOperationFromVerifiedResult<T>(
+  kv: StateKV,
+  identity: ExtractionOperationIdentity,
+  verifiedResponse: T,
+): Promise<ExtractionOperationResult<T>> {
+  const key = buildExtractionOperationKey(identity);
+  return withKeyedLock(`extraction-operation:${key}`, async () => {
+    const existing = await kv.get<ExtractionOperationReceipt<T>>(
+      KV.extractionOperationReceipt(key),
+      key,
+    );
+    if (!existing || existing.inputHash !== identity.inputHash) {
+      const failure: StageFailure = {
+        class: "hard",
+        cause: existing
+          ? "extraction_operation_input_hash_conflict"
+          : "extraction_operation_receipt_not_running",
+      };
+      return {
+        replayed: true,
+        failure,
+        receipt: existing ?? {
+          ...identity,
+          key,
+          status: "failed",
+          startedAt: new Date().toISOString(),
+          completedAt: new Date().toISOString(),
+          failure,
+        },
+      };
+    }
+    if (existing.status === "succeeded" && existing.response !== undefined) {
+      return { replayed: true, response: existing.response, receipt: existing };
+    }
+    if (existing.status === "failed") {
+      return {
+        replayed: true,
+        failure: existing.failure ?? { class: "unit", cause: "extraction_operation_failed" },
+        receipt: existing,
+      };
+    }
+    const response = safeResponse(identity.stage, verifiedResponse);
+    const succeeded = completedReceipt(identity, key, existing.startedAt, response);
+    await kv.set(KV.extractionOperationReceipt(key), key, succeeded);
+    return { replayed: true, response, receipt: succeeded };
+  });
+}
+
+export async function withIdempotentCommitReceipt<T>(
+  kv: StateKV,
+  identity: ExtractionOperationIdentity,
+  executeCommit: () => Promise<T>,
+): Promise<ExtractionOperationResult<T>> {
+  const key = buildExtractionOperationKey(identity);
+  return withKeyedLock(`extraction-operation:${key}`, async () => {
+    const existing = await kv.get<ExtractionOperationReceipt<T>>(
+      KV.extractionOperationReceipt(key),
+      key,
+    );
+    if (existing && existing.inputHash !== identity.inputHash) {
+      const failure: StageFailure = {
+        class: "hard",
+        cause: "extraction_operation_input_hash_conflict",
+      };
+      return { replayed: true, failure, receipt: existing };
+    }
+    if (existing?.status === "succeeded" && existing.response !== undefined) {
+      return { replayed: true, response: existing.response, receipt: existing };
+    }
+    if (existing?.status === "failed") {
+      return {
+        replayed: true,
+        failure: existing.failure ?? { class: "unit", cause: "extraction_operation_failed" },
+        receipt: existing,
+      };
+    }
+
+    const startedAt = existing?.startedAt ?? new Date().toISOString();
+    if (!existing) {
+      await kv.set<ExtractionOperationReceipt<T>>(KV.extractionOperationReceipt(key), key, {
+        ...identity,
+        key,
+        status: "running",
+        startedAt,
+      });
+    }
+
+    let rawResponse: T;
+    try {
+      rawResponse = await executeCommit();
+    } catch (error) {
+      const failure = causeFromError(error);
+      const running: ExtractionOperationReceipt<T> = {
+        ...identity,
+        key,
+        status: "running",
+        startedAt,
+      };
+      return { replayed: Boolean(existing), failure, receipt: running };
+    }
+    const responseFailure = failureFromResponse(rawResponse);
+    if (responseFailure) {
+      const failed = failedReceipt<T>(identity, key, startedAt, responseFailure);
+      await kv.set(KV.extractionOperationReceipt(key), key, failed);
+      return { replayed: Boolean(existing), failure: responseFailure, receipt: failed };
+    }
+    const response = safeResponse(identity.stage, rawResponse);
+    const succeeded = completedReceipt(identity, key, startedAt, response);
+    await kv.set(KV.extractionOperationReceipt(key), key, succeeded);
+    return { replayed: Boolean(existing), response, receipt: succeeded };
   });
 }
 
@@ -272,7 +446,7 @@ export function registerExtractionOperationReceiptFunctions(
       }
       const key = buildExtractionOperationKey(identity);
       const receipt = await kv.get<ExtractionOperationReceipt>(
-        KV.extractionOperationReceipts,
+        KV.extractionOperationReceipt(key),
         key,
       );
       if (receipt && receipt.inputHash !== identity.inputHash) {
@@ -290,6 +464,8 @@ export function registerExtractionOperationReceiptFunctions(
 }
 
 const EXTRACTION_OPERATION_STAGES = new Set<ExtractionOperationIdentity["stage"]>([
+  "summary",
+  "lessons",
   "memory_consolidate",
   "semantic_rollup",
   "skill_extract",

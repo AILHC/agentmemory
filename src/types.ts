@@ -144,6 +144,12 @@ export interface ResumableSummaryRun {
   completedChunks: number;
   skippedChunks: number;
   status: ResumableSummaryRunStatus;
+  /** v2 摘要生成所用 provider、有效模型和提示词契约的稳定哈希。 */
+  generationConfigHash?: string;
+  /** 绑定到内容寻址 resumable（可恢复）运行的 v2 Runner（运行器）尝试。 */
+  attemptId?: string;
+  /** 与 v2 尝试配对的 Runner（运行器）新鲜度边界。 */
+  attemptInputHash?: string;
   summary?: SessionSummary;
   lastError?: string;
   createdAt: string;
@@ -181,6 +187,8 @@ export interface StageFailure {
 }
 
 export type ExtractionOperationStage =
+  | "summary"
+  | "lessons"
   | "memory_consolidate"
   | "semantic_rollup"
   | "skill_extract"

@@ -22,6 +22,7 @@ import type { CompressedObservation, MemoryProvider, Session } from "../src/type
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
+    store,
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
     },
@@ -87,7 +88,7 @@ describe("consolidate full window helpers", () => {
     ]));
     const proposalHash = "proposal-hash";
     const handle = "mcph-handle";
-    await kv.set(KV.memoryConsolidationProposals, key, {
+    await kv.set(KV.memoryConsolidationProposal(key), key, {
       ...identity,
       key,
       handle,
@@ -125,6 +126,238 @@ describe("consolidate full window helpers", () => {
     expect(first).toMatchObject({ success: true, status: "succeeded" });
     expect(await kv.list(KV.memories)).toHaveLength(1);
     expect(await kv.list(KV.audit)).toHaveLength(1);
+    expect(kv.store.get(KV.memoryConsolidationProposal(key))?.size).toBe(1);
+    expect(kv.store.has(KV.memoryConsolidationProposals)).toBe(false);
+
+    const hashConflict = await commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: handle,
+      proposalHash: "wrong-proposal-hash",
+    });
+    expect(hashConflict).toMatchObject({
+      success: false,
+      failure: { class: "hard", cause: "proposal_identity_conflict" },
+    });
+
+    const handleConflict = await commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: "wrong-handle",
+      proposalHash,
+    });
+    expect(handleConflict).toMatchObject({
+      success: false,
+      failure: { class: "hard", cause: "proposal_identity_conflict" },
+    });
+  });
+
+  it.each([
+    "intent",
+    "parent",
+    "memory",
+    "audit",
+    "proposal",
+  ] as const)("re-enters after the %s commit write without duplicating effects", async (faultPoint) => {
+    const kv = mockKV();
+    const identity = {
+      runId: `formal-run-${faultPoint}`,
+      stage: "memory_consolidate" as const,
+      unitId: "mcw-1",
+      inputHash: "input-1",
+    };
+    const key = fingerprintId("mcp", JSON.stringify([
+      identity.runId,
+      identity.stage,
+      identity.unitId,
+    ]));
+    const parentId = "mem-parent";
+    await kv.set(KV.memories, parentId, {
+      id: parentId,
+      type: "workflow",
+      title: "Stable workflow",
+      content: "Old content.",
+      concepts: ["windows"],
+      files: [],
+      sessionIds: ["ses-old"],
+      strength: 6,
+      version: 1,
+      isLatest: true,
+      sourceObservationIds: ["obs-old"],
+      createdAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    });
+    await kv.set(KV.memoryConsolidationProposal(key), key, {
+      ...identity,
+      key,
+      handle: "mcph-handle",
+      proposalHash: "proposal-hash",
+      status: "prepared",
+      preparedAt: "2026-07-18T00:00:00.000Z",
+      concept: "windows",
+      sourceObservationIds: ["obs-1"],
+      parsed: {
+        type: "workflow",
+        title: "Stable workflow",
+        content: "New content.",
+        concepts: ["windows"],
+        files: [],
+        sessionIds: ["ses-1"],
+        strength: 8,
+        version: 1,
+        isLatest: true,
+      },
+      totalObservations: 1,
+      promptChars: 120,
+    });
+
+    const originalSet = kv.set.bind(kv);
+    let injected = false;
+    kv.set = async <T>(scope: string, itemKey: string, data: T): Promise<T> => {
+      const stored = await originalSet(scope, itemKey, data);
+      const record = data as { status?: unknown; id?: unknown; isLatest?: unknown };
+      const matches = (
+        (faultPoint === "intent"
+          && scope === KV.memoryConsolidationProposal(key)
+          && record.status === "committing")
+        || (faultPoint === "parent"
+          && scope === KV.memories
+          && itemKey === parentId
+          && record.isLatest === false)
+        || (faultPoint === "memory"
+          && scope === KV.memories
+          && itemKey !== parentId)
+        || (faultPoint === "audit" && scope === KV.audit)
+        || (faultPoint === "proposal"
+          && scope === KV.memoryConsolidationProposal(key)
+          && record.status === "committed")
+      );
+      if (!injected && matches) {
+        injected = true;
+        throw new Error(`interrupted after ${faultPoint}`);
+      }
+      return stored;
+    };
+
+    const commit = () => commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: "mcph-handle",
+      proposalHash: "proposal-hash",
+    });
+    await expect(commit()).rejects.toThrow(`interrupted after ${faultPoint}`);
+    await expect(commit()).resolves.toMatchObject({
+      success: true,
+      status: "succeeded",
+      memoryIds: [expect.any(String)],
+    });
+
+    const memories = await kv.list<any>(KV.memories);
+    const audits = await kv.list<any>(KV.audit);
+    expect(memories.filter((memory) => memory.id !== parentId)).toHaveLength(1);
+    expect(memories.find((memory) => memory.id === parentId)?.isLatest).toBe(false);
+    expect(audits).toHaveLength(1);
+  });
+
+  it("reconstructs the same result after proposal state rolls back behind persisted effects", async () => {
+    const kv = mockKV();
+    const identity = {
+      runId: "formal-run-proposal-rollback",
+      stage: "memory_consolidate" as const,
+      unitId: "mcw-1",
+      inputHash: "input-1",
+    };
+    const key = fingerprintId("mcp", JSON.stringify([
+      identity.runId,
+      identity.stage,
+      identity.unitId,
+    ]));
+    const proposalHash = "proposal-hash";
+    const handle = "mcph-handle";
+    const parentId = "mem-parent";
+    const preparedProposal = {
+      ...identity,
+      key,
+      handle,
+      proposalHash,
+      status: "prepared" as const,
+      preparedAt: "2026-07-18T00:00:00.000Z",
+      concept: "windows",
+      sourceObservationIds: ["obs-1"],
+      parsed: {
+        type: "workflow" as const,
+        title: "Stable workflow",
+        content: "New content.",
+        concepts: ["windows"],
+        files: [],
+        sessionIds: ["ses-1"],
+        strength: 8,
+        version: 1,
+        isLatest: true,
+      },
+      totalObservations: 1,
+      promptChars: 120,
+    };
+    await kv.set(KV.memories, parentId, {
+      id: parentId,
+      type: "workflow",
+      title: "Stable workflow",
+      content: "Old content.",
+      concepts: ["windows"],
+      files: [],
+      sessionIds: ["ses-old"],
+      strength: 6,
+      version: 1,
+      isLatest: true,
+      sourceObservationIds: ["obs-old"],
+      createdAt: "2026-07-18T00:00:00.000Z",
+      updatedAt: "2026-07-18T00:00:00.000Z",
+    });
+    await kv.set(
+      KV.memoryConsolidationProposal(key),
+      key,
+      structuredClone(preparedProposal),
+    );
+
+    const first = await commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: handle,
+      proposalHash,
+    });
+    const resultId = (first.memoryIds as string[])[0];
+    const persistedResult = await kv.get<any>(KV.memories, resultId);
+    const persistedParent = await kv.get<any>(KV.memories, parentId);
+    expect(resultId).toBe(fingerprintId("mem", JSON.stringify([key, proposalHash])));
+
+    await kv.set(
+      KV.memoryConsolidationProposal(key),
+      key,
+      structuredClone(preparedProposal),
+    );
+    kv.store.set(KV.memories, new Map([
+      [resultId, persistedResult],
+      [parentId, persistedParent],
+    ]));
+
+    const recovered = await commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: handle,
+      proposalHash,
+    });
+
+    expect(recovered).toMatchObject({
+      success: true,
+      status: "succeeded",
+      memoryIds: [resultId],
+      parentId,
+    });
+    expect(await kv.list(KV.memories)).toHaveLength(2);
+    expect(await kv.list(KV.audit)).toHaveLength(1);
+    expect((await kv.list<any>(KV.audit))[0].id).toBe(
+      fingerprintId("aud", JSON.stringify([key, proposalHash])),
+    );
   });
 
   it("prepares once, replays the same handle, and rejects a server-recomputed hash conflict", async () => {
@@ -180,7 +413,7 @@ describe("consolidate full window helpers", () => {
     });
   });
 
-  it("replays a succeeded legacy receipt without another provider call and blocks a running receipt", async () => {
+  it("replays a succeeded receipt without another provider call and blocks a running receipt", async () => {
     const kv = mockKV();
     const identity = {
       runId: "formal-run",
@@ -193,7 +426,7 @@ describe("consolidate full window helpers", () => {
       .digest("hex")
       .slice(0, 32)}`;
     const provider = { compress: vi.fn() };
-    await kv.set(KV.extractionOperationReceipts, receiptKey, {
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
       ...identity,
       key: receiptKey,
       status: "succeeded",
@@ -215,7 +448,7 @@ describe("consolidate full window helpers", () => {
     });
     expect(provider.compress).not.toHaveBeenCalled();
 
-    await kv.set(KV.extractionOperationReceipts, receiptKey, {
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
       ...identity,
       key: receiptKey,
       status: "succeeded",
@@ -237,7 +470,7 @@ describe("consolidate full window helpers", () => {
     });
     expect(provider.compress).not.toHaveBeenCalled();
 
-    await kv.set(KV.extractionOperationReceipts, receiptKey, {
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
       ...identity,
       key: receiptKey,
       status: "running",
@@ -253,7 +486,7 @@ describe("consolidate full window helpers", () => {
       failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" },
     });
 
-    await kv.set(KV.extractionOperationReceipts, receiptKey, {
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
       ...identity,
       key: receiptKey,
       status: "failed",

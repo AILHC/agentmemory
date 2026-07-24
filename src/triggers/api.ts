@@ -1,4 +1,5 @@
 import { TriggerAction, type ISdk, type ApiRequest } from "iii-sdk";
+import { createHash } from "node:crypto";
 import type {
   Session,
   CompressedObservation,
@@ -6,7 +7,9 @@ import type {
   CommitLink,
   SessionSummary,
   ExtractionOperationIdentity,
+  ExtractionOperationReceipt,
   ExtractionOperationStage,
+  StageFailure,
 } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
@@ -45,7 +48,13 @@ import {
   type StageModelKey,
 } from "../config.js";
 import { resolveOutputLanguage } from "../prompts/output-language.js";
-import { withExtractionOperationReceipt } from "../functions/extraction-operation-receipts.js";
+import {
+  buildExtractionOperationKey,
+  completeModelOperationFromVerifiedResult,
+  withExtractionOperationReceipt,
+  withIdempotentCommitReceipt,
+} from "../functions/extraction-operation-receipts.js";
+import { findMemoryConsolidationProposalResult } from "../functions/consolidate.js";
 import {
   sanitizeLessonFailureDiagnostics,
   sanitizeStageFailureDiagnostics,
@@ -373,6 +382,11 @@ function parseOptionalBoolean(value: unknown): boolean | undefined | null {
   return null;
 }
 
+function parseOptionalStrictBoolean(value: unknown): boolean | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  return typeof value === "boolean" ? value : null;
+}
+
 const allowedGraphBuildCreateKeys = new Set(["batchSize", "maxSessions"]);
 const allowedGraphBuildProcessKeys = new Set(["taskId", "maxBatches"]);
 const allowedSemanticRollupKeys = new Set([
@@ -386,12 +400,15 @@ const allowedSemanticRollupKeys = new Set([
   "sessionIds",
   "semanticMemoryIds",
   "model",
+  "requireExistingReceipt",
 ]);
 const extractionOperationIdentityKeys = ["runId", "stage", "unitId", "inputHash"] as const;
 const allowedFullSkillExtractKeys = new Set([
   ...extractionOperationIdentityKeys,
   "sessionId",
   "model",
+  "operationReceiptManaged",
+  "requireExistingReceipt",
 ]);
 const allowedFullConsolidatePlanKeys = new Set([
   "project",
@@ -418,10 +435,14 @@ const allowedFullConsolidateWindowKeys = new Set([
   "charBudget",
   "minObservations",
   "model",
+  "requireExistingReceipt",
 ]);
 const allowedFullConsolidateCommitKeys = new Set([
   ...extractionOperationIdentityKeys,
   "preparedHandle",
+  "proposalHash",
+  "prepareRunId",
+  "prepareInputHash",
 ]);
 const allowedFullProceduralPlanKeys = new Set(["project", "maxItemsPerWindow"]);
 const allowedFullProceduralWindowKeys = new Set([
@@ -431,6 +452,7 @@ const allowedFullProceduralWindowKeys = new Set([
   "memoryIds",
   "maxItemsPerWindow",
   "model",
+  "requireExistingReceipt",
 ]);
 const allowedFullReflectPlanKeys = new Set([
   "project",
@@ -449,6 +471,7 @@ const allowedFullReflectWindowKeys = new Set([
   "lessonIds",
   "crystalIds",
   "model",
+  "requireExistingReceipt",
 ]);
 const allowedFullCrystalAutoKeys = new Set([
   ...extractionOperationIdentityKeys,
@@ -456,6 +479,7 @@ const allowedFullCrystalAutoKeys = new Set([
   "project",
   "dryRun",
   "model",
+  "requireExistingReceipt",
 ]);
 const allowedExtractionRunRecordKeys = new Set([
   "runId",
@@ -499,8 +523,21 @@ async function executeExtractionOperation<T>(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
   execute: () => Promise<T>,
+  requireExistingReceiptValue?: unknown,
 ): Promise<Response> {
-  const result = await withExtractionOperationReceipt(kv, identity, execute);
+  const requireExistingReceipt = parseOptionalStrictBoolean(requireExistingReceiptValue);
+  if (requireExistingReceipt === null) {
+    return {
+      status_code: 400,
+      body: { error: "requireExistingReceipt must be a boolean" },
+    };
+  }
+  const result = await withExtractionOperationReceipt(
+    kv,
+    identity,
+    execute,
+    { requireExisting: requireExistingReceipt === true },
+  );
   if (result.response !== undefined) {
     return { status_code: 200, body: result.response };
   }
@@ -508,6 +545,41 @@ async function executeExtractionOperation<T>(
     status_code: result.failure?.class === "hard" ? 409 : 503,
     body: { success: false, failure: result.failure },
   };
+}
+
+async function executeIdempotentCommitOperation<T>(
+  kv: StateKV,
+  identity: ExtractionOperationIdentity,
+  execute: () => Promise<T>,
+): Promise<Response> {
+  const result = await withIdempotentCommitReceipt(kv, identity, execute);
+  if (result.response !== undefined) {
+    return { status_code: 200, body: result.response };
+  }
+  return {
+    status_code: result.failure?.class === "hard" ? 409 : 503,
+    body: { success: false, failure: result.failure },
+  };
+}
+
+function stableOperationHash(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(
+      Object.entries(item as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, normalize(child)]),
+    );
+  };
+  return createHash("sha256").update(JSON.stringify(normalize(value))).digest("hex");
+}
+
+function sessionAttemptInputHash(session: Session): string {
+  return stableOperationHash({
+    session_id: session.id,
+    started_at: session.startedAt || null,
+  });
 }
 
 function hasOnlyKeys(body: Record<string, unknown>, allowed: Set<string>): boolean {
@@ -863,10 +935,14 @@ export function registerApiTriggers(
       if (sessionIds) payload.sessionIds = sessionIds;
       if (semanticMemoryIds) payload.semanticMemoryIds = semanticMemoryIds;
       if (model) payload.model = model;
-      return executeExtractionOperation(kv, identity, () => sdk.trigger({
+      const receiptIdentity = {
+        ...identity,
+        inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
+      };
+      return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
         function_id: "mem::semantic-rollup",
         payload,
-      }));
+      }), body.requireExistingReceipt);
     },
   );
   sdk.registerTrigger({
@@ -913,7 +989,7 @@ export function registerApiTriggers(
         ...bodyResult,
         proceduralMemoryIds: skillId ? [skillId] : [],
       };
-    });
+    }, body.requireExistingReceipt);
   });
   sdk.registerTrigger({
     type: "http",
@@ -935,12 +1011,24 @@ export function registerApiTriggers(
     const identity = extractionOperationIdentity(body, "skill_extract");
     const sessionId = asNonEmptyString(body.sessionId);
     const model = optionalModelString(body);
-    if (!identity || !sessionId || model === null) {
+    const operationReceiptManaged = parseOptionalBoolean(body.operationReceiptManaged);
+    const requireExistingReceipt = parseOptionalStrictBoolean(body.requireExistingReceipt);
+    if (
+      !identity || !sessionId || model === null || operationReceiptManaged === null
+      || requireExistingReceipt === null
+      || (operationReceiptManaged !== undefined && operationReceiptManaged !== true)
+    ) {
       return { status_code: 400, body: { error: "invalid skill extract prepare identity or payload" } };
     }
     const result = await sdk.trigger({
       function_id: "mem::full-skill-extract-prepare",
-      payload: { identity, sessionId, ...(model ? { model } : {}) },
+      payload: {
+        identity,
+        sessionId,
+        ...(model ? { model } : {}),
+        ...(operationReceiptManaged ? { operationReceiptManaged: true } : {}),
+        ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+      },
     });
     return { status_code: 200, body: result };
   });
@@ -966,11 +1054,54 @@ export function registerApiTriggers(
     if (!identity || !preparedHandle) {
       return { status_code: 400, body: { error: "invalid skill extract commit identity or handle" } };
     }
-    const result = await sdk.trigger({
-      function_id: "mem::full-skill-extract-commit",
-      payload: { identity, preparedHandle },
+    const prepareRunId = optionalNonEmptyString(body, "prepareRunId");
+    const prepareInputHash = optionalNonEmptyString(body, "prepareInputHash");
+    const proposalHash = optionalNonEmptyString(body, "proposalHash");
+    const hasV2CommitIdentity = prepareRunId !== undefined
+      || prepareInputHash !== undefined
+      || proposalHash !== undefined;
+    if (
+      prepareRunId === null || prepareInputHash === null || proposalHash === null
+      || (hasV2CommitIdentity && (!prepareRunId || !prepareInputHash || !proposalHash))
+    ) {
+      return { status_code: 400, body: { error: "prepareRunId, prepareInputHash, and proposalHash are required together" } };
+    }
+    if (!hasV2CommitIdentity) {
+      const result = await sdk.trigger({
+        function_id: "mem::full-skill-extract-commit",
+        payload: { identity, preparedHandle },
+      });
+      return { status_code: 200, body: result };
+    }
+    if (!prepareRunId || !prepareInputHash || !proposalHash) {
+      return { status_code: 400, body: { error: "prepareRunId, prepareInputHash, and proposalHash are required together" } };
+    }
+    const prepareIdentity: ExtractionOperationIdentity = {
+      runId: prepareRunId,
+      stage: "skill_extract",
+      unitId: identity.unitId,
+      inputHash: prepareInputHash,
+    };
+    const expectedCommitInputHash = stableOperationHash({
+      prepareRunId,
+      unitId: identity.unitId,
+      prepareInputHash,
+      preparedHandle,
+      proposalHash,
     });
-    return { status_code: 200, body: result };
+    if (identity.inputHash !== expectedCommitInputHash) {
+      return {
+        status_code: 409,
+        body: {
+          success: false,
+          failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+        },
+      };
+    }
+    return executeIdempotentCommitOperation(kv, identity, () => sdk.trigger({
+      function_id: "mem::full-skill-extract-commit",
+      payload: { identity: prepareIdentity, preparedHandle },
+    }));
   });
   sdk.registerTrigger({
     type: "http",
@@ -1115,7 +1246,7 @@ export function registerApiTriggers(
     return executeExtractionOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-memory-consolidate-window",
       payload,
-    }));
+    }), body.requireExistingReceipt);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1161,11 +1292,42 @@ export function registerApiTriggers(
     if (minObservations !== undefined) payload.minObservations = minObservations;
     if (charBudget !== undefined) payload.charBudget = charBudget;
     if (model) payload.model = model;
-    const result = await sdk.trigger({
+    const receiptIdentity: ExtractionOperationIdentity = {
+      ...identity,
+      inputHash: stableOperationHash({
+        runnerInputHash: identity.inputHash,
+        payload,
+      }),
+    };
+    const receiptKey = buildExtractionOperationKey(receiptIdentity);
+    const receipt = await kv.get<ExtractionOperationReceipt<Record<string, unknown>>>(
+      KV.extractionOperationReceipt(receiptKey),
+      receiptKey,
+    );
+    if (receipt?.status === "running") {
+      const proposalResult = await findMemoryConsolidationProposalResult(kv, identity);
+      if (proposalResult) {
+        if (proposalResult.success === false) {
+          return { status_code: 409, body: proposalResult };
+        }
+        const reconciled = await completeModelOperationFromVerifiedResult(
+          kv,
+          receiptIdentity,
+          proposalResult,
+        );
+        if (reconciled.response !== undefined) {
+          return { status_code: 200, body: reconciled.response };
+        }
+        return {
+          status_code: reconciled.failure?.class === "hard" ? 409 : 503,
+          body: { success: false, failure: reconciled.failure },
+        };
+      }
+    }
+    return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
       function_id: "mem::full-memory-consolidate-window-prepare",
-      payload,
-    });
-    return { status_code: 200, body: result };
+      payload: { ...payload, operationReceiptManaged: true },
+    }), body.requireExistingReceipt);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1189,11 +1351,54 @@ export function registerApiTriggers(
     if (!identity || !preparedHandle) {
       return { status_code: 400, body: { error: "invalid memory consolidate commit identity or handle" } };
     }
-    const result = await sdk.trigger({
-      function_id: "mem::full-memory-consolidate-window-commit",
-      payload: { identity, preparedHandle },
+    const prepareRunId = optionalNonEmptyString(body, "prepareRunId");
+    const prepareInputHash = optionalNonEmptyString(body, "prepareInputHash");
+    const proposalHash = optionalNonEmptyString(body, "proposalHash");
+    const hasV2CommitIdentity = prepareRunId !== undefined
+      || prepareInputHash !== undefined
+      || proposalHash !== undefined;
+    if (
+      prepareRunId === null || prepareInputHash === null || proposalHash === null
+      || (hasV2CommitIdentity && (!prepareRunId || !prepareInputHash || !proposalHash))
+    ) {
+      return { status_code: 400, body: { error: "prepareRunId, prepareInputHash, and proposalHash are required together" } };
+    }
+    if (!hasV2CommitIdentity) {
+      const result = await sdk.trigger({
+        function_id: "mem::full-memory-consolidate-window-commit",
+        payload: { identity, preparedHandle },
+      });
+      return { status_code: 200, body: result };
+    }
+    if (!prepareRunId || !prepareInputHash || !proposalHash) {
+      return { status_code: 400, body: { error: "prepareRunId, prepareInputHash, and proposalHash are required together" } };
+    }
+    const prepareIdentity: ExtractionOperationIdentity = {
+      runId: prepareRunId,
+      stage: "memory_consolidate",
+      unitId: identity.unitId,
+      inputHash: prepareInputHash,
+    };
+    const expectedCommitInputHash = stableOperationHash({
+      prepareRunId,
+      unitId: identity.unitId,
+      prepareInputHash,
+      preparedHandle,
+      proposalHash,
     });
-    return { status_code: 200, body: result };
+    if (identity.inputHash !== expectedCommitInputHash) {
+      return {
+        status_code: 409,
+        body: {
+          success: false,
+          failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+        },
+      };
+    }
+    return executeIdempotentCommitOperation(kv, identity, () => sdk.trigger({
+      function_id: "mem::full-memory-consolidate-window-commit",
+      payload: { identity: prepareIdentity, preparedHandle, proposalHash },
+    }));
   });
   sdk.registerTrigger({
     type: "http",
@@ -1263,10 +1468,14 @@ export function registerApiTriggers(
     if (memoryIds !== undefined) payload.memoryIds = memoryIds;
     if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
     if (model) payload.model = model;
-    return executeExtractionOperation(kv, identity, () => sdk.trigger({
+    const receiptIdentity = {
+      ...identity,
+      inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
+    };
+    return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
       function_id: "mem::full-consolidation-procedural-window",
       payload,
-    }));
+    }), body.requireExistingReceipt);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1356,10 +1565,14 @@ export function registerApiTriggers(
     if (lessonIds !== undefined) payload.lessonIds = lessonIds;
     if (crystalIds !== undefined) payload.crystalIds = crystalIds;
     if (model) payload.model = model;
-    return executeExtractionOperation(kv, identity, () => sdk.trigger({
+    const receiptIdentity = {
+      ...identity,
+      inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
+    };
+    return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
       function_id: "mem::full-reflect-insight-window",
       payload,
-    }));
+    }), body.requireExistingReceipt);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1403,10 +1616,14 @@ export function registerApiTriggers(
     }
     const identity = extractionOperationIdentity(body, "crystal");
     if (!identity) return invalidExtractionOperationIdentityResponse("crystal");
-    return executeExtractionOperation(kv, identity, () => sdk.trigger({
+    const receiptIdentity = {
+      ...identity,
+      inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
+    };
+    return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
       function_id: "mem::full-crystals-auto",
       payload,
-    }));
+    }), body.requireExistingReceipt);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1978,7 +2195,13 @@ export function registerApiTriggers(
   sdk.registerFunction(
     "api::summarize-resumable",
     async (
-      req: ApiRequest<{ sessionId: string; model?: string }>,
+      req: ApiRequest<{
+        sessionId: string;
+        model?: string;
+        attemptId?: string;
+        inputHash?: string;
+        requireExistingReceipt?: boolean;
+      }>,
     ): Promise<Response> => {
       const body = (req.body as Record<string, unknown>) || {};
       const sessionId = asNonEmptyString(body.sessionId);
@@ -1987,9 +2210,26 @@ export function registerApiTriggers(
       }
       const model = optionalModelString(body);
       if (model === null) return invalidModelResponse();
+      const attemptId = optionalNonEmptyString(body, "attemptId");
+      const inputHash = optionalNonEmptyString(body, "inputHash");
+      const requireExistingReceipt = parseOptionalStrictBoolean(body.requireExistingReceipt);
+      if (
+        attemptId === null
+        || inputHash === null
+        || requireExistingReceipt === null
+        || Boolean(attemptId) !== Boolean(inputHash)
+        || (requireExistingReceipt === true && !attemptId)
+      ) {
+        return invalidExtractionOperationIdentityResponse("summary");
+      }
       const result = await sdk.trigger({
         function_id: "mem::summarize-resumable",
-        payload: { sessionId, ...(model ? { model } : {}) },
+        payload: {
+          sessionId,
+          ...(model ? { model } : {}),
+          ...(attemptId ? { attemptId, inputHash } : {}),
+          ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+        },
       });
       return { status_code: 200, body: sanitizeSummaryApiResult(result) };
     },
@@ -4574,6 +4814,9 @@ export function registerApiTriggers(
       "chunkConcurrency",
       "timeoutMs",
       "model",
+      "attemptId",
+      "inputHash",
+      "requireExistingReceipt",
     ]);
     const unknown = Object.keys(body).filter((key) => !allowed.has(key));
     if (unknown.length > 0) {
@@ -4581,7 +4824,7 @@ export function registerApiTriggers(
         status_code: 400,
         body: {
           error:
-            "invalid lesson extraction payload: only sessionIds, missingOnly, retryFailed, force, textLimit, saveLimit, chunkSize, chunkConcurrency, timeoutMs, model are allowed",
+              "invalid lesson extraction payload: only sessionIds, missingOnly, retryFailed, force, textLimit, saveLimit, chunkSize, chunkConcurrency, timeoutMs, model, attemptId, inputHash, requireExistingReceipt are allowed",
         },
       };
     }
@@ -4638,10 +4881,26 @@ export function registerApiTriggers(
     }
     const model = optionalModelString(body);
     if (model === null) return invalidModelResponse();
+    const attemptId = optionalNonEmptyString(body, "attemptId");
+    const inputHash = optionalNonEmptyString(body, "inputHash");
+    const requireExistingReceipt = parseOptionalStrictBoolean(body.requireExistingReceipt);
+    if (
+      attemptId === null
+      || inputHash === null
+      || requireExistingReceipt === null
+      || Boolean(attemptId) !== Boolean(inputHash)
+      || (requireExistingReceipt === true && !attemptId)
+    ) {
+      return invalidExtractionOperationIdentityResponse("lessons");
+    }
+    if (attemptId && sessionIds.length !== 1) {
+      return {
+        status_code: 400,
+        body: { error: "v2 lesson extraction requires exactly one sessionId" },
+      };
+    }
 
-    const result = await sdk.trigger({
-      function_id: "mem::lessons::extract-llm",
-      payload: {
+    const payload = {
         sessionIds,
         ...(body.missingOnly !== undefined ? { missingOnly: body.missingOnly } : {}),
         ...(body.retryFailed !== undefined ? { retryFailed: body.retryFailed } : {}),
@@ -4652,8 +4911,39 @@ export function registerApiTriggers(
         ...(chunkConcurrency !== undefined ? { chunkConcurrency } : {}),
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(model ? { model } : {}),
+      };
+    if (!attemptId || !inputHash) {
+      const result = await sdk.trigger({ function_id: "mem::lessons::extract-llm", payload });
+      return { status_code: 200, body: result };
+    }
+    const session = await kv.get<Session>(KV.sessions, sessionIds[0]);
+    if (!session || inputHash !== sessionAttemptInputHash(session)) {
+      return {
+        status_code: 409,
+        body: {
+          success: false,
+          failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+        },
+      };
+    }
+    const result = await sdk.trigger({
+      function_id: "mem::lessons::extract-llm",
+      payload: {
+        ...payload,
+        attemptId,
+        inputHash,
+        ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
       },
-    });
+    }) as {
+      success?: boolean;
+      failure?: StageFailure;
+    };
+    if (result?.failure) {
+      return {
+        status_code: result.failure.class === "hard" ? 409 : 503,
+        body: result,
+      };
+    }
     return { status_code: 200, body: result };
   });
   sdk.registerTrigger({

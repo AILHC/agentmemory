@@ -79,9 +79,16 @@ export const KV = {
     `mem:extraction-run-audit-manifest:${page}`,
   extractionRunAuditEvent: (eventToken: string) =>
     `mem:extraction-run-audit-event:${eventToken}`,
+  // Legacy read-only aggregates. New writes use one bounded scope per operation.
   extractionOperationReceipts: "mem:extraction-operation-receipts",
   memoryConsolidationProposals: "mem:memory-consolidation-proposals",
   skillExtractionProposals: "mem:skill-extraction-proposals",
+  extractionOperationReceipt: (operationToken: string) =>
+    `mem:extraction-operation-receipt:${operationToken}`,
+  memoryConsolidationProposal: (proposalToken: string) =>
+    `mem:memory-consolidation-proposal:${proposalToken}`,
+  skillExtractionProposal: (proposalToken: string) =>
+    `mem:skill-extraction-proposal:${proposalToken}`,
   graphEdgeHistory: "mem:graph:edge-history",
   lessonExtractionRuns: "mem:lesson-extraction:runs",
   lessonExtractionChunks: (runId: string) => `mem:lesson-extraction:chunks:${runId}`,

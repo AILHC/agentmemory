@@ -59,9 +59,10 @@ describe("extraction operation receipts", () => {
 
     const first = await withExtractionOperationReceipt(kv as never, identity, execute);
     const replay = await withExtractionOperationReceipt(kv as never, identity, execute);
+    const key = buildExtractionOperationKey(identity);
     const stored = await kv.get<Record<string, unknown>>(
-      KV.extractionOperationReceipts,
-      buildExtractionOperationKey(identity),
+      KV.extractionOperationReceipt(key),
+      key,
     );
 
     expect(execute).toHaveBeenCalledTimes(1);
@@ -94,7 +95,7 @@ describe("extraction operation receipts", () => {
   it("does not re-execute an operation left running across a server crash", async () => {
     const kv = mockKV();
     const key = buildExtractionOperationKey(identity);
-    await kv.set(KV.extractionOperationReceipts, key, {
+    await kv.set(KV.extractionOperationReceipt(key), key, {
       ...identity,
       key,
       status: "running",
@@ -111,7 +112,31 @@ describe("extraction operation receipts", () => {
     });
   });
 
-  it("stores only a structured failure and allows a confirmed failed attempt to retry", async () => {
+  it("does not execute a recovered operation when its acknowledged receipt is missing", async () => {
+    const kv = mockKV();
+    const execute = vi.fn(async () => ({ success: true, memoryIds: ["mem-1"] }));
+
+    const result = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      { requireExisting: true },
+    );
+
+    expect(execute).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      replayed: true,
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+    });
+    expect(result.receipt).toBeUndefined();
+    const key = buildExtractionOperationKey(identity);
+    await expect(kv.get(KV.extractionOperationReceipt(key), key)).resolves.toBeNull();
+  });
+
+  it("stores only a structured failure and immutably replays it for the same attempt", async () => {
     const kv = mockKV();
     const execute = vi
       .fn()
@@ -131,7 +156,18 @@ describe("extraction operation receipts", () => {
       failure: { class: "transient_provider", cause: "pi_stream_failed" },
     });
     expect(JSON.stringify(storedAfterFailure)).not.toContain("must-not-persist");
-    expect(retried).toMatchObject({ response: { success: true, memoryIds: ["mem-1"] } });
+    expect(retried).toMatchObject({
+      replayed: true,
+      failure: { class: "transient_provider", cause: "pi_stream_failed" },
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+
+    const nextAttempt = await withExtractionOperationReceipt(
+      kv as never,
+      { ...identity, runId: "formal-run-attempt-2" },
+      execute,
+    );
+    expect(nextAttempt).toMatchObject({ response: { success: true, memoryIds: ["mem-1"] } });
     expect(execute).toHaveBeenCalledTimes(2);
   });
 
@@ -143,7 +179,7 @@ describe("extraction operation receipts", () => {
       const stored = await originalSet(scope, key, value);
       if (
         failAfterSucceededCommit
-        && scope === KV.extractionOperationReceipts
+        && scope === KV.extractionOperationReceipt(buildExtractionOperationKey(identity))
         && (value as { status?: unknown }).status === "succeeded"
       ) {
         failAfterSucceededCommit = false;
@@ -279,7 +315,59 @@ describe("extraction operation receipts", () => {
     }
   });
 
-  it("classifies generic local transport failures as transient runtime failures", async () => {
+  it("keeps total receipt bytes linear while every StateKV scope stays bounded", async () => {
+    const kv = mockKV();
+    const identities: typeof identity[] = [];
+    const serializedBytes = async () => {
+      const receipts = await Promise.all(identities.map(async (entry) => {
+        const key = buildExtractionOperationKey(entry);
+        return kv.get(KV.extractionOperationReceipt(key), key);
+      }));
+      return {
+        total: receipts.reduce(
+          (sum, receipt) => sum + Buffer.byteLength(JSON.stringify(receipt)),
+          0,
+        ),
+        max: Math.max(...receipts.map((receipt) => Buffer.byteLength(JSON.stringify(receipt)))),
+        serialized: JSON.stringify(receipts),
+      };
+    };
+    const sizes = [];
+
+    for (const target of [100, 200]) {
+      for (let index = sizes.length === 0 ? 0 : 100; index < target; index += 1) {
+        const operationIdentity = {
+          runId: "scale-run",
+          stage: "summary" as const,
+          unitId: `summary-${String(index).padStart(4, "0")}`,
+          inputHash: `input-${String(index).padStart(4, "0")}`,
+        };
+        identities.push(operationIdentity);
+        await withExtractionOperationReceipt(
+          kv as never,
+          operationIdentity,
+          async () => ({
+            success: true,
+            status: "succeeded",
+            resultRef: {
+              scope: KV.summaryResumableRuns,
+              key: `summary-run-${String(index).padStart(4, "0")}`,
+            },
+            narrative: "large model prose must not enter the receipt",
+          }),
+        );
+      }
+      sizes.push(await serializedBytes());
+    }
+
+    const ratio = sizes[1].total / sizes[0].total;
+    expect(ratio).toBeGreaterThan(1.9);
+    expect(ratio).toBeLessThan(2.1);
+    expect(sizes[1].max).toBe(sizes[0].max);
+    expect(sizes[1].serialized).not.toContain("large model prose");
+  });
+
+  it("blocks an interrupted operation because its side effect is uncertain", async () => {
     const kv = mockKV();
     const result = await withExtractionOperationReceipt(
       kv as never,
@@ -291,11 +379,11 @@ describe("extraction operation receipts", () => {
 
     expect(result.failure).toEqual({
       class: "transient_runtime",
-      cause: "extraction_operation_interrupted",
+      cause: "extraction_operation_reconciliation_required",
     });
   });
 
-  it("keeps stable provider interruption codes classified as transient provider", async () => {
+  it("does not treat a thrown provider interruption as a confirmed failure", async () => {
     const kv = mockKV();
     const result = await withExtractionOperationReceipt(
       kv as never,
@@ -305,7 +393,10 @@ describe("extraction operation receipts", () => {
       },
     );
 
-    expect(result.failure).toEqual({ class: "transient_provider", cause: "pi_stream_failed" });
+    expect(result.failure).toEqual({
+      class: "transient_runtime",
+      cause: "extraction_operation_reconciliation_required",
+    });
   });
 
   it("validates identity at the receipt iii-function boundary", async () => {
@@ -329,5 +420,63 @@ describe("extraction operation receipts", () => {
       success: false,
       failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
     });
+  });
+
+  it("queries succeeded, failed, and orphaned running receipts without executing work", async () => {
+    const kv = mockKV();
+    const functions = new Map<string, Function>();
+    const sdk = {
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    };
+    registerExtractionOperationReceiptFunctions(sdk as never, kv as never);
+    const handler = functions.get("mem::extraction-operation-receipt-get")!;
+    const cases = [
+      {
+        identity: { ...identity, unitId: "succeeded-unit" },
+        receipt: {
+          ...identity,
+          unitId: "succeeded-unit",
+          key: buildExtractionOperationKey({ ...identity, unitId: "succeeded-unit" }),
+          status: "succeeded",
+          startedAt: "2026-07-24T00:00:00.000Z",
+          completedAt: "2026-07-24T00:01:00.000Z",
+          response: { success: true, memoryIds: ["mem-1"] },
+        },
+      },
+      {
+        identity: { ...identity, unitId: "failed-unit" },
+        receipt: {
+          ...identity,
+          unitId: "failed-unit",
+          key: buildExtractionOperationKey({ ...identity, unitId: "failed-unit" }),
+          status: "failed",
+          startedAt: "2026-07-24T00:00:00.000Z",
+          completedAt: "2026-07-24T00:01:00.000Z",
+          failure: { class: "transient_provider", cause: "pi_stream_failed" },
+        },
+      },
+      {
+        identity: { ...identity, unitId: "running-unit" },
+        receipt: {
+          ...identity,
+          unitId: "running-unit",
+          key: buildExtractionOperationKey({ ...identity, unitId: "running-unit" }),
+          status: "running",
+          startedAt: "2026-07-24T00:00:00.000Z",
+        },
+      },
+    ] as const;
+
+    for (const entry of cases) {
+      await kv.set(
+        KV.extractionOperationReceipt(entry.receipt.key),
+        entry.receipt.key,
+        entry.receipt,
+      );
+      await expect(handler(entry.identity)).resolves.toEqual({
+        success: true,
+        receipt: entry.receipt,
+      });
+    }
   });
 });

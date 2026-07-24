@@ -5,6 +5,13 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerLessonsFunctions } from "../src/functions/lessons.js";
+import {
+  computeLessonExtractionConfigHash,
+  computeLessonExtractionInputHash,
+  resolveLlmLessonExtractionRuntimeConfig,
+  stableHash,
+} from "../src/functions/lesson-extraction-runs.js";
+import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
 import type { Lesson, MemoryProvider } from "../src/types.js";
 import { KV } from "../src/state/schema.js";
 
@@ -403,6 +410,198 @@ describe("Lessons", () => {
       expect(runResult.run.id).toBe(extractResult.runs[0].id);
       expect(Array.isArray(runResult.chunks)).toBe(true);
       expect(runResult.chunks).toHaveLength(0);
+    });
+
+    it("binds a v2 receipt to actual observations and replays without another model call", async () => {
+      const xml = `
+<lessons>
+  <lesson confidence="0.8">
+    <content>Bind the receipt to actual lesson inputs.</content>
+    <context>v2 recovery</context>
+    <tags><tag>receipt</tag></tags>
+  </lesson>
+</lessons>`;
+      const provider: MemoryProvider = {
+        name: "mock-llm",
+        compress: vi.fn(async () => xml),
+        summarize: vi.fn(async () => ""),
+      };
+      registerLessonsFunctions(sdk as never, kv as never, provider);
+      await kv.set(KV.sessions, "session-v2", {
+        id: "session-v2",
+        project: "project",
+        cwd: "/tmp/project",
+        startedAt: "2026-07-24T00:00:00.000Z",
+        status: "active",
+        observationCount: 1,
+      });
+      await kv.set(KV.observations("session-v2"), "obs-1", {
+        id: "obs-1",
+        sessionId: "session-v2",
+        timestamp: "2026-07-24T00:00:01.000Z",
+        hookType: "user",
+        userPrompt: "Keep the receipt bound to the actual observation inventory.",
+        raw: {},
+        sourceEventIndex: 1,
+      });
+      const request = {
+        sessionIds: ["session-v2"],
+        attemptId: "attempt-v2",
+        inputHash: "runner-session-freshness",
+      };
+
+      const first = await sdk.trigger("mem::lessons::extract-llm", request) as {
+        success: boolean;
+        runs: Array<{ status: string }>;
+      };
+      const replay = await sdk.trigger("mem::lessons::extract-llm", request);
+
+      expect(first).toMatchObject({ success: true, runs: [{ status: "succeeded" }] });
+      expect(replay).toEqual(first);
+      expect(provider.compress).toHaveBeenCalledTimes(1);
+
+      await kv.set(KV.observations("session-v2"), "obs-2", {
+        id: "obs-2",
+        sessionId: "session-v2",
+        timestamp: "2026-07-24T00:00:02.000Z",
+        hookType: "user",
+        userPrompt: "This changes the actual service input.",
+        raw: {},
+        sourceEventIndex: 2,
+      });
+      const drift = await sdk.trigger("mem::lessons::extract-llm", request);
+      expect(drift).toMatchObject({
+        success: false,
+        failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+      });
+      expect(provider.compress).toHaveBeenCalledTimes(1);
+    });
+
+    it("blocks an orphaned v2 receipt and reconciles it only from a persisted terminal run", async () => {
+      const xml = `
+<lessons>
+  <lesson confidence="0.8">
+    <content>Reconcile only from durable lesson results.</content>
+    <context>v2 recovery</context>
+    <tags><tag>receipt</tag></tags>
+  </lesson>
+</lessons>`;
+      const provider: MemoryProvider = {
+        name: "mock-llm",
+        compress: vi.fn(async () => xml),
+        summarize: vi.fn(async () => ""),
+      };
+      registerLessonsFunctions(sdk as never, kv as never, provider);
+      const observation = {
+        id: "obs-1",
+        sessionId: "session-orphan",
+        timestamp: "2026-07-24T00:00:01.000Z",
+        hookType: "user",
+        userPrompt: "Do not repeat an uncertain model call.",
+        raw: {},
+        sourceEventIndex: 1,
+      };
+      await kv.set(KV.sessions, "session-orphan", {
+        id: "session-orphan",
+        project: "project",
+        cwd: "/tmp/project",
+        startedAt: "2026-07-24T00:00:00.000Z",
+        status: "active",
+        observationCount: 1,
+      });
+      await kv.set(KV.observations("session-orphan"), observation.id, observation);
+      const runnerInputHash = "runner-session-freshness";
+      const config = resolveLlmLessonExtractionRuntimeConfig(provider);
+      const identity = {
+        runId: "attempt-orphan",
+        stage: "lessons" as const,
+        unitId: "session-orphan",
+        inputHash: stableHash({
+          runnerInputHash,
+          serviceInputHash: computeLessonExtractionInputHash([observation]),
+          configHash: computeLessonExtractionConfigHash(config),
+        }),
+      };
+      const receiptKey = buildExtractionOperationKey(identity);
+      await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+        ...identity,
+        key: receiptKey,
+        status: "running",
+        startedAt: "2026-07-24T00:00:00.000Z",
+      });
+      const request = {
+        sessionIds: ["session-orphan"],
+        attemptId: identity.runId,
+        inputHash: runnerInputHash,
+      };
+
+      const blocked = await sdk.trigger("mem::lessons::extract-llm", request);
+      expect(blocked).toMatchObject({
+        success: false,
+        failure: {
+          class: "transient_runtime",
+          cause: "extraction_operation_reconciliation_required",
+        },
+      });
+      expect(provider.compress).not.toHaveBeenCalled();
+
+      const legacyResult = await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-orphan"],
+      }) as { runs: Array<{ status: string }> };
+      expect(legacyResult.runs[0].status).toBe("succeeded");
+      expect(provider.compress).toHaveBeenCalledTimes(1);
+
+      const reconciled = await sdk.trigger("mem::lessons::extract-llm", request);
+      expect(reconciled).toMatchObject({
+        success: true,
+        runs: [{ status: "succeeded" }],
+      });
+      expect(provider.compress).toHaveBeenCalledTimes(1);
+      expect(await kv.get(KV.extractionOperationReceipt(receiptKey), receiptKey)).toMatchObject({
+        status: "succeeded",
+      });
+    });
+
+    it("blocks a recovered v2 attempt whose receipt is missing", async () => {
+      const provider: MemoryProvider = {
+        name: "mock-llm",
+        compress: vi.fn(async () => "<lessons></lessons>"),
+        summarize: vi.fn(async () => ""),
+      };
+      registerLessonsFunctions(sdk as never, kv as never, provider);
+      await kv.set(KV.sessions, "session-missing-receipt", {
+        id: "session-missing-receipt",
+        project: "project",
+        cwd: "/tmp/project",
+        startedAt: "2026-07-24T00:00:00.000Z",
+        status: "active",
+        observationCount: 1,
+      });
+      await kv.set(KV.observations("session-missing-receipt"), "obs-1", {
+        id: "obs-1",
+        sessionId: "session-missing-receipt",
+        timestamp: "2026-07-24T00:00:01.000Z",
+        hookType: "user",
+        userPrompt: "A recovered attempt must not create a replacement receipt.",
+        raw: {},
+        sourceEventIndex: 1,
+      });
+
+      const result = await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-missing-receipt"],
+        attemptId: "attempt-missing-receipt",
+        inputHash: "runner-session-freshness",
+        requireExistingReceipt: true,
+      });
+
+      expect(result).toMatchObject({
+        success: false,
+        failure: {
+          class: "transient_runtime",
+          cause: "extraction_operation_reconciliation_required",
+        },
+      });
+      expect(provider.compress).not.toHaveBeenCalled();
     });
 
     it("uses explicit model in lesson runtime config and provider call options", async () => {

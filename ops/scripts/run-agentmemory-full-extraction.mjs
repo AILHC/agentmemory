@@ -4,8 +4,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AdaptiveProviderLimiter } from './lib/adaptive-provider-limiter.mjs';
+import { runV2RemainingStages } from './lib/full-extraction-stage-adapters-v2.mjs';
+import { runSinglePhaseStage, runTwoPhaseStage } from './lib/recoverable-stage-v2.mjs';
 import { RunStateStore } from './lib/run-state-store.mjs';
+import { RunStateJournalV2 } from './lib/run-state-journal-v2.mjs';
 import { runStagePipeline } from './lib/stage-pipeline.mjs';
+import { assertV1ReleaseGate } from './lib/v2-release-gate.mjs';
 
 export const SCHEMA_VERSION = 1;
 export const DEFAULT_MARK = 'agentmemory-full-extraction';
@@ -1095,6 +1099,7 @@ const HELP_TEXT = [
   '--reflect-insight-model <model>          本次 run 的 reflect_insight 阶段模型显式覆盖。',
   '--default-stage-model <model>            本次 run 的阶段模型默认显式覆盖；stage-specific CLI 优先。',
   '--reset-drifted-units                    resume 时重置漂移单元。',
+  '--run-state-format <v1|v2>               状态格式；v2 使用分阶段 journal 执行完整八阶段流程。',
   '--dry-run                                只盘点和写计划状态，不调用提炼写接口。',
   '--resume                                 从现有状态文件恢复。',
   '--help                                   显示帮助。',
@@ -1131,6 +1136,7 @@ export function parseArgs(argv) {
     reflectInsightModel: '',
     defaultStageModel: '',
     resetDriftedUnits: false,
+    runStateFormat: 'v1',
     dryRun: false,
     resume: false,
     help: false,
@@ -1230,6 +1236,9 @@ export function parseArgs(argv) {
       i += 1;
     } else if (arg === '--reset-drifted-units') {
       result.resetDriftedUnits = true;
+    } else if (arg === '--run-state-format') {
+      result.runStateFormat = requireValue(argv, i, arg);
+      i += 1;
     } else if (arg === '--dry-run') {
       result.dryRun = true;
     } else if (arg === '--resume') {
@@ -1240,6 +1249,12 @@ export function parseArgs(argv) {
   }
 
   if (result.help) return result;
+  if (!['v1', 'v2'].includes(result.runStateFormat)) {
+    throw new Error('--run-state-format 必须是 v1 或 v2');
+  }
+  if (result.runStateFormat === 'v2' && result.resetDriftedUnits) {
+    throw new Error('v2 明确拒绝 --reset-drifted-units；请创建新的 run_id');
+  }
   if (!result.baseUrl) throw new Error('缺少 --base-url');
   if (!result.stateDir) throw new Error('缺少 --state-dir');
   if (!Number.isInteger(result.semanticWindowSize) || result.semanticWindowSize < 1) {
@@ -2744,7 +2759,20 @@ export async function persistTerminalThenRecord({
   return stageOutcome(target.status);
 }
 
-async function pollSummaryFromSessions({ state, baseUrl, secret, sessionId, options }) {
+async function pollSummaryFromSessions({
+  state,
+  baseUrl,
+  secret,
+  sessionId,
+  options,
+  expectedObservationCount,
+}) {
+  if (
+    expectedObservationCount !== undefined
+    && (!Number.isSafeInteger(expectedObservationCount) || expectedObservationCount < 0)
+  ) {
+    return null;
+  }
   const delayMs = summarySessionPollDelayMs(state, options);
   for (let attempt = 1; attempt <= SUMMARY_SESSION_POLL_ATTEMPTS; attempt += 1) {
     if (attempt > 1 && delayMs > 0) await sleep(delayMs);
@@ -2755,7 +2783,17 @@ async function pollSummaryFromSessions({ state, baseUrl, secret, sessionId, opti
         state.config?.agent_id || '*',
         options,
       );
-      const summary = findSessionSummary(sessions, sessionId);
+      const session = sessions.find((entry) => entry.id === sessionId);
+      const summary = session?.summary;
+      if (
+        expectedObservationCount !== undefined
+        && (
+          session?.observationCount !== expectedObservationCount
+          || summary?.observationCount !== expectedObservationCount
+        )
+      ) {
+        continue;
+      }
       if (isUsableSummary(summary)) return summary;
     } catch (error) {
       if (error?.name === 'AbortError') throw error;
@@ -2766,6 +2804,7 @@ async function pollSummaryFromSessions({ state, baseUrl, secret, sessionId, opti
 }
 
 export async function runSummaryForSession({ state, statePath, baseUrl, secret, sessionId, options = {} }) {
+  const writeState = options.writeState || writeStateAtomically;
   const item = state.sessions[sessionId];
   if (!item) return stageOutcome('skipped');
   if (!summaryNeedsWork(item)) {
@@ -2783,9 +2822,10 @@ export async function runSummaryForSession({ state, statePath, baseUrl, secret, 
           payload: { summarySessionId: sessionId },
           options,
         }),
+        writeState,
       });
     } else if (failureMetadataCleared) {
-      await writeStateAtomically(statePath, state);
+      await writeState(statePath, state);
     }
     return stageOutcome(item.summary.status === 'skipped' ? 'skipped' : 'succeeded');
   }
@@ -2796,7 +2836,7 @@ export async function runSummaryForSession({ state, statePath, baseUrl, secret, 
     started_at: item.summary?.started_at || now,
     attempt_count: (item.summary?.attempt_count || 0) + 1,
   };
-  await writeStateAtomically(statePath, state);
+  await writeState(statePath, state);
 
   const failSummary = async (error, data, response) => {
     const failure = classifyStageResponse({ ...response, data });
@@ -2808,7 +2848,7 @@ export async function runSummaryForSession({ state, statePath, baseUrl, secret, 
       error: compactStateError(error, 'resumable summarize failed'),
     }, data, 'summary');
     applyFailureState(item.summary, failure);
-    await writeStateAtomically(statePath, state);
+    await writeState(statePath, state);
     return stageOutcome('failed', { failure });
   };
   const response = await requestJson(
@@ -2857,6 +2897,7 @@ export async function runSummaryForSession({ state, statePath, baseUrl, secret, 
         payload: { summarySessionId: sessionId },
         options,
       }),
+      writeState,
     });
   }
   if (data.status !== 'in_progress' || !['completed', 'skipped', 'none'].includes(data.advanced)) {
@@ -2883,7 +2924,7 @@ export async function runSummaryForSession({ state, statePath, baseUrl, secret, 
   }, data, 'summary');
   if (stepFailure) applyFailureState(item.summary, stepFailure);
   else clearSummaryFailureMetadata(item.summary);
-  await writeStateAtomically(statePath, state);
+  await writeState(statePath, state);
   return stageOutcome('in_progress', {
     failure: stepFailure,
     advanced: data.advanced,
@@ -5409,6 +5450,495 @@ function markStageItemIsolated(state, stage, item, outcome) {
   applyFailureState(target, failure);
 }
 
+async function runV2JournalSingleStage({
+  stage,
+  control,
+  journal,
+  durable,
+  plan,
+  adapter,
+  planOnly,
+}) {
+  const opened = control.some((event) => event.type === 'stage_opened' && event.payload?.stage === stage);
+  if (!opened) await durable('control', 'stage_opened', { stage });
+  const planMetadata = {
+    plan_hash: stableHash(plan),
+    order_hash: stableHash(plan.map((unit) => unit.unit_id)),
+  };
+  const result = await runSinglePhaseStage({
+    events: await journal.readStage(stage),
+    plan,
+    planMetadata,
+    append: (type, payload) => durable(stage, type, payload),
+    planOnly,
+    ...adapter,
+  });
+  if (result.status === 'completed') {
+    await journal.writeStatus({
+      current_stage: null,
+      [stage]: { status: 'completed', accepted: result.acceptedCount },
+    });
+  } else {
+    await journal.writeStatus({
+      current_stage: stage,
+      [stage]: {
+        status: result.status,
+        ...(result.unitId ? { unit_id: result.unitId } : {}),
+      },
+    });
+  }
+  return { ...result, control: await journal.readControl() };
+}
+
+async function runV2JournalTwoPhaseStage({
+  stage,
+  control,
+  journal,
+  durable,
+  plan,
+  adapter,
+  planOnly,
+}) {
+  const opened = control.some((event) => event.type === 'stage_opened' && event.payload?.stage === stage);
+  if (!opened) await durable('control', 'stage_opened', { stage });
+  const planMetadata = {
+    plan_hash: stableHash(plan),
+    order_hash: stableHash(plan.map((unit) => unit.unit_id)),
+  };
+  const result = await runTwoPhaseStage({
+    events: await journal.readStage(stage),
+    plan,
+    planMetadata,
+    append: (type, payload) => durable(stage, type, payload),
+    planOnly,
+    ...adapter,
+  });
+  if (result.status === 'completed') {
+    await journal.writeStatus({
+      current_stage: null,
+      [stage]: { status: 'completed', accepted: result.acceptedCount },
+    });
+  } else {
+    await journal.writeStatus({
+      current_stage: stage,
+      [stage]: {
+        status: result.status,
+        ...(result.unitId ? { unit_id: result.unitId } : {}),
+      },
+    });
+  }
+  return { ...result, control: await journal.readControl() };
+}
+
+function buildV2SummaryPlan(sessions, baseUrl, options) {
+  return sessions.map((session) => ({
+    unit_id: session.id,
+    input_hash: stableHash({
+      session_id: session.id,
+      started_at: session.startedAt || null,
+    }),
+    request_hash: stableHash({
+      base_url: baseUrl,
+      stage: 'summary',
+      request: buildSummaryBody(session.id, options),
+    }),
+  }));
+}
+
+function buildV2LessonsPlan(sessions, baseUrl, options) {
+  return sessions.map((session) => ({
+    unit_id: session.id,
+    input_hash: stableHash({
+      session_id: session.id,
+      started_at: session.startedAt || null,
+    }),
+    request_hash: stableHash({
+      base_url: baseUrl,
+      stage: 'lessons',
+      request: buildLessonExtractBody(session.id, options),
+    }),
+  }));
+}
+
+function verifiedV2SummaryResult(data, unit, attemptId) {
+  if (
+    !isUsableSummary(data?.summary)
+    || data.attemptId !== attemptId
+    || data.runnerInputHash !== unit.input_hash
+    || typeof data.serviceInputHash !== 'string'
+    || !data.serviceInputHash
+    || typeof data.resumableRunId !== 'string'
+    || !data.resumableRunId
+  ) {
+    return null;
+  }
+  return {
+    summary_hash: stableHash(summaryPromptFields(data.summary)),
+    service_input_hash: data.serviceInputHash,
+    resumable_run_id: data.resumableRunId,
+    runner_input_hash: data.runnerInputHash,
+  };
+}
+
+function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote }) {
+  return {
+    attemptIdForUnit: (unit) => stableHash({ run_id: runId, stage: 'summary', unit_id: unit.unit_id }),
+    execute: async ({ unit, attemptId, recovered }) => {
+      let requireExistingReceipt = recovered;
+      for (let advance = 0; advance < SUMMARY_ADVANCE_MAX_CALL_LIMIT; advance += 1) {
+        const result = await summaryRemote.advance({
+          baseUrl,
+          secret,
+          sessionId: unit.unit_id,
+          attemptId,
+          inputHash: unit.input_hash,
+          requireExistingReceipt,
+          request: buildSummaryBody(unit.unit_id, options),
+          signal: options.signal,
+        });
+        const data = result?.data || result || {};
+        const failureCause = data?.failure?.cause || data?.failure?.error || data?.error || result?.error;
+        if ([
+          'extraction_operation_reconciliation_required',
+          'extraction_operation_input_hash_conflict',
+        ].includes(failureCause)) {
+          return { status: 'blocked', reason: failureCause, payload: { error: failureCause } };
+        }
+        if (result?.ok === false && Number(result?.status_code ?? result?.statusCode ?? 0) === 0) {
+          if (!requireExistingReceipt) {
+            requireExistingReceipt = true;
+            continue;
+          }
+          return {
+            status: 'blocked',
+            reason: 'request_transport_failed',
+            payload: { error: 'summary_result_unknown_after_transport_failure' },
+          };
+        }
+        if (result?.ok === false || ['failed', 'infeasible', 'preflight_unavailable'].includes(data.status)) {
+          return { status: 'failed', payload: { error: failureCause || 'resumable summarize failed' } };
+        }
+        if (data.status === 'succeeded') {
+          const payload = verifiedV2SummaryResult(data, unit, attemptId);
+          if (!payload) {
+            return {
+              status: 'blocked',
+              reason: 'summary_source_unproven',
+              payload: { error: 'summary_source_unproven' },
+            };
+          }
+          return {
+            status: 'succeeded',
+            payload,
+          };
+        }
+        if (data.status !== 'in_progress' || !['completed', 'skipped', 'none'].includes(data.advanced)) {
+          throw new Error(`v2_summary_invalid_status:${String(data.status || '<missing>')}`);
+        }
+        if (data.advanced === 'none') return { status: 'pending' };
+        if (options.delayMs > 0) await sleep(Math.min(options.delayMs, 500), { signal: options.signal });
+      }
+      return { status: 'pending' };
+    },
+    record: ({ unit, attemptId }) => summaryRemote.record({
+      baseUrl,
+      secret,
+      runId,
+      mark: options.mark,
+      sessionId: unit.unit_id,
+      attemptId,
+      inputHash: unit.input_hash,
+      signal: options.signal,
+    }),
+  };
+}
+
+function buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote }) {
+  return {
+    attemptIdForUnit: (unit) => stableHash({ run_id: runId, stage: 'lessons', unit_id: unit.unit_id }),
+    execute: async ({ unit, attemptId, recovered }) => {
+      const result = await lessonsRemote.start({
+        baseUrl,
+        secret,
+        sessionId: unit.unit_id,
+        attemptId,
+        inputHash: unit.input_hash,
+        requireExistingReceipt: recovered,
+        request: buildLessonExtractBody(unit.unit_id, options),
+        signal: options.signal,
+      });
+      const data = result?.data || result || {};
+      const failureCause = data?.failure?.cause || data?.failure?.error || data?.error || result?.error;
+      if (failureCause === 'extraction_operation_reconciliation_required') {
+        return { status: 'blocked', reason: failureCause, payload: { error: failureCause } };
+      }
+      if (result?.ok === false && Number(result?.status_code ?? result?.statusCode ?? 0) === 0) {
+        return {
+          status: 'blocked',
+          reason: 'request_transport_failed',
+          payload: { error: 'lesson_result_unknown_after_transport_failure' },
+        };
+      }
+      if (result?.ok === false) {
+        return { status: 'failed', payload: { error: failureCause || 'lessons extract failed' } };
+      }
+      const lessonRun = data?.runs?.[0] || data?.run || null;
+      const lessonRunId = lessonRun?.id || lessonRun?.runId || lessonRun?.run_id || null;
+      if (!lessonRunId) {
+        return { status: 'failed', payload: { error: 'lessons extract returned no run id' } };
+      }
+      const lessonStatus = lessonRun.status || data.status || 'running';
+      if (['succeeded', 'skipped'].includes(lessonStatus)) {
+        return { status: lessonStatus, payload: { run_id: lessonRunId } };
+      }
+      if (['failed', 'retryable', 'infeasible'].includes(lessonStatus)) {
+        return {
+          status: 'failed',
+          payload: {
+            run_id: lessonRunId,
+            error: lessonRun.error || lessonRun.lastError || failureCause || 'lesson run failed',
+          },
+        };
+      }
+      return { status: 'pending' };
+    },
+    record: ({ unit, attemptId, terminal }) => lessonsRemote.record({
+      baseUrl,
+      secret,
+      runId: terminal.run_id,
+      attemptId,
+      inputHash: unit.input_hash,
+      signal: options.signal,
+    }),
+  };
+}
+
+async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
+  const secret = requireSecret();
+  const baseUrl = normalizeBaseUrl(options.baseUrl);
+  const fsApi = dependencies.fsApi || fs;
+  if (options.doctorScript) {
+    await runDoctorGate(path.resolve(options.doctorScript), options.doctorOk);
+  }
+  const summaryRemote = dependencies.v2SummaryRemote || {
+    advance: async ({
+      sessionId,
+      attemptId,
+      inputHash,
+      requireExistingReceipt,
+      request,
+      signal,
+    }) => requestJson(
+      baseUrl,
+      secret,
+      'POST',
+      SUMMARY_RESUMABLE_PATH,
+      {
+        ...request,
+        sessionId,
+        attemptId,
+        inputHash,
+        ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+      },
+      requestOptions({ ...options, signal }),
+    ),
+    record: async ({ sessionId, attemptId, inputHash, signal }) => {
+      const response = await requestJson(baseUrl, secret, 'POST', '/agentmemory/extraction-runs/record', {
+        runId,
+        mark: options.mark,
+        summarySessionId: sessionId,
+      }, requestOptions({ ...options, signal }));
+      if (!response.ok) throw new Error(response.error || 'v2_summary_record_failed');
+    },
+  };
+  const lessonsRemote = dependencies.v2LessonsRemote || {
+    start: async ({
+      sessionId,
+      attemptId,
+      inputHash,
+      requireExistingReceipt,
+      request,
+      signal,
+    }) => requestJson(
+      baseUrl,
+      secret,
+      'POST',
+      '/agentmemory/lessons/extract',
+      {
+        ...request,
+        sessionIds: [sessionId],
+        attemptId,
+        inputHash,
+        ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+      },
+      requestOptions({ ...options, signal }),
+    ),
+    record: async ({ runId: lessonRunId, attemptId, inputHash, signal }) => {
+      const response = await requestJson(baseUrl, secret, 'POST', '/agentmemory/extraction-runs/record', {
+        runId,
+        mark: options.mark,
+        lessonRunId,
+      }, requestOptions({ ...options, signal }));
+      if (!response.ok) throw new Error(response.error || 'v2_lessons_record_failed');
+    },
+  };
+  const journal = new RunStateJournalV2({
+    rootDir: path.join(options.stateDir, `${runId}.v2`),
+    runId,
+    fsApi,
+  });
+  const durable = async (scope, type, payload) => {
+    const event = scope === 'control'
+      ? await journal.appendControl(type, payload)
+      : await journal.appendStage(scope, type, payload);
+    await dependencies.onV2DurableEvent?.({ scope, type, payload, event });
+    return event;
+  };
+  try {
+    for (const v1Path of [
+      path.join(options.stateDir, `${runId}.json`),
+      path.join(options.stateDir, `${runId}.journal.jsonl`),
+      path.join(options.stateDir, `${runId}.status.json`),
+      path.join(options.stateDir, `${runId}.json.lock`),
+    ]) {
+      const exists = await fsApi.access(v1Path).then(() => true).catch((error) => {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+      });
+      if (exists) throw new Error('v2_v1_state_collision: 该 run_id 已有 v1 状态或锁');
+    }
+    await assertV1ReleaseGate(options.stateDir, { fsApi });
+    await journal.acquireLock({ takeover: dependencies.v2VerifiedTakeover || null });
+    let control = await journal.open();
+    const allSessions = await loadSessions(baseUrl, secret, options.agentId, options);
+    const excludedSessionIds = await loadExcludedSessionIds(options.excludeRecords);
+    const selection = selectFullExtractionSessions(allSessions, excludedSessionIds);
+    const sessions = selection.sessions;
+    const config = {
+      ...buildConfigFromOptions(options),
+      base_url: baseUrl,
+    };
+    const configHash = stableHash(config);
+    const inventoryHash = computeInventoryHash(sessions, options.agentId);
+    const started = control.find((event) => event.type === 'run_started');
+    if (started) {
+      if (
+        started.payload?.format !== 'run-state-journal-v2'
+        || started.payload?.schema_version !== 2
+        || started.payload?.base_url !== baseUrl
+        || started.payload?.config_hash !== configHash
+        || started.payload?.inventory_hash !== inventoryHash
+      ) {
+        throw new Error('v2_run_input_drifted: 请创建新的 run_id');
+      }
+    } else {
+      await durable('control', 'run_started', {
+        run_id: runId,
+        format: 'run-state-journal-v2',
+        schema_version: 2,
+        base_url: baseUrl,
+        config_hash: configHash,
+        inventory_hash: inventoryHash,
+      });
+      control = await journal.readControl();
+    }
+    const summaryResult = await runV2JournalSingleStage({
+      stage: 'summary',
+      control,
+      journal,
+      durable,
+      plan: buildV2SummaryPlan(sessions, baseUrl, options),
+      adapter: buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote }),
+      planOnly: options.dryRun,
+    });
+    control = summaryResult.control;
+    if (!['completed', 'planned'].includes(summaryResult.status)) {
+      return summaryResult.status === 'pending' ? 75 : 1;
+    }
+    const lessonsResult = await runV2JournalSingleStage({
+      stage: 'lessons',
+      control,
+      journal,
+      durable,
+      plan: buildV2LessonsPlan(sessions, baseUrl, options),
+      adapter: buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote }),
+      planOnly: options.dryRun,
+    });
+    if (!['completed', 'planned'].includes(lessonsResult.status)) {
+      return lessonsResult.status === 'pending' ? 75 : 1;
+    }
+    if (dependencies.v2RemainingStages === false) return 0;
+    control = lessonsResult.control;
+    const request = (endpoint, body) => requestJson(
+      baseUrl,
+      secret,
+      'POST',
+      endpoint,
+      body,
+      requestOptions(options),
+    );
+    const runRemaining = typeof dependencies.v2RemainingStages === 'function'
+      ? dependencies.v2RemainingStages
+      : runV2RemainingStages;
+    const remainingResult = await runRemaining({
+      options,
+      runId,
+      config,
+      configHash,
+      inventoryHash,
+      request,
+      stableHash,
+      loadSelectedSessions: async () => {
+        const latest = await loadSessions(baseUrl, secret, options.agentId, options);
+        return selectFullExtractionSessions(latest, excludedSessionIds).sessions;
+      },
+      runSingleStage: async ({ stage, plan, adapter }) => {
+        const result = await runV2JournalSingleStage({
+          stage,
+          control,
+          journal,
+          durable,
+          plan,
+          adapter,
+          planOnly: options.dryRun,
+        });
+        control = result.control;
+        return result;
+      },
+      runTwoPhaseStage: async ({ stage, plan, adapter }) => {
+        const result = await runV2JournalTwoPhaseStage({
+          stage,
+          control,
+          journal,
+          durable,
+          plan,
+          adapter,
+          planOnly: options.dryRun,
+        });
+        control = result.control;
+        return result;
+      },
+    });
+    if (!['completed', 'planned'].includes(remainingResult.status)) {
+      return remainingResult.status === 'pending' ? 75 : 1;
+    }
+    if (!options.dryRun && !control.some((event) => event.type === 'run_completed')) {
+      await durable('control', 'run_completed', {
+        run_id: runId,
+        stage_count: 8,
+      });
+      await journal.writeStatus({
+        status: 'completed',
+        current_stage: null,
+        stage_count: 8,
+      });
+    }
+    return 0;
+  } finally {
+    await journal.releaseLock();
+  }
+}
+
 export async function mainForTest(argv = process.argv.slice(2), dependencies = {}) {
   const options = parseArgs(argv);
   if (options.help) {
@@ -5421,6 +5951,13 @@ export async function mainForTest(argv = process.argv.slice(2), dependencies = {
   options.signal = dependencies.signal || cancellation.signal;
 
   const runId = options.runId || makeRunId();
+  if (options.runStateFormat === 'v2') {
+    try {
+      return await runV2SummaryLifecycle({ options, runId, dependencies });
+    } finally {
+      cancellation.dispose?.();
+    }
+  }
   const statePath = path.join(options.stateDir, `${runId}.json`);
   const drainRequestPath = `${statePath}.drain-request.json`;
   let stateLock = null;

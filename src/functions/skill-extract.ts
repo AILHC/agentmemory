@@ -1,9 +1,9 @@
 import type { ISdk } from "iii-sdk";
+import { createHash } from "node:crypto";
 import type {
   AuditEntry,
   CompressedObservation,
   ExtractionOperationIdentity,
-  ExtractionOperationReceipt,
   SessionSummary,
   ProceduralMemory,
   Session,
@@ -15,7 +15,10 @@ import { StateKV } from "../state/kv.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
-import { buildExtractionOperationKey } from "./extraction-operation-receipts.js";
+import {
+  completeModelOperationFromVerifiedResult,
+  withExtractionOperationReceipt,
+} from "./extraction-operation-receipts.js";
 import { withOutputLanguagePolicy } from "../prompts/output-language.js";
 import {
   resolveStageModelCallOptions,
@@ -134,10 +137,29 @@ interface SkillExtractOptions {
   sessionId: string;
   model?: string;
   operationIdentity?: ExtractionOperationIdentity;
+  operationReceiptManaged?: boolean;
+  requireExistingReceipt?: boolean;
 }
 
 type ParsedSkill = NonNullable<ReturnType<typeof parseSkillXml>>;
 const SKILL_COMMIT_LOCK_KEY = "skill-extract-commit";
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter((key) => record[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
+}
+
+function stableHash(value: unknown): string {
+  return createHash("sha256").update(stableStringify(value)).digest("hex");
+}
 
 function skillProposalKey(identity: ExtractionOperationIdentity): string {
   return fingerprintId("skp", JSON.stringify([
@@ -202,51 +224,16 @@ async function storeSkillProposal(options: {
       },
     } : {}),
   };
-  await options.kv.set(KV.skillExtractionProposals, key, proposal);
+  await options.kv.set(KV.skillExtractionProposal(key), key, proposal);
   return skillProposalResponse(proposal);
 }
 
-async function reconcileSkillPreparation(
+async function findSkillPreparationResult(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
 ): Promise<Record<string, unknown> | null> {
-  const receipt = await kv.get<ExtractionOperationReceipt<Record<string, unknown>>>(
-    KV.extractionOperationReceipts,
-    buildExtractionOperationKey(identity),
-  );
-  if (receipt && receipt.inputHash !== identity.inputHash) {
-    return {
-      success: false,
-      status: "failed",
-      failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
-    };
-  }
-  if (receipt?.status === "running") {
-    return {
-      success: false,
-      status: "failed",
-      failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" },
-    };
-  }
-  if (receipt?.status === "failed") {
-    return {
-      success: false,
-      status: "failed",
-      failure: receipt.failure ?? { class: "unit", cause: "extraction_operation_failed" },
-    };
-  }
-  if (receipt?.status === "succeeded" && receipt.response) {
-    return {
-      ...receipt.response,
-      success: true,
-      status: typeof receipt.response.status === "string"
-        ? receipt.response.status
-        : "succeeded",
-      replayed: true,
-    };
-  }
   const proposal = await kv.get<SkillExtractionProposal>(
-    KV.skillExtractionProposals,
+    KV.skillExtractionProposal(skillProposalKey(identity)),
     skillProposalKey(identity),
   );
   if (!proposal) return null;
@@ -337,10 +324,6 @@ export async function runSkillExtract(options: SkillExtractOptions): Promise<Rec
   if (!options.sessionId) {
     return { success: false, error: "sessionId is required", ...responseMetadata("failed") };
   }
-  if (options.operationIdentity) {
-    const reconciled = await reconcileSkillPreparation(options.kv, options.operationIdentity);
-    if (reconciled) return reconciled;
-  }
 
   const session = await options.kv.get<Session>(KV.sessions, options.sessionId).catch(() => null);
   if (!session) {
@@ -373,7 +356,45 @@ export async function runSkillExtract(options: SkillExtractOptions): Promise<Rec
     };
   }
 
-  try {
+  const verifiedIdentity = options.operationIdentity && options.operationReceiptManaged
+    ? {
+        ...options.operationIdentity,
+        inputHash: stableHash({
+          runnerInputHash: options.operationIdentity.inputHash,
+          session: {
+            id: session.id,
+            status: session.status,
+            startedAt: session.startedAt,
+          },
+          summary: {
+            sessionId: summary.sessionId,
+            title: summary.title,
+            narrative: summary.narrative,
+            keyDecisions: summary.keyDecisions,
+            filesModified: summary.filesModified,
+            concepts: summary.concepts,
+          },
+          observations: observations.map((observation) => ({
+            id: observation.id,
+            timestamp: observation.timestamp,
+            type: observation.type,
+            title: observation.title,
+            narrative: observation.narrative,
+            importance: observation.importance,
+          })),
+          provider: stageMetadata.provider,
+          model: stageMetadata.model ?? null,
+          modelSource: stageMetadata.modelSource ?? null,
+        }),
+      }
+    : options.operationIdentity;
+
+  const execute = async (): Promise<Record<string, unknown>> => {
+    if (verifiedIdentity) {
+      const existing = await findSkillPreparationResult(options.kv, verifiedIdentity);
+      if (existing) return existing;
+    }
+    try {
     const prompt = buildSkillPrompt(summary, observations, session);
     const systemPrompt = withOutputLanguagePolicy(SKILL_EXTRACT_SYSTEM);
     const callOptions = resolveStageModelCallOptions("skill_extract", options.model);
@@ -382,10 +403,10 @@ export async function runSkillExtract(options: SkillExtractOptions): Promise<Rec
       : await options.provider.summarize(systemPrompt, prompt);
     const parsed = parseSkillXml(response);
 
-    if (options.operationIdentity) {
+    if (verifiedIdentity) {
       return storeSkillProposal({
         kv: options.kv,
-        identity: options.operationIdentity,
+        identity: verifiedIdentity,
         sessionId: options.sessionId,
         parsed,
         concepts: summary.concepts,
@@ -426,7 +447,36 @@ export async function runSkillExtract(options: SkillExtractOptions): Promise<Rec
     const msg = err instanceof Error ? err.message : String(err);
     logger.error("Skill extraction failed", { error: msg });
     return { success: false, error: msg, ...responseMetadata("failed") };
+    }
+  };
+
+  if (!verifiedIdentity || !options.operationReceiptManaged) return execute();
+  let operation = await withExtractionOperationReceipt(
+    options.kv,
+    verifiedIdentity,
+    execute,
+    { requireExisting: options.requireExistingReceipt === true },
+  );
+  if (
+    operation.failure?.cause === "extraction_operation_reconciliation_required"
+  ) {
+    const persisted = await findSkillPreparationResult(options.kv, verifiedIdentity);
+    if (persisted) {
+      operation = await completeModelOperationFromVerifiedResult(
+        options.kv,
+        verifiedIdentity,
+        persisted,
+      );
+    }
   }
+  if (operation.failure) {
+    return { success: false, status: "failed", failure: operation.failure };
+  }
+  return operation.response ?? {
+    success: false,
+    status: "failed",
+    failure: { class: "hard", cause: "skill_extract_result_reference_missing" },
+  };
 }
 
 export async function commitSkillExtractionProposal(options: {
@@ -437,7 +487,7 @@ export async function commitSkillExtractionProposal(options: {
   const key = skillProposalKey(options.identity);
   return withKeyedLock(SKILL_COMMIT_LOCK_KEY, async () => {
     const proposal = await options.kv.get<SkillExtractionProposal>(
-      KV.skillExtractionProposals,
+      KV.skillExtractionProposal(key),
       key,
     );
     if (!proposal) {
@@ -479,7 +529,7 @@ export async function commitSkillExtractionProposal(options: {
         createdAt: new Date().toISOString(),
       };
       proposal.status = "committing";
-      await options.kv.set(KV.skillExtractionProposals, key, proposal);
+      await options.kv.set(KV.skillExtractionProposal(key), key, proposal);
     }
 
     const intent = proposal.commitIntent;
@@ -537,7 +587,7 @@ export async function commitSkillExtractionProposal(options: {
       promptChars: proposal.promptChars,
       parseFailures: 0,
     };
-    await options.kv.set(KV.skillExtractionProposals, key, proposal);
+    await options.kv.set(KV.skillExtractionProposal(key), key, proposal);
     return skillProposalResponse(proposal);
   });
 }
@@ -558,6 +608,8 @@ export function registerSkillExtractFunctions(
       identity: ExtractionOperationIdentity;
       sessionId: string;
       model?: string;
+      operationReceiptManaged?: boolean;
+      requireExistingReceipt?: boolean;
     }) => withKeyedLock(
       `skill-extract-prepare:${skillProposalKey(data.identity)}`,
       () => runSkillExtract({ kv, provider, ...data, operationIdentity: data.identity }),

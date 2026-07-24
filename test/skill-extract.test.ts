@@ -358,6 +358,11 @@ describe("skill-extract", () => {
       modelApplied: true,
     });
     expect(mockProvider.summarize).toHaveBeenCalledTimes(2);
+    const proposalScopes = [...store.keys()].filter((scope) =>
+      scope.startsWith("mem:skill-extraction-proposal:"));
+    expect(proposalScopes).toHaveLength(2);
+    expect(proposalScopes.every((scope) => store.get(scope)?.size === 1)).toBe(true);
+    expect(store.has(KV.skillExtractionProposals)).toBe(false);
 
     const replay = await prepare({
       identity: identities[0],

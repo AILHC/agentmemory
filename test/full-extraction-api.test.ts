@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { describe, expect, it, vi } from "vitest";
 
 import { registerConsolidateFunction } from "../src/functions/consolidate.js";
-import { KV } from "../src/state/schema.js";
+import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
+import { fingerprintId, KV } from "../src/state/schema.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 
 function mockKV() {
@@ -43,7 +45,452 @@ function mockSdk(triggerImpl?: (input: { function_id: string; payload: unknown }
   };
 }
 
+function stableHash(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(
+      Object.entries(item as Record<string, unknown>)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, child]) => [key, normalize(child)]),
+    );
+  };
+  return createHash("sha256").update(JSON.stringify(normalize(value))).digest("hex");
+}
+
+function sessionInputHash(sessionId: string, startedAt: string): string {
+  return stableHash({ session_id: sessionId, started_at: startedAt });
+}
+
 describe("full extraction REST wrappers", () => {
+  it("replays a v2 memory prepare response with its proposal handle", async () => {
+    const sdk = mockSdk(async () => ({
+      success: true,
+      status: "prepared",
+      preparedHandle: "mcph-1",
+      proposalHash: "proposal-1",
+      totalObservations: 2,
+    }));
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    const body = {
+      runId: "prepare-attempt-1",
+      stage: "memory_consolidate",
+      unitId: "window-1",
+      inputHash: "input-1",
+      concept: "windows",
+      sourceObservationIds: ["obs-1"],
+    };
+    const handler = sdk.getFunction("api::full-memory-consolidate-window-prepare");
+
+    const first = await handler({ headers: {}, body });
+    const replay = await handler({ headers: {}, body });
+
+    expect(first.status_code).toBe(200);
+    expect(replay.body).toEqual(first.body);
+    expect(replay.body).toMatchObject({ preparedHandle: "mcph-1", proposalHash: "proposal-1" });
+    expect(sdk.trigger).toHaveBeenCalledTimes(1);
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::full-memory-consolidate-window-prepare",
+      payload: expect.objectContaining({ operationReceiptManaged: true }),
+    });
+  });
+
+  it("hard-stops an orphaned v2 memory prepare receipt", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const identity = {
+      runId: "prepare-orphaned",
+      stage: "memory_consolidate" as const,
+      unitId: "window-1",
+      inputHash: "input-1",
+    };
+    const receiptIdentity = {
+      ...identity,
+      inputHash: stableHash({
+        runnerInputHash: identity.inputHash,
+        payload: {
+          identity,
+          concept: "windows",
+          observationIds: ["obs-1"],
+        },
+      }),
+    };
+    const receiptKey = buildExtractionOperationKey(receiptIdentity);
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+      ...receiptIdentity,
+      key: receiptKey,
+      status: "running",
+      startedAt: "2026-07-24T00:00:00.000Z",
+    });
+    registerApiTriggers(sdk as never, kv as never, "");
+
+    const response = await sdk.getFunction("api::full-memory-consolidate-window-prepare")({
+      headers: {},
+      body: { ...identity, concept: "windows", sourceObservationIds: ["obs-1"] },
+    });
+
+    expect(response.status_code).toBe(503);
+    expect(response.body).toMatchObject({
+      failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" },
+    });
+    expect(sdk.trigger).not.toHaveBeenCalled();
+  });
+
+  it("hard-stops a recovered memory prepare when the receipt is missing", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+
+    const response = await sdk.getFunction("api::full-memory-consolidate-window-prepare")({
+      headers: {},
+      body: {
+        runId: "prepare-missing",
+        stage: "memory_consolidate",
+        unitId: "window-1",
+        inputHash: "input-1",
+        concept: "windows",
+        sourceObservationIds: ["obs-1"],
+        requireExistingReceipt: true,
+      },
+    });
+
+    expect(response.status_code).toBe(503);
+    expect(response.body).toMatchObject({
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+    });
+    expect(sdk.trigger).not.toHaveBeenCalled();
+  });
+
+  it("replays a v2 memory prepare direct terminal without dispatching it twice", async () => {
+    const sdk = mockSdk(async () => ({
+      success: true,
+      status: "skipped",
+      consolidated: 0,
+      totalObservations: 0,
+    }));
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    const body = {
+      runId: "prepare-terminal-1",
+      stage: "memory_consolidate",
+      unitId: "window-empty",
+      inputHash: "input-empty",
+      concept: "windows",
+      sourceObservationIds: [],
+    };
+    const handler = sdk.getFunction("api::full-memory-consolidate-window-prepare");
+
+    const first = await handler({ headers: {}, body });
+    const replay = await handler({ headers: {}, body });
+
+    expect(first.status_code).toBe(200);
+    expect(replay.body).toEqual(first.body);
+    expect(replay.body).toMatchObject({ status: "skipped", consolidated: 0 });
+    expect(sdk.trigger).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles an orphaned v2 memory prepare receipt from its persisted proposal", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const identity = {
+      runId: "prepare-reconciled",
+      stage: "memory_consolidate" as const,
+      unitId: "window-1",
+      inputHash: "input-1",
+    };
+    const receiptIdentity = {
+      ...identity,
+      inputHash: stableHash({
+        runnerInputHash: identity.inputHash,
+        payload: {
+          identity,
+          concept: "windows",
+          observationIds: ["obs-1"],
+        },
+      }),
+    };
+    const receiptKey = buildExtractionOperationKey(receiptIdentity);
+    const proposalKey = fingerprintId("mcp", JSON.stringify([
+      identity.runId,
+      identity.stage,
+      identity.unitId,
+    ]));
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+      ...receiptIdentity,
+      key: receiptKey,
+      status: "running",
+      startedAt: "2026-07-24T00:00:00.000Z",
+    });
+    await kv.set(KV.memoryConsolidationProposal(proposalKey), proposalKey, {
+      ...identity,
+      key: proposalKey,
+      handle: "mcph-1",
+      proposalHash: "proposal-1",
+      status: "prepared",
+      preparedAt: "2026-07-24T00:00:01.000Z",
+      concept: "windows",
+      sourceObservationIds: ["obs-1"],
+      parsed: {},
+      totalObservations: 1,
+      promptChars: 42,
+    });
+    registerApiTriggers(sdk as never, kv as never, "");
+
+    const response = await sdk.getFunction("api::full-memory-consolidate-window-prepare")({
+      headers: {},
+      body: { ...identity, concept: "windows", sourceObservationIds: ["obs-1"] },
+    });
+
+    expect(response.status_code).toBe(200);
+    expect(response.body).toMatchObject({
+      status: "prepared",
+      preparedHandle: "mcph-1",
+      proposalHash: "proposal-1",
+    });
+    expect(sdk.trigger).not.toHaveBeenCalled();
+    expect(await kv.get(KV.extractionOperationReceipt(receiptKey), receiptKey)).toMatchObject({
+      status: "succeeded",
+    });
+  });
+
+  it("replays a v2 memory commit with an identity distinct from prepare", async () => {
+    const sdk = mockSdk(async () => ({
+      success: true,
+      status: "succeeded",
+      consolidated: 1,
+      memoryIds: ["mem-1"],
+    }));
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    const commitInputHash = stableHash({
+      prepareRunId: "prepare-attempt-1",
+      unitId: "window-1",
+      prepareInputHash: "prepare-input-1",
+      preparedHandle: "mcph-1",
+      proposalHash: "proposal-1",
+    });
+    const body = {
+      runId: "commit-attempt-1",
+      stage: "memory_consolidate",
+      unitId: "window-1",
+      inputHash: commitInputHash,
+      prepareRunId: "prepare-attempt-1",
+      prepareInputHash: "prepare-input-1",
+      preparedHandle: "mcph-1",
+      proposalHash: "proposal-1",
+    };
+    const handler = sdk.getFunction("api::full-memory-consolidate-window-commit");
+
+    const first = await handler({ headers: {}, body });
+    const replay = await handler({ headers: {}, body });
+
+    expect(first.status_code).toBe(200);
+    expect(replay.body).toEqual(first.body);
+    expect(sdk.trigger).toHaveBeenCalledTimes(1);
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::full-memory-consolidate-window-commit",
+      payload: {
+        identity: {
+          runId: "prepare-attempt-1",
+          stage: "memory_consolidate",
+          unitId: "window-1",
+          inputHash: "prepare-input-1",
+        },
+        preparedHandle: "mcph-1",
+        proposalHash: "proposal-1",
+      },
+    });
+    const conflict = await handler({
+      headers: {},
+      body: { ...body, inputHash: "caller-supplied-conflict" },
+    });
+    expect(conflict).toMatchObject({
+      status_code: 409,
+      body: {
+        failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+      },
+    });
+    expect(sdk.trigger).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-enters an orphaned deterministic v2 memory commit", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const commitInputHash = stableHash({
+      prepareRunId: "prepare-1",
+      unitId: "window-1",
+      prepareInputHash: "prepare-input-1",
+      preparedHandle: "mcph-1",
+      proposalHash: "proposal-1",
+    });
+    const identity = {
+      runId: "commit-orphaned",
+      stage: "memory_consolidate" as const,
+      unitId: "window-1",
+      inputHash: commitInputHash,
+    };
+    const receiptKey = buildExtractionOperationKey(identity);
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+      ...identity,
+      key: receiptKey,
+      status: "running",
+      startedAt: "2026-07-24T00:00:00.000Z",
+    });
+    registerApiTriggers(sdk as never, kv as never, "");
+
+    const response = await sdk.getFunction("api::full-memory-consolidate-window-commit")({
+      headers: {},
+      body: {
+        ...identity,
+        prepareRunId: "prepare-1",
+        prepareInputHash: "prepare-input-1",
+        preparedHandle: "mcph-1",
+        proposalHash: "proposal-1",
+      },
+    });
+
+    expect(response.status_code).toBe(200);
+    expect(sdk.trigger).toHaveBeenCalledTimes(1);
+  });
+
+  it("forwards a v2 summary attempt identity without changing the legacy resumable payload", async () => {
+    const sdk = mockSdk(async () => ({ success: true, status: "in_progress" }));
+    registerApiTriggers(sdk as never, mockKV() as never, "");
+
+    const response = await sdk.getFunction("api::summarize-resumable")({
+      headers: {},
+      body: {
+        sessionId: "session-1",
+        attemptId: "attempt-1",
+        inputHash: "freshness-1",
+        requireExistingReceipt: true,
+      },
+    });
+
+    expect(response.status_code).toBe(200);
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::summarize-resumable",
+      payload: {
+        sessionId: "session-1",
+        attemptId: "attempt-1",
+        inputHash: "freshness-1",
+        requireExistingReceipt: true,
+      },
+    });
+  });
+
+  it.each(["true", "false"])(
+    "rejects string requireExistingReceipt=%s on the summary HTTP boundary",
+    async (requireExistingReceipt) => {
+      const sdk = mockSdk(async () => ({ success: true, status: "in_progress" }));
+      registerApiTriggers(sdk as never, mockKV() as never, "");
+
+      const response = await sdk.getFunction("api::summarize-resumable")({
+        headers: {},
+        body: {
+          sessionId: "session-1",
+          attemptId: "attempt-1",
+          inputHash: "freshness-1",
+          requireExistingReceipt,
+        },
+      });
+
+      expect(response).toMatchObject({
+        status_code: 400,
+        body: {
+          success: false,
+          failure: {
+            class: "hard",
+            cause: "invalid_extraction_operation_identity",
+          },
+        },
+      });
+      expect(sdk.trigger).not.toHaveBeenCalled();
+    },
+  );
+
+  it("forwards a v2 lesson attempt identity to the service-owned receipt boundary", async () => {
+    const sdk = mockSdk(async () => ({
+      success: true,
+      runs: [{
+        id: "lex-stable",
+        sessionId: "session-1",
+        status: "succeeded",
+        inputHash: "service-input",
+        configHash: "config-a",
+        createdLessonIds: ["lesson-1"],
+      }],
+    }));
+    const kv = mockKV();
+    const startedAt = "2026-07-22T00:00:00.000Z";
+    await kv.set(KV.sessions, "session-1", {
+      id: "session-1",
+      startedAt,
+    });
+    registerApiTriggers(sdk as never, kv as never, "");
+    const handler = sdk.getFunction("api::lesson-extract");
+    const body = {
+      sessionIds: ["session-1"],
+      attemptId: "attempt-1",
+      inputHash: sessionInputHash("session-1", startedAt),
+    };
+
+    const response = await handler({ headers: {}, body });
+
+    expect(response.status_code).toBe(200);
+    expect(sdk.trigger).toHaveBeenCalledTimes(1);
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::lessons::extract-llm",
+      payload: {
+        sessionIds: ["session-1"],
+        attemptId: "attempt-1",
+        inputHash: sessionInputHash("session-1", startedAt),
+      },
+    });
+  });
+
+  it("maps a service-owned orphaned v2 lesson receipt to a hard stop", async () => {
+    const sdk = mockSdk(async () => ({
+      success: false,
+      status: "failed",
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+    }));
+    const kv = mockKV();
+    const startedAt = "2026-07-22T00:00:00.000Z";
+    const inputHash = sessionInputHash("session-1", startedAt);
+    await kv.set(KV.sessions, "session-1", {
+      id: "session-1",
+      startedAt,
+    });
+    registerApiTriggers(sdk as never, kv as never, "");
+
+    const response = await sdk.getFunction("api::lesson-extract")({
+      headers: {},
+      body: {
+        sessionIds: ["session-1"],
+        attemptId: "attempt-orphaned",
+        inputHash,
+      },
+    });
+
+    expect(response.status_code).toBe(503);
+    expect(response.body).toMatchObject({
+      success: false,
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+    });
+    expect(sdk.trigger).toHaveBeenCalledTimes(1);
+  });
+
   it("allows only structured summary failure diagnostics through the REST boundary", async () => {
     const sdk = mockSdk(async () => ({
       success: false,
