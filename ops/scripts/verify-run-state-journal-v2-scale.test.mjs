@@ -23,8 +23,9 @@ test('eight-stage v2 scale verification measures linear runner and receipt growt
     assert.equal(report.samples[0].service_receipt_count, 0);
     assert.equal(report.samples[1].service_receipt_count, 40);
     assert.equal(report.samples[2].service_receipt_count, 80);
-    assert.equal(report.release_decision.default_format, 'v1');
+    assert.equal(report.release_decision.default_format, 'v2');
     assert.equal(report.release_decision.change_default, false);
+    assert.equal(report.release_decision.reason, 'default_already_switched_after_managed_canary');
     for (const sample of report.samples) {
       assert.equal(sample.stage_count, 8);
       assert.equal(sample.v1_snapshot_files.length, 0);

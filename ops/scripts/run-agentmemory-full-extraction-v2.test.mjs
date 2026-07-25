@@ -39,7 +39,7 @@ function successfulSummaryResponse({ attemptId, inputHash }, title = 'summary') 
   };
 }
 
-test('v2 runs the shared runtime concurrency gate before inventory access', async () => {
+test('default v2 runs the shared runtime concurrency gate before inventory access', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-runtime-gate-'));
@@ -49,7 +49,6 @@ test('v2 runs the shared runtime concurrency gate before inventory access', asyn
         '--base-url', 'http://127.0.0.1:1',
         '--state-dir', stateDir,
         '--run-id', 'runtime-gate',
-        '--run-state-format', 'v2',
       ], {
         v2RuntimeCheck: async () => {
           throw new Error('SUMMARIZE_CHUNK_CONCURRENCY=2');

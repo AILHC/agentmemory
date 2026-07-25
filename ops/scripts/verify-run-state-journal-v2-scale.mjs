@@ -342,14 +342,14 @@ export async function runScaleVerification({ workDir, units = 100 } = {}) {
     },
     samples,
     release_decision: {
-      default_format: 'v1',
+      default_format: 'v2',
       change_default: false,
-      reason: 'managed_runtime_statekv_physical_sample_not_measured',
+      reason: 'default_already_switched_after_managed_canary',
     },
     limitations: [
       'StateKV 仅测量服务收据 JSON 序列化载荷，不代表 iii-engine SQLite、WAL 或页开销。',
       '模型与业务服务由确定性适配器替代；本工具验证恢复协议、事件规模和收据投影，不验证线上延迟。',
-      '切换默认格式前仍需在受管正式运行环境取得 StateKV 物理增量、进程峰值内存和真实恢复耗时。',
+      '本工具不单独决定默认格式；默认切换依据还包括受管隔离测量、真实 provider canary 和正式发布门禁。',
     ],
   };
 }

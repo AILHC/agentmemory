@@ -324,10 +324,10 @@ export async function runStateKvReceiptScale({
     samples,
     recovery,
     release_decision: {
-      default_format: 'v1',
+      default_format: 'v2',
       change_default: false,
       reason: accumulatedLinear
-        ? 'managed_agentmemory_worker_and_proposal_scopes_not_measured'
+        ? 'default_already_switched_after_managed_canary'
         : 'statekv_per_operation_receipt_growth_not_linear',
     },
     limitations: [

@@ -34,7 +34,7 @@ import {
   findSessionSummary,
   freezeMemoryConsolidateOrder,
   isRunFreshForAttempt,
-  mainForTest,
+  mainForTest as runMainForTest,
   makeRunId,
   migrateOrchestrationPolicy,
   normalizeSessions,
@@ -83,6 +83,10 @@ import {
   writeStateAtomically,
 } from './run-agentmemory-full-extraction.mjs';
 import { AdaptiveProviderLimiter } from './lib/adaptive-provider-limiter.mjs';
+
+function mainForTest(argv, dependencies) {
+  return runMainForTest([...argv, '--run-state-format', 'v1'], dependencies);
+}
 
 test('plan 404 is runtime-transient only when runtime diagnostics are unhealthy', async () => {
   const response = { status_code: 404, data: { error: 'not found' } };
@@ -2160,6 +2164,8 @@ test('parseArgs accepts session concurrency up to 3', () => {
   assert.equal(options.sessionConcurrency, 3);
   assert.equal(buildConfigFromOptions(options).session_concurrency, 3);
   assert.equal(parseArgs(required).sessionConcurrency, 1);
+  assert.equal(parseArgs(required).runStateFormat, 'v2');
+  assert.equal(parseArgs([...required, '--run-state-format', 'v1']).runStateFormat, 'v1');
   assert.throws(() => parseArgs([...required, '--session-concurrency', '0']), /必须是 1 到 3/);
   assert.throws(() => parseArgs([...required, '--session-concurrency', '4']), /必须是 1 到 3/);
 });
@@ -4087,6 +4093,7 @@ test('main resume rebuilds historical provider failures into fair single-item re
       '--run-id', runId,
       '--resume',
       '--reset-drifted-units',
+      '--run-state-format', 'v1',
       '--session-concurrency', '3',
       '--delay-ms', '0',
     ];
