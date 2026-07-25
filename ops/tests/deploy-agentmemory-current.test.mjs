@@ -378,11 +378,14 @@ if ($sourceCommit -notmatch '^[0-9a-f]{40}$') { throw 'invalid source commit' }
   assert.equal(result.status, 0, result.stderr || result.stdout);
 });
 
-test('生命周期 owner 自动选择运行中的 Service，否则使用 Console', () => {
+test('生命周期 owner 不依赖 CIM，并自动选择运行中的 Service，否则使用 Console', async () => {
+  const source = await fs.readFile(deployScript, 'utf8');
+  assert.doesNotMatch(source, /Get-CimInstance/);
+
   const result = runPowerShell(`
 if ((Resolve-AmDeploymentOwner -Service $null) -cne 'Console') { throw 'missing service owner mismatch' }
 if ((Resolve-AmDeploymentOwner -Service ([pscustomobject]@{ State = 'Stopped' })) -cne 'Console') { throw 'stopped service owner mismatch' }
-if ((Resolve-AmDeploymentOwner -Service ([pscustomobject]@{ State = 'Running' })) -cne 'Service') { throw 'running service owner mismatch' }
+if ((Resolve-AmDeploymentOwner -Service ([pscustomobject]@{ Status = 'Running' })) -cne 'Service') { throw 'running service owner mismatch' }
 `);
 
   assert.equal(result.status, 0, result.stderr || result.stdout);

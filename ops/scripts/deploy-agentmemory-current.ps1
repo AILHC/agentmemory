@@ -515,7 +515,17 @@ function Invoke-AmDeploymentDoctor {
 
 function Resolve-AmDeploymentOwner {
   param([AllowNull()]$Service)
-  if ($Service -and [string]$Service.State -ne 'Stopped') {
+  if (-not $Service) {
+    return 'Console'
+  }
+  $stateProperty = $Service.PSObject.Properties['Status']
+  if (-not $stateProperty) {
+    $stateProperty = $Service.PSObject.Properties['State']
+  }
+  if (-not $stateProperty) {
+    throw 'service state is unavailable'
+  }
+  if ([string]$stateProperty.Value -ne 'Stopped') {
     return 'Service'
   }
   return 'Console'
@@ -543,7 +553,7 @@ function Invoke-AmDeployment {
   try {
     $sourceCommit = Resolve-AmGitCommit -Repo $RepositoryRoot -Commit 'HEAD'
     $owner = Resolve-AmDeploymentOwner -Service (
-      Get-CimInstance Win32_Service -Filter "Name='agentmemory'" -ErrorAction SilentlyContinue
+      Get-Service -Name 'agentmemory' -ErrorAction Stop
     )
     Write-Output "deployment.sourceCommit=$sourceCommit"
     Write-Output "deployment.owner=$owner"
