@@ -325,8 +325,12 @@ function Copy-AmReleaseScripts {
   $destinationLib = Join-Path $Destination 'lib'
   $requiredLib = @(
     'adaptive-provider-limiter.mjs',
+    'full-extraction-stage-adapters-v2.mjs',
+    'recoverable-stage-v2.mjs',
+    'run-state-journal-v2.mjs',
     'run-state-store.mjs',
-    'stage-pipeline.mjs'
+    'stage-pipeline.mjs',
+    'v2-release-gate.mjs'
   )
   New-Item -ItemType Directory -Path $destinationLib -Force | Out-Null
   foreach ($name in $requiredLib) {

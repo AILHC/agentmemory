@@ -4,6 +4,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { pathToFileURL } from 'node:url';
 
 const deployScript = path.resolve(
   'ops',
@@ -233,10 +234,25 @@ Copy-AmReleaseScripts -Source ${quotePowerShell(source)} -Destination ${quotePow
     (await fs.readdir(path.join(root, 'lib'))).sort(),
     [
       'adaptive-provider-limiter.mjs',
+      'full-extraction-stage-adapters-v2.mjs',
+      'recoverable-stage-v2.mjs',
+      'run-state-journal-v2.mjs',
       'run-state-store.mjs',
       'stage-pipeline.mjs',
+      'v2-release-gate.mjs',
     ],
   );
+
+  const runnerImport = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '--eval',
+      `await import(${JSON.stringify(pathToFileURL(path.join(root, 'run-agentmemory-full-extraction.mjs')).href)})`,
+    ],
+    { encoding: 'utf8', windowsHide: true },
+  );
+  assert.equal(runnerImport.status, 0, runnerImport.stderr || runnerImport.stdout);
 });
 
 test('只读状态入口优先读取 manifest 并校验 lock PID', async (context) => {
