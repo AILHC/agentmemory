@@ -71,6 +71,14 @@ test('journal fold projects durable facts without owning lifecycle validation', 
   const state = foldStageEvents([
     { type: 'unit_planned', payload: { unit_id: 's1', input_hash: 'hash' } },
     { type: 'unit_started', payload: { unit_id: 's1', attempt_id: 'attempt-1' } },
+    {
+      type: 'unit_operation_started',
+      payload: { unit_id: 's1', attempt_id: 'attempt-1', operation_id: 's1:map:0' },
+    },
+    {
+      type: 'unit_operation_completed',
+      payload: { unit_id: 's1', attempt_id: 'attempt-1', operation_id: 's1:map:0' },
+    },
     { type: 'unit_terminal', payload: { unit_id: 's1', status: 'succeeded' } },
   ]);
   assert.deepEqual(state.units.get('s1'), {
@@ -85,6 +93,12 @@ test('journal fold projects durable facts without owning lifecycle validation', 
     terminal_payload: { unit_id: 's1', status: 'succeeded' },
     blocked: false,
     recorded: false,
+    active_operation: null,
+    completed_operations: [{
+      unit_id: 's1',
+      attempt_id: 'attempt-1',
+      operation_id: 's1:map:0',
+    }],
   });
 });
 

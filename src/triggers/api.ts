@@ -479,6 +479,9 @@ const allowedFullCrystalAutoKeys = new Set([
   "project",
   "dryRun",
   "model",
+  "groupId",
+  "actionIds",
+  "actionUpdatedAts",
   "requireExistingReceipt",
 ]);
 const allowedExtractionRunRecordKeys = new Set([
@@ -558,7 +561,11 @@ async function executeIdempotentCommitOperation<T>(
   }
   return {
     status_code: result.failure?.class === "hard" ? 409 : 503,
-    body: { success: false, failure: result.failure },
+    body: {
+      success: false,
+      failure: result.failure,
+      ...(result.receipt?.status === "running" ? { retrySameIdentity: true } : {}),
+    },
   };
 }
 
@@ -1100,7 +1107,7 @@ export function registerApiTriggers(
     }
     return executeIdempotentCommitOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-skill-extract-commit",
-      payload: { identity: prepareIdentity, preparedHandle },
+      payload: { identity: prepareIdentity, preparedHandle, proposalHash },
     }));
   });
   sdk.registerTrigger({
@@ -1602,11 +1609,46 @@ export function registerApiTriggers(
     if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
     const model = optionalNonEmptyString(body, "model");
     if (model === null) return { status_code: 400, body: { error: "model must be a non-empty string" } };
+    const groupId = optionalNonEmptyString(body, "groupId");
+    const actionIds = body.actionIds === undefined ? undefined : parseStringArray(body.actionIds);
+    const actionUpdatedAts = body.actionUpdatedAts === undefined
+      ? undefined
+      : Array.isArray(body.actionUpdatedAts)
+        && body.actionUpdatedAts.every((value) => typeof value === "string" && value.trim())
+        ? body.actionUpdatedAts.map((value) => (value as string).trim())
+        : null;
+    const hasPinnedGroup = groupId !== undefined
+      || actionIds !== undefined
+      || actionUpdatedAts !== undefined;
+    if (
+      groupId === null
+      || actionIds === null
+      || actionUpdatedAts === null
+      || (
+        hasPinnedGroup
+        && (
+          !groupId
+          || !actionIds
+          || actionIds.length === 0
+          || !actionUpdatedAts
+          || actionUpdatedAts.length !== actionIds.length
+          || (Array.isArray(body.actionIds) && body.actionIds.length !== actionIds.length)
+        )
+      )
+    ) {
+      return {
+        status_code: 400,
+        body: { error: "groupId, unique actionIds, and matching actionUpdatedAts are required together" },
+      };
+    }
     const payload: Record<string, unknown> = {};
     if (olderThanDays !== undefined) payload.olderThanDays = olderThanDays;
     if (project !== undefined) payload.project = project;
     if (dryRun !== undefined) payload.dryRun = dryRun;
     if (model !== undefined) payload.model = model;
+    if (groupId !== undefined) payload.groupId = groupId;
+    if (actionIds !== undefined) payload.actionIds = actionIds;
+    if (actionUpdatedAts !== undefined) payload.actionUpdatedAts = actionUpdatedAts;
     if (dryRun === true) {
       const result = await sdk.trigger({
         function_id: "mem::full-crystals-auto",
@@ -2200,6 +2242,7 @@ export function registerApiTriggers(
         model?: string;
         attemptId?: string;
         inputHash?: string;
+        operationUnitId?: string;
         requireExistingReceipt?: boolean;
       }>,
     ): Promise<Response> => {
@@ -2212,13 +2255,16 @@ export function registerApiTriggers(
       if (model === null) return invalidModelResponse();
       const attemptId = optionalNonEmptyString(body, "attemptId");
       const inputHash = optionalNonEmptyString(body, "inputHash");
+      const operationUnitId = optionalNonEmptyString(body, "operationUnitId");
       const requireExistingReceipt = parseOptionalStrictBoolean(body.requireExistingReceipt);
       if (
         attemptId === null
         || inputHash === null
+        || operationUnitId === null
         || requireExistingReceipt === null
         || Boolean(attemptId) !== Boolean(inputHash)
         || (requireExistingReceipt === true && !attemptId)
+        || (requireExistingReceipt === true && !operationUnitId)
       ) {
         return invalidExtractionOperationIdentityResponse("summary");
       }
@@ -2228,6 +2274,7 @@ export function registerApiTriggers(
           sessionId,
           ...(model ? { model } : {}),
           ...(attemptId ? { attemptId, inputHash } : {}),
+          ...(operationUnitId ? { operationUnitId } : {}),
           ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
         },
       });

@@ -306,6 +306,8 @@ export function foldStageEvents(events) {
       terminal: null,
       blocked: false,
       recorded: false,
+      active_operation: null,
+      completed_operations: [],
     };
     if (event.type === 'unit_planned') Object.assign(unit, event.payload, { planned: true });
     if (event.type === 'unit_started') {
@@ -315,6 +317,13 @@ export function foldStageEvents(events) {
     if (event.type === 'unit_prepare_started') {
       unit.started = true;
       unit.prepare_attempt_id = event.payload.attempt_id;
+    }
+    if (event.type === 'unit_operation_started') {
+      unit.active_operation = event.payload;
+    }
+    if (event.type === 'unit_operation_completed') {
+      unit.completed_operations.push(event.payload);
+      unit.active_operation = null;
     }
     if (event.type === 'unit_prepared') {
       unit.prepared = true;

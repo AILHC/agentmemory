@@ -22,6 +22,7 @@ import { StateKV } from "../state/kv.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import {
   buildExtractionOperationKey,
+  completeModelOperationFromVerifiedResult,
   withExtractionOperationReceipt,
 } from "./extraction-operation-receipts.js";
 import {
@@ -251,6 +252,7 @@ type ResumableSummaryResponse = {
   runnerInputHash?: string;
   serviceInputHash?: string;
   resumableRunId?: string;
+  operationUnitId?: string;
   error?: string;
   failureCause?: SummaryFailureCause;
   failure?: StageFailure;
@@ -978,6 +980,7 @@ function resumableResponse(
     runnerInputHash?: string;
     serviceInputHash?: string;
     resumableRunId?: string;
+    operationUnitId?: string;
   } = {},
 ): ResumableSummaryResponse {
   const failure = options.failure
@@ -1001,6 +1004,7 @@ function resumableResponse(
       }
       : {}),
     ...(options.error ? { error: options.error } : {}),
+    ...(options.operationUnitId ? { operationUnitId: options.operationUnitId } : {}),
     ...(options.failureCause ? { failureCause: options.failureCause } : {}),
     ...(failure ? { failure } : {}),
     ...(options.telemetry
@@ -1047,6 +1051,7 @@ async function bindSucceededSummaryReuseReceipt(
   runnerInputHash: string,
   modelOperationInputHash: string,
   requireExisting: boolean,
+  operationUnitId?: string,
 ): Promise<
   | {
     proof: Pick<
@@ -1057,14 +1062,15 @@ async function bindSucceededSummaryReuseReceipt(
   | { failure: StageFailure }
 > {
   const resultRef = { scope: KV.summaryResumableRuns, key: run.id };
-  const receipt = await withExtractionOperationReceipt(
+  const receiptUnitId = operationUnitId || (run.totalChunks === 1
+    ? `${run.sessionId}:map:0`
+    : `${run.sessionId}:reduce`);
+  let receipt = await withExtractionOperationReceipt(
     kv,
     {
       runId: attemptId,
       stage: "summary",
-      unitId: run.totalChunks === 1
-        ? `${run.sessionId}:map:0`
-        : `${run.sessionId}:reduce`,
+      unitId: receiptUnitId,
       inputHash: modelOperationInputHash,
     },
     async () => ({
@@ -1074,6 +1080,21 @@ async function bindSucceededSummaryReuseReceipt(
     }),
     { requireExisting },
   );
+  if (
+    receipt.failure?.cause === "extraction_operation_reconciliation_required"
+    && receipt.receipt?.status === "running"
+  ) {
+    receipt = await completeModelOperationFromVerifiedResult(
+      kv,
+      {
+        runId: attemptId,
+        stage: "summary",
+        unitId: receiptUnitId,
+        inputHash: modelOperationInputHash,
+      },
+      { success: true, status: "succeeded", resultRef },
+    );
+  }
   if (receipt.failure) return { failure: receipt.failure };
   const receiptRef = receipt.response?.resultRef;
   if (
@@ -1154,6 +1175,7 @@ async function runResumableSummaryStep(
     model?: string;
     attemptId?: string;
     inputHash?: string;
+    operationUnitId?: string;
     requireExistingReceipt?: boolean;
   } | undefined,
   kv: StateKV,
@@ -1168,16 +1190,44 @@ async function runResumableSummaryStep(
   const sessionId = data.sessionId.trim();
   const attemptId = typeof data.attemptId === "string" ? data.attemptId.trim() : "";
   const externalInputHash = typeof data.inputHash === "string" ? data.inputHash.trim() : "";
+  const operationUnitId = typeof data.operationUnitId === "string"
+    ? data.operationUnitId.trim()
+    : "";
   if (
     Boolean(attemptId) !== Boolean(externalInputHash)
+    || (
+      data.operationUnitId !== undefined
+      && (typeof data.operationUnitId !== "string" || !operationUnitId)
+    )
     || (
       data.requireExistingReceipt !== undefined
       && typeof data.requireExistingReceipt !== "boolean"
     )
     || (data.requireExistingReceipt === true && !attemptId)
+    || (data.requireExistingReceipt === true && !operationUnitId)
   ) {
     return resumableResponse("failed", 0, 0, 0, {
       error: "attemptId and inputHash must be provided together",
+      failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+    });
+  }
+  const mapOperationPrefix = `${sessionId}:map:`;
+  const requestedMapIndex = operationUnitId.startsWith(mapOperationPrefix)
+    ? Number.parseInt(operationUnitId.slice(mapOperationPrefix.length), 10)
+    : null;
+  const requestedReduce = operationUnitId === `${sessionId}:reduce`;
+  if (
+    operationUnitId
+    && !requestedReduce
+    && (
+      requestedMapIndex === null
+      || !Number.isSafeInteger(requestedMapIndex)
+      || requestedMapIndex < 0
+      || operationUnitId !== `${mapOperationPrefix}${requestedMapIndex}`
+    )
+  ) {
+    return resumableResponse("failed", 0, 0, 0, {
+      error: "invalid summary operationUnitId",
       failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
     });
   }
@@ -1530,6 +1580,7 @@ async function runResumableSummaryStep(
             externalInputHash,
             modelOperationInputHash,
             data.requireExistingReceipt === true,
+            operationUnitId || undefined,
           );
           if ("failure" in reuse) {
             return resumableResponse(
@@ -1549,7 +1600,11 @@ async function runResumableSummaryStep(
           completedChunks,
           totalChunks,
           skippedChunks,
-          { summary: run.summary, ...proof },
+          {
+            summary: run.summary,
+            operationUnitId: operationUnitId || undefined,
+            ...proof,
+          },
         );
       }
 
@@ -1655,7 +1710,117 @@ async function runResumableSummaryStep(
           return !partial || partial.status === "skipped";
         },
       );
+      if (
+        attemptId
+        && data.requireExistingReceipt === true
+        && requestedMapIndex !== null
+      ) {
+        const identity: ExtractionOperationIdentity = {
+          runId: attemptId,
+          stage: "summary",
+          unitId: operationUnitId,
+          inputHash: modelOperationInputHash,
+        };
+        const key = buildExtractionOperationKey(identity);
+        const receipt = await kv.get<ExtractionOperationReceipt<Record<string, unknown>>>(
+          KV.extractionOperationReceipt(key),
+          key,
+        );
+        if (!receipt) {
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: "extraction_operation_reconciliation_required",
+            failure: {
+              class: "transient_runtime",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            telemetry,
+          });
+        }
+        if (receipt.inputHash !== modelOperationInputHash) {
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: "extraction_operation_input_hash_conflict",
+            failure: {
+              class: "hard",
+              cause: "extraction_operation_input_hash_conflict",
+            },
+            telemetry,
+          });
+        }
+        if (receipt.status === "failed") {
+          const failure = receipt.failure ?? {
+            class: "unit" as const,
+            cause: "extraction_operation_failed",
+          };
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: failure.cause,
+            failure,
+            telemetry,
+          });
+        }
+        const partial = partialByIndex.get(requestedMapIndex);
+        if (partial?.status !== "completed" || !partial.summary) {
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: "extraction_operation_reconciliation_required",
+            failure: {
+              class: "transient_runtime",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            telemetry,
+          });
+        }
+        const resultRef = {
+          scope: KV.summaryResumablePartials(runId),
+          key: String(requestedMapIndex),
+          chunkIndex: requestedMapIndex,
+        };
+        let response = receipt.response;
+        if (receipt.status === "running") {
+          const completed = await completeModelOperationFromVerifiedResult(
+            kv,
+            identity,
+            { success: true, status: "succeeded", resultRef },
+          );
+          if (completed.failure) {
+            return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+              error: completed.failure.cause,
+              failure: completed.failure,
+              telemetry,
+            });
+          }
+          response = completed.response;
+        }
+        const receiptRef = response?.resultRef as typeof resultRef | undefined;
+        if (
+          receiptRef?.scope !== resultRef.scope
+          || receiptRef?.key !== resultRef.key
+          || receiptRef?.chunkIndex !== resultRef.chunkIndex
+        ) {
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: "extraction_operation_reconciliation_required",
+            failure: {
+              class: "hard",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            telemetry,
+          });
+        }
+        return resumableResponse(
+          "in_progress",
+          completedChunks,
+          totalChunks,
+          skippedChunks,
+          { advanced: "completed", operationUnitId, telemetry },
+        );
+      }
       if (nextChunkIndex >= 0) {
+        const expectedOperationUnitId = `${sessionId}:map:${nextChunkIndex}`;
+        if (operationUnitId && operationUnitId !== expectedOperationUnitId) {
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: "invalid summary operationUnitId for current progress",
+            failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+            telemetry,
+          });
+        }
         const previousPartial = partialByIndex.get(nextChunkIndex);
         const invocationMarker = resumableInvocationMarker(run);
         const failure: {
@@ -1793,6 +1958,7 @@ async function runResumableSummaryStep(
               {
                 summary: succeededRun.summary,
                 advanced: "completed",
+                operationUnitId: operationUnitId || undefined,
                 telemetry,
                 ...resumableSummarySourceProof(succeededRun),
               },
@@ -1877,6 +2043,7 @@ async function runResumableSummaryStep(
               failureCause,
               failure: summaryStageFailure(failureCause, failure.diagnostics),
               advanced: "skipped",
+              operationUnitId: operationUnitId || undefined,
               telemetry,
             },
           );
@@ -1909,6 +2076,7 @@ async function runResumableSummaryStep(
           skippedChunks,
           {
             advanced: summary ? "completed" : "skipped",
+            operationUnitId: operationUnitId || undefined,
             ...(!summary && failure.cause
               ? {
                 failureCause: failure.cause,
@@ -1920,6 +2088,14 @@ async function runResumableSummaryStep(
         );
       }
 
+      const expectedReduceOperationUnitId = `${sessionId}:reduce`;
+      if (operationUnitId && operationUnitId !== expectedReduceOperationUnitId) {
+        return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+          error: "invalid summary operationUnitId for current progress",
+          failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+          telemetry,
+        });
+      }
       const chunkStartOffsets: number[] = [];
       let nextOffset = 0;
       for (const chunk of chunks) {
@@ -1984,7 +2160,7 @@ async function runResumableSummaryStep(
           {
               runId: attemptId,
               stage: "summary",
-              unitId: `${sessionId}:reduce`,
+              unitId: expectedReduceOperationUnitId,
               inputHash: modelOperationInputHash,
           },
           async () => {
@@ -2082,6 +2258,7 @@ async function runResumableSummaryStep(
           {
             summary: succeededRun.summary,
             advanced: "reduced",
+            operationUnitId: operationUnitId || undefined,
             telemetry,
             ...resumableSummarySourceProof(succeededRun),
           },

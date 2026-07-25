@@ -6,6 +6,8 @@ const PLAN_EVENTS = new Set(['unit_planned', 'stage_plan_completed']);
 const SINGLE_EVENTS = new Set([
   ...PLAN_EVENTS,
   'unit_started',
+  'unit_operation_started',
+  'unit_operation_completed',
   'unit_split',
   'unit_terminal',
   'unit_blocked',
@@ -45,7 +47,13 @@ function createUnit(unitId) {
     terminal: null,
     blocked: false,
     recorded: false,
+    active_operation: null,
+    completed_operations: [],
   };
+}
+
+function acceptedUnitCount(units) {
+  return [...units.values()].filter((unit) => !unit.split).length;
 }
 
 function validateStageEvents(events, mode) {
@@ -105,7 +113,39 @@ function validateStageEvents(events, mode) {
       continue;
     }
     if (!unit.started) transitionError(mode, event, 'before_started');
+    if (mode === 'single' && event.type === 'unit_operation_started') {
+      if (unit.active_operation) transitionError(mode, event, 'operation_already_started');
+      if (event.payload?.attempt_id !== unit.attempt_id) {
+        transitionError(mode, event, 'operation_attempt_identity');
+      }
+      if (typeof event.payload?.operation_id !== 'string' || !event.payload.operation_id) {
+        transitionError(mode, event, 'operation_id');
+      }
+      if (unit.completed_operations.some((operation) =>
+        operation.operation_id === event.payload.operation_id)) {
+        transitionError(mode, event, 'duplicate_operation');
+      }
+      unit.active_operation = event.payload;
+      continue;
+    }
+    if (mode === 'single' && event.type === 'unit_operation_completed') {
+      if (!unit.active_operation) transitionError(mode, event, 'operation_not_started');
+      if (
+        event.payload?.attempt_id !== unit.attempt_id
+        || event.payload?.operation_id !== unit.active_operation.operation_id
+      ) {
+        transitionError(mode, event, 'operation_identity');
+      }
+      unit.completed_operations.push(event.payload);
+      unit.active_operation = null;
+      continue;
+    }
     if (event.type === 'unit_split') {
+      if (unit.active_operation) transitionError(mode, event, 'split_with_active_operation');
+      const expectedAttemptId = mode === 'single' ? unit.attempt_id : unit.prepare_attempt_id;
+      if (event.payload?.attempt_id !== expectedAttemptId) {
+        transitionError(mode, event, 'split_attempt_identity');
+      }
       const children = event.payload?.children;
       if (!Array.isArray(children) || children.length < 2) {
         transitionError(mode, event, 'split_children');
@@ -129,6 +169,9 @@ function validateStageEvents(events, mode) {
     }
     if (mode === 'two_phase' && event.type === 'unit_prepared') {
       if (unit.prepared) transitionError(mode, event, 'duplicate_prepared');
+      if (event.payload?.attempt_id !== unit.prepare_attempt_id) {
+        transitionError(mode, event, 'prepared_attempt_identity');
+      }
       unit.prepared = true;
       unit.prepared_payload = event.payload;
       continue;
@@ -139,19 +182,42 @@ function validateStageEvents(events, mode) {
       if (typeof event.payload?.attempt_id !== 'string' || !event.payload.attempt_id) {
         transitionError(mode, event, 'attempt_id');
       }
+      if (event.payload?.prepared_attempt_id !== unit.prepare_attempt_id) {
+        transitionError(mode, event, 'commit_prepare_identity');
+      }
       unit.committing = true;
       unit.commit_attempt_id = event.payload.attempt_id;
       continue;
     }
     if (event.type === 'unit_blocked') {
+      if (mode === 'two_phase' && unit.prepared && !unit.committing) {
+        transitionError(mode, event, 'blocked_before_committing');
+      }
+      const expectedAttemptId = mode === 'single'
+        ? unit.attempt_id
+        : unit.committing
+          ? unit.commit_attempt_id
+          : unit.prepare_attempt_id;
+      if (event.payload?.attempt_id !== expectedAttemptId) {
+        transitionError(mode, event, 'blocked_attempt_identity');
+      }
       unit.blocked = true;
       unit.blocked_payload = event.payload;
       continue;
     }
     if (event.type === 'unit_terminal') {
+      if (unit.active_operation) transitionError(mode, event, 'terminal_with_active_operation');
       if (!TERMINALS.has(event.payload?.status)) transitionError(mode, event, 'terminal_status');
       if (mode === 'two_phase' && unit.prepared && !unit.committing) {
         transitionError(mode, event, 'terminal_before_committing');
+      }
+      const expectedAttemptId = mode === 'single'
+        ? unit.attempt_id
+        : unit.committing
+          ? unit.commit_attempt_id
+          : unit.prepare_attempt_id;
+      if (event.payload?.attempt_id !== expectedAttemptId) {
+        transitionError(mode, event, 'terminal_attempt_identity');
       }
       unit.terminal = event.payload.status;
       unit.terminal_payload = event.payload;
@@ -159,6 +225,9 @@ function validateStageEvents(events, mode) {
     }
     if (event.type === 'unit_recorded') {
       if (!ACCEPTED_TERMINALS.has(unit.terminal)) transitionError(mode, event, 'record_before_accepted_terminal');
+      if (event.payload?.attempt_id !== unit.terminal_payload?.attempt_id) {
+        transitionError(mode, event, 'record_attempt_identity');
+      }
       unit.recorded = true;
       continue;
     }
@@ -261,7 +330,7 @@ export async function runSinglePhaseStage({
   const events = [...initialEvents];
   let state = await ensurePlan({ events, plan, planMetadata, append, mode: 'single' });
   if (planOnly) return { status: 'planned', unitCount: plan.length };
-  if (state.completed) return { status: 'completed', acceptedCount: plan.length };
+  if (state.completed) return { status: 'completed', acceptedCount: acceptedUnitCount(state.units) };
 
   const work = [...state.units.values()];
   for (let cursor = 0; cursor < work.length; cursor += 1) {
@@ -286,10 +355,50 @@ export async function runSinglePhaseStage({
       state.units.set(unit.unit_id, unit);
     }
     if (!unit.terminal) {
+      const startOperation = async ({ operationId, ...payload }) => {
+        if (unit.active_operation) throw new Error('v2_single_operation_already_started');
+        if (typeof operationId !== 'string' || !operationId) {
+          throw new Error('v2_single_operation_id_invalid');
+        }
+        const eventPayload = {
+          ...payload,
+          unit_id: unit.unit_id,
+          attempt_id: attemptId,
+          operation_id: operationId,
+        };
+        await appendAndTrack(events, append, 'unit_operation_started', eventPayload);
+        unit = { ...unit, active_operation: eventPayload };
+        state.units.set(unit.unit_id, unit);
+        return eventPayload;
+      };
+      const completeOperation = async ({ operationId, ...payload }) => {
+        if (!unit.active_operation) throw new Error('v2_single_operation_not_started');
+        if (operationId !== unit.active_operation.operation_id) {
+          throw new Error('v2_single_operation_identity_mismatch');
+        }
+        const eventPayload = {
+          ...payload,
+          unit_id: unit.unit_id,
+          attempt_id: attemptId,
+          operation_id: operationId,
+        };
+        await appendAndTrack(events, append, 'unit_operation_completed', eventPayload);
+        unit = {
+          ...unit,
+          active_operation: null,
+          completed_operations: [...unit.completed_operations, eventPayload],
+        };
+        state.units.set(unit.unit_id, unit);
+        return eventPayload;
+      };
       const result = normalizeAdapterResult(await execute({
         unit: plannedUnit,
         attemptId,
         recovered,
+        activeOperation: unit.active_operation,
+        completedOperations: [...unit.completed_operations],
+        startOperation,
+        completeOperation,
       }));
       if (result.status === 'pending') {
         return { status: 'pending', unitId: unit.unit_id };
@@ -350,7 +459,7 @@ export async function runSinglePhaseStage({
   validateStageEvents(events, 'single');
   return {
     status: 'completed',
-    acceptedCount: [...state.units.values()].filter((unit) => !unit.split).length,
+    acceptedCount: acceptedUnitCount(state.units),
   };
 }
 
@@ -369,7 +478,7 @@ export async function runTwoPhaseStage({
   const events = [...initialEvents];
   let state = await ensurePlan({ events, plan, planMetadata, append, mode: 'two_phase' });
   if (planOnly) return { status: 'planned', unitCount: plan.length };
-  if (state.completed) return { status: 'completed', acceptedCount: plan.length };
+  if (state.completed) return { status: 'completed', acceptedCount: acceptedUnitCount(state.units) };
 
   const work = [...state.units.values()];
   for (let cursor = 0; cursor < work.length; cursor += 1) {
@@ -506,7 +615,7 @@ export async function runTwoPhaseStage({
   validateStageEvents(events, 'two_phase');
   return {
     status: 'completed',
-    acceptedCount: [...state.units.values()].filter((unit) => !unit.split).length,
+    acceptedCount: acceptedUnitCount(state.units),
   };
 }
 

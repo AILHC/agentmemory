@@ -7,7 +7,11 @@ import test from 'node:test';
 import { mainForTest, stableHash } from './run-agentmemory-full-extraction.mjs';
 
 function mainForEarlyStages(argv, dependencies = {}) {
-  return mainForTest(argv, { ...dependencies, v2RemainingStages: false });
+  return mainForTest(argv, {
+    v2RuntimeCheck: async () => ({ summarizeChunkConcurrency: 1 }),
+    ...dependencies,
+    v2RemainingStages: false,
+  });
 }
 
 async function withServer(handler, run) {
@@ -35,7 +39,67 @@ function successfulSummaryResponse({ attemptId, inputHash }, title = 'summary') 
   };
 }
 
-test('v2 summary recovery rejects a pre-existing same-count summary without an exact receipt', async () => {
+test('v2 runs the shared runtime concurrency gate before inventory access', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-runtime-gate-'));
+  try {
+    await assert.rejects(
+      () => mainForEarlyStages([
+        '--base-url', 'http://127.0.0.1:1',
+        '--state-dir', stateDir,
+        '--run-id', 'runtime-gate',
+        '--run-state-format', 'v2',
+      ], {
+        v2RuntimeCheck: async () => {
+          throw new Error('SUMMARIZE_CHUNK_CONCURRENCY=2');
+        },
+      }),
+      /SUMMARIZE_CHUNK_CONCURRENCY=2/,
+    );
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 explicit resume takes over a dead writer lock for the same run', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-stale-lock-'));
+  const runRoot = path.join(stateDir, 'stale-lock.v2');
+  await fs.mkdir(runRoot, { recursive: true });
+  await fs.writeFile(path.join(runRoot, 'writer.lock.json'), JSON.stringify({
+    run_id: 'stale-lock',
+    pid: 2147483647,
+    created_at: '2026-07-24T00:00:00.000Z',
+    owner_id: 'dead-owner',
+  }));
+  try {
+    await withServer((_request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ success: true, sessions: [] }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'stale-lock',
+        '--run-state-format', 'v2',
+        '--dry-run',
+      ];
+      await assert.rejects(
+        () => mainForEarlyStages(argv),
+        /v2_writer_lock_stale_requires_verified_takeover/,
+      );
+      assert.equal(await mainForEarlyStages([...argv, '--resume']), 0);
+    });
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 summary treats unit_started without an inner operation as not yet dispatched', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-runner-'));
@@ -99,7 +163,7 @@ test('v2 summary recovery rejects a pre-existing same-count summary without an e
       assert.equal(stage.some((event) => event.type === 'unit_terminal'), false);
     });
     assert.equal(attempts.length, 1);
-    assert.equal(attempts[0].requireExistingReceipt, true);
+    assert.equal(attempts[0].requireExistingReceipt, false);
     assert.equal(typeof attempts[0].attemptId, 'string');
     assert.equal(typeof attempts[0].inputHash, 'string');
     assert.equal(recorded.length, 0);
@@ -135,7 +199,7 @@ test('v2 summary recovery hard-stops when no durable result is visible', async (
       ];
       await assert.rejects(() => mainForEarlyStages(argv, {
         v2SummaryRemote: {
-          advance: async () => assert.fail('must not call before unit_started durability'),
+          advance: async () => assert.fail('must not call before operation_started durability'),
           record: async () => {},
         },
         v2LessonsRemote: {
@@ -143,7 +207,7 @@ test('v2 summary recovery hard-stops when no durable result is visible', async (
           record: async () => {},
         },
         onV2DurableEvent: async ({ type }) => {
-          if (type === 'unit_started') throw new Error('injected_crash');
+          if (type === 'unit_operation_started') throw new Error('injected_crash');
         },
       }), /injected_crash/);
 
@@ -181,6 +245,268 @@ test('v2 summary recovery hard-stops when no durable result is visible', async (
   }
 });
 
+test('v2 summary recovery reconciles one durable chunk before advancing the next chunk', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-cursor-'));
+  const receiptModes = [];
+  const operationIds = [];
+  let responseLost = true;
+  let recoveredSteps = 0;
+  const lessonsRemote = {
+    start: async ({ attemptId }) => ({
+      ok: true,
+      data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+    }),
+    record: async () => {},
+  };
+  try {
+    await withServer((request, response) => {
+      assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+      }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'summary-cursor',
+        '--run-state-format', 'v2',
+      ];
+      const summaryRemote = {
+        advance: async ({ attemptId, inputHash, operationUnitId, requireExistingReceipt }) => {
+          receiptModes.push(requireExistingReceipt);
+          operationIds.push(operationUnitId);
+          if (responseLost) {
+            responseLost = false;
+            throw new Error('summary_response_lost');
+          }
+          recoveredSteps += 1;
+          if (recoveredSteps <= 2) {
+            return {
+              ok: true,
+              data: {
+                status: 'in_progress',
+                advanced: 'completed',
+                completedChunks: recoveredSteps,
+                totalChunks: 2,
+                operationUnitId,
+              },
+            };
+          }
+          return successfulSummaryResponse({ attemptId, inputHash }, 'merged summary');
+        },
+        record: async () => {},
+      };
+
+      await assert.rejects(
+        () => mainForEarlyStages(argv, { v2SummaryRemote: summaryRemote, v2LessonsRemote: lessonsRemote }),
+        /summary_response_lost/,
+      );
+      assert.equal(await mainForEarlyStages(
+        [...argv, '--resume'],
+        { v2SummaryRemote: summaryRemote, v2LessonsRemote: lessonsRemote },
+      ), 0);
+    });
+
+    assert.deepEqual(receiptModes, [false, true, false, false]);
+    assert.deepEqual(operationIds, [
+      's1:map:0',
+      's1:map:0',
+      's1:map:1',
+      's1:reduce',
+    ]);
+    const events = (await fs.readFile(
+      path.join(stateDir, 'summary-cursor.v2', 'summary.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(events.map((event) => event.type), [
+      'unit_planned',
+      'stage_plan_completed',
+      'unit_started',
+      'unit_operation_started',
+      'unit_operation_completed',
+      'unit_operation_started',
+      'unit_operation_completed',
+      'unit_operation_started',
+      'unit_operation_completed',
+      'unit_terminal',
+      'unit_recorded',
+      'stage_completed',
+    ]);
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 summary recovers a completed final inner operation without another remote call', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-terminal-'));
+  let summaryCalls = 0;
+  let crashAfterOperation = true;
+  const lessonsRemote = {
+    start: async ({ attemptId }) => ({
+      ok: true,
+      data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+    }),
+    record: async () => {},
+  };
+  try {
+    await withServer((request, response) => {
+      assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+      }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'summary-terminal',
+        '--run-state-format', 'v2',
+      ];
+      const summaryRemote = {
+        advance: async ({ attemptId, inputHash, operationUnitId }) => {
+          summaryCalls += 1;
+          return {
+            ...successfulSummaryResponse({ attemptId, inputHash }, 'terminal summary'),
+            data: {
+              ...successfulSummaryResponse({ attemptId, inputHash }, 'terminal summary').data,
+              operationUnitId,
+            },
+          };
+        },
+        record: async () => {},
+      };
+
+      await assert.rejects(() => mainForEarlyStages(argv, {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: lessonsRemote,
+        onV2DurableEvent: async ({ type }) => {
+          if (crashAfterOperation && type === 'unit_operation_completed') {
+            crashAfterOperation = false;
+            throw new Error('crash_after_final_operation');
+          }
+        },
+      }), /crash_after_final_operation/);
+
+      assert.equal(await mainForEarlyStages([...argv, '--resume'], {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: lessonsRemote,
+      }), 0);
+    });
+    assert.equal(summaryCalls, 1);
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 recovery consumes the completed journal plan instead of a rebuilt live plan', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-persisted-plan-'));
+  const persistedUnit = {
+    unit_id: 'crystal-group:1:repo',
+    source_ids: ['action-1'],
+    action_ids: ['action-1'],
+    action_updated_ats: ['2026-07-24T00:00:00.000Z'],
+    input_hash: 'pinned-crystal-input',
+  };
+  const summaryRemote = {
+    advance: async (request) => successfulSummaryResponse(request),
+    record: async () => {},
+  };
+  const lessonsRemote = {
+    start: async ({ attemptId }) => ({
+      ok: true,
+      data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+    }),
+    record: async () => {},
+  };
+  try {
+    await withServer((request, response) => {
+      assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+      }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'persisted-plan',
+        '--run-state-format', 'v2',
+      ];
+      const baseDependencies = {
+        v2RuntimeCheck: async () => ({ summarizeChunkConcurrency: 1 }),
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: lessonsRemote,
+      };
+      await assert.rejects(
+        () => mainForTest(argv, {
+          ...baseDependencies,
+          v2RemainingStages: ({ runSingleStage }) => runSingleStage({
+            stage: 'crystal',
+            plan: [persistedUnit],
+            adapter: {
+              attemptIdForUnit: () => 'crystal-attempt',
+              execute: async () => {
+                throw new Error('crystal_response_lost');
+              },
+              record: async () => {},
+            },
+          }),
+        }),
+        /crystal_response_lost/,
+      );
+
+      assert.equal(await mainForTest([...argv, '--resume'], {
+        ...baseDependencies,
+        v2RemainingStages: ({ runSingleStage }) => runSingleStage({
+          stage: 'crystal',
+          plan: async () => {
+            throw new Error('completed journal plan must skip live planner');
+          },
+          adapter: {
+            attemptIdForUnit: () => 'must-not-replace-persisted-attempt',
+            execute: async ({ unit, attemptId, recovered }) => {
+              assert.equal(unit.unit_id, persistedUnit.unit_id);
+              assert.deepEqual(unit.action_ids, persistedUnit.action_ids);
+              assert.deepEqual(unit.action_updated_ats, persistedUnit.action_updated_ats);
+              assert.equal(unit.input_hash, persistedUnit.input_hash);
+              assert.equal(attemptId, 'crystal-attempt');
+              assert.equal(recovered, true);
+              return { status: 'succeeded', payload: { result_ids: ['crystal-1'] } };
+            },
+            record: async ({ unit }) => {
+              assert.equal(unit.unit_id, persistedUnit.unit_id);
+              assert.deepEqual(unit.action_ids, persistedUnit.action_ids);
+            },
+          },
+        }),
+      }), 0);
+    });
+
+    const events = (await fs.readFile(
+      path.join(stateDir, 'persisted-plan.v2', 'crystal.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.deepEqual(events.filter((event) => event.type === 'unit_planned').map((event) => event.payload), [
+      persistedUnit,
+    ]);
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
 test('v2 default production adapters send stable summary and lesson identities', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
@@ -193,7 +519,12 @@ test('v2 default production adapters send stable summary and lesson identities',
       const payload = body ? JSON.parse(body) : null;
       requests.push({ url: request.url, payload });
       response.setHeader('content-type', 'application/json');
-      if (request.url.startsWith('/agentmemory/sessions')) {
+      if (request.url === '/agentmemory/runtime-config') {
+        response.end(JSON.stringify({
+          success: true,
+          runtime: { summarizeChunkConcurrency: 1 },
+        }));
+      } else if (request.url.startsWith('/agentmemory/sessions')) {
         response.end(JSON.stringify({
           success: true,
           sessions: [{
@@ -531,7 +862,20 @@ test('v2 binds normalized base URL into run identity drift checks', async () => 
       response.setHeader('content-type', 'application/json');
       response.end(JSON.stringify({ success: true, sessions: [{ id: 's1', startedAt: '2026-07-24T00:00:00.000Z' }] }));
     }, async (baseUrl) => {
-      assert.equal(await mainForEarlyStages(['--base-url', `${baseUrl}/`, ...args], dependencies), 0);
+      assert.equal(await mainForEarlyStages([
+        '--base-url', `${baseUrl}/`,
+        ...args,
+        '--mark', 'mark-a',
+      ], dependencies), 0);
+      await assert.rejects(
+        () => mainForEarlyStages([
+          '--base-url', `${baseUrl}/`,
+          ...args,
+          '--mark', 'mark-b',
+          '--resume',
+        ], dependencies),
+        /v2_run_input_drifted/,
+      );
     });
     await withServer((_request, response) => {
       response.setHeader('content-type', 'application/json');

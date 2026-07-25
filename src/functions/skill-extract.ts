@@ -483,6 +483,7 @@ export async function commitSkillExtractionProposal(options: {
   kv: StateKV;
   identity: ExtractionOperationIdentity;
   preparedHandle: string;
+  proposalHash?: string;
 }): Promise<Record<string, unknown>> {
   const key = skillProposalKey(options.identity);
   return withKeyedLock(SKILL_COMMIT_LOCK_KEY, async () => {
@@ -496,6 +497,10 @@ export async function commitSkillExtractionProposal(options: {
     if (
       proposal.inputHash !== options.identity.inputHash
       || proposal.handle !== options.preparedHandle
+      || (
+        options.proposalHash !== undefined
+        && proposal.proposalHash !== options.proposalHash
+      )
       || proposal.stage !== "skill_extract"
     ) {
       return {
@@ -621,6 +626,7 @@ export function registerSkillExtractFunctions(
     async (data: {
       identity: ExtractionOperationIdentity;
       preparedHandle: string;
+      proposalHash?: string;
     }) => commitSkillExtractionProposal({ kv, ...data }),
   );
 

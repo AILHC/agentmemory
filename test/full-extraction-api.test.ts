@@ -357,7 +357,88 @@ describe("full extraction REST wrappers", () => {
     expect(sdk.trigger).toHaveBeenCalledTimes(1);
   });
 
-  it("forwards a v2 summary attempt identity without changing the legacy resumable payload", async () => {
+  it("keeps an interrupted deterministic v2 memory commit retryable", async () => {
+    let calls = 0;
+    const sdk = mockSdk(async () => {
+      calls += 1;
+      if (calls === 1) throw new Error("state write interrupted");
+      return {
+        success: true,
+        status: "succeeded",
+        consolidated: 1,
+        memoryIds: ["mem-1"],
+      };
+    });
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    const commitInputHash = stableHash({
+      prepareRunId: "prepare-attempt-1",
+      unitId: "window-1",
+      prepareInputHash: "prepare-input-1",
+      preparedHandle: "mcph-1",
+      proposalHash: "proposal-1",
+    });
+    const body = {
+      runId: "commit-attempt-1",
+      stage: "memory_consolidate",
+      unitId: "window-1",
+      inputHash: commitInputHash,
+      prepareRunId: "prepare-attempt-1",
+      prepareInputHash: "prepare-input-1",
+      preparedHandle: "mcph-1",
+      proposalHash: "proposal-1",
+    };
+    const handler = sdk.getFunction("api::full-memory-consolidate-window-commit");
+
+    const interrupted = await handler({ headers: {}, body });
+    const retried = await handler({ headers: {}, body });
+
+    expect(interrupted).toMatchObject({
+      status_code: 503,
+      body: {
+        retrySameIdentity: true,
+        failure: {
+          class: "transient_runtime",
+          cause: "extraction_operation_interrupted",
+        },
+      },
+    });
+    expect(retried).toMatchObject({
+      status_code: 200,
+      body: { success: true, status: "succeeded", memoryIds: ["mem-1"] },
+    });
+    expect(sdk.trigger).toHaveBeenCalledTimes(2);
+  });
+
+  it("forwards a v2 summary attempt and exact operation identity", async () => {
+    const sdk = mockSdk(async () => ({ success: true, status: "in_progress" }));
+    registerApiTriggers(sdk as never, mockKV() as never, "");
+
+    const response = await sdk.getFunction("api::summarize-resumable")({
+      headers: {},
+      body: {
+        sessionId: "session-1",
+        attemptId: "attempt-1",
+        inputHash: "freshness-1",
+        operationUnitId: "session-1:map:0",
+        requireExistingReceipt: true,
+      },
+    });
+
+    expect(response.status_code).toBe(200);
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::summarize-resumable",
+      payload: {
+        sessionId: "session-1",
+        attemptId: "attempt-1",
+        inputHash: "freshness-1",
+        operationUnitId: "session-1:map:0",
+        requireExistingReceipt: true,
+      },
+    });
+  });
+
+  it("rejects receipt-only summary recovery without an exact operation identity", async () => {
     const sdk = mockSdk(async () => ({ success: true, status: "in_progress" }));
     registerApiTriggers(sdk as never, mockKV() as never, "");
 
@@ -371,16 +452,8 @@ describe("full extraction REST wrappers", () => {
       },
     });
 
-    expect(response.status_code).toBe(200);
-    expect(sdk.trigger).toHaveBeenCalledWith({
-      function_id: "mem::summarize-resumable",
-      payload: {
-        sessionId: "session-1",
-        attemptId: "attempt-1",
-        inputHash: "freshness-1",
-        requireExistingReceipt: true,
-      },
-    });
+    expect(response.status_code).toBe(400);
+    expect(sdk.trigger).not.toHaveBeenCalled();
   });
 
   it.each(["true", "false"])(
@@ -894,6 +967,36 @@ describe("full extraction REST wrappers", () => {
     expect(sdk.trigger).toHaveBeenCalledWith({
       function_id: "mem::full-crystals-auto",
       payload: { dryRun: true },
+    });
+  });
+
+  it("full crystals auto forwards an exact pinned action snapshot", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    const handler = sdk.getFunction("api::full-crystals-auto");
+
+    const response = await handler({
+      headers: {},
+      body: {
+        runId: "crystal-attempt",
+        stage: "crystal",
+        unitId: "crystal-group:1:repo",
+        inputHash: "runner-input",
+        groupId: "crystal-group:1:repo",
+        actionIds: [" action-1 "],
+        actionUpdatedAts: [" 2026-07-24T00:00:00.000Z "],
+      },
+    });
+
+    expect(response.status_code).toBe(200);
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::full-crystals-auto",
+      payload: {
+        groupId: "crystal-group:1:repo",
+        actionIds: ["action-1"],
+        actionUpdatedAts: ["2026-07-24T00:00:00.000Z"],
+      },
     });
   });
 

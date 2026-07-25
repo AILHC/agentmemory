@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { runV2RemainingStages } from './full-extraction-stage-adapters-v2.mjs';
+import {
+  classifyIdempotentCommitResponse,
+  executeReceiptAwareRequest,
+  runV2RemainingStages,
+} from './full-extraction-stage-adapters-v2.mjs';
 
 function stableHash(value) {
   const normalize = (item) => {
@@ -158,18 +162,20 @@ test('remaining v2 stages are thin adapters over the two common recovery modes',
   };
 
   const runSingleStage = async ({ stage, plan, adapter }) => {
-    stages.push({ stage, mode: 'single', plan });
-    for (const unit of plan) {
+    const effectivePlan = await (typeof plan === 'function' ? plan() : plan);
+    stages.push({ stage, mode: 'single', plan: effectivePlan });
+    for (const unit of effectivePlan) {
       const attemptId = adapter.attemptIdForUnit(unit);
       const terminal = await adapter.execute({ unit, attemptId, recovered: true });
       assert.match(terminal.status, /^(succeeded|skipped)$/);
       await adapter.record({ unit, attemptId, terminal: { ...terminal.payload, status: terminal.status } });
     }
-    return { status: 'completed', acceptedCount: plan.length };
+    return { status: 'completed', acceptedCount: effectivePlan.length };
   };
   const runTwoPhaseStage = async ({ stage, plan, adapter }) => {
-    stages.push({ stage, mode: 'two_phase', plan });
-    for (const unit of plan) {
+    const effectivePlan = await (typeof plan === 'function' ? plan() : plan);
+    stages.push({ stage, mode: 'two_phase', plan: effectivePlan });
+    for (const unit of effectivePlan) {
       const prepareAttemptId = adapter.prepareAttemptIdForUnit(unit);
       const preparedResult = await adapter.prepare({
         unit,
@@ -189,7 +195,7 @@ test('remaining v2 stages are thin adapters over the two common recovery modes',
         terminal: { ...terminal.payload, status: terminal.status },
       });
     }
-    return { status: 'completed', acceptedCount: plan.length };
+    return { status: 'completed', acceptedCount: effectivePlan.length };
   };
 
   const result = await runV2RemainingStages({
@@ -280,6 +286,12 @@ test('remaining v2 stages are thin adapters over the two common recovery modes',
     proposalHash: 'skill-proposal',
   }));
 
+  const crystalCall = calls.find((call) =>
+    call.endpoint === '/agentmemory/full/crystals/auto' && call.body.dryRun !== true).body;
+  assert.equal(crystalCall.groupId, 'cg-1');
+  assert.deepEqual(crystalCall.actionIds, ['action-1']);
+  assert.deepEqual(crystalCall.actionUpdatedAts, ['2026-07-24T00:00:00.000Z']);
+
   for (const call of calls.filter((entry) => [
     '/agentmemory/semantic-rollup',
     '/agentmemory/full/crystals/auto',
@@ -301,6 +313,95 @@ test('remaining v2 stages are thin adapters over the two common recovery modes',
       ['reflect_insight', ['insight-1']],
     ],
   );
+});
+
+test('default remaining-stage planners stay lazy for journal-backed recovery', async () => {
+  const stages = [];
+  const skipPlanner = async ({ stage, plan }) => {
+    assert.equal(typeof plan, 'function');
+    stages.push(stage);
+    return { status: 'completed', acceptedCount: 1 };
+  };
+
+  const result = await runV2RemainingStages({
+    options: { mark: 'test-mark' },
+    runId: 'lazy-plan-run',
+    config: {
+      semantic_window_size: 20,
+      semantic_rollup_target_prompt_chars: 64000,
+      memory_consolidate_char_budget: 64000,
+      reflect_insight_char_budget: 64000,
+    },
+    configHash: 'config-1',
+    inventoryHash: 'inventory-1',
+    request: async () => assert.fail('journal-backed recovery must not call a planner endpoint'),
+    loadSelectedSessions: async () => assert.fail('journal-backed recovery must not reload planner inputs'),
+    stableHash,
+    runSingleStage: skipPlanner,
+    runTwoPhaseStage: skipPlanner,
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(stages, [
+    'memory_consolidate',
+    'semantic_rollup',
+    'skill_extract',
+    'crystal',
+    'consolidation_procedural',
+    'reflect_insight',
+  ]);
+});
+
+test('idempotent commit response loss stays retryable with the same identity', () => {
+  assert.deepEqual(
+    classifyIdempotentCommitResponse({
+      ok: false,
+      status_code: 0,
+      error: 'connection reset after request dispatch',
+    }, ['memoryIds']),
+    { status: 'pending' },
+  );
+  assert.deepEqual(
+    classifyIdempotentCommitResponse({
+      ok: false,
+      status_code: 503,
+      data: {
+        success: false,
+        retrySameIdentity: true,
+        failure: {
+          class: 'transient_runtime',
+          cause: 'extraction_operation_interrupted',
+        },
+      },
+    }, ['memoryIds']),
+    { status: 'pending' },
+  );
+});
+
+test('model operation transport loss performs receipt-only reconciliation', async () => {
+  const freshModes = [];
+  const fresh = await executeReceiptAwareRequest({
+    recovered: false,
+    invoke: async (requireExistingReceipt) => {
+      freshModes.push(requireExistingReceipt);
+      return requireExistingReceipt
+        ? { ok: true, data: { status: 'succeeded' } }
+        : { ok: false, status_code: 0, error: 'response lost' };
+    },
+  });
+  assert.deepEqual(freshModes, [false, true]);
+  assert.equal(fresh.response.data.status, 'succeeded');
+
+  const recoveryModes = [];
+  const unavailable = await executeReceiptAwareRequest({
+    recovered: true,
+    invoke: async (requireExistingReceipt) => {
+      recoveryModes.push(requireExistingReceipt);
+      return { ok: false, status_code: 0, error: 'temporarily unavailable' };
+    },
+  });
+  assert.deepEqual(recoveryModes, [true]);
+  assert.deepEqual(unavailable, { pending: true });
 });
 
 test('memory and semantic adapters deterministically split oversized units', async () => {
@@ -365,6 +466,7 @@ test('memory and semantic adapters deterministically split oversized units', asy
     ],
     runTwoPhaseStage: async ({ stage, plan, adapter }) => {
       assert.equal(stage, 'memory_consolidate');
+      plan = await (typeof plan === 'function' ? plan() : plan);
       const prepared = await adapter.prepare({
         unit: plan[0],
         attemptId: adapter.prepareAttemptIdForUnit(plan[0]),
@@ -375,6 +477,7 @@ test('memory and semantic adapters deterministically split oversized units', asy
     },
     runSingleStage: async ({ stage, plan, adapter }) => {
       assert.equal(stage, 'semantic_rollup');
+      plan = await (typeof plan === 'function' ? plan() : plan);
       const executed = await adapter.execute({
         unit: plan[0],
         attemptId: adapter.attemptIdForUnit(plan[0]),

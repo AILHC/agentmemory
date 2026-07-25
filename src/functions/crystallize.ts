@@ -79,15 +79,62 @@ async function runAutoCrystallize(
     project?: string;
     dryRun?: boolean;
     model?: string;
+    groupId?: string;
+    actionIds?: string[];
+    actionUpdatedAts?: string[];
   },
   failedGroupsMakeRunFail: boolean,
 ): Promise<Record<string, unknown>> {
   const dryRun = data.dryRun ?? false;
-  const groups = await buildEligibleCrystalActionGroups({
-    kv,
-    olderThanDays: data.olderThanDays,
-    project: data.project,
-  });
+  const hasPinnedGroup = data.groupId !== undefined
+    || data.actionIds !== undefined
+    || data.actionUpdatedAts !== undefined;
+  let groups: EligibleCrystalActionGroup[];
+  if (hasPinnedGroup) {
+    if (
+      !data.groupId
+      || !Array.isArray(data.actionIds)
+      || data.actionIds.length === 0
+      || !Array.isArray(data.actionUpdatedAts)
+      || data.actionUpdatedAts.length !== data.actionIds.length
+      || new Set(data.actionIds).size !== data.actionIds.length
+    ) {
+      return {
+        success: false,
+        status: "failed",
+        failure: { class: "hard", cause: "crystal_plan_identity_invalid" },
+      };
+    }
+    const actions = await Promise.all(
+      data.actionIds.map((id) => kv.get<Action>(KV.actions, id)),
+    );
+    const drifted = actions.some((action, index) =>
+      !action
+      || action.status !== "done"
+      || Boolean(action.crystallizedInto)
+      || action.updatedAt !== data.actionUpdatedAts![index]);
+    if (drifted) {
+      return {
+        success: false,
+        status: "failed",
+        failure: { class: "hard", cause: "crystal_plan_drifted" },
+      };
+    }
+    groups = [{
+      groupId: data.groupId,
+      groupKey: data.groupId,
+      actionIds: data.actionIds,
+      actionUpdatedAts: data.actionUpdatedAts,
+      actionCount: data.actionIds.length,
+      project: data.project ?? actions[0]?.project,
+    }];
+  } else {
+    groups = await buildEligibleCrystalActionGroups({
+      kv,
+      olderThanDays: data.olderThanDays,
+      project: data.project,
+    });
+  }
 
   if (dryRun) {
     return {
@@ -292,13 +339,29 @@ export function registerCrystallizeFunction(
 
   sdk.registerFunction(
     "mem::auto-crystallize",
-    async (data: { olderThanDays?: number; project?: string; dryRun?: boolean; model?: string }) =>
+    async (data: {
+      olderThanDays?: number;
+      project?: string;
+      dryRun?: boolean;
+      model?: string;
+      groupId?: string;
+      actionIds?: string[];
+      actionUpdatedAts?: string[];
+    }) =>
       runAutoCrystallize(sdk, kv, data, false),
   );
 
   sdk.registerFunction(
     "mem::full-crystals-auto",
-    async (data: { olderThanDays?: number; project?: string; dryRun?: boolean; model?: string }) =>
+    async (data: {
+      olderThanDays?: number;
+      project?: string;
+      dryRun?: boolean;
+      model?: string;
+      groupId?: string;
+      actionIds?: string[];
+      actionUpdatedAts?: string[];
+    }) =>
       runAutoCrystallize(sdk, kv, data, true),
   );
 }

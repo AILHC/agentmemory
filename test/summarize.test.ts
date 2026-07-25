@@ -1292,6 +1292,167 @@ describe("mem::summarize-resumable", () => {
     expect(inProgressProvider.calls).toHaveLength(1);
   });
 
+  it("reconciles a completed map receipt before advancing a multi-chunk attempt", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const sessionId = "ses_v2_multi_chunk_resume";
+    const attemptId = "attempt-multi-chunk";
+    const session = await seedSummarySession(kv, sessionId, 2);
+    const inputHash = summarySessionInputHash(session);
+    const provider = makeProvider([
+      summaryXml({ title: "first chunk" }),
+      summaryXml({ title: "second chunk" }),
+      summaryXml({ title: "merged" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    const first = await handler({ sessionId, attemptId, inputHash });
+    const reconciled = await handler({
+      sessionId,
+      attemptId,
+      inputHash,
+      operationUnitId: `${sessionId}:map:0`,
+      requireExistingReceipt: true,
+    });
+
+    expect(first).toMatchObject({
+      status: "in_progress",
+      advanced: "completed",
+      completedChunks: 1,
+      totalChunks: 2,
+    });
+    expect(reconciled).toMatchObject({
+      status: "in_progress",
+      advanced: "completed",
+      completedChunks: 1,
+      totalChunks: 2,
+    });
+    expect(provider.calls).toHaveLength(1);
+
+    const advanced = await handler({ sessionId, attemptId, inputHash });
+
+    expect(provider.calls).toHaveLength(2);
+    expect(advanced).toMatchObject({
+      status: "in_progress",
+      advanced: "completed",
+      completedChunks: 2,
+      totalChunks: 2,
+    });
+    expect(extractionReceipts(kv).map((receipt) => receipt.unitId).sort()).toEqual([
+      `${sessionId}:map:0`,
+      `${sessionId}:map:1`,
+    ]);
+  });
+
+  it("completes a running map receipt from its exact persisted partial", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const sessionId = "ses_v2_running_map_reconcile";
+    const attemptId = "attempt-running-map";
+    const session = await seedSummarySession(kv, sessionId, 2);
+    const inputHash = summarySessionInputHash(session);
+    const provider = makeProvider([summaryXml({ title: "persisted first chunk" })]);
+    const { handler } = setupResumableHandler(kv, provider);
+    const originalSet = kv.set.bind(kv);
+    let interruptReceiptCompletion = true;
+    kv.set = async <T>(scope: string, key: string, value: T): Promise<T> => {
+      if (
+        interruptReceiptCompletion
+        && scope.startsWith("mem:extraction-operation-receipt:")
+        && (value as { status?: unknown }).status === "succeeded"
+      ) {
+        interruptReceiptCompletion = false;
+        throw new Error("receipt completion interrupted");
+      }
+      return originalSet(scope, key, value);
+    };
+
+    await handler({ sessionId, attemptId, inputHash });
+    const recovered = await handler({
+      sessionId,
+      attemptId,
+      inputHash,
+      operationUnitId: `${sessionId}:map:0`,
+      requireExistingReceipt: true,
+    });
+
+    expect(recovered).toMatchObject({
+      status: "in_progress",
+      advanced: "completed",
+      completedChunks: 1,
+      totalChunks: 2,
+    });
+    expect(provider.calls).toHaveLength(1);
+    expect(extractionReceipts(kv)).toEqual([
+      expect.objectContaining({
+        status: "succeeded",
+        unitId: `${sessionId}:map:0`,
+        response: expect.objectContaining({
+          resultRef: expect.objectContaining({
+            scope: expect.stringContaining("summary-resumable-partials"),
+            key: "0",
+            chunkIndex: 0,
+          }),
+        }),
+      }),
+    ]);
+  });
+
+  it("does not fall back to an older map receipt when the exact uncertain receipt is missing", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const sessionId = "ses_v2_exact_missing_map";
+    const attemptId = "attempt-exact-missing-map";
+    const session = await seedSummarySession(kv, sessionId, 3);
+    const inputHash = summarySessionInputHash(session);
+    const provider = makeProvider([
+      summaryXml({ title: "map zero" }),
+      summaryXml({ title: "map one" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({
+      sessionId,
+      attemptId,
+      inputHash,
+      operationUnitId: `${sessionId}:map:0`,
+    });
+    await handler({
+      sessionId,
+      attemptId,
+      inputHash,
+      operationUnitId: `${sessionId}:map:1`,
+    });
+
+    const mapOneReceipt = extractionReceipts(kv).find(
+      (receipt) => receipt.unitId === `${sessionId}:map:1`,
+    );
+    expect(mapOneReceipt).toBeDefined();
+    await kv.delete(
+      KV.extractionOperationReceipt(mapOneReceipt!.key),
+      mapOneReceipt!.key,
+    );
+    const [run] = await kv.list<any>(KV.summaryResumableRuns);
+    await kv.delete(KV.summaryResumablePartials(run.id), "1");
+
+    const recovered = await handler({
+      sessionId,
+      attemptId,
+      inputHash,
+      operationUnitId: `${sessionId}:map:1`,
+      requireExistingReceipt: true,
+    });
+
+    expect(recovered).toMatchObject({
+      success: false,
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+    });
+    expect(provider.calls).toHaveLength(2);
+  });
+
   it("binds a fresh attempt receipt when reusing an exact succeeded summary", async () => {
     const kv = mockKV();
     const sessionId = "ses_v2_fresh_attempt_reuse";
@@ -1314,12 +1475,14 @@ describe("mem::summarize-resumable", () => {
       sessionId,
       attemptId: "attempt-2",
       inputHash,
+      operationUnitId: `${sessionId}:map:0`,
       requireExistingReceipt: true,
     });
     const missingReceiptReuse = await handler({
       sessionId,
       attemptId: "attempt-3",
       inputHash,
+      operationUnitId: `${sessionId}:map:0`,
       requireExistingReceipt: true,
     });
 
@@ -1406,6 +1569,7 @@ describe("mem::summarize-resumable", () => {
       sessionId,
       attemptId: "attempt-model-b-reuse",
       inputHash,
+      operationUnitId: `${sessionId}:map:0`,
       requireExistingReceipt: true,
     });
 
@@ -1521,6 +1685,7 @@ describe("mem::summarize-resumable", () => {
       sessionId,
       attemptId,
       inputHash,
+      operationUnitId: `${sessionId}:map:0`,
       requireExistingReceipt: true,
     });
 
@@ -1587,6 +1752,7 @@ describe("mem::summarize-resumable", () => {
       sessionId,
       attemptId: "attempt-missing-receipt",
       inputHash: summarySessionInputHash(session),
+      operationUnitId: `${sessionId}:map:0`,
       requireExistingReceipt: true,
     });
 

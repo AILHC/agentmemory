@@ -69,6 +69,33 @@ function classifyResponse(response, resultFields) {
   return { status: 'succeeded', payload: { result_ids: resultIds } };
 }
 
+export function classifyIdempotentCommitResponse(response, resultFields) {
+  const statusCode = Number(response?.status_code ?? response?.statusCode ?? 0);
+  const data = responseData(response);
+  if (
+    (response?.ok === false && statusCode === 0)
+    || data?.retrySameIdentity === true
+    || data?.retry_same_identity === true
+  ) {
+    return { status: 'pending' };
+  }
+  return classifyResponse(response, resultFields);
+}
+
+export async function executeReceiptAwareRequest({ recovered, invoke }) {
+  let requireExistingReceipt = recovered;
+  while (true) {
+    const response = await invoke(requireExistingReceipt);
+    const rawStatusCode = response?.status_code ?? response?.statusCode;
+    const transportFailed = response?.ok === false
+      && rawStatusCode !== undefined
+      && Number(rawStatusCode) === 0;
+    if (!transportFailed) return { response };
+    if (requireExistingReceipt) return { pending: true };
+    requireExistingReceipt = true;
+  }
+}
+
 function normalizePlanItems(data) {
   return firstArray(data, ['windows', 'units', 'items', 'groups'])
     .concat(firstArray(data?.plan, ['windows', 'units', 'items', 'groups']));
@@ -195,15 +222,20 @@ function singleAdapter({
       if (unit.skip_reason) {
         return { status: 'skipped', payload: { reason: unit.skip_reason, result_ids: [] } };
       }
-      const response = await request(endpoint, buildFormalBody({
-        stage,
-        unit,
-        attemptId,
-        payload: {
-          ...buildPayload(unit),
-          ...(recovered ? { requireExistingReceipt: true } : {}),
-        },
-      }));
+      const requestResult = await executeReceiptAwareRequest({
+        recovered,
+        invoke: (requireExistingReceipt) => request(endpoint, buildFormalBody({
+          stage,
+          unit,
+          attemptId,
+          payload: {
+            ...buildPayload(unit),
+            ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+          },
+        })),
+      });
+      if (requestResult.pending) return { status: 'pending' };
+      const response = requestResult.response;
       const children = inputTooLarge(response) ? splitUnit?.(unit) || [] : [];
       if (children.length > 0) return { status: 'split', children };
       return classifyResponse(response, resultFields);
@@ -246,15 +278,20 @@ function twoPhaseAdapter({
       if (unit.skip_reason) {
         return { status: 'skipped', payload: { reason: unit.skip_reason, result_ids: [] } };
       }
-      const response = await request(prepareEndpoint, buildFormalBody({
-        stage,
-        unit,
-        attemptId,
-        payload: {
-          ...buildPreparePayload(unit),
-          ...(recovered ? { requireExistingReceipt: true } : {}),
-        },
-      }));
+      const requestResult = await executeReceiptAwareRequest({
+        recovered,
+        invoke: (requireExistingReceipt) => request(prepareEndpoint, buildFormalBody({
+          stage,
+          unit,
+          attemptId,
+          payload: {
+            ...buildPreparePayload(unit),
+            ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+          },
+        })),
+      });
+      if (requestResult.pending) return { status: 'pending' };
+      const response = requestResult.response;
       const children = inputTooLarge(response) ? splitUnit?.(unit) || [] : [];
       if (children.length > 0) return { status: 'split', children };
       const data = responseData(response);
@@ -300,7 +337,7 @@ function twoPhaseAdapter({
           proposalHash: prepared.proposal_hash,
         },
       }));
-      return classifyResponse(response, resultFields);
+      return classifyIdempotentCommitResponse(response, resultFields);
     },
     record: recordAdapter({ request, runId, mark, stage, resultType }),
   };
@@ -566,17 +603,16 @@ export async function runV2RemainingStages({
   runSingleStage,
   runTwoPhaseStage,
 }) {
-  const memoryUnits = planOrNone(await memoryPlan({
-    request,
-    runId,
-    configHash,
-    inventoryHash,
-    config,
-    stableHash,
-  }), 'no eligible memory consolidate windows', stableHash);
   let result = await runTwoPhaseStage({
     stage: 'memory_consolidate',
-    plan: memoryUnits,
+    plan: async () => planOrNone(await memoryPlan({
+      request,
+      runId,
+      configHash,
+      inventoryHash,
+      config,
+      stableHash,
+    }), 'no eligible memory consolidate windows', stableHash),
     adapter: twoPhaseAdapter({
       stage: 'memory_consolidate',
       prepareEndpoint: '/agentmemory/full/memory-consolidate-window/prepare',
@@ -608,15 +644,18 @@ export async function runV2RemainingStages({
   });
   if (!stageAccepted(result)) return result;
 
-  const sessions = await loadSelectedSessions();
-  const semanticUnits = planOrNone(
-    semanticPlan(sessions, config, stableHash),
-    'no summarized sessions',
-    stableHash,
-  );
+  let sessionsPromise;
+  const selectedSessions = () => {
+    sessionsPromise ||= loadSelectedSessions();
+    return sessionsPromise;
+  };
   result = await runSingleStage({
     stage: 'semantic_rollup',
-    plan: semanticUnits,
+    plan: async () => planOrNone(
+      semanticPlan(await selectedSessions(), config, stableHash),
+      'no summarized sessions',
+      stableHash,
+    ),
     adapter: singleAdapter({
       stage: 'semantic_rollup',
       endpoint: '/agentmemory/semantic-rollup',
@@ -637,14 +676,13 @@ export async function runV2RemainingStages({
   });
   if (!stageAccepted(result)) return result;
 
-  const skillUnits = planOrNone(
-    skillPlan(sessions, stableHash),
-    'no completed summarized sessions',
-    stableHash,
-  );
   result = await runTwoPhaseStage({
     stage: 'skill_extract',
-    plan: skillUnits,
+    plan: async () => planOrNone(
+      skillPlan(await selectedSessions(), stableHash),
+      'no completed summarized sessions',
+      stableHash,
+    ),
     adapter: twoPhaseAdapter({
       stage: 'skill_extract',
       prepareEndpoint: '/agentmemory/full/skill-extract/prepare',
@@ -663,30 +701,30 @@ export async function runV2RemainingStages({
   });
   if (!stageAccepted(result)) return result;
 
-  const crystalGroups = await serverPlan({
-    request,
-    endpoint: '/agentmemory/full/crystals/auto',
-    body: modelBody({ dryRun: true }, options, 'crystal'),
-    prefix: 'cg',
-    stableHash,
-  });
-  const crystalUnits = crystalGroups.length > 0
-    ? [{
-        unit_id: 'auto',
-        source_ids: crystalGroups.flatMap((unit) => unit.action_ids.length > 0 ? unit.action_ids : unit.source_ids),
-        planned_group_ids: crystalGroups.map((unit) => unit.unit_id),
-        input_hash: stableHash(crystalGroups.map((unit) => [
-          unit.unit_id,
-          stableHash({
-            action_ids: unit.action_ids.length > 0 ? unit.action_ids : unit.source_ids,
-            action_updated_ats: unit.action_updated_ats,
-          }),
-        ])),
-      }]
-    : [noneUnit('no eligible actions', stableHash)];
   result = await runSingleStage({
     stage: 'crystal',
-    plan: crystalUnits,
+    plan: async () => {
+      const crystalGroups = await serverPlan({
+        request,
+        endpoint: '/agentmemory/full/crystals/auto',
+        body: modelBody({ dryRun: true }, options, 'crystal'),
+        prefix: 'cg',
+        stableHash,
+      });
+      return planOrNone(crystalGroups.map((unit) => {
+        const actionIds = unit.action_ids.length > 0 ? unit.action_ids : unit.source_ids;
+        return {
+          ...unit,
+          source_ids: actionIds,
+          action_ids: actionIds,
+          input_hash: stableHash({
+            group_id: unit.unit_id,
+            action_ids: actionIds,
+            action_updated_ats: unit.action_updated_ats,
+          }),
+        };
+      }), 'no eligible actions', stableHash);
+    },
     adapter: singleAdapter({
       stage: 'crystal',
       endpoint: '/agentmemory/full/crystals/auto',
@@ -696,21 +734,25 @@ export async function runV2RemainingStages({
       runId,
       mark: options.mark,
       stableHash,
-      buildPayload: () => modelBody({}, options, 'crystal'),
+      buildPayload: (unit) => modelBody({
+        groupId: unit.unit_id,
+        actionIds: unit.action_ids,
+        actionUpdatedAts: unit.action_updated_ats,
+        ...(unit.project ? { project: unit.project } : {}),
+      }, options, 'crystal'),
     }),
   });
   if (!stageAccepted(result)) return result;
 
-  const proceduralUnits = planOrNone(await serverPlan({
-    request,
-    endpoint: '/agentmemory/full/consolidation-procedural-windows/plan',
-    body: {},
-    prefix: 'cpw',
-    stableHash,
-  }), 'no eligible pattern memories', stableHash);
   result = await runSingleStage({
     stage: 'consolidation_procedural',
-    plan: proceduralUnits,
+    plan: async () => planOrNone(await serverPlan({
+      request,
+      endpoint: '/agentmemory/full/consolidation-procedural-windows/plan',
+      body: {},
+      prefix: 'cpw',
+      stableHash,
+    }), 'no eligible pattern memories', stableHash),
     adapter: singleAdapter({
       stage: 'consolidation_procedural',
       endpoint: '/agentmemory/full/consolidation-procedural-window',
@@ -735,16 +777,15 @@ export async function runV2RemainingStages({
   });
   if (!stageAccepted(result)) return result;
 
-  const reflectUnits = planOrNone(await serverPlan({
-    request,
-    endpoint: '/agentmemory/full/reflect-insight-windows/plan',
-    body: { useGraph: false, charBudget: config.reflect_insight_char_budget },
-    prefix: 'riw',
-    stableHash,
-  }), 'no eligible reflect insight windows', stableHash);
   return runSingleStage({
     stage: 'reflect_insight',
-    plan: reflectUnits,
+    plan: async () => planOrNone(await serverPlan({
+      request,
+      endpoint: '/agentmemory/full/reflect-insight-windows/plan',
+      body: { useGraph: false, charBudget: config.reflect_insight_char_budget },
+      prefix: 'riw',
+      stableHash,
+    }), 'no eligible reflect insight windows', stableHash),
     adapter: singleAdapter({
       stage: 'reflect_insight',
       endpoint: '/agentmemory/full/reflect-insight-window',

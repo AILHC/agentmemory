@@ -376,14 +376,24 @@ describe("skill-extract", () => {
     await Promise.all(prepared.map((proposal, index) => commit({
       identity: identities[index],
       preparedHandle: proposal.preparedHandle,
+      proposalHash: proposal.proposalHash,
     })));
     const skills = Array.from(store.get(KV.procedural)?.values() || []);
     expect(skills).toHaveLength(1);
     const committed = await commit({
       identity: identities[0],
       preparedHandle: prepared[0].preparedHandle,
+      proposalHash: prepared[0].proposalHash,
     });
     expect(committed.model).toBe("skill-release-b");
+    await expect(commit({
+      identity: identities[0],
+      preparedHandle: prepared[0].preparedHandle,
+      proposalHash: "wrong-proposal-hash",
+    })).resolves.toMatchObject({
+      success: false,
+      failure: { class: "hard", cause: "proposal_identity_conflict" },
+    });
     expect(skills[0]).toMatchObject({
       frequency: 2,
       strength: 0.75,
@@ -393,6 +403,7 @@ describe("skill-extract", () => {
     await Promise.all(prepared.map((proposal, index) => commit({
       identity: identities[index],
       preparedHandle: proposal.preparedHandle,
+      proposalHash: proposal.proposalHash,
     })));
     expect(Array.from(store.get(KV.procedural)?.values() || [])[0]).toMatchObject({
       frequency: 2,
@@ -500,6 +511,7 @@ describe("skill-extract", () => {
     const commitResultPromise = commit({
       identity,
       preparedHandle: prepared.preparedHandle,
+      proposalHash: prepared.proposalHash,
     });
     const proposalReadWhileDirectHeldLock = await Promise.race([
       secondReadStarted.then(() => true),
@@ -523,7 +535,11 @@ describe("skill-extract", () => {
 
     await Promise.all([
       direct({ sessionId: "direct" }),
-      commit({ identity, preparedHandle: prepared.preparedHandle }),
+      commit({
+        identity,
+        preparedHandle: prepared.preparedHandle,
+        proposalHash: prepared.proposalHash,
+      }),
     ]);
     expect(Array.from(store.get(KV.procedural)?.values() || [])[0]).toMatchObject({
       frequency: 3,

@@ -99,6 +99,113 @@ test('single-phase blocked is durable and never becomes a failed terminal', asyn
   assert.equal(harness.events.at(-1).type, 'unit_blocked');
 });
 
+test('single-phase adapters can journal an exact inner operation before dispatch', async () => {
+  const harness = makeHarness();
+  const receiptModes = [];
+  let responseLost = true;
+  const invoke = () => runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'attempt-inner',
+    execute: async ({
+      activeOperation,
+      startOperation,
+      completeOperation,
+    }) => {
+      const operation = activeOperation
+        || await startOperation({ operationId: 'unit-1:map:0' });
+      receiptModes.push(Boolean(activeOperation));
+      if (responseLost) {
+        responseLost = false;
+        throw new Error('inner_response_lost');
+      }
+      await completeOperation({
+        operationId: operation.operation_id,
+        status: 'succeeded',
+      });
+      return { status: 'succeeded' };
+    },
+    record: async () => {},
+  });
+
+  await assert.rejects(invoke, /inner_response_lost/);
+  assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 1 });
+  assert.deepEqual(receiptModes, [false, true]);
+  assert.deepEqual(harness.events.map((event) => event.type), [
+    'unit_planned',
+    'stage_plan_completed',
+    'unit_started',
+    'unit_operation_started',
+    'unit_operation_completed',
+    'unit_terminal',
+    'unit_recorded',
+    'stage_completed',
+  ]);
+});
+
+test('unit_started without operation_started remains a fresh inner dispatch boundary', async () => {
+  const harness = makeHarness();
+  let executeCalls = 0;
+  const invoke = () => runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'attempt-before-inner',
+    execute: async ({ activeOperation, completedOperations }) => {
+      executeCalls += 1;
+      assert.equal(activeOperation, null);
+      assert.deepEqual(completedOperations, []);
+      return { status: 'succeeded' };
+    },
+    record: async () => {},
+  });
+
+  harness.failAfter('unit_started');
+  await assert.rejects(invoke, /crash_after_unit_started/);
+  assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 1 });
+  assert.equal(executeCalls, 1);
+});
+
+test('single-phase adapters can recover a terminal inner result without redispatch', async () => {
+  const harness = makeHarness();
+  let remoteCalls = 0;
+  const invoke = () => runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'attempt-terminal-inner',
+    execute: async ({
+      activeOperation,
+      completedOperations,
+      startOperation,
+      completeOperation,
+    }) => {
+      const recoveredTerminal = completedOperations.at(-1)?.terminal_result;
+      if (recoveredTerminal) return recoveredTerminal;
+      const operation = activeOperation
+        || await startOperation({ operationId: 'unit-1:map:0' });
+      remoteCalls += 1;
+      const terminalResult = {
+        status: 'succeeded',
+        payload: { result_id: 'result-1' },
+      };
+      await completeOperation({
+        operationId: operation.operation_id,
+        status: 'succeeded',
+        terminal_result: terminalResult,
+      });
+      return terminalResult;
+    },
+    record: async () => {},
+  });
+
+  harness.failAfter('unit_operation_completed');
+  await assert.rejects(invoke, /crash_after_unit_operation_completed/);
+  assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 1 });
+  assert.equal(remoteCalls, 1);
+});
+
 test('two-phase recovery persists prepare and commit identities at every boundary', async () => {
   const harness = makeHarness();
   const prepareAttempts = [];
@@ -255,6 +362,7 @@ test('single-phase split becomes durable plan facts and resumes from child units
   harness.failAfter('unit_split');
   await assert.rejects(invoke, /crash_after_unit_split/);
   assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 2 });
+  assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 2 });
   assert.deepEqual(executed, ['unit-1', 'unit-1a', 'unit-1b']);
   assert.deepEqual(recorded, ['unit-1a', 'unit-1b']);
   assert.equal(harness.events.filter((event) => event.type === 'unit_split').length, 1);
@@ -310,7 +418,21 @@ test('recovery executors reject illegal lifecycle order instead of guessing', ()
     { seq: 0, type: 'unit_planned', payload: { unit_id: 'unit-1' } },
     { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
     { seq: 2, type: 'unit_prepare_started', payload: { unit_id: 'unit-1', attempt_id: 'prepare-1' } },
-    { seq: 3, type: 'unit_prepared', payload: { unit_id: 'unit-1', prepared_handle: 'handle-1' } },
+    {
+      seq: 3,
+      type: 'unit_prepared',
+      payload: { unit_id: 'unit-1', attempt_id: 'prepare-1', prepared_handle: 'handle-1' },
+    },
     { seq: 4, type: 'unit_terminal', payload: { unit_id: 'unit-1', status: 'succeeded' } },
   ]), /terminal_before_committing/);
+  assert.throws(() => validateTwoPhaseStage([
+    { seq: 0, type: 'unit_planned', payload: { unit_id: 'unit-1' } },
+    { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
+    { seq: 2, type: 'unit_prepare_started', payload: { unit_id: 'unit-1', attempt_id: 'prepare-1' } },
+    {
+      seq: 3,
+      type: 'unit_prepared',
+      payload: { unit_id: 'unit-1', attempt_id: 'prepare-other', prepared_handle: 'handle-1' },
+    },
+  ]), /prepared_attempt_identity/);
 });

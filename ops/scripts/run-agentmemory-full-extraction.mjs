@@ -4,7 +4,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { AdaptiveProviderLimiter } from './lib/adaptive-provider-limiter.mjs';
-import { runV2RemainingStages } from './lib/full-extraction-stage-adapters-v2.mjs';
+import {
+  executeReceiptAwareRequest,
+  runV2RemainingStages,
+} from './lib/full-extraction-stage-adapters-v2.mjs';
 import { runSinglePhaseStage, runTwoPhaseStage } from './lib/recoverable-stage-v2.mjs';
 import { RunStateStore } from './lib/run-state-store.mjs';
 import { RunStateJournalV2 } from './lib/run-state-journal-v2.mjs';
@@ -5461,13 +5464,17 @@ async function runV2JournalSingleStage({
 }) {
   const opened = control.some((event) => event.type === 'stage_opened' && event.payload?.stage === stage);
   if (!opened) await durable('control', 'stage_opened', { stage });
+  const events = await journal.readStage(stage);
+  const effectivePlan = events.some((event) => event.type === 'stage_plan_completed')
+    ? events.filter((event) => event.type === 'unit_planned').map((event) => event.payload)
+    : await (typeof plan === 'function' ? plan() : plan);
   const planMetadata = {
-    plan_hash: stableHash(plan),
-    order_hash: stableHash(plan.map((unit) => unit.unit_id)),
+    plan_hash: stableHash(effectivePlan),
+    order_hash: stableHash(effectivePlan.map((unit) => unit.unit_id)),
   };
   const result = await runSinglePhaseStage({
-    events: await journal.readStage(stage),
-    plan,
+    events,
+    plan: effectivePlan,
     planMetadata,
     append: (type, payload) => durable(stage, type, payload),
     planOnly,
@@ -5501,13 +5508,17 @@ async function runV2JournalTwoPhaseStage({
 }) {
   const opened = control.some((event) => event.type === 'stage_opened' && event.payload?.stage === stage);
   if (!opened) await durable('control', 'stage_opened', { stage });
+  const events = await journal.readStage(stage);
+  const effectivePlan = events.some((event) => event.type === 'stage_plan_completed')
+    ? events.filter((event) => event.type === 'unit_planned').map((event) => event.payload)
+    : await (typeof plan === 'function' ? plan() : plan);
   const planMetadata = {
-    plan_hash: stableHash(plan),
-    order_hash: stableHash(plan.map((unit) => unit.unit_id)),
+    plan_hash: stableHash(effectivePlan),
+    order_hash: stableHash(effectivePlan.map((unit) => unit.unit_id)),
   };
   const result = await runTwoPhaseStage({
-    events: await journal.readStage(stage),
-    plan,
+    events,
+    plan: effectivePlan,
     planMetadata,
     append: (type, payload) => durable(stage, type, payload),
     planOnly,
@@ -5580,18 +5591,56 @@ function verifiedV2SummaryResult(data, unit, attemptId) {
   };
 }
 
+function nextV2SummaryOperationId(unitId, operationId, data) {
+  const mapPrefix = `${unitId}:map:`;
+  if (!operationId.startsWith(mapPrefix)) {
+    throw new Error(`v2_summary_operation_sequence_invalid:${operationId}`);
+  }
+  const chunkIndex = Number.parseInt(operationId.slice(mapPrefix.length), 10);
+  const totalChunks = Number(data.totalChunks);
+  if (
+    !Number.isSafeInteger(chunkIndex)
+    || chunkIndex < 0
+    || !Number.isSafeInteger(totalChunks)
+    || totalChunks <= chunkIndex
+  ) {
+    throw new Error(`v2_summary_operation_progress_invalid:${operationId}`);
+  }
+  return chunkIndex + 1 < totalChunks
+    ? `${unitId}:map:${chunkIndex + 1}`
+    : `${unitId}:reduce`;
+}
+
 function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote }) {
   return {
     attemptIdForUnit: (unit) => stableHash({ run_id: runId, stage: 'summary', unit_id: unit.unit_id }),
-    execute: async ({ unit, attemptId, recovered }) => {
-      let requireExistingReceipt = recovered;
+    execute: async ({
+      unit,
+      attemptId,
+      activeOperation,
+      completedOperations,
+      startOperation,
+      completeOperation,
+    }) => {
+      const completedTerminal = completedOperations.at(-1)?.terminal_result;
+      if (completedTerminal) return completedTerminal;
+      let operationId = activeOperation?.operation_id
+        || completedOperations.at(-1)?.next_operation_id
+        || `${unit.unit_id}:map:0`;
+      let operationStarted = Boolean(activeOperation);
+      let requireExistingReceipt = Boolean(activeOperation);
       for (let advance = 0; advance < SUMMARY_ADVANCE_MAX_CALL_LIMIT; advance += 1) {
+        if (!operationStarted) {
+          await startOperation({ operationId });
+          operationStarted = true;
+        }
         const result = await summaryRemote.advance({
           baseUrl,
           secret,
           sessionId: unit.unit_id,
           attemptId,
           inputHash: unit.input_hash,
+          operationUnitId: operationId,
           requireExistingReceipt,
           request: buildSummaryBody(unit.unit_id, options),
           signal: options.signal,
@@ -5609,14 +5658,27 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
             requireExistingReceipt = true;
             continue;
           }
-          return {
-            status: 'blocked',
-            reason: 'request_transport_failed',
-            payload: { error: 'summary_result_unknown_after_transport_failure' },
-          };
+          return { status: 'pending' };
         }
         if (result?.ok === false || ['failed', 'infeasible', 'preflight_unavailable'].includes(data.status)) {
-          return { status: 'failed', payload: { error: failureCause || 'resumable summarize failed' } };
+          const terminalResult = {
+            status: 'failed',
+            payload: { error: failureCause || 'resumable summarize failed' },
+          };
+          await completeOperation({
+            operationId,
+            status: 'failed',
+            error: failureCause || 'resumable summarize failed',
+            terminal_result: terminalResult,
+          });
+          return terminalResult;
+        }
+        if (data.operationUnitId && data.operationUnitId !== operationId) {
+          return {
+            status: 'blocked',
+            reason: 'summary_operation_identity_conflict',
+            payload: { error: 'summary_operation_identity_conflict', operation_id: operationId },
+          };
         }
         if (data.status === 'succeeded') {
           const payload = verifiedV2SummaryResult(data, unit, attemptId);
@@ -5627,15 +5689,33 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
               payload: { error: 'summary_source_unproven' },
             };
           }
-          return {
+          const terminalResult = {
             status: 'succeeded',
             payload,
           };
+          await completeOperation({
+            operationId,
+            status: 'succeeded',
+            terminal_result: terminalResult,
+          });
+          return terminalResult;
         }
         if (data.status !== 'in_progress' || !['completed', 'skipped', 'none'].includes(data.advanced)) {
           throw new Error(`v2_summary_invalid_status:${String(data.status || '<missing>')}`);
         }
         if (data.advanced === 'none') return { status: 'pending' };
+        const nextOperationId = nextV2SummaryOperationId(unit.unit_id, operationId, data);
+        await completeOperation({
+          operationId,
+          status: data.advanced,
+          completed_chunks: data.completedChunks,
+          total_chunks: data.totalChunks,
+          skipped_chunks: data.skippedChunks,
+          next_operation_id: nextOperationId,
+        });
+        operationId = nextOperationId;
+        operationStarted = false;
+        requireExistingReceipt = false;
         if (options.delayMs > 0) await sleep(Math.min(options.delayMs, 500), { signal: options.signal });
       }
       return { status: 'pending' };
@@ -5657,27 +5737,25 @@ function buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote 
   return {
     attemptIdForUnit: (unit) => stableHash({ run_id: runId, stage: 'lessons', unit_id: unit.unit_id }),
     execute: async ({ unit, attemptId, recovered }) => {
-      const result = await lessonsRemote.start({
-        baseUrl,
-        secret,
-        sessionId: unit.unit_id,
-        attemptId,
-        inputHash: unit.input_hash,
-        requireExistingReceipt: recovered,
-        request: buildLessonExtractBody(unit.unit_id, options),
-        signal: options.signal,
+      const requestResult = await executeReceiptAwareRequest({
+        recovered,
+        invoke: (requireExistingReceipt) => lessonsRemote.start({
+          baseUrl,
+          secret,
+          sessionId: unit.unit_id,
+          attemptId,
+          inputHash: unit.input_hash,
+          requireExistingReceipt,
+          request: buildLessonExtractBody(unit.unit_id, options),
+          signal: options.signal,
+        }),
       });
+      if (requestResult.pending) return { status: 'pending' };
+      const result = requestResult.response;
       const data = result?.data || result || {};
       const failureCause = data?.failure?.cause || data?.failure?.error || data?.error || result?.error;
       if (failureCause === 'extraction_operation_reconciliation_required') {
         return { status: 'blocked', reason: failureCause, payload: { error: failureCause } };
-      }
-      if (result?.ok === false && Number(result?.status_code ?? result?.statusCode ?? 0) === 0) {
-        return {
-          status: 'blocked',
-          reason: 'request_transport_failed',
-          payload: { error: 'lesson_result_unknown_after_transport_failure' },
-        };
       }
       if (result?.ok === false) {
         return { status: 'failed', payload: { error: failureCause || 'lessons extract failed' } };
@@ -5720,11 +5798,23 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
   if (options.doctorScript) {
     await runDoctorGate(path.resolve(options.doctorScript), options.doctorOk);
   }
+  const runtimeCheck = dependencies.v2RuntimeCheck || assertRuntimeConcurrency;
+  try {
+    await runtimeCheck({
+      baseUrl,
+      secret,
+      allowed: options.allowSummarizeConcurrency,
+      options,
+    });
+  } catch (error) {
+    if (!options.dryRun) throw error;
+  }
   const summaryRemote = dependencies.v2SummaryRemote || {
     advance: async ({
       sessionId,
       attemptId,
       inputHash,
+      operationUnitId,
       requireExistingReceipt,
       request,
       signal,
@@ -5738,6 +5828,7 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
         sessionId,
         attemptId,
         inputHash,
+        operationUnitId,
         ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
       },
       requestOptions({ ...options, signal }),
@@ -5808,7 +5899,9 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       if (exists) throw new Error('v2_v1_state_collision: 该 run_id 已有 v1 状态或锁');
     }
     await assertV1ReleaseGate(options.stateDir, { fsApi });
-    await journal.acquireLock({ takeover: dependencies.v2VerifiedTakeover || null });
+    const verifiedTakeover = dependencies.v2VerifiedTakeover
+      || (options.resume ? async ({ owner }) => owner.run_id === runId : null);
+    await journal.acquireLock({ takeover: verifiedTakeover });
     let control = await journal.open();
     const allSessions = await loadSessions(baseUrl, secret, options.agentId, options);
     const excludedSessionIds = await loadExcludedSessionIds(options.excludeRecords);
@@ -5817,6 +5910,7 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     const config = {
       ...buildConfigFromOptions(options),
       base_url: baseUrl,
+      mark: options.mark,
     };
     const configHash = stableHash(config);
     const inventoryHash = computeInventoryHash(sessions, options.agentId);

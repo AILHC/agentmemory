@@ -451,6 +451,65 @@ describe("Crystallize Functions", () => {
       expect(result.crystalIds).toEqual([]);
     });
 
+    it("executes one pinned group without rebuilding the live auto plan", async () => {
+      const action = makeAction({
+        id: "act_pinned",
+        status: "done",
+        project: "pinned-project",
+        updatedAt: "2026-06-01T00:00:00.000Z",
+      });
+      await kv.set("mem:actions", action.id, action);
+
+      const result = (await sdk.trigger("mem::full-crystals-auto", {
+        groupId: "crystal-group:pinned",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+      })) as {
+        success: boolean;
+        groupCount: number;
+        groups: Array<{ groupId: string; actionIds: string[]; status: string }>;
+        crystalIds: string[];
+      };
+
+      expect(result).toMatchObject({
+        success: true,
+        groupCount: 1,
+        groups: [{
+          groupId: "crystal-group:pinned",
+          actionIds: [action.id],
+          status: "succeeded",
+        }],
+      });
+      expect(result.crystalIds).toHaveLength(1);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+    });
+
+    it("hard-stops a pinned group when an action snapshot has drifted", async () => {
+      const action = makeAction({
+        id: "act_pinned_drift",
+        status: "done",
+        updatedAt: "2026-06-02T00:00:00.000Z",
+      });
+      await kv.set("mem:actions", action.id, action);
+
+      const result = (await sdk.trigger("mem::full-crystals-auto", {
+        groupId: "crystal-group:drift",
+        actionIds: [action.id],
+        actionUpdatedAts: ["2026-06-01T00:00:00.000Z"],
+      })) as {
+        success: boolean;
+        status: string;
+        failure: { class: string; cause: string };
+      };
+
+      expect(result).toMatchObject({
+        success: false,
+        status: "failed",
+        failure: { class: "hard", cause: "crystal_plan_drifted" },
+      });
+      expect(provider.summarize).not.toHaveBeenCalled();
+    });
+
     it("groups by parentId when present", async () => {
       const parent = makeAction({
         id: "act_parent",
