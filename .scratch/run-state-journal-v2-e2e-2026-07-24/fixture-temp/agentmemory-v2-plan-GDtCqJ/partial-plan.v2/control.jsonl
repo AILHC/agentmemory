@@ -1,0 +1,3 @@
+{"seq":0,"at":"2026-07-24T14:04:15.690Z","type":"run_started","payload":{"run_id":"partial-plan","format":"run-state-journal-v2","schema_version":2,"base_url":"http://127.0.0.1:8408","config_hash":"790cbd241e247a8cb67a1aad2688a5bab1b0fc71fb0c0b2ee04b1faa3d46afb0","inventory_hash":"f6bc8f53a788e38a8f6600709c615dbcbd987052efe76ca7815c263932a4971d"},"checksum":"0d9003efe92f14eb6d68e0bad5476bc3c721436374b8be45b50a56d9262bdb55"}
+{"seq":1,"at":"2026-07-24T14:04:15.701Z","type":"stage_opened","payload":{"stage":"summary"},"checksum":"0694b35627535465dfc2b15c9cc83260f799903b75bcc178bbf9f744aa343152"}
+{"seq":2,"at":"2026-07-24T14:04:15.781Z","type":"stage_opened","payload":{"stage":"lessons"},"checksum":"4645b67237a9fbd389c12f8a7caaded4d86291af0abc49ffe437b48f1dbf48bf"}

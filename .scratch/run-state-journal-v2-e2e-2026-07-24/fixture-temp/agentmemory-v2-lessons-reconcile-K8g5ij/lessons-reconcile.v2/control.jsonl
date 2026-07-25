@@ -1,0 +1,3 @@
+{"seq":0,"at":"2026-07-24T14:04:16.214Z","type":"run_started","payload":{"run_id":"lessons-reconcile","format":"run-state-journal-v2","schema_version":2,"base_url":"http://127.0.0.1:8423","config_hash":"c1a64c23d95a2bf5fddf7c49e97d9b8d2ec70a2de03ddeae16193b486fefe7fb","inventory_hash":"d5ec111faa4cc4f104833d63859760c12d20100deb5b3983a65ffa651c72b871"},"checksum":"623ead66b2b0c60b6ca6facb76630aa40e38eb201f59b076c3acc9891416bdce"}
+{"seq":1,"at":"2026-07-24T14:04:16.224Z","type":"stage_opened","payload":{"stage":"summary"},"checksum":"83a8f629cb16bdba7d361c0d1f7a89f3a960e1d73185fd76096e1f0039607a6b"}
+{"seq":2,"at":"2026-07-24T14:04:16.279Z","type":"stage_opened","payload":{"stage":"lessons"},"checksum":"2a225ff3eb63827cd7d43fd80d916aaccbd4fd4dc46352e5788f5e48e5c26e3e"}

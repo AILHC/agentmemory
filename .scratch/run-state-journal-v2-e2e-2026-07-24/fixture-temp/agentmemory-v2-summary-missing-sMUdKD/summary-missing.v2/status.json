@@ -1,0 +1,10 @@
+{
+  "current_stage": "summary",
+  "summary": {
+    "status": "blocked",
+    "unit_id": "s1"
+  },
+  "run_id": "summary-missing",
+  "control_seq": 1,
+  "stage_seq": 3
+}

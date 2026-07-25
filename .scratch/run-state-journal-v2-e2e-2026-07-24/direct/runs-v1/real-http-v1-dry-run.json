@@ -1,0 +1,352 @@
+{
+  "schema_version": 1,
+  "run_id": "real-http-v1-dry-run",
+  "mark": "agentmemory-full-extraction",
+  "base_url": "http://127.0.0.1:3211",
+  "started_at": "2026-07-24T14:08:47.277Z",
+  "updated_at": "2026-07-24T14:08:47.375Z",
+  "config": {
+    "agent_id": "*",
+    "session_concurrency": 1,
+    "lesson_chunk_concurrency": 1,
+    "semantic_window_size": 20,
+    "semantic_char_budget": 64000,
+    "semantic_rollup_target_prompt_chars": 64000,
+    "memory_consolidate_char_budget": 64000,
+    "reflect_insight_char_budget": 64000,
+    "delay_ms": 1500,
+    "stop_after_consecutive_failures": 3
+  },
+  "config_hash": "b6de05d589b81844746aa74a9f45e8f2653ad7c9bc4607e0834cfc1db29336c7",
+  "inventory_hash": "52cfaefbfbfd010380f9ded32107e7485c4eb8a04cf2a0ef57851958e4c7df39",
+  "health": {
+    "last_ok_at": null,
+    "last_error": "SUMMARIZE_CHUNK_CONCURRENCY=6，正式全量提炼要求为 1；如已评估风险，传 --allow-summarize-concurrency 6",
+    "runtime_warning": "SUMMARIZE_CHUNK_CONCURRENCY=6，正式全量提炼要求为 1；如已评估风险，传 --allow-summarize-concurrency 6"
+  },
+  "sessions": {
+    "v2-e2e-session": {
+      "session_id": "v2-e2e-session",
+      "project": "agentmemory-v2-e2e",
+      "started_at": "2026-07-24T14:08:04.0380056Z",
+      "completed_at": "2026-07-24T14:08:11.022Z",
+      "session_status": "completed",
+      "agent_id": null,
+      "summary": {
+        "status": "pending",
+        "attempt_count": 0
+      },
+      "lessons_extract": {
+        "status": "pending",
+        "attempt_count": 0
+      }
+    }
+  },
+  "memory_consolidate_windows": {
+    "none": {
+      "unit_id": "none",
+      "status": "skipped",
+      "skipped_reason": "no eligible memory consolidate windows",
+      "input_hash": "149876c02459babb1f455a308f10616857bd8eb64bc0bc015d552ce5eebee5e1",
+      "completed_at": "2026-07-24T14:08:47.351Z"
+    }
+  },
+  "semantic_windows": {},
+  "skill_extract": {
+    "none": {
+      "unit_id": "none",
+      "status": "skipped",
+      "skipped_reason": "no completed summarized sessions",
+      "input_hash": "5f272e14fb6047e0cd048847ddde04d70018e3caeeb793f9df5f2555295377af",
+      "completed_at": "2026-07-24T14:08:47.353Z"
+    }
+  },
+  "crystal_groups": {
+    "none": {
+      "unit_id": "none",
+      "status": "skipped",
+      "skipped_reason": "no eligible actions",
+      "input_hash": "527a3f4d0833fc21f9e8cb874b87e8a87787e4783ca72eb915a5d0cd3166953c",
+      "completed_at": "2026-07-24T14:08:47.358Z"
+    }
+  },
+  "consolidation_procedural_windows": {
+    "none": {
+      "unit_id": "none",
+      "status": "skipped",
+      "skipped_reason": "no eligible pattern memories",
+      "input_hash": "444ed85a26e1abbd7a289df1be37f40fbbe048cf4dec5d838bd21dfcce0cd878",
+      "completed_at": "2026-07-24T14:08:47.364Z"
+    }
+  },
+  "reflect_insight_windows": {
+    "none": {
+      "unit_id": "none",
+      "status": "skipped",
+      "skipped_reason": "no eligible reflect insight windows",
+      "input_hash": "f6d07ca0d9c64ece92f269c674edea6ff275e46b892fc902735beae0c67ca68d",
+      "completed_at": "2026-07-24T14:08:47.370Z"
+    }
+  },
+  "semantic_memory_char_sizes": {},
+  "coverage": {
+    "enabled_stages": [
+      "summary",
+      "lessons",
+      "memory_consolidate_windows",
+      "semantic_windows",
+      "skill_extract",
+      "crystal_groups",
+      "consolidation_procedural_windows",
+      "reflect_insight_windows"
+    ],
+    "sessions": {
+      "total": 1
+    },
+    "summary": {
+      "succeeded": 0,
+      "skipped": 0,
+      "failed": 0,
+      "pending": 1,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "lessons": {
+      "succeeded": 0,
+      "skipped": 0,
+      "failed": 0,
+      "pending": 1,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "memory_consolidate_windows": {
+      "succeeded": 0,
+      "skipped": 1,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "semantic_windows": {
+      "succeeded": 0,
+      "skipped": 0,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "skill_extract": {
+      "succeeded": 0,
+      "skipped": 1,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "crystal_groups": {
+      "succeeded": 0,
+      "skipped": 1,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "consolidation_procedural_windows": {
+      "succeeded": 0,
+      "skipped": 1,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "reflect_insight_windows": {
+      "succeeded": 0,
+      "skipped": 1,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "acceptance_ready": false
+  },
+  "orchestration_policy_version": 1,
+  "orchestration_policy_hash": "a0b54c62c9261c78f438c8ee52dc108bfc907a92e3cde4850c5efb66748ea8c4",
+  "scheduler_epoch": 1,
+  "next_retry_at": null,
+  "last_failure_cause": null,
+  "stage_work_queues": {},
+  "orchestration_policy_backfilled_at": "2026-07-24T14:08:47.277Z",
+  "inventory_audit": {
+    "discovered_count": 1,
+    "included_count": 1,
+    "excluded_count": 0,
+    "excluded_reason_counts": {},
+    "excluded_sessions": []
+  },
+  "stage_metrics": {
+    "summary": {
+      "stage": "summary",
+      "window_count": 1,
+      "status_counts": {
+        "succeeded": 0,
+        "skipped": 0,
+        "failed": 0,
+        "pending": 1,
+        "running": 0,
+        "planned": 0,
+        "other": 0
+      },
+      "models": {},
+      "prompt_chars": null,
+      "char_budget": null,
+      "duration_seconds": null,
+      "parse_failures_total": 0,
+      "parse_failure_units": 0
+    },
+    "lessons": {
+      "stage": "lessons",
+      "window_count": 1,
+      "status_counts": {
+        "succeeded": 0,
+        "skipped": 0,
+        "failed": 0,
+        "pending": 1,
+        "running": 0,
+        "planned": 0,
+        "other": 0
+      },
+      "models": {},
+      "prompt_chars": null,
+      "char_budget": null,
+      "duration_seconds": null,
+      "parse_failures_total": 0,
+      "parse_failure_units": 0
+    },
+    "memory_consolidate_windows": {
+      "stage": "memory_consolidate_windows",
+      "window_count": 1,
+      "status_counts": {
+        "succeeded": 0,
+        "skipped": 1,
+        "failed": 0,
+        "pending": 0,
+        "running": 0,
+        "planned": 0,
+        "other": 0
+      },
+      "models": {},
+      "prompt_chars": null,
+      "char_budget": null,
+      "duration_seconds": null,
+      "parse_failures_total": 0,
+      "parse_failure_units": 0
+    },
+    "semantic_windows": {
+      "stage": "semantic_windows",
+      "window_count": 0,
+      "status_counts": {
+        "succeeded": 0,
+        "skipped": 0,
+        "failed": 0,
+        "pending": 0,
+        "running": 0,
+        "planned": 0,
+        "other": 0
+      },
+      "models": {},
+      "prompt_chars": null,
+      "char_budget": null,
+      "duration_seconds": null,
+      "parse_failures_total": 0,
+      "parse_failure_units": 0
+    },
+    "skill_extract": {
+      "stage": "skill_extract",
+      "window_count": 1,
+      "status_counts": {
+        "succeeded": 0,
+        "skipped": 1,
+        "failed": 0,
+        "pending": 0,
+        "running": 0,
+        "planned": 0,
+        "other": 0
+      },
+      "models": {},
+      "prompt_chars": null,
+      "char_budget": null,
+      "duration_seconds": null,
+      "parse_failures_total": 0,
+      "parse_failure_units": 0
+    },
+    "crystal_groups": {
+      "stage": "crystal_groups",
+      "window_count": 1,
+      "status_counts": {
+        "succeeded": 0,
+        "skipped": 1,
+        "failed": 0,
+        "pending": 0,
+        "running": 0,
+        "planned": 0,
+        "other": 0
+      },
+      "models": {},
+      "prompt_chars": null,
+      "char_budget": null,
+      "duration_seconds": null,
+      "parse_failures_total": 0,
+      "parse_failure_units": 0
+    },
+    "consolidation_procedural_windows": {
+      "stage": "consolidation_procedural_windows",
+      "window_count": 1,
+      "status_counts": {
+        "succeeded": 0,
+        "skipped": 1,
+        "failed": 0,
+        "pending": 0,
+        "running": 0,
+        "planned": 0,
+        "other": 0
+      },
+      "models": {},
+      "prompt_chars": null,
+      "char_budget": null,
+      "duration_seconds": null,
+      "parse_failures_total": 0,
+      "parse_failure_units": 0
+    },
+    "reflect_insight_windows": {
+      "stage": "reflect_insight_windows",
+      "window_count": 1,
+      "status_counts": {
+        "succeeded": 0,
+        "skipped": 1,
+        "failed": 0,
+        "pending": 0,
+        "running": 0,
+        "planned": 0,
+        "other": 0
+      },
+      "models": {},
+      "prompt_chars": null,
+      "char_budget": null,
+      "duration_seconds": null,
+      "parse_failures_total": 0,
+      "parse_failure_units": 0
+    }
+  },
+  "orchestration_journal": {
+    "included_seq": 0,
+    "included_hash": null
+  }
+}

@@ -1,0 +1,9 @@
+{"seq":0,"at":"2026-07-24T14:08:28.719Z","type":"run_started","payload":{"run_id":"real-http-dry-run","format":"run-state-journal-v2","schema_version":2,"base_url":"http://127.0.0.1:3211","config_hash":"3948edd57a7d80dadd38b825f9fd86e0e51c584f97a2a2d4a270f9d6dc320c3f","inventory_hash":"52cfaefbfbfd010380f9ded32107e7485c4eb8a04cf2a0ef57851958e4c7df39"},"checksum":"bee553ccafa4648881f4cbd736bfcba4fc772ba34256871f49829d5d208e807a"}
+{"seq":1,"at":"2026-07-24T14:08:28.729Z","type":"stage_opened","payload":{"stage":"summary"},"checksum":"e8f754b5876b92cc0c9656daabf0e1b01630a67877986177f2d302bce1cc9790"}
+{"seq":2,"at":"2026-07-24T14:08:28.760Z","type":"stage_opened","payload":{"stage":"lessons"},"checksum":"68c21f029a1418d47f61833f3924da3f6c802b44c944c95377d8f462fb054ce4"}
+{"seq":3,"at":"2026-07-24T14:08:28.797Z","type":"stage_opened","payload":{"stage":"memory_consolidate"},"checksum":"b9b672263e08cff918fe9f6fb0b2103076f679f13554def91c51734cc5241928"}
+{"seq":4,"at":"2026-07-24T14:08:28.826Z","type":"stage_opened","payload":{"stage":"semantic_rollup"},"checksum":"d0a3b0bc3acb588a0956945a7e06169bb6f4945f065aa37b978b74bdc5eba6c9"}
+{"seq":5,"at":"2026-07-24T14:08:28.851Z","type":"stage_opened","payload":{"stage":"skill_extract"},"checksum":"9de39b2fd313b7ca8ce6278566c62fbb87addc4d9d7d179ea16cd8fbb96c7b3c"}
+{"seq":6,"at":"2026-07-24T14:08:28.880Z","type":"stage_opened","payload":{"stage":"crystal"},"checksum":"2da8de859293ac4fa5defc1daf173d572660caa0de3d1d667ab1426cfb5adca0"}
+{"seq":7,"at":"2026-07-24T14:08:28.908Z","type":"stage_opened","payload":{"stage":"consolidation_procedural"},"checksum":"fe6ad75e51d92a109850019fd813fd23010f3f2a368676bb8e07ca743d839876"}
+{"seq":8,"at":"2026-07-24T14:08:28.935Z","type":"stage_opened","payload":{"stage":"reflect_insight"},"checksum":"5995a5176602863580d0750dd68a51e3f9937a0189f5805ed163586ac56c10a6"}

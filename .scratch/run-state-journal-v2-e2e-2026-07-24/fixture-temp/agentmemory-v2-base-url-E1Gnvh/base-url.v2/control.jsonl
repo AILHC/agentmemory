@@ -1,0 +1,3 @@
+{"seq":0,"at":"2026-07-24T14:04:28.811Z","type":"run_started","payload":{"run_id":"base-url","format":"run-state-journal-v2","schema_version":2,"base_url":"http://127.0.0.1:8565","config_hash":"60422cb6341b8856192546837f958d57e926730e979c4a0433fea4ab30efc0f7","inventory_hash":"d5ec111faa4cc4f104833d63859760c12d20100deb5b3983a65ffa651c72b871"},"checksum":"c085ee977e08a26b4a5da192518e371327bb1f8155d4b6a74e59f48b4fbee670"}
+{"seq":1,"at":"2026-07-24T14:04:28.813Z","type":"stage_opened","payload":{"stage":"summary"},"checksum":"8830ce0c36157ede628a14a8ff47dadad6dd309c50fe98e0e50158476a0e3fe7"}
+{"seq":2,"at":"2026-07-24T14:04:28.822Z","type":"stage_opened","payload":{"stage":"lessons"},"checksum":"0d08869f694a311be0bcff32a9d280da7aaa4913f6d8afcd608b8226a1ffcfec"}

@@ -1,0 +1,3 @@
+{"seq":0,"at":"2026-07-24T14:04:16.031Z","type":"run_started","payload":{"run_id":"lessons-boundaries","format":"run-state-journal-v2","schema_version":2,"base_url":"http://127.0.0.1:8420","config_hash":"be97132cf0a70d264c65ddaf38998753469a21d79e710582f10fd8a26176a70f","inventory_hash":"d5ec111faa4cc4f104833d63859760c12d20100deb5b3983a65ffa651c72b871"},"checksum":"a4b94a39e60920ab4b44582b7036df3ed9fb46831c81279d092480a7b0f5edeb"}
+{"seq":1,"at":"2026-07-24T14:04:16.040Z","type":"stage_opened","payload":{"stage":"summary"},"checksum":"60e681da117dd2c1a5572685836aa2b5455724d31f9486f33cf650f2279d9a50"}
+{"seq":2,"at":"2026-07-24T14:04:16.095Z","type":"stage_opened","payload":{"stage":"lessons"},"checksum":"aef88c482742babf80eb78d807208551547c94ca3fc2d70f4d7bd39fd56da9e8"}

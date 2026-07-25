@@ -1,0 +1,3 @@
+{"at":"2026-07-24T14:05:01.639Z","instanceId":"dev-isolated","event":"parent_check_failed","state":"CLOSED","failureCount":1,"reason":"PROCESS_CHAIN_STARTUP_FAILED"}
+{"at":"2026-07-24T14:05:07.309Z","instanceId":"dev-isolated","event":"parent_check_failed","state":"CLOSED","failureCount":2,"reason":"PROCESS_CHAIN_STARTUP_FAILED"}
+{"at":"2026-07-24T14:05:07.310Z","instanceId":"dev-isolated","event":"stopping","state":"STOPPING","reason":"STOP_REQUESTED"}

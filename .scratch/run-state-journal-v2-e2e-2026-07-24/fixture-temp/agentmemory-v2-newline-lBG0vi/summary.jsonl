@@ -1,0 +1,2 @@
+{"seq":0,"at":"2026-07-24T14:04:27.945Z","type":"unit_planned","payload":{"unit_id":"s1"},"checksum":"2c9832876a39dd6acfc4725698fbd50652af36d379963dd630a445e95239b1fe"}
+{"seq":1,"at":"2026-07-24T14:04:27.972Z","type":"stage_plan_completed","payload":{"unit_count":1},"checksum":"81a244cffcf25fba1d12e810d5d129db62a1f5737a1275271fe15d674f6f5c1b"}

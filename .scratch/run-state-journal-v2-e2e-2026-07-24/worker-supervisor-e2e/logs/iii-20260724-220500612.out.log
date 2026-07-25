@@ -1,0 +1,109 @@
+Initializing logging from config file: F:\projs_space\ai\ai-workflow-lab\vendor\agentmemory\.scratch\run-state-journal-v2-e2e-2026-07-24\worker-supervisor-e2e\iii-config.yaml
+Parsed config file: F:\projs_space\ai\ai-workflow-lab\vendor\agentmemory\.scratch\run-state-journal-v2-e2e-2026-07-24\worker-supervisor-e2e\iii-config.yaml
+Log level from config: info, Log format: default, OTel enabled: false
+OpenTelemetry is disabled
+[10:05:00.708 PM] [INFO] opentelemetry Global meter provider is set. Meters can now be created using global::meter() or global::meter_with_scope().
+    └ name: "MeterProvider.GlobalSet"
+[10:05:00.714 PM] [INFO] iii::workers::config Building engine with 8 workers
+[10:05:00.714 PM] [INFO] iii::workers::worker Initializing WorkerManager
+[10:05:00.714 PM] [INFO] iii::workers::rest_api::api_core Initializing API adapter on port 3211
+[10:05:00.715 PM] [INFO] iii::trigger [REGISTERED] Trigger Type http
+[10:05:00.717 PM] [INFO] iii::workers::rest_api::api_core API listening on address: 127.0.0.1:3211
+[10:05:00.718 PM] [INFO] iii::workers::state::state Initializing StateWorker
+[10:05:00.718 PM] [INFO] iii::trigger [REGISTERED] Trigger Type state
+[10:05:00.718 PM] [INFO] iii::function [REGISTERED] Function state::set
+[10:05:00.718 PM] [INFO] iii::function [REGISTERED] Function state::get
+[10:05:00.719 PM] [INFO] iii::function [REGISTERED] Function state::delete
+[10:05:00.719 PM] [INFO] iii::function [REGISTERED] Function state::update
+[10:05:00.719 PM] [INFO] iii::function [REGISTERED] Function state::list
+[10:05:00.719 PM] [INFO] iii::function [REGISTERED] Function state::list_groups
+[10:05:00.720 PM] [WARN] iii::builtins::kv DO NOT USE IN_MEMORY STORE_METHOD IN PRODUCTION - DATA WILL BE LOST ON SHUTDOWN
+[10:05:00.720 PM] [INFO] iii::builtins::queue No persisted queue state found, rebuilding from job records
+[10:05:00.720 PM] [INFO] iii::builtins::queue Queue state rebuilt from storage
+[10:05:00.720 PM] [INFO] iii::workers::queue::queue Initializing QueueModule
+[10:05:00.721 PM] [INFO] iii::trigger [REGISTERED] Trigger Type durable:subscriber
+[10:05:00.721 PM] [INFO] iii::function [REGISTERED] Function iii::durable::publish
+[10:05:00.721 PM] [INFO] iii::function [REGISTERED] Function iii::queue::redrive
+[10:05:00.721 PM] [INFO] iii::function [REGISTERED] Function iii::queue::redrive_message
+[10:05:00.721 PM] [INFO] iii::function [REGISTERED] Function iii::queue::discard_message
+[10:05:00.722 PM] [INFO] iii::function [REGISTERED] Function engine::queue::list_topics
+[10:05:00.722 PM] [INFO] iii::function [REGISTERED] Function engine::queue::topic_stats
+[10:05:00.722 PM] [INFO] iii::function [REGISTERED] Function engine::queue::dlq_topics
+[10:05:00.722 PM] [INFO] iii::function [REGISTERED] Function engine::queue::dlq_messages
+[10:05:00.722 PM] [INFO] iii::workers::pubsub::pubsub Initializing PubSubModule
+[10:05:00.723 PM] [INFO] iii::trigger [REGISTERED] Trigger Type subscribe
+[10:05:00.723 PM] [INFO] iii::function [REGISTERED] Function publish
+[10:05:00.723 PM] [WARN] iii::workers::cron::adapters::kv_adapter KvCronAdapter uses process-local locks; cron jobs may run on every engine instance
+    ├ lock_index: cron_locks
+    └ lock_ttl_ms: 30000
+[10:05:00.723 PM] [WARN] iii::builtins::kv DO NOT USE IN_MEMORY STORE_METHOD IN PRODUCTION - DATA WILL BE LOST ON SHUTDOWN
+[10:05:00.723 PM] [INFO] iii::workers::cron::cron Initializing CronModule
+[10:05:00.724 PM] [INFO] iii::trigger [REGISTERED] Trigger Type cron
+[10:05:00.724 PM] [INFO] iii::workers::cron::cron [READY] Cron trigger type initialized
+[10:05:00.724 PM] [INFO] iii::workers::stream::stream Initializing StreamWorker
+[10:05:00.724 PM] [INFO] iii::workers::stream::stream Starting StreamWorker on 127.0.0.1:3212
+[10:05:00.725 PM] [INFO] iii::trigger [REGISTERED] Trigger Type stream:join
+[10:05:00.725 PM] [INFO] iii::trigger [REGISTERED] Trigger Type stream:leave
+[10:05:00.726 PM] [INFO] iii::trigger [REGISTERED] Trigger Type stream
+[10:05:00.726 PM] [INFO] iii::function [REGISTERED] Function stream::set
+[10:05:00.726 PM] [INFO] iii::workers::stream::stream Stream API listening on address: 127.0.0.1:3212
+[10:05:00.726 PM] [INFO] iii::function [REGISTERED] Function stream::get
+[10:05:00.727 PM] [INFO] iii::function [REGISTERED] Function stream::delete
+[10:05:00.727 PM] [INFO] iii::function [REGISTERED] Function stream::list
+[10:05:00.727 PM] [INFO] iii::function [REGISTERED] Function stream::list_groups
+[10:05:00.727 PM] [INFO] iii::function [REGISTERED] Function stream::list_all
+[10:05:00.727 PM] [INFO] iii::function [REGISTERED] Function stream::send
+[10:05:00.728 PM] [INFO] iii::function [REGISTERED] Function stream::update
+[10:05:00.728 PM] [INFO] iii::workers::shell::exec Creating Exec module with config: ExecConfig { watch: None, exec: ["node F:/projs_space/ai/ai-workflow-lab/vendor/agentmemory/dist/worker-supervisor.mjs --instance-id dev-isolated --worker-entry F:/projs_space/ai/ai-workflow-lab/vendor/agentmemory/dist/index.mjs"] }
+[10:05:00.728 PM] [INFO] iii::workers::telemetry Anonymous telemetry disabled (CI detected).
+[10:05:00.728 PM] [INFO] iii::workers::engine_fn Initializing EngineFunctionsWorker
+[10:05:00.728 PM] [INFO] iii::trigger [REGISTERED] Trigger Type engine::functions-available
+[10:05:00.728 PM] [INFO] iii::trigger [REGISTERED] Trigger Type engine::workers-available
+[10:05:00.729 PM] [INFO] iii::function [REGISTERED] Function engine::channels::create
+[10:05:00.729 PM] [INFO] iii::function [REGISTERED] Function engine::functions::list
+[10:05:00.729 PM] [INFO] iii::function [REGISTERED] Function engine::workers::list
+[10:05:00.729 PM] [INFO] iii::function [REGISTERED] Function engine::triggers::list
+[10:05:00.729 PM] [INFO] iii::function [REGISTERED] Function engine::trigger-types::list
+[10:05:00.730 PM] [INFO] iii::function [REGISTERED] Function engine::workers::register
+[10:05:00.730 PM] [INFO] opentelemetry_sdk Last reference of MeterProvider dropped, initiating shutdown.
+    └ name: "MeterProvider.Drop"
+[10:05:00.730 PM] [INFO] opentelemetry Global meter provider is set. Meters can now be created using global::meter() or global::meter_with_scope().
+    └ name: "MeterProvider.GlobalSet"
+[Metrics] OpenTelemetry metrics initialized: exporter=memory (in-memory only), service_name=iii
+[10:05:00.730 PM] [INFO] iii::workers::observability [ROLLUPS] Rollup storage initialized with 3 levels (1m, 5m, 1h)
+[10:05:00.731 PM] [INFO] iii::trigger [REGISTERED] Trigger Type log
+[10:05:00.731 PM] [INFO] iii::workers::observability [READY] OpenTelemetry module initialized (log, traces, metrics, logs, rollups functions available)
+[10:05:00.731 PM] [INFO] iii::function [REGISTERED] Function engine::log::info
+[10:05:00.731 PM] [INFO] iii::function [REGISTERED] Function engine::log::warn
+[10:05:00.731 PM] [INFO] iii::function [REGISTERED] Function engine::log::error
+[10:05:00.732 PM] [INFO] iii::function [REGISTERED] Function engine::log::debug
+[10:05:00.732 PM] [INFO] iii::function [REGISTERED] Function engine::log::trace
+[10:05:00.732 PM] [INFO] iii::function [REGISTERED] Function engine::baggage::get
+[10:05:00.732 PM] [INFO] iii::function [REGISTERED] Function engine::baggage::set
+[10:05:00.732 PM] [INFO] iii::function [REGISTERED] Function engine::baggage::get_all
+[10:05:00.732 PM] [INFO] iii::function [REGISTERED] Function engine::traces::list
+[10:05:00.733 PM] [INFO] iii::function [REGISTERED] Function engine::traces::tree
+[10:05:00.733 PM] [INFO] iii::function [REGISTERED] Function engine::traces::clear
+[10:05:00.733 PM] [INFO] iii::function [REGISTERED] Function engine::metrics::list
+[10:05:00.733 PM] [INFO] iii::function [REGISTERED] Function engine::logs::list
+[10:05:00.733 PM] [INFO] iii::function [REGISTERED] Function engine::logs::clear
+[10:05:00.733 PM] [INFO] iii::function [REGISTERED] Function engine::sampling::rules
+[10:05:00.734 PM] [INFO] iii::function [REGISTERED] Function engine::health::check
+[10:05:00.734 PM] [INFO] iii::function [REGISTERED] Function engine::alerts::list
+[10:05:00.734 PM] [INFO] iii::function [REGISTERED] Function engine::alerts::evaluate
+[10:05:00.734 PM] [INFO] iii::function [REGISTERED] Function engine::rollups::list
+[10:05:00.734 PM] [INFO] iii::workers::shell::exec Starting process: node F:/projs_space/ai/ai-workflow-lab/vendor/agentmemory/dist/worker-supervisor.mjs --instance-id dev-isolated --worker-entry F:/projs_space/ai/ai-workflow-lab/vendor/agentmemory/dist/index.mjs
+[10:05:00.735 PM] [INFO] iii::workers::config reload: watching F:\projs_space\ai\ai-workflow-lab\vendor\agentmemory\.scratch\run-state-journal-v2-e2e-2026-07-24\worker-supervisor-e2e\iii-config.yaml for changes
+[10:05:00.735 PM] [INFO] iii::workers::worker Engine listening on address: 127.0.0.1:49234
+[10:05:01.622 PM] [INFO] iii::workers::reload reload: config changed, reloading from F:\projs_space\ai\ai-workflow-lab\vendor\agentmemory\.scratch\run-state-journal-v2-e2e-2026-07-24\worker-supervisor-e2e\iii-config.yaml
+[10:05:01.623 PM] [INFO] iii::workers::reload reload: diff +0 added, -0 removed, ~0 changed (0 revived), =11 unchanged
+[10:05:01.623 PM] [INFO] iii::workers::reload reload: success
+[10:05:02.141 PM] [INFO] iii::workers::reload reload: config changed, reloading from F:\projs_space\ai\ai-workflow-lab\vendor\agentmemory\.scratch\run-state-journal-v2-e2e-2026-07-24\worker-supervisor-e2e\iii-config.yaml
+[10:05:02.142 PM] [INFO] iii::workers::reload reload: diff +0 added, -0 removed, ~0 changed (0 revived), =11 unchanged
+[10:05:02.143 PM] [INFO] iii::workers::reload reload: success
+[10:05:07.272 PM] [INFO] iii::workers::reload reload: config changed, reloading from F:\projs_space\ai\ai-workflow-lab\vendor\agentmemory\.scratch\run-state-journal-v2-e2e-2026-07-24\worker-supervisor-e2e\iii-config.yaml
+[10:05:07.272 PM] [INFO] iii::workers::reload reload: diff +0 added, -0 removed, ~0 changed (0 revived), =11 unchanged
+[10:05:07.273 PM] [INFO] iii::workers::reload reload: success
+[10:05:07.812 PM] [INFO] iii::workers::reload reload: config changed, reloading from F:\projs_space\ai\ai-workflow-lab\vendor\agentmemory\.scratch\run-state-journal-v2-e2e-2026-07-24\worker-supervisor-e2e\iii-config.yaml
+[10:05:07.813 PM] [INFO] iii::workers::reload reload: diff +0 added, -0 removed, ~0 changed (0 revived), =11 unchanged
+[10:05:07.813 PM] [INFO] iii::workers::reload reload: success

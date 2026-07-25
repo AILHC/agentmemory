@@ -1,0 +1,10 @@
+{
+  "current_stage": "lessons",
+  "lessons": {
+    "status": "blocked",
+    "unit_id": "s1"
+  },
+  "run_id": "lessons-reconcile",
+  "control_seq": 2,
+  "stage_seq": 3
+}

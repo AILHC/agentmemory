@@ -1,0 +1,9 @@
+{
+  "current_stage": "reflect_insight",
+  "reflect_insight": {
+    "status": "planned"
+  },
+  "run_id": "real-http-dry-run",
+  "control_seq": 8,
+  "stage_seq": 1
+}

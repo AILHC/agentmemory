@@ -1,0 +1,104 @@
+{
+  "run_id": "real-http-v1-dry-run",
+  "current_stage": null,
+  "coverage": {
+    "enabled_stages": [
+      "summary",
+      "lessons",
+      "memory_consolidate_windows",
+      "semantic_windows",
+      "skill_extract",
+      "crystal_groups",
+      "consolidation_procedural_windows",
+      "reflect_insight_windows"
+    ],
+    "sessions": {
+      "total": 1
+    },
+    "summary": {
+      "succeeded": 0,
+      "skipped": 0,
+      "failed": 0,
+      "pending": 1,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "lessons": {
+      "succeeded": 0,
+      "skipped": 0,
+      "failed": 0,
+      "pending": 1,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "memory_consolidate_windows": {
+      "succeeded": 0,
+      "skipped": 1,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "semantic_windows": {
+      "succeeded": 0,
+      "skipped": 0,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "skill_extract": {
+      "succeeded": 0,
+      "skipped": 1,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "crystal_groups": {
+      "succeeded": 0,
+      "skipped": 1,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "consolidation_procedural_windows": {
+      "succeeded": 0,
+      "skipped": 1,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "reflect_insight_windows": {
+      "succeeded": 0,
+      "skipped": 1,
+      "failed": 0,
+      "pending": 0,
+      "running": 0,
+      "planned": 0,
+      "other": 0
+    },
+    "acceptance_ready": false
+  },
+  "scheduler_epoch": 1,
+  "next_retry_at": null,
+  "runner_pid": 78784,
+  "snapshot_at": "2026-07-24T14:08:47.375Z",
+  "journal_seq": 1,
+  "in_flight_gaps": {
+    "total": 0,
+    "by_stage": {
+      "memory_consolidate": 0,
+      "skill_extract": 0
+    }
+  }
+}

@@ -1,0 +1,42 @@
+workers:
+  - name: iii-worker-manager
+    config:
+      host: 127.0.0.1
+      port: 49234
+  - name: iii-http
+    config:
+      port: 3211
+      host: 127.0.0.1
+      default_timeout: 180000
+  - name: iii-state
+    config:
+      adapter:
+        name: kv
+        config:
+          store_method: file_based
+          file_path: F:/projs_space/ai/ai-workflow-lab/vendor/agentmemory/.scratch/run-state-journal-v2-e2e-2026-07-24/worker-supervisor-e2e/home/data/state_store.db
+  - name: iii-queue
+    config:
+      adapter:
+        name: builtin
+  - name: iii-pubsub
+    config:
+      adapter:
+        name: local
+  - name: iii-cron
+    config:
+      adapter:
+        name: kv
+  - name: iii-stream
+    config:
+      port: 3212
+      host: 127.0.0.1
+      adapter:
+        name: kv
+        config:
+          store_method: file_based
+          file_path: F:/projs_space/ai/ai-workflow-lab/vendor/agentmemory/.scratch/run-state-journal-v2-e2e-2026-07-24/worker-supervisor-e2e/home/data/stream_store
+  - name: iii-exec
+    config:
+      exec:
+        - node F:/projs_space/ai/ai-workflow-lab/vendor/agentmemory/dist/worker-supervisor.mjs --instance-id dev-isolated --worker-entry F:/projs_space/ai/ai-workflow-lab/vendor/agentmemory/dist/index.mjs

@@ -1,0 +1,9 @@
+{
+  "current_stage": "lessons",
+  "lessons": {
+    "status": "planned"
+  },
+  "run_id": "dry-run",
+  "control_seq": 2,
+  "stage_seq": 1
+}

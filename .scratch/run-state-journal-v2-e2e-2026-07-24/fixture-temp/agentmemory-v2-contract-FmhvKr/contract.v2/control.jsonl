@@ -1,0 +1,10 @@
+{"seq":0,"at":"2026-07-24T14:04:28.216Z","type":"run_started","payload":{"run_id":"contract","format":"run-state-journal-v2","schema_version":2,"base_url":"http://127.0.0.1:8556","config_hash":"0624f5fb0c6c9ba758ea0bd062430138a7c21cea30080f3bc809fb733e5fcadd","inventory_hash":"50880987664e25899f4be04e87e7c92517d32e6fe9a59effd6a14bc693dcc5e1"},"checksum":"2867d82eef22dc6dff1f07eee998f46ee740b017b79bf22a37febba2e8d1edd9"}
+{"seq":1,"at":"2026-07-24T14:04:28.226Z","type":"stage_opened","payload":{"stage":"summary"},"checksum":"3da150a95ae3e627dbcab4588ff588f54e7189a61d2f273965383b4a5adf3167"}
+{"seq":2,"at":"2026-07-24T14:04:28.299Z","type":"stage_opened","payload":{"stage":"lessons"},"checksum":"5aa1b4cc5f04bdd119e49044a0d864b988c4bca83733dc83bef366046ddfcbfe"}
+{"seq":3,"at":"2026-07-24T14:04:28.363Z","type":"stage_opened","payload":{"stage":"memory_consolidate"},"checksum":"48c18345705c1f5b965791ec13c5dccfc3bbff6749b5a1fd597962651d07fa2e"}
+{"seq":4,"at":"2026-07-24T14:04:28.432Z","type":"stage_opened","payload":{"stage":"semantic_rollup"},"checksum":"93078abf763157b1c6a20a63c3f8fb8b392f02615dee6db27dbc1e8a48112104"}
+{"seq":5,"at":"2026-07-24T14:04:28.489Z","type":"stage_opened","payload":{"stage":"skill_extract"},"checksum":"1139741a985614324d679f06141d554c92bf04bc962b66b6abf78beee6b41443"}
+{"seq":6,"at":"2026-07-24T14:04:28.564Z","type":"stage_opened","payload":{"stage":"crystal"},"checksum":"cef9b5e63a1d8b9d988da13452fd34b20c09dbeb317f53026ec63211c5e426bd"}
+{"seq":7,"at":"2026-07-24T14:04:28.632Z","type":"stage_opened","payload":{"stage":"consolidation_procedural"},"checksum":"b6c1885d459c4beda620ed4d7e41eef9b93f8f8050fe2d265a3597edfcda620d"}
+{"seq":8,"at":"2026-07-24T14:04:28.665Z","type":"stage_opened","payload":{"stage":"reflect_insight"},"checksum":"f37d7084599cc2e92297887a2853a3b975cef29d45f2f4bb410211178f24b5cd"}
+{"seq":9,"at":"2026-07-24T14:04:28.686Z","type":"run_completed","payload":{"run_id":"contract","stage_count":8},"checksum":"c244c49bd8c14f2787219ee82bc5026326c367b885ca80d837d8cfc2290e7863"}

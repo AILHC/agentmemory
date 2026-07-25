@@ -1,0 +1,10 @@
+{"seq":0,"at":"2026-07-24T14:04:15.273Z","type":"run_started","payload":{"run_id":"contract","format":"run-state-journal-v2","schema_version":2,"base_url":"http://127.0.0.1:8403","config_hash":"0198de86a619811baa5b4c5061df59d39ca89a9cde386e8ea54308b87036d1da","inventory_hash":"50880987664e25899f4be04e87e7c92517d32e6fe9a59effd6a14bc693dcc5e1"},"checksum":"6ca13f31c7410ba8df879a1d1bb8f0165dd0dbb8b07fe473c74935fb0745195c"}
+{"seq":1,"at":"2026-07-24T14:04:15.282Z","type":"stage_opened","payload":{"stage":"summary"},"checksum":"43d835b717e0247fe6f08d2cd2f1a02e5bb65d858534ff48d56e6238374b258a"}
+{"seq":2,"at":"2026-07-24T14:04:15.333Z","type":"stage_opened","payload":{"stage":"lessons"},"checksum":"25a2d26cf203c4baa0016493a92330f4b63b971e4683359e909f32d1b888eb00"}
+{"seq":3,"at":"2026-07-24T14:04:15.383Z","type":"stage_opened","payload":{"stage":"memory_consolidate"},"checksum":"2130b1e48709fdac5f5a9af1a58fe0fa0c845a751409d5050ab68fc01c04c8e4"}
+{"seq":4,"at":"2026-07-24T14:04:15.438Z","type":"stage_opened","payload":{"stage":"semantic_rollup"},"checksum":"bb7449506e4257412edc958a38a039815f7e4e2d3aa1cec0046026be177c99ca"}
+{"seq":5,"at":"2026-07-24T14:04:15.479Z","type":"stage_opened","payload":{"stage":"skill_extract"},"checksum":"f2d9f81ae762971485cca9db1a093e259c2e146da9d44093cb4cc373b2b28e8f"}
+{"seq":6,"at":"2026-07-24T14:04:15.539Z","type":"stage_opened","payload":{"stage":"crystal"},"checksum":"d50ff9b6c32c248ec8195033d65541559e6f780b2872d3e75683b6fde1892036"}
+{"seq":7,"at":"2026-07-24T14:04:15.584Z","type":"stage_opened","payload":{"stage":"consolidation_procedural"},"checksum":"caedc3e7494aadafc6d7b6dd4650eb5a46a3142f548b2edc4d2fb3c249809635"}
+{"seq":8,"at":"2026-07-24T14:04:15.625Z","type":"stage_opened","payload":{"stage":"reflect_insight"},"checksum":"b12ce148d8e9318fb0e3cb46a2df70fb82e1a8994d51d5f8637835f21e87e080"}
+{"seq":9,"at":"2026-07-24T14:04:15.668Z","type":"run_completed","payload":{"run_id":"contract","stage_count":8},"checksum":"af1a181a991e0b486409f3fd7241a74a7e57f706b764262b3c8b406c17948838"}
