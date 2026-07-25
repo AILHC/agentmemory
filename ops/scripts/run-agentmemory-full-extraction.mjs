@@ -5791,6 +5791,36 @@ function buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote 
   };
 }
 
+async function ensureV2CompletedStatus({ journal, fsApi, runId, control }) {
+  const completed = control.find((event) => event.type === 'run_completed');
+  if (!completed) return false;
+  if (completed.payload?.run_id !== runId || Number(completed.payload?.stage_count) !== 8) {
+    throw new Error('v2_run_completed_invalid');
+  }
+
+  let current = null;
+  try {
+    current = JSON.parse(await fsApi.readFile(journal.statusPath, 'utf8'));
+  } catch (error) {
+    if (error?.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+  }
+  const controlSeq = control.at(-1)?.seq ?? -1;
+  if (
+    current?.status !== 'completed'
+    || current?.current_stage !== null
+    || Number(current?.stage_count) !== 8
+    || current?.run_id !== runId
+    || Number(current?.control_seq) !== controlSeq
+  ) {
+    await journal.writeStatus({
+      status: 'completed',
+      current_stage: null,
+      stage_count: 8,
+    });
+  }
+  return true;
+}
+
 async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
   const secret = requireSecret();
   const baseUrl = normalizeBaseUrl(options.baseUrl);
@@ -5936,6 +5966,8 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       });
       control = await journal.readControl();
     }
+    if (await ensureV2CompletedStatus({ journal, fsApi, runId, control })) return 0;
+
     const summaryResult = await runV2JournalSingleStage({
       stage: 'summary',
       control,

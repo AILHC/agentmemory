@@ -639,12 +639,42 @@ test('v2 default production adapters send stable summary and lesson identities',
         response.end(JSON.stringify({ error: 'unexpected endpoint' }));
       }
     }, async (baseUrl) => {
-      assert.equal(await mainForTest([
+      const argv = [
         '--base-url', baseUrl,
         '--state-dir', stateDir,
         '--run-id', 'contract',
         '--run-state-format', 'v2',
-      ]), 0);
+      ];
+      assert.equal(await mainForTest(argv), 0);
+
+      const runRoot = path.join(stateDir, 'contract.v2');
+      const readRunFiles = async () => Object.fromEntries(await Promise.all(
+        (await fs.readdir(runRoot)).sort().map(async (name) => [
+          name,
+          await fs.readFile(path.join(runRoot, name), 'utf8'),
+        ]),
+      ));
+      const completedFiles = await readRunFiles();
+      assert.equal(await mainForTest([...argv, '--resume']), 0);
+      assert.deepEqual(await readRunFiles(), completedFiles);
+
+      const completedJournals = Object.fromEntries(
+        Object.entries(completedFiles).filter(([name]) => name.endsWith('.jsonl')),
+      );
+      await fs.rm(path.join(runRoot, 'status.json'));
+      assert.equal(await mainForTest([...argv, '--resume']), 0);
+      const repairedFiles = await readRunFiles();
+      assert.deepEqual(
+        Object.fromEntries(Object.entries(repairedFiles).filter(([name]) => name.endsWith('.jsonl'))),
+        completedJournals,
+      );
+      assert.deepEqual(JSON.parse(repairedFiles['status.json']), {
+        status: 'completed',
+        current_stage: null,
+        stage_count: 8,
+        run_id: 'contract',
+        control_seq: 9,
+      });
     });
     const summary = requests.find((entry) => entry.url === '/agentmemory/summarize/resumable').payload;
     const lessons = requests.find((entry) => entry.url === '/agentmemory/lessons/extract').payload;
