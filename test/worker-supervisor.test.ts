@@ -25,6 +25,7 @@ import {
   resolveWorkerLifecycleIdentity,
 } from "../src/worker-lifecycle-lock";
 import {
+  buildProcessChainSnapshotCommand,
   encodePowerShellCommand,
   parseProcessChain,
 } from "../src/platform/powershell-runner";
@@ -555,6 +556,17 @@ describe("worker and supervisor ownership", () => {
 });
 
 describe("PowerShell and CLI boundaries", () => {
+  it("uses the native process snapshot instead of CIM for parent-chain validation", () => {
+    const command = buildProcessChainSnapshotCommand(
+      "F:\\runtime\\agent's scripts\\_agentmemory-local-common.ps1",
+      3,
+    );
+    expect(command).toContain(". 'F:\\runtime\\agent''s scripts\\_agentmemory-local-common.ps1'");
+    expect(command).toContain("$all = @(Get-AmProcesses)");
+    expect(command).toContain("Get-AmProcessById -ProcessId $supervisorPid -AllProcesses $all");
+    expect(command).not.toContain("Get-CimInstance");
+  });
+
   it("encodes PowerShell commands as UTF-16LE base64 and parses a validated process chain", () => {
     expect(Buffer.from(encodePowerShellCommand("Write-Output 'ok'"), "base64").toString("utf16le")).toBe("Write-Output 'ok'");
     expect(parseProcessChain(JSON.stringify([

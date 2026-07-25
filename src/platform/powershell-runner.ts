@@ -1,5 +1,6 @@
 import { execFile, spawnSync } from "node:child_process";
-import { resolve } from "node:path";
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -86,6 +87,41 @@ function configArgument(commandLine: string): string | null {
   return null;
 }
 
+function powerShellLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
+}
+
+export function resolveProcessSnapshotScript(supervisorEntry = process.argv[1] ?? ""): string {
+  if (!supervisorEntry) throw new Error("PROCESS_SNAPSHOT_SCRIPT_MISSING");
+  const appRoot = resolve(dirname(supervisorEntry), "..");
+  const candidates = [
+    join(appRoot, "scripts", "_agentmemory-local-common.ps1"),
+    join(appRoot, "ops", "scripts", "_agentmemory-local-common.ps1"),
+  ];
+  const script = candidates.find((candidate) => existsSync(candidate));
+  if (!script) throw new Error("PROCESS_SNAPSHOT_SCRIPT_MISSING");
+  return script;
+}
+
+export function buildProcessChainSnapshotCommand(snapshotScript: string, supervisorPid: number): string {
+  if (!Number.isSafeInteger(supervisorPid) || supervisorPid <= 0) {
+    throw new Error("SUPERVISOR_PID_INVALID");
+  }
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    `. ${powerShellLiteral(snapshotScript)}`,
+    `$supervisorPid = ${supervisorPid}`,
+    "$all = @(Get-AmProcesses)",
+    "$supervisor = Get-AmProcessById -ProcessId $supervisorPid -AllProcesses $all",
+    "if (-not $supervisor) { throw 'SUPERVISOR_PROCESS_MISSING' }",
+    "$cmd = Get-AmProcessById -ProcessId ([int]$supervisor.ParentProcessId) -AllProcesses $all",
+    "if (-not $cmd) { throw 'SUPERVISOR_PARENT_MISSING' }",
+    "$iii = Get-AmProcessById -ProcessId ([int]$cmd.ParentProcessId) -AllProcesses $all",
+    "if (-not $iii) { throw 'SUPERVISOR_ANCESTOR_MISSING' }",
+    "@($supervisor, $cmd, $iii) | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate | ConvertTo-Json -Compress",
+  ].join("\n");
+}
+
 export function parseProcessChain(
   serialized: string,
   expected: {
@@ -124,16 +160,7 @@ export async function queryAndValidateProcessChain(expected: {
   expectedInstallHome: string;
   expectedConfig: string;
 }): Promise<ProcessChain> {
-  const script = [
-    "$ErrorActionPreference = 'Stop'",
-    `$supervisorPid = ${expected.supervisorPid}`,
-    "$supervisor = Get-CimInstance Win32_Process -Filter \"ProcessId=$supervisorPid\"",
-    "if (-not $supervisor) { throw 'SUPERVISOR_PROCESS_MISSING' }",
-    "$cmd = Get-CimInstance Win32_Process -Filter \"ProcessId=$($supervisor.ParentProcessId)\"",
-    "if (-not $cmd) { throw 'SUPERVISOR_PARENT_MISSING' }",
-    "$iii = Get-CimInstance Win32_Process -Filter \"ProcessId=$($cmd.ParentProcessId)\"",
-    "if (-not $iii) { throw 'SUPERVISOR_ANCESTOR_MISSING' }",
-    "@($supervisor, $cmd, $iii) | Select-Object ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine,CreationDate | ConvertTo-Json -Compress",
-  ].join("\n");
-  return parseProcessChain(await runPowerShellEncoded(script), expected);
+  const snapshotScript = resolveProcessSnapshotScript();
+  const command = buildProcessChainSnapshotCommand(snapshotScript, expected.supervisorPid);
+  return parseProcessChain(await runPowerShellEncoded(command, 10_000), expected);
 }
