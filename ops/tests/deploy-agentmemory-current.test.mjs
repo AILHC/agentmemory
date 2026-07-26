@@ -220,6 +220,7 @@ Copy-AmReleaseScripts -Source ${quotePowerShell(source)} -Destination ${quotePow
       'doctor-agentmemory.ps1',
       'lib',
       'request-agentmemory-full-extraction-drain.ps1',
+      'run-agentmemory-cli-import-batch.mjs',
       'run-agentmemory-full-extraction.mjs',
       'start-agentmemory-console.ps1',
       'start-agentmemory.ps1',

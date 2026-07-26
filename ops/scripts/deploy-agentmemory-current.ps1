@@ -311,6 +311,7 @@ function Copy-AmReleaseScripts {
     'doctor-agentmemory.ps1',
     'request-agentmemory-full-extraction-drain.ps1',
     'status-agentmemory-full-extraction.ps1',
+    'run-agentmemory-cli-import-batch.mjs',
     'run-agentmemory-full-extraction.mjs'
   )
   foreach ($name in $required) {
