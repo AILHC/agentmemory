@@ -33,6 +33,36 @@ test('v2 journal uses independent zero-based sequences and only repairs a torn f
   }
 });
 
+test('v2 journal retries transient sharing violations when opening an append handle', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-append-ebusy-'));
+  let appendOpenAttempts = 0;
+  const fsApi = {
+    ...fs,
+    open: async (filePath, flags, ...args) => {
+      if (String(filePath).endsWith('summary.jsonl') && flags === 'a') {
+        appendOpenAttempts += 1;
+        if (appendOpenAttempts === 1) {
+          const error = new Error('resource busy');
+          error.code = 'EBUSY';
+          throw error;
+        }
+      }
+      return fs.open(filePath, flags, ...args);
+    },
+  };
+  const journal = new RunStateJournalV2({ rootDir, runId: 'v2-append-ebusy', fsApi });
+  try {
+    await journal.acquireLock();
+    await journal.open();
+    await journal.appendStage('summary', 'unit_planned', { unit_id: 's1' });
+    assert.equal(appendOpenAttempts, 2);
+    assert.equal((await journal.readStage('summary')).length, 1);
+  } finally {
+    await journal.releaseLock();
+    await fs.rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test('v2 journal rejects complete checksum and sequence corruption', async () => {
   const { journal } = await makeJournal('agentmemory-v2-integrity');
   try {

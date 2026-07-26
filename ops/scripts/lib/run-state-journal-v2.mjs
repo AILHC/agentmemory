@@ -9,6 +9,8 @@ const SENSITIVE_KEY = /(?:token|secret|password|authorization|api[_-]?key|provid
 const ERROR_KEYS = new Set(['error', 'message', 'error_text', 'provider_error']);
 const MAX_ERROR_CHARS = 2000;
 const STAGE_NAME = /^[a-z][a-z0-9_-]{0,63}$/;
+const APPEND_OPEN_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800];
+const RETRYABLE_APPEND_OPEN_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
 
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
@@ -54,6 +56,22 @@ function isPidAlive(pid) {
   }
 }
 
+async function openForAppend(filePath, fsApi) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await fsApi.open(filePath, 'a');
+    } catch (error) {
+      if (
+        !RETRYABLE_APPEND_OPEN_CODES.has(error?.code)
+        || attempt >= APPEND_OPEN_RETRY_DELAYS_MS.length
+      ) {
+        throw error;
+      }
+      await new Promise((resolve) => setTimeout(resolve, APPEND_OPEN_RETRY_DELAYS_MS[attempt]));
+    }
+  }
+}
+
 class JournalFile {
   constructor(filePath, fsApi) {
     this.filePath = filePath;
@@ -74,7 +92,7 @@ class JournalFile {
       const line = `${JSON.stringify(event)}\n`;
       if (Buffer.byteLength(line) > lineLimit(type)) throw new Error(`v2_journal_line_too_large:${type}`);
       await this.fs.mkdir(path.dirname(this.filePath), { recursive: true });
-      const handle = await this.fs.open(this.filePath, 'a');
+      const handle = await openForAppend(this.filePath, this.fs);
       try {
         await handle.writeFile(line, 'utf8');
         await handle.sync();
@@ -155,7 +173,7 @@ async function readJournal(filePath, fsApi) {
     if (result.torn) {
       await fsApi.truncate(filePath, validBytes);
     } else {
-      const appendHandle = await fsApi.open(filePath, 'a');
+      const appendHandle = await openForAppend(filePath, fsApi);
       try {
         await appendHandle.writeFile('\n', 'utf8');
         await appendHandle.sync();
