@@ -2,8 +2,12 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 const MAX_V1_STATUS_BYTES = 1024 * 1024;
+const EXIT_DIAGNOSTIC_SUFFIX = '.exit.json';
 
 function artifactIdentity(name) {
+  if (name.endsWith(EXIT_DIAGNOSTIC_SUFFIX)) {
+    return null;
+  }
   for (const [suffix, kind] of [
     ['.json.lock', 'lock'],
     ['.journal.jsonl', 'journal'],

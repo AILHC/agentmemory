@@ -43,6 +43,34 @@ test('v2 release gate allows completed v1 status without reading the large snaps
   assert.deepEqual(await assertV1ReleaseGate(stateDir), { ready: true, blockers: [] });
 });
 
+test('v2 release gate ignores exit diagnostics but still blocks real v1 snapshots', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-release-diagnostics-'));
+  await fs.writeFile(path.join(stateDir, 'resume-attempt.exit.json'), JSON.stringify({
+    pid: 123,
+    exit_code: 1,
+    error_name: 'Error',
+  }));
+  await fs.writeFile(path.join(stateDir, 'resume-attempt.stdout.log'), '');
+  await fs.writeFile(path.join(stateDir, 'resume-attempt.stderr.log'), '');
+  await fs.writeFile(path.join(stateDir, 'resume-attempt.launch.mjs'), 'export {};\n');
+  await fs.writeFile(path.join(stateDir, 'legacy-run.json'), '{}\n');
+
+  assert.deepEqual(await inspectV1ReleaseGate(stateDir), {
+    ready: false,
+    blockers: [
+      { run_id: 'legacy-run', reason: 'v1_completion_unproven' },
+    ],
+  });
+});
+
+test('v2 release gate allows a state directory containing only exit diagnostics', async () => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-release-exit-only-'));
+  await fs.writeFile(path.join(stateDir, 'resume-attempt.exit.json'), '{}\n');
+  await fs.writeFile(path.join(stateDir, 'another-attempt.exit.json'), '{}\n');
+
+  assert.deepEqual(await assertV1ReleaseGate(stateDir), { ready: true, blockers: [] });
+});
+
 test('v2 release gate treats a missing state directory as drained', async () => {
   const stateDir = path.join(os.tmpdir(), `agentmemory-v2-release-missing-${Date.now()}`);
   assert.deepEqual(await inspectV1ReleaseGate(stateDir), { ready: true, blockers: [] });
