@@ -576,10 +576,15 @@ describe("extraction operation receipts", () => {
   it("CAS-reconciles only an exact orphaned summary reduce receipt with no result", async () => {
     const kv = mockKV();
     await seedOrphanedSummaryOperation(kv);
+    const runtimeKV = {
+      ...kv,
+      get: async <T>(scope: string, key: string): Promise<T | null | undefined> =>
+        scope === KV.summaries ? undefined : kv.get<T>(scope, key),
+    };
     const functions = new Map<string, Function>();
     registerExtractionOperationReceiptFunctions({
       registerFunction: (id: string, handler: Function) => functions.set(id, handler),
-    } as never, kv as never);
+    } as never, runtimeKV as never);
     const handler = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
 
     const first = await handler({

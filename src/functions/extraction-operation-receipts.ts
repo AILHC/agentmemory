@@ -518,7 +518,10 @@ export function registerExtractionOperationReceiptFunctions(
           ),
           kv.get(KV.summaries, input.result.sessionId),
         ]);
-        if (persistedSummary !== null || run?.summary !== undefined) {
+        if (
+          (persistedSummary !== null && persistedSummary !== undefined)
+          || run?.summary !== undefined
+        ) {
           return orphanReconciliationFailure("orphan_reconciliation_result_present");
         }
         if (
