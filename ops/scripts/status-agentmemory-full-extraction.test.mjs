@@ -137,6 +137,40 @@ test('v2 journal 单独报告 blocked 且不把它计入 running', async (contex
   );
 });
 
+test('v2 journal 在受控协调后把原 blocked 单元恢复为 pending', async (context) => {
+  const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-reconciled-'));
+  context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
+  const runId = 'v2-reconciled';
+  const runRoot = path.join(runtimeRoot, 'extraction-runs', `${runId}.v2`);
+  await writeJournal(path.join(runRoot, 'control.jsonl'), [
+    event(0, 'run_started', { run_id: runId }),
+    event(1, 'stage_opened', { stage: 'summary' }),
+  ]);
+  await writeJournal(path.join(runRoot, 'summary.jsonl'), [
+    event(0, 'unit_planned', { unit_id: 'session-a' }),
+    event(1, 'stage_plan_completed', {}),
+    event(2, 'unit_started', { unit_id: 'session-a' }),
+    event(3, 'unit_blocked', {
+      unit_id: 'session-a',
+      reason: 'extraction_operation_reconciliation_required',
+    }),
+    event(4, 'unit_reconciliation_resolved', {
+      unit_id: 'session-a',
+      reconciliation_id: 'xrec_1234',
+      result_status: 'absent',
+    }),
+  ]);
+
+  const result = runStatus(runtimeRoot, runId, 'summary');
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /acceptance_ready=false/);
+  assert.match(
+    result.stdout,
+    /stage\.summary=succeeded:0,skipped:0,failed:0,pending:1,running:0,blocked:0/,
+  );
+});
+
 test('v2 全阶段模式仍要求 run_completed', async (context) => {
   const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-full-'));
   context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));

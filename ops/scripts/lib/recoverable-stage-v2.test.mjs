@@ -99,6 +99,89 @@ test('single-phase blocked is durable and never becomes a failed terminal', asyn
   assert.equal(harness.events.at(-1).type, 'unit_blocked');
 });
 
+test('single-phase orphan reconciliation clears only the matching blocked active operation', async () => {
+  const harness = makeHarness();
+  const invoke = (execute) => runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'attempt-reconciled',
+    execute,
+    record: async () => {},
+  });
+
+  assert.equal((await invoke(async ({ startOperation }) => {
+    await startOperation({ operationId: 'unit-1:reduce' });
+    return {
+      status: 'blocked',
+      reason: 'extraction_operation_reconciliation_required',
+    };
+  })).status, 'blocked');
+
+  await harness.append('unit_reconciliation_resolved', {
+    unit_id: 'unit-1',
+    attempt_id: 'attempt-reconciled',
+    operation_id: 'unit-1:reduce',
+    reconciliation_id: 'xrec_0123456789abcdef0123456789abcdef',
+    receipt_input_hash: 'b'.repeat(64),
+    receipt_started_at: '2026-07-26T17:44:07.622Z',
+    receipt_status: 'reconciled',
+    result_status: 'absent',
+    cause: 'orphaned_operation_result_absent',
+  });
+
+  assert.deepEqual(await invoke(async ({
+    activeOperation,
+    completedOperations,
+    startOperation,
+    completeOperation,
+  }) => {
+    assert.equal(activeOperation, null);
+    assert.deepEqual(completedOperations, []);
+    const operation = await startOperation({ operationId: 'unit-1:reduce' });
+    await completeOperation({
+      operationId: operation.operation_id,
+      status: 'succeeded',
+    });
+    return { status: 'succeeded' };
+  }), { status: 'completed', acceptedCount: 1 });
+  assert.equal(
+    harness.events.filter((event) => event.type === 'unit_operation_started').length,
+    2,
+  );
+});
+
+test('single-phase orphan reconciliation rejects a changed operation identity', async () => {
+  const harness = makeHarness();
+  await runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'attempt-reconciled',
+    execute: async ({ startOperation }) => {
+      await startOperation({ operationId: 'unit-1:reduce' });
+      return { status: 'blocked', reason: 'extraction_operation_reconciliation_required' };
+    },
+    record: async () => {},
+  });
+  await harness.append('unit_reconciliation_resolved', {
+    unit_id: 'unit-1',
+    attempt_id: 'attempt-reconciled',
+    operation_id: 'unit-1:map:0',
+    reconciliation_id: 'xrec_0123456789abcdef0123456789abcdef',
+    receipt_input_hash: 'b'.repeat(64),
+    receipt_started_at: '2026-07-26T17:44:07.622Z',
+    receipt_status: 'reconciled',
+    result_status: 'absent',
+    cause: 'orphaned_operation_result_absent',
+  });
+
+  assert.throws(
+    () => validateSinglePhaseStage(harness.events),
+    /reconciliation_operation_identity/,
+  );
+});
+
 test('single-phase adapters can journal an exact inner operation before dispatch', async () => {
   const harness = makeHarness();
   const receiptModes = [];

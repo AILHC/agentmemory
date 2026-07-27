@@ -132,6 +132,45 @@ test('journal fold projects durable facts without owning lifecycle validation', 
   });
 });
 
+test('journal fold clears a blocked active operation only after durable reconciliation', () => {
+  const state = foldStageEvents([
+    { type: 'unit_planned', payload: { unit_id: 's1', input_hash: 'hash' } },
+    { type: 'unit_started', payload: { unit_id: 's1', attempt_id: 'attempt-1' } },
+    {
+      type: 'unit_operation_started',
+      payload: { unit_id: 's1', attempt_id: 'attempt-1', operation_id: 's1:reduce' },
+    },
+    {
+      type: 'unit_blocked',
+      payload: {
+        unit_id: 's1',
+        attempt_id: 'attempt-1',
+        reason: 'extraction_operation_reconciliation_required',
+      },
+    },
+    {
+      type: 'unit_reconciliation_resolved',
+      payload: {
+        unit_id: 's1',
+        attempt_id: 'attempt-1',
+        operation_id: 's1:reduce',
+        reconciliation_id: 'xrec_0123456789abcdef0123456789abcdef',
+        receipt_input_hash: 'b'.repeat(64),
+        receipt_started_at: '2026-07-26T17:44:07.622Z',
+        receipt_status: 'reconciled',
+        result_status: 'absent',
+        cause: 'orphaned_operation_result_absent',
+      },
+    },
+  ]);
+  assert.equal(state.units.get('s1').blocked, false);
+  assert.equal(state.units.get('s1').active_operation, null);
+  assert.equal(
+    state.units.get('s1').reconciliations[0].reconciliation_id,
+    'xrec_0123456789abcdef0123456789abcdef',
+  );
+});
+
 test('v2 journal repairs a complete final line without newline before the next append', async () => {
   const { journal } = await makeJournal('agentmemory-v2-newline');
   try {

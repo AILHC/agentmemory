@@ -107,6 +107,9 @@ function Get-AmV2StageFacts {
       [void]$started.Add([string]$unitId)
     } elseif ([string]$event.type -eq 'unit_blocked') {
       [void]$blocked.Add([string]$unitId)
+    } elseif ([string]$event.type -eq 'unit_reconciliation_resolved') {
+      [void]$blocked.Remove([string]$unitId)
+      [void]$started.Remove([string]$unitId)
     } elseif ([string]$event.type -eq 'unit_terminal') {
       $status = [string](Get-AmStatusProperty -Object $event.payload -Name 'status')
       $terminal[[string]$unitId] = $status

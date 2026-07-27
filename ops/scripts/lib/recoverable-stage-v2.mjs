@@ -11,6 +11,7 @@ const SINGLE_EVENTS = new Set([
   'unit_split',
   'unit_terminal',
   'unit_blocked',
+  'unit_reconciliation_resolved',
   'unit_recorded',
   'stage_completed',
 ]);
@@ -89,6 +90,35 @@ function validateStageEvents(events, mode) {
     const unitId = assertUnitId(event, mode);
     const unit = units.get(unitId);
     if (!unit) transitionError(mode, event, 'unit_not_planned');
+    if (event.type === 'unit_reconciliation_resolved') {
+      if (mode !== 'single') transitionError(mode, event, 'reconciliation_mode');
+      if (!unit.blocked) transitionError(mode, event, 'reconciliation_without_block');
+      if (!unit.active_operation) transitionError(mode, event, 'reconciliation_without_active_operation');
+      if (
+        event.payload?.attempt_id !== unit.attempt_id
+        || event.payload?.operation_id !== unit.active_operation.operation_id
+      ) {
+        transitionError(mode, event, 'reconciliation_operation_identity');
+      }
+      if (
+        unit.blocked_payload?.reason !== 'extraction_operation_reconciliation_required'
+        || !/^xrec_[0-9a-f]{32}$/.test(String(event.payload?.reconciliation_id || ''))
+        || !/^[0-9a-f]{64}$/.test(String(event.payload?.receipt_input_hash || ''))
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(
+          String(event.payload?.receipt_started_at || ''),
+        )
+        || event.payload?.receipt_status !== 'reconciled'
+        || event.payload?.result_status !== 'absent'
+        || event.payload?.cause !== 'orphaned_operation_result_absent'
+      ) {
+        transitionError(mode, event, 'reconciliation_evidence');
+      }
+      unit.blocked = false;
+      unit.blocked_payload = undefined;
+      unit.active_operation = null;
+      unit.reconciliations = [...(unit.reconciliations || []), event.payload];
+      continue;
+    }
     if (unit.recorded) transitionError(mode, event, 'after_recorded');
     if (unit.blocked) transitionError(mode, event, 'after_blocked');
     if (unit.terminal && event.type !== 'unit_recorded') transitionError(mode, event, 'after_terminal');

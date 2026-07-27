@@ -206,11 +206,17 @@ export interface ExtractionOperationIdentity {
 export interface ExtractionOperationReceipt<T = unknown>
   extends ExtractionOperationIdentity {
   key: string;
-  status: "running" | "succeeded" | "failed";
+  status: "running" | "succeeded" | "failed" | "reconciled";
   startedAt: string;
   completedAt?: string;
   response?: T;
   failure?: StageFailure;
+  reconciliation?: {
+    id: string;
+    at: string;
+    resultStatus: "absent";
+    resumableRunId: string;
+  };
 }
 
 export interface MemoryConsolidationProposal extends ExtractionOperationIdentity {

@@ -19,6 +19,9 @@ function mockKV() {
     },
     list: async <T>(scope: string): Promise<T[]> =>
       Array.from(store.get(scope)?.values() ?? []) as T[],
+    delete: async (scope: string, key: string): Promise<void> => {
+      store.get(scope)?.delete(key);
+    },
   };
 }
 
@@ -28,6 +31,56 @@ const identity = {
   unitId: "mcw-1",
   inputHash: "input-a",
 };
+
+const orphanIdentity = {
+  runId: "a".repeat(64),
+  stage: "summary",
+  unitId: "session-1:reduce",
+  inputHash: "b".repeat(64),
+};
+
+const orphanReconciliationInput = {
+  operation: {
+    ...orphanIdentity,
+    expectedStatus: "running",
+    expectedStartedAt: "2026-07-26T17:44:07.622Z",
+  },
+  result: {
+    sessionId: "session-1",
+    resumableRunId: `sumr_${"c".repeat(24)}`,
+    serviceInputHash: "d".repeat(64),
+    runnerInputHash: "e".repeat(64),
+    generationConfigHash: "f".repeat(64),
+  },
+};
+
+async function seedOrphanedSummaryOperation(kv: ReturnType<typeof mockKV>) {
+  const key = buildExtractionOperationKey(orphanIdentity);
+  await kv.set(KV.extractionOperationReceipt(key), key, {
+    ...orphanIdentity,
+    key,
+    status: "running",
+    startedAt: orphanReconciliationInput.operation.expectedStartedAt,
+  });
+  await kv.set(KV.summaryResumableRuns, orphanReconciliationInput.result.resumableRunId, {
+    id: orphanReconciliationInput.result.resumableRunId,
+    sessionId: orphanReconciliationInput.result.sessionId,
+    inputHash: orphanReconciliationInput.result.serviceInputHash,
+    attemptId: orphanIdentity.runId,
+    attemptInputHash: orphanReconciliationInput.result.runnerInputHash,
+    generationConfigHash: orphanReconciliationInput.result.generationConfigHash,
+    status: "in_progress",
+    createdAt: "2026-07-26T17:39:42.912Z",
+    updatedAt: "2026-07-26T17:44:06.658Z",
+  });
+  await kv.set(KV.summaryResumableActiveRuns, orphanReconciliationInput.result.sessionId, {
+    sessionId: orphanReconciliationInput.result.sessionId,
+    runId: orphanReconciliationInput.result.resumableRunId,
+    inputHash: orphanReconciliationInput.result.serviceInputHash,
+    createdAt: "2026-07-26T17:39:42.912Z",
+    updatedAt: "2026-07-26T17:44:07.395Z",
+  });
+}
 
 describe("extraction operation receipts", () => {
   it("serializes concurrent calls and executes the same successful operation once", async () => {
@@ -518,5 +571,120 @@ describe("extraction operation receipts", () => {
         /memoryIds|prompt|response|rawMessage|must-not-cross-boundary/,
       );
     }
+  });
+
+  it("CAS-reconciles only an exact orphaned summary reduce receipt with no result", async () => {
+    const kv = mockKV();
+    await seedOrphanedSummaryOperation(kv);
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never);
+    const handler = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
+
+    const first = await handler(orphanReconciliationInput);
+    const replay = await handler(orphanReconciliationInput);
+
+    expect(first).toEqual({
+      success: true,
+      replayed: false,
+      operation: orphanIdentity,
+      receipt: {
+        status: "reconciled",
+        startedAt: orphanReconciliationInput.operation.expectedStartedAt,
+        completedAt: expect.any(String),
+        failure: {
+          class: "transient_runtime",
+          cause: "orphaned_operation_result_absent",
+        },
+      },
+      reconciliation: {
+        id: expect.stringMatching(/^xrec_[0-9a-f]{32}$/),
+        at: expect.any(String),
+        resultStatus: "absent",
+      },
+    });
+    expect(replay).toEqual({
+      ...first,
+      replayed: true,
+    });
+
+    const execute = vi.fn(async () => ({ success: true }));
+    await expect(withExtractionOperationReceipt(
+      kv as never,
+      orphanIdentity,
+      execute,
+      { requireExisting: true },
+    )).resolves.toMatchObject({
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+    });
+    expect(execute).not.toHaveBeenCalled();
+
+    await expect(withExtractionOperationReceipt(
+      kv as never,
+      orphanIdentity,
+      execute,
+    )).resolves.toMatchObject({
+      replayed: false,
+      response: { success: true },
+      receipt: { status: "succeeded" },
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects stale orphan reconciliation evidence without mutating the receipt", async () => {
+    const kv = mockKV();
+    await seedOrphanedSummaryOperation(kv);
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never);
+    const handler = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
+
+    await expect(handler({
+      ...orphanReconciliationInput,
+      operation: {
+        ...orphanReconciliationInput.operation,
+        expectedStartedAt: "2026-07-26T17:44:07.623Z",
+      },
+    })).resolves.toEqual({
+      success: false,
+      failure: {
+        class: "hard",
+        cause: "orphan_reconciliation_evidence_drifted",
+      },
+    });
+
+    const key = buildExtractionOperationKey(orphanIdentity);
+    await expect(kv.get<Record<string, unknown>>(
+      KV.extractionOperationReceipt(key),
+      key,
+    )).resolves.toMatchObject({ status: "running" });
+  });
+
+  it("refuses orphan reconciliation when a summary result already exists", async () => {
+    const kv = mockKV();
+    await seedOrphanedSummaryOperation(kv);
+    await kv.set(KV.summaries, orphanReconciliationInput.result.sessionId, {
+      sessionId: orphanReconciliationInput.result.sessionId,
+      createdAt: "2026-07-26T17:44:08.000Z",
+      title: "must-not-cross-boundary",
+    });
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never);
+    const handler = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
+
+    await expect(handler(orphanReconciliationInput)).resolves.toEqual({
+      success: false,
+      failure: {
+        class: "hard",
+        cause: "orphan_reconciliation_result_present",
+      },
+    });
   });
 });

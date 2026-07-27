@@ -3,6 +3,8 @@ import type { ISdk } from "iii-sdk";
 import type {
   ExtractionOperationIdentity,
   ExtractionOperationReceipt,
+  ResumableSummaryActiveRun,
+  ResumableSummaryRun,
   StageFailure,
 } from "../types.js";
 import type { StateKV } from "../state/kv.js";
@@ -474,6 +476,110 @@ export function registerExtractionOperationReceiptFunctions(
       };
     },
   );
+
+  sdk.registerFunction(
+    "mem::extraction-operation-receipt-reconcile-orphan",
+    async (value: unknown) => {
+      const input = normalizeOrphanSummaryReconciliation(value);
+      if (!input) {
+        return orphanReconciliationFailure("invalid_orphan_reconciliation_identity");
+      }
+      const key = buildExtractionOperationKey(input.operation);
+      return withKeyedLock(`extraction-operation:${key}`, async () => {
+        const receipt = await kv.get<ExtractionOperationReceipt>(
+          KV.extractionOperationReceipt(key),
+          key,
+        );
+        const reconciliationId = orphanReconciliationId(input);
+        if (
+          !receipt
+          || receipt.runId !== input.operation.runId
+          || receipt.stage !== input.operation.stage
+          || receipt.unitId !== input.operation.unitId
+          || receipt.inputHash !== input.operation.inputHash
+          || receipt.startedAt !== input.operation.expectedStartedAt
+          || !["running", "reconciled"].includes(receipt.status)
+          || (
+            receipt.status === "reconciled"
+            && receipt.reconciliation?.id !== reconciliationId
+          )
+        ) {
+          return orphanReconciliationFailure("orphan_reconciliation_evidence_drifted");
+        }
+
+        const [run, activeRun, persistedSummary] = await Promise.all([
+          kv.get<ResumableSummaryRun>(
+            KV.summaryResumableRuns,
+            input.result.resumableRunId,
+          ),
+          kv.get<ResumableSummaryActiveRun>(
+            KV.summaryResumableActiveRuns,
+            input.result.sessionId,
+          ),
+          kv.get(KV.summaries, input.result.sessionId),
+        ]);
+        if (persistedSummary !== null || run?.summary !== undefined) {
+          return orphanReconciliationFailure("orphan_reconciliation_result_present");
+        }
+        if (
+          !run
+          || !activeRun
+          || run.id !== input.result.resumableRunId
+          || run.sessionId !== input.result.sessionId
+          || run.status !== "in_progress"
+          || run.inputHash !== input.result.serviceInputHash
+          || run.attemptId !== input.operation.runId
+          || run.attemptInputHash !== input.result.runnerInputHash
+          || run.generationConfigHash !== input.result.generationConfigHash
+          || activeRun.sessionId !== input.result.sessionId
+          || activeRun.runId !== input.result.resumableRunId
+          || activeRun.inputHash !== input.result.serviceInputHash
+        ) {
+          return orphanReconciliationFailure("orphan_reconciliation_result_binding_drifted");
+        }
+
+        let reconciled = receipt;
+        const replayed = receipt.status === "reconciled";
+        if (!replayed) {
+          const at = new Date().toISOString();
+          reconciled = {
+            ...receipt,
+            status: "reconciled",
+            completedAt: at,
+            response: undefined,
+            failure: {
+              class: "transient_runtime",
+              cause: "orphaned_operation_result_absent",
+            },
+            reconciliation: {
+              id: reconciliationId,
+              at,
+              resultStatus: "absent",
+              resumableRunId: input.result.resumableRunId,
+            },
+          };
+          await kv.set(KV.extractionOperationReceipt(key), key, reconciled);
+        }
+
+        return {
+          success: true,
+          replayed,
+          operation: {
+            runId: reconciled.runId,
+            stage: reconciled.stage,
+            unitId: reconciled.unitId,
+            inputHash: reconciled.inputHash,
+          },
+          receipt: sanitizeExtractionOperationReceipt(reconciled),
+          reconciliation: {
+            id: reconciled.reconciliation!.id,
+            at: reconciled.reconciliation!.at,
+            resultStatus: "absent",
+          },
+        };
+      });
+    },
+  );
 }
 
 const EXTRACTION_OPERATION_STAGES = new Set<ExtractionOperationIdentity["stage"]>([
@@ -491,6 +597,7 @@ const EXTRACTION_OPERATION_RECEIPT_STATUSES = new Set([
   "running",
   "succeeded",
   "failed",
+  "reconciled",
 ]);
 
 const STAGE_FAILURE_CLASSES = new Set([
@@ -560,5 +667,111 @@ function sanitizeExtractionOperationReceipt(receipt: ExtractionOperationReceipt)
       ? { completedAt: receipt.completedAt }
       : {}),
     ...(safeFailure ? { failure: safeFailure } : {}),
+  };
+}
+
+type OrphanSummaryReconciliationInput = {
+  operation: ExtractionOperationIdentity & {
+    expectedStatus: "running";
+    expectedStartedAt: string;
+  };
+  result: {
+    sessionId: string;
+    resumableRunId: string;
+    serviceInputHash: string;
+    runnerInputHash: string;
+    generationConfigHash: string;
+  };
+};
+
+const ORPHAN_RECONCILIATION_TOP_LEVEL_KEYS = new Set(["operation", "result"]);
+const ORPHAN_RECONCILIATION_OPERATION_KEYS = new Set([
+  "runId",
+  "stage",
+  "unitId",
+  "inputHash",
+  "expectedStatus",
+  "expectedStartedAt",
+]);
+const ORPHAN_RECONCILIATION_RESULT_KEYS = new Set([
+  "sessionId",
+  "resumableRunId",
+  "serviceInputHash",
+  "runnerInputHash",
+  "generationConfigHash",
+]);
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const RESUMABLE_SUMMARY_RUN_ID = /^sumr_[0-9a-f]{24}$/;
+
+function exactObjectKeys(value: unknown, allowed: Set<string>): value is Record<string, unknown> {
+  return Boolean(value)
+    && typeof value === "object"
+    && !Array.isArray(value)
+    && Object.keys(value as Record<string, unknown>).every((key) => allowed.has(key))
+    && Object.keys(value as Record<string, unknown>).length === allowed.size;
+}
+
+function normalizeOrphanSummaryReconciliation(
+  value: unknown,
+): OrphanSummaryReconciliationInput | null {
+  if (!exactObjectKeys(value, ORPHAN_RECONCILIATION_TOP_LEVEL_KEYS)) return null;
+  if (
+    !exactObjectKeys(value.operation, ORPHAN_RECONCILIATION_OPERATION_KEYS)
+    || !exactObjectKeys(value.result, ORPHAN_RECONCILIATION_RESULT_KEYS)
+  ) {
+    return null;
+  }
+  const operation = value.operation;
+  const result = value.result;
+  const strings = [...ORPHAN_RECONCILIATION_OPERATION_KEYS, ...ORPHAN_RECONCILIATION_RESULT_KEYS]
+    .filter((key) => key !== "expectedStatus" && key !== "stage")
+    .map((key) => (
+      Object.prototype.hasOwnProperty.call(operation, key) ? operation[key] : result[key]
+    ));
+  if (strings.some((item) => typeof item !== "string" || !item.trim())) return null;
+  if (
+    operation.stage !== "summary"
+    || operation.expectedStatus !== "running"
+    || !SHA256_HEX.test(String(operation.runId))
+    || !SHA256_HEX.test(String(operation.inputHash))
+    || !SHA256_HEX.test(String(result.serviceInputHash))
+    || !SHA256_HEX.test(String(result.runnerInputHash))
+    || !SHA256_HEX.test(String(result.generationConfigHash))
+    || !RESUMABLE_SUMMARY_RUN_ID.test(String(result.resumableRunId))
+    || operation.unitId !== `${result.sessionId}:reduce`
+  ) {
+    return null;
+  }
+  return {
+    operation: operation as OrphanSummaryReconciliationInput["operation"],
+    result: result as OrphanSummaryReconciliationInput["result"],
+  };
+}
+
+function orphanReconciliationId(input: OrphanSummaryReconciliationInput): string {
+  const hash = createHash("sha256")
+    .update(JSON.stringify([
+      input.operation.runId,
+      input.operation.stage,
+      input.operation.unitId,
+      input.operation.inputHash,
+      input.operation.expectedStartedAt,
+      input.result.sessionId,
+      input.result.resumableRunId,
+      input.result.serviceInputHash,
+      input.result.runnerInputHash,
+      input.result.generationConfigHash,
+    ]))
+    .digest("hex");
+  return `xrec_${hash.slice(0, 32)}`;
+}
+
+function orphanReconciliationFailure(cause: string) {
+  return {
+    success: false,
+    failure: {
+      class: "hard" as const,
+      cause,
+    },
   };
 }

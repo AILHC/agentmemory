@@ -359,6 +359,12 @@ export function foldStageEvents(events) {
       unit.blocked = true;
       unit.blocked_payload = event.payload;
     }
+    if (event.type === 'unit_reconciliation_resolved') {
+      unit.blocked = false;
+      unit.blocked_payload = undefined;
+      unit.active_operation = null;
+      unit.reconciliations = [...(unit.reconciliations || []), event.payload];
+    }
     if (event.type === 'unit_recorded') unit.recorded = true;
     units.set(unitId, unit);
   }
