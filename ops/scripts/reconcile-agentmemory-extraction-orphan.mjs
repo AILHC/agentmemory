@@ -13,6 +13,12 @@ const SHA256_HEX = /^[0-9a-f]{64}$/;
 const RESUMABLE_RUN_ID = /^sumr_[0-9a-f]{24}$/;
 const RECONCILIATION_ID = /^xrec_[0-9a-f]{32}$/;
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+const SAFE_RECONCILIATION_FAILURES = new Set([
+  'invalid_orphan_reconciliation_identity',
+  'orphan_reconciliation_evidence_drifted',
+  'orphan_reconciliation_result_present',
+  'orphan_reconciliation_result_binding_drifted',
+]);
 
 function requireValue(argv, index, option) {
   const value = argv[index + 1];
@@ -128,6 +134,13 @@ function validateBlockedUnit(events, options) {
 }
 
 function validateReceiptResult(result, options) {
+  if (
+    result?.success === false
+    && result.failure?.class === 'hard'
+    && SAFE_RECONCILIATION_FAILURES.has(result.failure?.cause)
+  ) {
+    throw new Error(`orphan_reconciliation_rejected:${result.failure.cause}`);
+  }
   if (
     result?.success !== true
     || result.operation?.runId !== options.operation.runId

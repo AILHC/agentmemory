@@ -151,6 +151,30 @@ test('stale journal CAS evidence stops before changing the receipt', async () =>
   assert.equal(called, false);
 });
 
+test('safe receipt rejection preserves the exact failure cause without appending a journal event', async () => {
+  const fixture = await makeBlockedJournal();
+  await assert.rejects(
+    () => reconcileSummaryOrphan(options(fixture), {
+      reconcileReceipt: async () => ({
+        success: false,
+        failure: {
+          class: 'hard',
+          cause: 'orphan_reconciliation_result_binding_drifted',
+        },
+      }),
+    }),
+    /orphan_reconciliation_rejected:orphan_reconciliation_result_binding_drifted/,
+  );
+
+  const journal = new RunStateJournalV2({
+    rootDir: fixture.rootDir,
+    runId: fixture.formalRunId,
+  });
+  const events = await journal.readStage('summary');
+  assert.equal(events.at(-1).type, 'unit_blocked');
+  assert.equal(events.at(-1).seq, 4);
+});
+
 test('CLI requires one complete explicit identity and has no bulk reset mode', () => {
   assert.throws(() => parseArguments(['--all']), /unknown_argument:--all/);
   assert.throws(() => parseArguments([]), /state_dir_required/);
