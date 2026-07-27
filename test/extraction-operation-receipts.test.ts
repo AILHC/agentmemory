@@ -582,8 +582,14 @@ describe("extraction operation receipts", () => {
     } as never, kv as never);
     const handler = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
 
-    const first = await handler(orphanReconciliationInput);
-    const replay = await handler(orphanReconciliationInput);
+    const first = await handler({
+      ...orphanReconciliationInput,
+      runtimeContext: { traceId: "framework-added" },
+    });
+    const replay = await handler({
+      ...orphanReconciliationInput,
+      runtimeContext: { traceId: "framework-added" },
+    });
 
     expect(first).toEqual({
       success: true,
@@ -633,6 +639,30 @@ describe("extraction operation receipts", () => {
       receipt: { status: "succeeded" },
     });
     expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects extra fields inside the exact orphan operation identity", async () => {
+    const kv = mockKV();
+    await seedOrphanedSummaryOperation(kv);
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never);
+    const handler = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
+
+    await expect(handler({
+      ...orphanReconciliationInput,
+      operation: {
+        ...orphanReconciliationInput.operation,
+        reset: true,
+      },
+    })).resolves.toEqual({
+      success: false,
+      failure: {
+        class: "hard",
+        cause: "invalid_orphan_reconciliation_identity",
+      },
+    });
   });
 
   it("rejects stale orphan reconciliation evidence without mutating the receipt", async () => {

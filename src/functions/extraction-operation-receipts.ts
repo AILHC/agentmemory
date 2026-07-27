@@ -684,7 +684,6 @@ type OrphanSummaryReconciliationInput = {
   };
 };
 
-const ORPHAN_RECONCILIATION_TOP_LEVEL_KEYS = new Set(["operation", "result"]);
 const ORPHAN_RECONCILIATION_OPERATION_KEYS = new Set([
   "runId",
   "stage",
@@ -714,15 +713,16 @@ function exactObjectKeys(value: unknown, allowed: Set<string>): value is Record<
 function normalizeOrphanSummaryReconciliation(
   value: unknown,
 ): OrphanSummaryReconciliationInput | null {
-  if (!exactObjectKeys(value, ORPHAN_RECONCILIATION_TOP_LEVEL_KEYS)) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const input = value as Record<string, unknown>;
   if (
-    !exactObjectKeys(value.operation, ORPHAN_RECONCILIATION_OPERATION_KEYS)
-    || !exactObjectKeys(value.result, ORPHAN_RECONCILIATION_RESULT_KEYS)
+    !exactObjectKeys(input.operation, ORPHAN_RECONCILIATION_OPERATION_KEYS)
+    || !exactObjectKeys(input.result, ORPHAN_RECONCILIATION_RESULT_KEYS)
   ) {
     return null;
   }
-  const operation = value.operation;
-  const result = value.result;
+  const operation = input.operation;
+  const result = input.result;
   const strings = [...ORPHAN_RECONCILIATION_OPERATION_KEYS, ...ORPHAN_RECONCILIATION_RESULT_KEYS]
     .filter((key) => key !== "expectedStatus" && key !== "stage")
     .map((key) => (
