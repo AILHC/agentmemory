@@ -877,6 +877,117 @@ test('v2 dry-run persists plans without calling model or record adapters', async
   }
 });
 
+test('v2 resume freezes a completed summary plan and ignores appended live sessions', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-frozen-plan-addition-'));
+  let sessions = [{ id: 's1', startedAt: '2026-07-24T00:00:00.000Z' }];
+  const summaryCalls = [];
+  const lessonCalls = [];
+  try {
+    await withServer((_request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ success: true, sessions }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'frozen-plan-addition',
+        '--run-state-format', 'v2',
+      ];
+      assert.equal(await mainForEarlyStages([...argv, '--dry-run']), 0);
+
+      sessions = [
+        ...sessions,
+        { id: 's2', startedAt: '2026-07-25T00:00:00.000Z' },
+      ];
+      assert.equal(await mainForEarlyStages([...argv, '--resume'], {
+        v2SummaryRemote: {
+          advance: async (request) => {
+            summaryCalls.push(request.sessionId);
+            return successfulSummaryResponse(request);
+          },
+          record: async () => {},
+        },
+        v2LessonsRemote: {
+          start: async ({ sessionId, attemptId }) => {
+            lessonCalls.push(sessionId);
+            return {
+              ok: true,
+              data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+            };
+          },
+          record: async () => {},
+        },
+      }), 0);
+    });
+
+    assert.deepEqual(summaryCalls, ['s1']);
+    assert.deepEqual(lessonCalls, ['s1']);
+    for (const stage of ['summary', 'lessons']) {
+      const events = (await fs.readFile(
+        path.join(stateDir, 'frozen-plan-addition.v2', `${stage}.jsonl`),
+        'utf8',
+      )).trim().split('\n').map(JSON.parse);
+      assert.deepEqual(
+        events.filter((event) => event.type === 'unit_planned')
+          .map((event) => event.payload.unit_id),
+        ['s1'],
+      );
+    }
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 frozen resume hard-stops when an original live session is missing or changed', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  context.after(() => {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  });
+
+  for (const scenario of [
+    {
+      name: 'missing',
+      sessions: [{ id: 's2', startedAt: '2026-07-25T00:00:00.000Z' }],
+      expected: /v2_frozen_plan_source_missing/,
+    },
+    {
+      name: 'changed',
+      sessions: [{ id: 's1', startedAt: '2026-07-24T00:00:01.000Z' }],
+      expected: /v2_frozen_plan_source_drifted/,
+    },
+  ]) {
+    await context.test(scenario.name, async () => {
+      const stateDir = await fs.mkdtemp(path.join(
+        os.tmpdir(),
+        `agentmemory-v2-frozen-plan-${scenario.name}-`,
+      ));
+      let sessions = [{ id: 's1', startedAt: '2026-07-24T00:00:00.000Z' }];
+      await withServer((_request, response) => {
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ success: true, sessions }));
+      }, async (baseUrl) => {
+        const argv = [
+          '--base-url', baseUrl,
+          '--state-dir', stateDir,
+          '--run-id', `frozen-plan-${scenario.name}`,
+          '--run-state-format', 'v2',
+        ];
+        assert.equal(await mainForEarlyStages([...argv, '--dry-run']), 0);
+        sessions = scenario.sessions;
+        await assert.rejects(
+          () => mainForEarlyStages([...argv, '--resume']),
+          scenario.expected,
+        );
+      });
+    });
+  }
+});
+
 test('v2 binds normalized base URL into run identity drift checks', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';

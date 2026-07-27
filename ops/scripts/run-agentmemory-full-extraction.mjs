@@ -8,7 +8,11 @@ import {
   executeReceiptAwareRequest,
   runV2RemainingStages,
 } from './lib/full-extraction-stage-adapters-v2.mjs';
-import { runSinglePhaseStage, runTwoPhaseStage } from './lib/recoverable-stage-v2.mjs';
+import {
+  runSinglePhaseStage,
+  runTwoPhaseStage,
+  validateSinglePhaseStage,
+} from './lib/recoverable-stage-v2.mjs';
 import { RunStateStore } from './lib/run-state-store.mjs';
 import { RunStateJournalV2 } from './lib/run-state-journal-v2.mjs';
 import { runStagePipeline } from './lib/stage-pipeline.mjs';
@@ -5556,6 +5560,69 @@ function buildV2SummaryPlan(sessions, baseUrl, options) {
   }));
 }
 
+export function resolveV2FrozenSummaryInventory({
+  options,
+  started,
+  sessions,
+  events,
+  baseUrl,
+}) {
+  if (!options.resume || !started || events.length === 0) return null;
+  const lifecycle = validateSinglePhaseStage(events);
+  if (!lifecycle.planCompleted) return null;
+
+  const plan = events
+    .filter((event) => event.type === 'unit_planned')
+    .map((event) => event.payload);
+  const completed = events.find((event) => event.type === 'stage_plan_completed');
+  const expectedKeys = ['input_hash', 'request_hash', 'unit_id'];
+  if (
+    !completed
+    || Number(completed.payload?.unit_count) !== plan.length
+    || completed.payload?.plan_hash !== stableHash(plan)
+    || completed.payload?.order_hash !== stableHash(plan.map((unit) => unit.unit_id))
+    || plan.some((unit) => (
+      Object.keys(unit || {}).sort().join(',') !== expectedKeys.join(',')
+      || typeof unit.unit_id !== 'string'
+      || !unit.unit_id
+      || typeof unit.input_hash !== 'string'
+      || !unit.input_hash
+      || typeof unit.request_hash !== 'string'
+      || !unit.request_hash
+    ))
+  ) {
+    throw new Error('v2_frozen_plan_invalid');
+  }
+
+  const livePlan = buildV2SummaryPlan(sessions, baseUrl, options);
+  const livePlanById = new Map(livePlan.map((unit) => [unit.unit_id, unit]));
+  const liveSessionById = new Map(sessions.map((session) => [session.id, session]));
+  for (const unit of plan) {
+    const liveUnit = livePlanById.get(unit.unit_id);
+    if (!liveUnit || !liveSessionById.has(unit.unit_id)) {
+      throw new Error('v2_frozen_plan_source_missing');
+    }
+    if (
+      liveUnit.input_hash !== unit.input_hash
+      || liveUnit.request_hash !== unit.request_hash
+    ) {
+      throw new Error('v2_frozen_plan_source_drifted');
+    }
+  }
+
+  const frozenSessions = plan.map((unit) => liveSessionById.get(unit.unit_id));
+  const inventoryHash = computeInventoryHash(frozenSessions, options.agentId);
+  if (started.payload?.inventory_hash !== inventoryHash) {
+    throw new Error('v2_frozen_plan_inventory_drifted');
+  }
+  return {
+    sessions: frozenSessions,
+    inventoryHash,
+    plan,
+    addedCount: sessions.length - frozenSessions.length,
+  };
+}
+
 function buildV2LessonsPlan(sessions, baseUrl, options) {
   return sessions.map((session) => ({
     unit_id: session.id,
@@ -5936,14 +6003,13 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     const allSessions = await loadSessions(baseUrl, secret, options.agentId, options);
     const excludedSessionIds = await loadExcludedSessionIds(options.excludeRecords);
     const selection = selectFullExtractionSessions(allSessions, excludedSessionIds);
-    const sessions = selection.sessions;
+    let sessions = selection.sessions;
     const config = {
       ...buildConfigFromOptions(options),
       base_url: baseUrl,
       mark: options.mark,
     };
     const configHash = stableHash(config);
-    const inventoryHash = computeInventoryHash(sessions, options.agentId);
     const started = control.find((event) => event.type === 'run_started');
     if (started) {
       if (
@@ -5951,11 +6017,27 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
         || started.payload?.schema_version !== 2
         || started.payload?.base_url !== baseUrl
         || started.payload?.config_hash !== configHash
-        || started.payload?.inventory_hash !== inventoryHash
       ) {
         throw new Error('v2_run_input_drifted: 请创建新的 run_id');
       }
-    } else {
+    }
+    const summaryEvents = started && options.resume
+      ? await journal.readStage('summary')
+      : [];
+    const frozenSummary = resolveV2FrozenSummaryInventory({
+      options,
+      started,
+      sessions,
+      events: summaryEvents,
+      baseUrl,
+    });
+    if (frozenSummary) sessions = frozenSummary.sessions;
+    const inventoryHash = frozenSummary?.inventoryHash
+      || computeInventoryHash(sessions, options.agentId);
+    if (started && started.payload?.inventory_hash !== inventoryHash) {
+      throw new Error('v2_run_input_drifted: 请创建新的 run_id');
+    }
+    if (!started) {
       await durable('control', 'run_started', {
         run_id: runId,
         format: 'run-state-journal-v2',
@@ -6016,7 +6098,15 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       stableHash,
       loadSelectedSessions: async () => {
         const latest = await loadSessions(baseUrl, secret, options.agentId, options);
-        return selectFullExtractionSessions(latest, excludedSessionIds).sessions;
+        const latestSelection = selectFullExtractionSessions(latest, excludedSessionIds).sessions;
+        if (!frozenSummary) return latestSelection;
+        return resolveV2FrozenSummaryInventory({
+          options,
+          started,
+          sessions: latestSelection,
+          events: summaryEvents,
+          baseUrl,
+        }).sessions;
       },
       runSingleStage: async ({ stage, plan, adapter }) => {
         const result = await runV2JournalSingleStage({
