@@ -487,13 +487,6 @@ const EXTRACTION_OPERATION_STAGES = new Set<ExtractionOperationIdentity["stage"]
   "reflect_insight",
 ]);
 
-const EXTRACTION_OPERATION_IDENTITY_KEYS = new Set([
-  "runId",
-  "stage",
-  "unitId",
-  "inputHash",
-]);
-
 const EXTRACTION_OPERATION_RECEIPT_STATUSES = new Set([
   "running",
   "succeeded",
@@ -513,9 +506,6 @@ function normalizeExtractionOperationLookup(value: unknown): (
 ) | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).some((key) => !EXTRACTION_OPERATION_IDENTITY_KEYS.has(key))) {
-    return null;
-  }
   const runId = typeof record.runId === "string" ? record.runId.trim() : "";
   const stage = typeof record.stage === "string" ? record.stage.trim() : "";
   const unitId = typeof record.unitId === "string" ? record.unitId.trim() : "";

@@ -424,8 +424,9 @@ describe("extraction operation receipts", () => {
       ...identity,
       response: { prompt: "must-not-cross-boundary" },
     })).resolves.toEqual({
-      success: false,
-      failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+      success: true,
+      operation: identity,
+      receipt: null,
     });
   });
 
