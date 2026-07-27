@@ -76,6 +76,9 @@ function Get-AmV2StageFacts {
   $started = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::Ordinal
   )
+  $blocked = [System.Collections.Generic.HashSet[string]]::new(
+    [System.StringComparer]::Ordinal
+  )
   $terminal = [System.Collections.Generic.Dictionary[string, string]]::new(
     [System.StringComparer]::Ordinal
   )
@@ -102,6 +105,8 @@ function Get-AmV2StageFacts {
         'unit_committing'
       )) {
       [void]$started.Add([string]$unitId)
+    } elseif ([string]$event.type -eq 'unit_blocked') {
+      [void]$blocked.Add([string]$unitId)
     } elseif ([string]$event.type -eq 'unit_terminal') {
       $status = [string](Get-AmStatusProperty -Object $event.payload -Name 'status')
       $terminal[[string]$unitId] = $status
@@ -121,11 +126,13 @@ function Get-AmV2StageFacts {
   }
   $running = 0
   foreach ($unitId in $started) {
-    if (-not $terminal.ContainsKey($unitId)) { $running++ }
+    if (-not $terminal.ContainsKey($unitId) -and -not $blocked.Contains($unitId)) {
+      $running++
+    }
   }
   $pending = [Math]::Max(
     0,
-    $planned.Count - $terminal.Count - $running
+    $planned.Count - $terminal.Count - $running - $blocked.Count
   )
   return [pscustomobject]@{
     completed = $completed
@@ -134,6 +141,7 @@ function Get-AmV2StageFacts {
     failed = $failed
     pending = $pending
     running = $running
+    blocked = $blocked.Count
     last_seq = $lastSeq
     last_at = $lastAt
   }
@@ -224,7 +232,8 @@ if (Test-Path -LiteralPath $v2Root -PathType Container) {
     if (-not $stageFacts.completed -or
         $stageFacts.failed -ne 0 -or
         $stageFacts.pending -ne 0 -or
-        $stageFacts.running -ne 0) {
+        $stageFacts.running -ne 0 -or
+        $stageFacts.blocked -ne 0) {
       $completionReady = $false
     }
   }
@@ -272,13 +281,15 @@ if (Test-Path -LiteralPath $v2Root -PathType Container) {
         $stageFacts.skipped -eq 0 -and
         $stageFacts.failed -eq 0 -and
         $stageFacts.pending -eq 0 -and
-        $stageFacts.running -eq 0) {
+        $stageFacts.running -eq 0 -and
+        $stageFacts.blocked -eq 0) {
       continue
     }
     Write-Output (
       "stage.$($coverageNames[$stageName])=succeeded:$($stageFacts.succeeded)," +
       "skipped:$($stageFacts.skipped),failed:$($stageFacts.failed)," +
-      "pending:$($stageFacts.pending),running:$($stageFacts.running)"
+      "pending:$($stageFacts.pending),running:$($stageFacts.running)," +
+      "blocked:$($stageFacts.blocked)"
     )
   }
   return

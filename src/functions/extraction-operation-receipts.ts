@@ -232,7 +232,9 @@ function completedReceipt<T>(
   };
 }
 
-export function buildExtractionOperationKey(identity: ExtractionOperationIdentity): string {
+export function buildExtractionOperationKey(
+  identity: Pick<ExtractionOperationIdentity, "runId" | "stage" | "unitId">,
+): string {
   const hash = createHash("sha256")
     .update(JSON.stringify([identity.runId, identity.stage, identity.unitId]))
     .digest("hex");
@@ -434,8 +436,8 @@ export function registerExtractionOperationReceiptFunctions(
   sdk.registerFunction(
     "mem::extraction-operation-receipt-get",
     async (value: unknown) => {
-      const identity = normalizeExtractionOperationIdentity(value);
-      if (!identity) {
+      const lookup = normalizeExtractionOperationLookup(value);
+      if (!lookup) {
         return {
           success: false,
           failure: {
@@ -444,12 +446,12 @@ export function registerExtractionOperationReceiptFunctions(
           },
         };
       }
-      const key = buildExtractionOperationKey(identity);
+      const key = buildExtractionOperationKey(lookup);
       const receipt = await kv.get<ExtractionOperationReceipt>(
         KV.extractionOperationReceipt(key),
         key,
       );
-      if (receipt && receipt.inputHash !== identity.inputHash) {
+      if (receipt && lookup.inputHash && receipt.inputHash !== lookup.inputHash) {
         return {
           success: false,
           failure: {
@@ -458,7 +460,18 @@ export function registerExtractionOperationReceiptFunctions(
           },
         };
       }
-      return { success: true, receipt };
+      return {
+        success: true,
+        operation: receipt
+          ? {
+              runId: receipt.runId,
+              stage: receipt.stage,
+              unitId: receipt.unitId,
+              inputHash: receipt.inputHash,
+            }
+          : lookup,
+        receipt: receipt ? sanitizeExtractionOperationReceipt(receipt) : null,
+      };
     },
   );
 }
@@ -474,20 +487,88 @@ const EXTRACTION_OPERATION_STAGES = new Set<ExtractionOperationIdentity["stage"]
   "reflect_insight",
 ]);
 
-function normalizeExtractionOperationIdentity(value: unknown): ExtractionOperationIdentity | null {
+const EXTRACTION_OPERATION_IDENTITY_KEYS = new Set([
+  "runId",
+  "stage",
+  "unitId",
+  "inputHash",
+]);
+
+const EXTRACTION_OPERATION_RECEIPT_STATUSES = new Set([
+  "running",
+  "succeeded",
+  "failed",
+]);
+
+const STAGE_FAILURE_CLASSES = new Set([
+  "transient_provider",
+  "transient_runtime",
+  "unit",
+  "hard",
+]);
+
+function normalizeExtractionOperationLookup(value: unknown): (
+  Pick<ExtractionOperationIdentity, "runId" | "stage" | "unitId">
+  & Partial<Pick<ExtractionOperationIdentity, "inputHash">>
+) | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const record = value as Record<string, unknown>;
+  if (Object.keys(record).some((key) => !EXTRACTION_OPERATION_IDENTITY_KEYS.has(key))) {
+    return null;
+  }
   const runId = typeof record.runId === "string" ? record.runId.trim() : "";
   const stage = typeof record.stage === "string" ? record.stage.trim() : "";
   const unitId = typeof record.unitId === "string" ? record.unitId.trim() : "";
-  const inputHash = typeof record.inputHash === "string" ? record.inputHash.trim() : "";
-  if (!runId || !unitId || !inputHash || !EXTRACTION_OPERATION_STAGES.has(stage as ExtractionOperationIdentity["stage"])) {
+  const inputHash = record.inputHash === undefined
+    ? undefined
+    : typeof record.inputHash === "string"
+      ? record.inputHash.trim()
+      : "";
+  if (
+    !runId
+    || !unitId
+    || inputHash === ""
+    || !EXTRACTION_OPERATION_STAGES.has(stage as ExtractionOperationIdentity["stage"])
+  ) {
     return null;
   }
   return {
     runId,
     stage: stage as ExtractionOperationIdentity["stage"],
     unitId,
-    inputHash,
+    ...(inputHash ? { inputHash } : {}),
+  };
+}
+
+function sanitizeExtractionOperationReceipt(receipt: ExtractionOperationReceipt): {
+  status: ExtractionOperationReceipt["status"];
+  startedAt: string;
+  completedAt?: string;
+  failure?: {
+    class: StageFailure["class"];
+    cause: string;
+  };
+} {
+  if (
+    !EXTRACTION_OPERATION_RECEIPT_STATUSES.has(receipt.status)
+    || typeof receipt.startedAt !== "string"
+    || !receipt.startedAt
+  ) {
+    throw new Error("invalid_extraction_operation_receipt");
+  }
+  const failure = receipt.failure;
+  const safeFailure = failure
+    && STAGE_FAILURE_CLASSES.has(failure.class)
+    && typeof failure.cause === "string"
+    && /^[a-z0-9][a-z0-9_.:-]{0,127}$/i.test(failure.cause)
+    ? { class: failure.class, cause: failure.cause }
+    : undefined;
+  return {
+    status: receipt.status,
+    startedAt: receipt.startedAt,
+    ...(typeof receipt.completedAt === "string" && receipt.completedAt
+      ? { completedAt: receipt.completedAt }
+      : {}),
+    ...(safeFailure ? { failure: safeFailure } : {}),
   };
 }

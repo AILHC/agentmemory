@@ -420,9 +420,16 @@ describe("extraction operation receipts", () => {
       success: false,
       failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
     });
+    await expect(handler({
+      ...identity,
+      response: { prompt: "must-not-cross-boundary" },
+    })).resolves.toEqual({
+      success: false,
+      failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+    });
   });
 
-  it("queries succeeded, failed, and orphaned running receipts without executing work", async () => {
+  it("returns only whitelisted receipt diagnostics without executing work", async () => {
     const kv = mockKV();
     const functions = new Map<string, Function>();
     const sdk = {
@@ -440,7 +447,12 @@ describe("extraction operation receipts", () => {
           status: "succeeded",
           startedAt: "2026-07-24T00:00:00.000Z",
           completedAt: "2026-07-24T00:01:00.000Z",
-          response: { success: true, memoryIds: ["mem-1"] },
+          response: {
+            success: true,
+            prompt: "must-not-cross-boundary",
+            response: "must-not-cross-boundary",
+            memoryIds: ["mem-1"],
+          },
         },
       },
       {
@@ -452,7 +464,11 @@ describe("extraction operation receipts", () => {
           status: "failed",
           startedAt: "2026-07-24T00:00:00.000Z",
           completedAt: "2026-07-24T00:01:00.000Z",
-          failure: { class: "transient_provider", cause: "pi_stream_failed" },
+          failure: {
+            class: "transient_provider",
+            cause: "pi_stream_failed",
+            diagnostics: { rawMessage: "must-not-cross-boundary" },
+          },
         },
       },
       {
@@ -473,10 +489,33 @@ describe("extraction operation receipts", () => {
         entry.receipt.key,
         entry.receipt,
       );
-      await expect(handler(entry.identity)).resolves.toEqual({
+      const {
+        inputHash: _inputHash,
+        ...operationLookup
+      } = entry.identity;
+      const result = await handler(operationLookup);
+      expect(result).toEqual({
         success: true,
-        receipt: entry.receipt,
+        operation: entry.identity,
+        receipt: {
+          status: entry.receipt.status,
+          startedAt: entry.receipt.startedAt,
+          ...("completedAt" in entry.receipt
+            ? { completedAt: entry.receipt.completedAt }
+            : {}),
+          ...("failure" in entry.receipt
+            ? {
+                failure: {
+                  class: entry.receipt.failure.class,
+                  cause: entry.receipt.failure.cause,
+                },
+              }
+            : {}),
+        },
       });
+      expect(JSON.stringify(result)).not.toMatch(
+        /memoryIds|prompt|response|rawMessage|must-not-cross-boundary/,
+      );
     }
   });
 });

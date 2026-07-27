@@ -74,7 +74,7 @@ test('v2 journal 在阶段执行中发布有界进度和存活 lock', async (con
   assert.match(result.stdout, /acceptance_ready=false/);
   assert.match(
     result.stdout,
-    /stage\.summary=succeeded:1,skipped:0,failed:0,pending:0,running:1/,
+    /stage\.summary=succeeded:1,skipped:0,failed:0,pending:0,running:1,blocked:0/,
   );
 });
 
@@ -105,6 +105,36 @@ test('v2 required stages 完成后使用阶段性完成判据', async (context) 
   assert.match(result.stdout, /required_stages=summary,lessons/);
   assert.match(result.stdout, /acceptance_ready=true/);
   assert.match(result.stdout, /current_stage=\s*(?:\r?\n|$)/);
+});
+
+test('v2 journal 单独报告 blocked 且不把它计入 running', async (context) => {
+  const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-blocked-'));
+  context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
+  const runId = 'v2-blocked';
+  const runRoot = path.join(runtimeRoot, 'extraction-runs', `${runId}.v2`);
+  await writeJournal(path.join(runRoot, 'control.jsonl'), [
+    event(0, 'run_started', { run_id: runId }),
+    event(1, 'stage_opened', { stage: 'summary' }),
+  ]);
+  await writeJournal(path.join(runRoot, 'summary.jsonl'), [
+    event(0, 'unit_planned', { unit_id: 'session-a' }),
+    event(1, 'unit_planned', { unit_id: 'session-b' }),
+    event(2, 'stage_plan_completed', {}),
+    event(3, 'unit_started', { unit_id: 'session-a' }),
+    event(4, 'unit_blocked', {
+      unit_id: 'session-a',
+      reason: 'extraction_operation_reconciliation_required',
+    }),
+  ]);
+
+  const result = runStatus(runtimeRoot, runId, 'summary');
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /acceptance_ready=false/);
+  assert.match(
+    result.stdout,
+    /stage\.summary=succeeded:0,skipped:0,failed:0,pending:1,running:0,blocked:1/,
+  );
 });
 
 test('v2 全阶段模式仍要求 run_completed', async (context) => {
