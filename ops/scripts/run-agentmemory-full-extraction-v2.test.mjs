@@ -341,6 +341,105 @@ test('v2 summary recovery reconciles one durable chunk before advancing the next
   }
 });
 
+test('v2 summary retains an active reduce operation for a retryable structured failure', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-retryable-reduce-'));
+  const receiptModes = [];
+  let reduceFailed = false;
+  try {
+    await withServer((request, response) => {
+      assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+      }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'summary-retryable-reduce',
+        '--run-state-format', 'v2',
+      ];
+      const summaryRemote = {
+        advance: async ({ attemptId, inputHash, operationUnitId, requireExistingReceipt }) => {
+          receiptModes.push(requireExistingReceipt);
+          if (operationUnitId === 's1:map:0' || operationUnitId === 's1:map:1') {
+            const completedChunks = operationUnitId.endsWith(':0') ? 1 : 2;
+            return {
+              ok: true,
+              data: {
+                status: 'in_progress',
+                advanced: 'completed',
+                completedChunks,
+                totalChunks: 2,
+                operationUnitId,
+              },
+            };
+          }
+          if (!reduceFailed) {
+            reduceFailed = true;
+            return {
+              ok: false,
+              status_code: 500,
+              data: {
+                status: 'failed',
+                operationUnitId,
+                failure: {
+                  class: 'transient_provider',
+                  cause: 'network_error',
+                  phase: 'provider_call',
+                },
+              },
+            };
+          }
+          return {
+            ...successfulSummaryResponse({ attemptId, inputHash }, 'retried reduce'),
+            data: {
+              ...successfulSummaryResponse({ attemptId, inputHash }, 'retried reduce').data,
+              operationUnitId,
+            },
+          };
+        },
+        record: async () => {},
+      };
+      const lessonsRemote = {
+        start: async ({ attemptId }) => ({ ok: true, data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] } }),
+        record: async () => {},
+      };
+
+      assert.equal(await mainForEarlyStages(argv, {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: lessonsRemote,
+      }), 75);
+      const status = JSON.parse(await fs.readFile(
+        path.join(stateDir, 'summary-retryable-reduce.v2', 'status.json'),
+        'utf8',
+      ));
+      assert.deepEqual(status.summary.failure, {
+        class: 'transient_provider',
+        cause: 'network_error',
+        phase: 'provider_call',
+      });
+      assert.equal(await mainForEarlyStages([...argv, '--resume'], {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: lessonsRemote,
+      }), 0);
+    });
+    assert.deepEqual(receiptModes, [false, false, false, true]);
+    const events = (await fs.readFile(
+      path.join(stateDir, 'summary-retryable-reduce.v2', 'summary.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(events.filter((event) => event.type === 'unit_terminal').length, 1);
+    assert.equal(events.some((event) => event.type === 'unit_blocked'), false);
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
 test('v2 summary recovers a completed final inner operation without another remote call', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';

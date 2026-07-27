@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   buildExtractionOperationKey,
+  ExtractionOperationResultUncertainError,
   registerExtractionOperationReceiptFunctions,
   withExtractionOperationReceipt,
 } from "../src/functions/extraction-operation-receipts.js";
@@ -222,6 +223,195 @@ describe("extraction operation receipts", () => {
     );
     expect(nextAttempt).toMatchObject({ response: { success: true, memoryIds: ["mem-1"] } });
     expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves whitelisted diagnostics and retry metadata for an opt-in safe failure", async () => {
+    const kv = mockKV();
+    const result = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      async () => ({
+        success: false,
+        status: "failed",
+        retryableReceiptFailure: true,
+        failure: {
+          class: "transient_provider",
+          cause: "network_error",
+          phase: "provider_call",
+          diagnostics: {
+            requestPhase: "reduce",
+            providerErrorCode: "network_error",
+            elapsedMs: 12,
+            inputChars: 34,
+            maxOutputTokens: 4096,
+            responseStarted: false,
+          },
+        },
+        error: "secret must not persist",
+      }),
+    );
+
+    expect(result.receipt).toMatchObject({
+      status: "failed",
+      failure: {
+        phase: "provider_call",
+        diagnostics: {
+          requestPhase: "reduce",
+          providerErrorCode: "network_error",
+        },
+      },
+      retry: {
+        epoch: 0,
+        lastSafeFailure: {
+          errorClass: "transient_provider",
+          cause: "network_error",
+        },
+      },
+    });
+    expect(JSON.stringify(result.receipt)).not.toContain("secret must not persist");
+  });
+
+  it("reopens only require-existing safe failures and preserves retry audit after a later hard failure", async () => {
+    const kv = mockKV();
+    const execute = vi.fn()
+      .mockResolvedValueOnce({
+        success: false,
+        retryableReceiptFailure: true,
+        failure: {
+          class: "transient_provider",
+          cause: "network_error",
+          phase: "provider_call",
+        },
+      })
+      .mockResolvedValueOnce({
+        success: false,
+        failure: { class: "hard", cause: "pi_auth_failed", phase: "provider_preflight" },
+      });
+
+    await withExtractionOperationReceipt(kv as never, identity, execute);
+    const ordinaryReplay = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      { retryFailed: true },
+    );
+    const reopened = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      { retryFailed: true, requireExisting: true },
+    );
+    const hardReplay = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      { retryFailed: true, requireExisting: true },
+    );
+
+    expect(execute).toHaveBeenCalledTimes(2);
+    expect(ordinaryReplay).toMatchObject({ replayed: true, failure: { cause: "network_error" } });
+    expect(reopened).toMatchObject({ failure: { class: "hard", cause: "pi_auth_failed" } });
+    expect(hardReplay).toMatchObject({ replayed: true, failure: { cause: "pi_auth_failed" } });
+    expect(reopened.receipt).toMatchObject({
+      retry: { epoch: 1, lastSafeFailure: { cause: "network_error" } },
+    });
+  });
+
+  it("does not reopen when the current safe-looking failure differs from its retry audit", async () => {
+    const kv = mockKV();
+    const execute = vi.fn()
+      .mockResolvedValueOnce({
+        success: false,
+        retryableReceiptFailure: true,
+        failure: {
+          class: "transient_provider",
+          cause: "network_error",
+          phase: "provider_call",
+        },
+      })
+      .mockResolvedValueOnce({
+        success: false,
+        failure: {
+          class: "transient_provider",
+          cause: "server_error",
+          phase: "provider_call",
+        },
+      });
+
+    await withExtractionOperationReceipt(kv as never, identity, execute);
+    const secondFailure = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      { retryFailed: true, requireExisting: true },
+    );
+    const replay = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      { retryFailed: true, requireExisting: true },
+    );
+
+    expect(secondFailure).toMatchObject({ failure: { cause: "server_error" } });
+    expect(replay).toMatchObject({ replayed: true, failure: { cause: "server_error" } });
+    expect(replay.receipt).toMatchObject({
+      retry: { lastSafeFailure: { cause: "network_error", phase: "provider_call" } },
+    });
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["provider_preflight", "final_result_persistence", undefined] as const)(
+    "does not reopen a retry opt-in failure outside safe phases: %s",
+    async (phase) => {
+      const kv = mockKV();
+      const execute = vi.fn(async () => ({
+        success: false,
+        retryableReceiptFailure: true,
+        failure: {
+          class: "transient_runtime" as const,
+          cause: "network_error",
+          ...(phase ? { phase } : {}),
+        },
+      }));
+
+      await withExtractionOperationReceipt(kv as never, identity, execute);
+      const replay = await withExtractionOperationReceipt(
+        kv as never,
+        identity,
+        execute,
+        { retryFailed: true, requireExisting: true },
+      );
+
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(replay).toMatchObject({ replayed: true, receipt: { status: "failed" } });
+      expect(replay.receipt?.retry).toBeUndefined();
+    },
+  );
+
+  it("records only whitelisted uncertainty when final persistence becomes indeterminate", async () => {
+    const kv = mockKV();
+    const result = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      async () => { throw new ExtractionOperationResultUncertainError(); },
+    );
+
+    expect(result).toMatchObject({
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+        phase: "final_result_persistence",
+      },
+      receipt: {
+        status: "running",
+        uncertainty: {
+          phase: "final_result_persistence",
+          errorClass: "transient_runtime",
+          cause: "extraction_operation_reconciliation_required",
+          timestamp: expect.any(String),
+        },
+      },
+    });
   });
 
   it("does not downgrade an uncertain succeeded-receipt write into a retryable failure", async () => {

@@ -1986,7 +1986,13 @@ describe("mem::summarize-resumable", () => {
     const kv = mockKV();
     await seedSummarySession(kv, "ses_22_transient", 22);
     const provider = makeProvider([
-      new Error("pi_stream_failed"),
+      new ProviderCallError("pi_stream_failed", {
+        providerErrorCode: "network_error",
+        elapsedMs: 12,
+        inputChars: 34,
+        maxOutputTokens: 4096,
+        responseStarted: false,
+      }),
       new Error("pi_stream_failed"),
     ]);
     const { handler } = setupResumableHandler(kv, provider, {
@@ -2181,6 +2187,7 @@ describe("mem::summarize-resumable", () => {
     expect(failed.failure).toEqual({
       class: "transient_provider",
       cause: "pi_stream_failed",
+      phase: "provider_call",
       diagnostics: {
         requestPhase: "reduce",
         providerErrorCode: "server_error",
@@ -2195,6 +2202,84 @@ describe("mem::summarize-resumable", () => {
       },
     });
     expect(JSON.stringify(failed)).not.toContain("narrative for obs");
+  });
+
+  it.each(["timeout", "network_error", "server_error"] as const)(
+    "classifies ordinary provider errors with %s diagnostics as transient provider failures",
+    async (providerErrorCode) => {
+      process.env.SUMMARIZE_CHUNK_SIZE = "1";
+      const kv = mockKV();
+      const sessionId = `ses_diagnostic_${providerErrorCode}`;
+      const attemptId = `attempt_diagnostic_${providerErrorCode}`;
+      const session = await seedSummarySession(kv, sessionId, 2);
+      const provider = makeProvider([
+        summaryXml({ title: "chunk-1" }),
+        summaryXml({ title: "chunk-2" }),
+        new ProviderCallError("ordinary provider error", {
+          providerErrorCode,
+          elapsedMs: 5,
+          inputChars: 40,
+          maxOutputTokens: 4096,
+          responseStarted: false,
+        }),
+      ]);
+      const { handler } = setupResumableHandler(kv, provider);
+
+      await handler({ sessionId, attemptId, inputHash: summarySessionInputHash(session) });
+      await handler({ sessionId, attemptId, inputHash: summarySessionInputHash(session) });
+      const failed = await handler({ sessionId, attemptId, inputHash: summarySessionInputHash(session) });
+
+      expect(failed.failure).toMatchObject({
+        class: "transient_provider",
+        diagnostics: { providerErrorCode },
+      });
+    },
+  );
+
+  it("reopens a server-error reduce receipt when diagnostics classify it as transient", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const sessionId = "ses_server_error_reduce_retry";
+    const attemptId = "attempt-server-error-reduce-retry";
+    const session = await seedSummarySession(kv, sessionId, 2);
+    const inputHash = summarySessionInputHash(session);
+    const provider = makeProvider([
+      summaryXml({ title: "chunk-1" }),
+      summaryXml({ title: "chunk-2" }),
+      new ProviderCallError("ordinary provider error", {
+        providerErrorCode: "server_error",
+        elapsedMs: 5,
+        inputChars: 40,
+        maxOutputTokens: 4096,
+        responseStarted: false,
+      }),
+      summaryXml({ title: "reduced after server retry" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId, attemptId, inputHash });
+    await handler({ sessionId, attemptId, inputHash });
+    const failed = await handler({ sessionId, attemptId, inputHash });
+    const resumed = await handler({
+      sessionId,
+      attemptId,
+      inputHash,
+      operationUnitId: `${sessionId}:reduce`,
+      requireExistingReceipt: true,
+    });
+
+    expect(failed).toMatchObject({
+      failure: {
+        class: "transient_provider",
+        phase: "provider_call",
+        diagnostics: { providerErrorCode: "server_error" },
+      },
+    });
+    expect(resumed).toMatchObject({ status: "succeeded", summary: { title: "reduced after server retry" } });
+    expect(extractionReceipts(kv).find((entry) => entry.unitId === `${sessionId}:reduce`)).toMatchObject({
+      status: "succeeded",
+      retry: { epoch: 1, lastSafeFailure: { cause: "provider_failure" } },
+    });
   });
 
   it("returns a structured hard failure for a real map preflight error", async () => {
@@ -2252,6 +2337,251 @@ describe("mem::summarize-resumable", () => {
       advanced: "none",
       failure: { class: "hard", cause: "provider_drift" },
     });
+  });
+
+  it("finalizes a receipt-wrapped reduce preflight failure without reconciliation", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const sessionId = "ses_v2_reduce_preflight_receipt";
+    const attemptId = "attempt-reduce-preflight-receipt";
+    const session = await seedSummarySession(kv, sessionId, 2);
+    const inputHash = summarySessionInputHash(session);
+    const provider = makeProvider([
+      summaryXml({ title: "chunk-1" }),
+      summaryXml({ title: "chunk-2" }),
+      new ProviderPreflightError({
+        operation: "summarize",
+        callRole: "reduce",
+        callIndex: 2,
+        durationMs: 0,
+        metadataStatus: "unsupported",
+        providerInvoked: false,
+        preflightBlocked: true,
+        reason: "provider_drift",
+        promptChars: 500,
+      }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId, attemptId, inputHash });
+    await handler({ sessionId, attemptId, inputHash });
+    const failed = await handler({ sessionId, attemptId, inputHash });
+
+    expect(failed).toMatchObject({
+      status: "failed",
+      failure: {
+        class: "hard",
+        cause: "provider_drift",
+        phase: "provider_preflight",
+      },
+    });
+    const receipt = extractionReceipts(kv).find(
+      (entry) => entry.unitId === `${sessionId}:reduce`,
+    );
+    expect(receipt).toMatchObject({
+      status: "failed",
+      failure: {
+        class: "hard",
+        cause: "provider_drift",
+        phase: "provider_preflight",
+      },
+    });
+    expect(JSON.stringify(receipt)).not.toContain("narrative for obs");
+  });
+
+  it("reopens only a receipt-wrapped transient reduce failure with the same identity", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const sessionId = "ses_v2_reduce_retry_receipt";
+    const attemptId = "attempt-reduce-retry-receipt";
+    const session = await seedSummarySession(kv, sessionId, 2);
+    const inputHash = summarySessionInputHash(session);
+    const provider = makeProvider([
+      summaryXml({ title: "chunk-1" }),
+      summaryXml({ title: "chunk-2" }),
+      new Error("pi_stream_failed"),
+      summaryXml({ title: "reduced after retry" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId, attemptId, inputHash });
+    await handler({ sessionId, attemptId, inputHash });
+    const transient = await handler({ sessionId, attemptId, inputHash });
+    const resumed = await handler({
+      sessionId,
+      attemptId,
+      inputHash,
+      operationUnitId: `${sessionId}:reduce`,
+      requireExistingReceipt: true,
+    });
+
+    expect(transient).toMatchObject({
+      status: "failed",
+      failure: {
+        class: "transient_provider",
+        cause: "pi_stream_failed",
+        phase: "provider_call",
+      },
+    });
+    expect(resumed).toMatchObject({
+      status: "succeeded",
+      summary: { title: "reduced after retry" },
+    });
+    expect(provider.calls).toHaveLength(4);
+    const receipt = extractionReceipts(kv).find(
+      (entry) => entry.unitId === `${sessionId}:reduce`,
+    );
+    expect(receipt).toMatchObject({
+      status: "succeeded",
+      retry: {
+        epoch: 1,
+        lastSafeFailure: {
+          phase: "provider_call",
+          errorClass: "transient_provider",
+          cause: "pi_stream_failed",
+          timestamp: expect.any(String),
+        },
+      },
+    });
+  });
+
+  it("reopens a safe pre-persistence reduce failure without repeating map work", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const sessionId = "ses_v2_reduce_before_persist";
+    const attemptId = "attempt-reduce-before-persist";
+    const session = await seedSummarySession(kv, sessionId, 2);
+    const inputHash = summarySessionInputHash(session);
+    const provider = makeProvider([
+      summaryXml({ title: "chunk-1" }),
+      summaryXml({ title: "chunk-2" }),
+      summaryXml({ title: "first reduce" }),
+      summaryXml({ title: "second reduce" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId, attemptId, inputHash });
+    await handler({ sessionId, attemptId, inputHash });
+    vi.mocked(validateOutput).mockImplementationOnce(() => {
+      throw new Error("validator interrupted");
+    });
+    const failed = await handler({ sessionId, attemptId, inputHash });
+    const resumed = await handler({
+      sessionId,
+      attemptId,
+      inputHash,
+      operationUnitId: `${sessionId}:reduce`,
+      requireExistingReceipt: true,
+    });
+
+    expect(failed).toMatchObject({
+      failure: {
+        class: "transient_runtime",
+        cause: "summary_reduce_before_final_persistence_failed",
+        phase: "before_final_persistence",
+      },
+    });
+    expect(resumed).toMatchObject({
+      status: "succeeded",
+      summary: { title: "second reduce" },
+    });
+    expect(provider.calls).toHaveLength(4);
+  });
+
+  it("keeps a receipt running only when the final reduce persistence is uncertain", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const sessionId = "ses_v2_reduce_persist_uncertain";
+    const attemptId = "attempt-reduce-persist-uncertain";
+    const session = await seedSummarySession(kv, sessionId, 2);
+    const inputHash = summarySessionInputHash(session);
+    const provider = makeProvider([
+      summaryXml({ title: "chunk-1" }),
+      summaryXml({ title: "chunk-2" }),
+      summaryXml({ title: "reduce" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId, attemptId, inputHash });
+    await handler({ sessionId, attemptId, inputHash });
+    const originalSet = kv.set.bind(kv);
+    let interrupt = true;
+    kv.set = async <T>(scope: string, key: string, value: T): Promise<T> => {
+      if (interrupt && scope === KV.summaryResumableRuns && (value as { status?: string }).status === "succeeded") {
+        interrupt = false;
+        throw new Error("final persistence interrupted");
+      }
+      return originalSet(scope, key, value);
+    };
+
+    const failed = await handler({ sessionId, attemptId, inputHash });
+    const receipt = extractionReceipts(kv).find(
+      (entry) => entry.unitId === `${sessionId}:reduce`,
+    );
+
+    expect(failed).toMatchObject({
+      failure: { cause: "extraction_operation_reconciliation_required" },
+    });
+    expect(receipt).toMatchObject({
+      status: "running",
+      uncertainty: {
+        phase: "final_result_persistence",
+        errorClass: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+        timestamp: expect.any(String),
+      },
+    });
+    expect(JSON.stringify(receipt)).not.toContain("final persistence interrupted");
+    expect(JSON.stringify(failed)).not.toContain("final persistence interrupted");
+    expect(provider.calls).toHaveLength(3);
+  });
+
+  it("resumes a reconciled reduce receipt after seventeen durable partials without repeating map", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const sessionId = "ses_v2_reconciled_reduce_17";
+    const attemptId = "attempt-reconciled-reduce-17";
+    const session = await seedSummarySession(kv, sessionId, 17);
+    const inputHash = summarySessionInputHash(session);
+    const provider = makeProvider([
+      ...Array.from({ length: 17 }, (_, index) => summaryXml({ title: `chunk-${index}` })),
+      summaryXml({ title: "recovered reduce" }),
+    ]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    for (let index = 0; index < 17; index += 1) {
+      await handler({ sessionId, attemptId, inputHash });
+    }
+    const mapReceipt = extractionReceipts(kv)[0];
+    const reduceIdentity = {
+      runId: attemptId,
+      stage: "summary" as const,
+      unitId: `${sessionId}:reduce`,
+      inputHash: mapReceipt.inputHash,
+    };
+    const reduceKey = buildExtractionOperationKey(reduceIdentity);
+    await kv.set(KV.extractionOperationReceipt(reduceKey), reduceKey, {
+      ...reduceIdentity,
+      key: reduceKey,
+      status: "reconciled",
+      startedAt: "2026-07-27T00:00:00.000Z",
+      completedAt: "2026-07-27T00:01:00.000Z",
+      failure: { class: "transient_runtime", cause: "orphaned_operation_result_absent" },
+      reconciliation: {
+        id: "xrec_0123456789abcdef0123456789abcdef",
+        at: "2026-07-27T00:01:00.000Z",
+        resultStatus: "absent",
+        resumableRunId: "test",
+      },
+    });
+
+    const result = await handler({ sessionId, attemptId, inputHash });
+    const [run] = await kv.list<any>(KV.summaryResumableRuns);
+
+    expect(result).toMatchObject({ status: "succeeded", summary: { title: "recovered reduce" } });
+    expect(run).toMatchObject({ status: "succeeded", completedChunks: 17, summary: { title: "recovered reduce" } });
+    expect(await kv.get<any>(KV.summaries, sessionId)).toMatchObject({ title: "recovered reduce" });
+    expect(provider.calls).toHaveLength(18);
   });
 
   afterEach(() => {

@@ -23,6 +23,7 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import {
   buildExtractionOperationKey,
   completeModelOperationFromVerifiedResult,
+  ExtractionOperationResultUncertainError,
   withExtractionOperationReceipt,
 } from "./extraction-operation-receipts.js";
 import {
@@ -297,7 +298,12 @@ function summaryStageFailure(
   ) {
     return { class: "hard", cause, ...detail };
   }
-  if (transientSummaryFailure(cause)) {
+  if (
+    transientSummaryFailure(cause)
+    || ["rate_limited", "timeout", "network_error", "server_error"].includes(
+      diagnostics?.providerErrorCode ?? "",
+    )
+  ) {
     return { class: "transient_provider", cause, ...detail };
   }
   return { class: "unit", cause, ...detail };
@@ -314,6 +320,11 @@ function transientSummaryFailure(cause: SummaryFailureCause): boolean {
   return cause === "pi_stream_failed"
     || cause === "circuit_breaker_open"
     || cause === "network_error";
+}
+
+function retryableReduceReceiptFailure(failure: StageFailure): boolean {
+  return (failure.class === "transient_provider" || failure.class === "transient_runtime")
+    && (failure.phase === "provider_call" || failure.phase === "before_final_persistence");
 }
 
 function defaultSummaryRetryCooldownMs(sessionId: string): number {
@@ -2127,16 +2138,14 @@ async function runResumableSummaryStep(
       );
 
       const persistReduceFailure = async (
-        message: string,
-        failureCause: SummaryFailureCause,
-        diagnostics?: StageFailureDiagnostics,
+        failure: StageFailure,
       ): Promise<ResumableSummaryResponse> => {
         run = {
           ...run!,
           status: "in_progress",
           completedChunks,
           skippedChunks,
-          lastError: message,
+          lastError: failure.cause,
           updatedAt: new Date().toISOString(),
         };
         await kv.set(KV.summaryResumableRuns, runId, run);
@@ -2146,9 +2155,9 @@ async function runResumableSummaryStep(
           totalChunks,
           skippedChunks,
           {
-            error: message,
-            failureCause,
-            failure: summaryStageFailure(failureCause, diagnostics),
+            error: failure.cause,
+            failureCause: summaryFailureCause(failure.cause),
+            failure,
             telemetry,
           },
         );
@@ -2164,65 +2173,127 @@ async function runResumableSummaryStep(
               inputHash: modelOperationInputHash,
           },
           async () => {
-            const response = await summarizeWithOptions(
-              provider,
-              reduceSystemPrompt,
-              reducePrompt,
-              summaryCallOptions,
-              telemetry,
-              "reduce",
-              resumableCallIndex(
-                run!,
+            let response: string;
+            try {
+              response = await summarizeWithOptions(
+                provider,
+                reduceSystemPrompt,
+                reducePrompt,
+                summaryCallOptions,
+                telemetry,
                 "reduce",
-                totalChunks,
-                0,
-                resumableInvocationMarker(run!),
-              ),
-            );
+                resumableCallIndex(
+                  run!,
+                  "reduce",
+                  totalChunks,
+                  0,
+                  resumableInvocationMarker(run!),
+                ),
+              );
+            } catch (error) {
+              if (isProviderPreflightError(error)) {
+                return {
+                  success: false,
+                  status: "failed",
+                  failure: {
+                    ...summaryPreflightFailure(error),
+                    phase: "provider_preflight" as const,
+                  },
+                };
+              }
+              const failureCause = summaryFailureCause(error);
+              const diagnostics = diagnosticsFromProviderError(error, "reduce")
+                ?? sanitizeStageFailureDiagnostics(telemetry.at(-1)?.metadata, "reduce");
+              const failure: StageFailure = {
+                ...summaryStageFailure(
+                  failureCause,
+                  diagnostics,
+                ),
+                phase: "provider_call",
+              };
+              return {
+                success: false,
+                status: "failed",
+                retryableReceiptFailure: retryableReduceReceiptFailure(failure),
+                failure,
+              };
+            }
             if (!response || !response.trim()) {
               return {
                 success: false,
                 status: "failed",
-                failure: summaryStageFailure("provider_failure"),
+                failure: {
+                  ...summaryStageFailure("provider_failure"),
+                  phase: "provider_call" as const,
+                },
               };
             }
-            const summary = parseSummaryXml(
-              response,
-              sessionId,
-              session.project,
-              compressed.length,
-            );
+            let summary: SessionSummary | null;
+            let validationError: string | null;
+            try {
+              summary = parseSummaryXml(
+                response,
+                sessionId,
+                session.project,
+                compressed.length,
+              );
+              validationError = summary ? validateFinalSummary(summary) : null;
+            } catch {
+              const failure: StageFailure = {
+                class: "transient_runtime",
+                cause: "summary_reduce_before_final_persistence_failed",
+                phase: "before_final_persistence",
+              };
+              return {
+                success: false,
+                status: "failed",
+                retryableReceiptFailure: retryableReduceReceiptFailure(failure),
+                failure,
+              };
+            }
             if (!summary) {
               return {
                 success: false,
                 status: "failed",
-                failure: summaryStageFailure("parse_failed"),
+                failure: {
+                  ...summaryStageFailure("parse_failed"),
+                  phase: "before_final_persistence" as const,
+                },
               };
             }
-            const validationError = validateFinalSummary(summary);
             if (validationError) {
               return {
                 success: false,
                 status: "failed",
-                failure: summaryStageFailure("parse_failed"),
+                failure: {
+                  ...summaryStageFailure("parse_failed"),
+                  phase: "before_final_persistence" as const,
+                },
               };
             }
-            await persistResumableSummary(
-              kv,
-              run!,
-              summary,
-              completedChunks,
-              skippedChunks,
-              telemetry,
-              "reduced",
-            );
+            try {
+              await persistResumableSummary(
+                kv,
+                run!,
+                summary,
+                completedChunks,
+                skippedChunks,
+                telemetry,
+                "reduced",
+              );
+            } catch {
+              throw new ExtractionOperationResultUncertainError();
+            }
             return {
               success: true,
               status: "succeeded",
               resultRef: { scope: KV.summaryResumableRuns, key: run!.id },
             };
           },
-          { requireExisting: data.requireExistingReceipt === true },
+          {
+            requireExisting: data.requireExistingReceipt === true,
+            retryFailed: true,
+          },
         );
         if (receipt.failure) {
           if (receipt.failure.class === "hard" || receipt.failure.cause === "extraction_operation_reconciliation_required") {
@@ -2232,10 +2303,7 @@ async function runResumableSummaryStep(
               telemetry,
             });
           }
-          return persistReduceFailure(
-            receipt.failure.cause,
-            summaryFailureCause(receipt.failure.cause),
-          );
+          return persistReduceFailure(receipt.failure);
         }
         const succeededRun = await kv.get<ResumableSummaryRun>(
           KV.summaryResumableRuns,
@@ -2294,14 +2362,19 @@ async function runResumableSummaryStep(
           );
         }
         const failureCause = summaryFailureCause(error);
-        return persistReduceFailure(
-          failureCause,
-          failureCause,
-          diagnosticsFromProviderError(error, "reduce"),
-        );
+        return persistReduceFailure({
+          ...summaryStageFailure(
+            failureCause,
+            diagnosticsFromProviderError(error, "reduce"),
+          ),
+          phase: "provider_call",
+        });
       }
       if (!response || !response.trim()) {
-        return persistReduceFailure("empty_provider_response", "provider_failure");
+        return persistReduceFailure({
+          ...summaryStageFailure("provider_failure"),
+          phase: "provider_call",
+        });
       }
       const summary = parseSummaryXml(
         response,
@@ -2309,9 +2382,15 @@ async function runResumableSummaryStep(
         session.project,
         compressed.length,
       );
-      if (!summary) return persistReduceFailure("parse_failed", "parse_failed");
+      if (!summary) return persistReduceFailure({
+        ...summaryStageFailure("parse_failed"),
+        phase: "before_final_persistence",
+      });
       const validationError = validateFinalSummary(summary);
-      if (validationError) return persistReduceFailure(validationError, "parse_failed");
+      if (validationError) return persistReduceFailure({
+        ...summaryStageFailure("parse_failed"),
+        phase: "before_final_persistence",
+      });
       return await persistResumableSummary(
         kv,
         run,

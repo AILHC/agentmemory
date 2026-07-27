@@ -81,6 +81,12 @@ const ORCHESTRATION_POLICY = Object.freeze({
   unit_extra_attempts_per_epoch: 2,
   runtime_unhealthy_confirmations: 2,
 });
+const STAGE_FAILURE_PHASES = new Set([
+  'provider_preflight',
+  'provider_call',
+  'before_final_persistence',
+  'final_result_persistence',
+]);
 const STAGE_FAILURE_CLASSES = new Set(['transient_provider', 'transient_runtime', 'unit', 'hard']);
 const PROVIDER_FAILURE_CAUSES = new Set([
   'pi_stream_failed',
@@ -218,6 +224,7 @@ function normalizeFailureClassification(failure) {
   return {
     class: classification,
     cause: nonEmptyString(failure.cause) || 'stage_failed',
+    ...(STAGE_FAILURE_PHASES.has(failure.phase) ? { phase: failure.phase } : {}),
     ...(diagnostics ? { diagnostics } : {}),
   };
 }
@@ -5495,6 +5502,7 @@ async function runV2JournalSingleStage({
       [stage]: {
         status: result.status,
         ...(result.unitId ? { unit_id: result.unitId } : {}),
+        ...(result.failure ? { failure: normalizeFailureClassification(result.failure) } : {}),
       },
     });
   }
@@ -5728,6 +5736,17 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
           return { status: 'pending' };
         }
         if (result?.ok === false || ['failed', 'infeasible', 'preflight_unavailable'].includes(data.status)) {
+          const failure = data?.failure;
+          if (
+            operationId.endsWith(':reduce')
+            && ['transient_provider', 'transient_runtime'].includes(failure?.class)
+            && ['provider_call', 'before_final_persistence'].includes(failure?.phase)
+          ) {
+            return {
+              status: 'pending',
+              failure,
+            };
+          }
           const terminalResult = {
             status: 'failed',
             payload: { error: failureCause || 'resumable summarize failed' },

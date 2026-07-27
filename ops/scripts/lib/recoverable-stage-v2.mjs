@@ -431,7 +431,11 @@ export async function runSinglePhaseStage({
         completeOperation,
       }));
       if (result.status === 'pending') {
-        return { status: 'pending', unitId: unit.unit_id };
+        return {
+          status: 'pending',
+          unitId: unit.unit_id,
+          ...(result.failure ? { failure: result.failure } : {}),
+        };
       }
       if (result.status === 'blocked') {
         const payload = blockedPayload(unit, attemptId, result);

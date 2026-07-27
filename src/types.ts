@@ -183,6 +183,8 @@ export type StageFailureClass =
 export interface StageFailure {
   class: StageFailureClass;
   cause: string;
+  /** 仅用于可审计的模型操作失败阶段，不包含原始错误文本。 */
+  phase?: "provider_preflight" | "provider_call" | "before_final_persistence" | "final_result_persistence";
   diagnostics?: StageFailureDiagnostics;
 }
 
@@ -216,6 +218,26 @@ export interface ExtractionOperationReceipt<T = unknown>
     at: string;
     resultStatus: "absent";
     resumableRunId: string;
+  };
+  retry?: {
+    epoch: number;
+    lastSafeFailure: {
+      errorClass: StageFailureClass;
+      cause: string;
+      timestamp: string;
+      phase?: StageFailure["phase"];
+      diagnostics?: StageFailureDiagnostics;
+    };
+  };
+  /**
+   * 最终结果持久化抛出时只记录可白名单化的不确定性；receipt 保持 running，
+   * 以便后续协调而不是把未知提交结果误判为可安全重试。
+   */
+  uncertainty?: {
+    phase: "final_result_persistence";
+    errorClass: "transient_runtime";
+    cause: "extraction_operation_reconciliation_required";
+    timestamp: string;
   };
 }
 

@@ -20,7 +20,29 @@ export interface ExtractionOperationResult<T> {
 
 export interface ExtractionOperationReceiptOptions {
   requireExisting?: boolean;
+  /** 仅 summary reduce 显式启用，允许已确认未持久化结果的失败重开同一 receipt。 */
+  retryFailed?: boolean;
 }
+
+/** 表示回调失去确定性时，最终结果可能已经持久化。 */
+export class ExtractionOperationResultUncertainError extends Error {
+  constructor() {
+    super("extraction_operation_result_uncertain");
+    this.name = "ExtractionOperationResultUncertainError";
+  }
+}
+
+const RECEIPT_FAILURE_PHASES = new Set([
+  "provider_preflight",
+  "provider_call",
+  "before_final_persistence",
+  "final_result_persistence",
+]);
+const PROVIDER_ERROR_CODES = new Set([
+  "model_not_found", "rate_limited", "timeout", "provider_rejected", "auth_failed",
+  "network_error", "server_error", "unknown",
+]);
+const PROVIDER_STOP_REASONS = new Set(["stop", "max_tokens", "tool_use", "error", "aborted"]);
 
 const COMMON_RECEIPT_RESPONSE_KEYS = new Set([
   "success", "status", "stage", "provider", "providerName", "provider_name",
@@ -181,6 +203,63 @@ function causeFromError(error: unknown): StageFailure {
   return { class: "transient_runtime", cause: "extraction_operation_interrupted" };
 }
 
+function safeFailureDiagnostics(value: unknown): StageFailure["diagnostics"] | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    (raw.requestPhase !== "chunk" && raw.requestPhase !== "reduce")
+    || typeof raw.providerErrorCode !== "string"
+    || !PROVIDER_ERROR_CODES.has(raw.providerErrorCode)
+    || !Number.isSafeInteger(raw.elapsedMs) || Number(raw.elapsedMs) < 0
+    || !Number.isSafeInteger(raw.inputChars) || Number(raw.inputChars) < 0
+    || !Number.isSafeInteger(raw.maxOutputTokens) || Number(raw.maxOutputTokens) < 0
+    || typeof raw.responseStarted !== "boolean"
+  ) return undefined;
+  const statusCode = Number.isSafeInteger(raw.statusCode) && Number(raw.statusCode) >= 0
+    ? Number(raw.statusCode) : undefined;
+  const retryAfterMs = Number.isSafeInteger(raw.retryAfterMs) && Number(raw.retryAfterMs) >= 0
+    ? Number(raw.retryAfterMs) : undefined;
+  const responseModel = typeof raw.responseModel === "string"
+    && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(raw.responseModel.trim())
+    ? raw.responseModel.trim() : undefined;
+  const stopReason = typeof raw.stopReason === "string" && PROVIDER_STOP_REASONS.has(raw.stopReason)
+    ? raw.stopReason : undefined;
+  return {
+    requestPhase: raw.requestPhase as NonNullable<StageFailure["diagnostics"]>["requestPhase"],
+    providerErrorCode: raw.providerErrorCode as NonNullable<StageFailure["diagnostics"]>["providerErrorCode"],
+    ...(statusCode === undefined ? {} : { statusCode }),
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+    elapsedMs: Number(raw.elapsedMs),
+    inputChars: Number(raw.inputChars),
+    maxOutputTokens: Number(raw.maxOutputTokens),
+    responseStarted: raw.responseStarted,
+    ...(responseModel ? { responseModel } : {}),
+    ...(stopReason ? { stopReason } : {}),
+  };
+}
+
+function retryableFailureFromResponse(response: unknown, failure: StageFailure): boolean {
+  if (!response || typeof response !== "object" || Array.isArray(response)) return false;
+  const retryable = (response as Record<string, unknown>).retryableReceiptFailure;
+  return retryable === true
+    && (failure.class === "transient_provider" || failure.class === "transient_runtime")
+    && (failure.phase === "provider_call" || failure.phase === "before_final_persistence");
+}
+
+function canReopenFailedReceipt(receipt: ExtractionOperationReceipt): boolean {
+  const failure = receipt.failure;
+  const safeFailure = receipt.retry?.lastSafeFailure;
+  return Boolean(
+    safeFailure
+    && failure
+    && (failure.class === "transient_provider" || failure.class === "transient_runtime")
+    && (failure.phase === "provider_call" || failure.phase === "before_final_persistence")
+    && safeFailure.errorClass === failure.class
+    && safeFailure.cause === failure.cause
+    && safeFailure.phase === failure.phase,
+  );
+}
+
 function failureFromResponse(response: unknown): StageFailure | null {
   if (!response || typeof response !== "object" || Array.isArray(response)) return null;
   const record = response as Record<string, unknown>;
@@ -193,9 +272,16 @@ function failureFromResponse(response: unknown): StageFailure | null {
       && typeof candidate.cause === "string"
       && candidate.cause.trim()
     ) {
+      const diagnostics = safeFailureDiagnostics(candidate.diagnostics);
       return {
         class: candidate.class as StageFailure["class"],
         cause: candidate.cause.trim(),
+        ...(typeof candidate.phase === "string" && RECEIPT_FAILURE_PHASES.has(candidate.phase)
+          ? { phase: candidate.phase as StageFailure["phase"] }
+          : {}),
+        ...(diagnostics
+          ? { diagnostics }
+          : {}),
       };
     }
   }
@@ -207,6 +293,7 @@ function failedReceipt<T>(
   key: string,
   startedAt: string,
   failure: StageFailure,
+  retry: ExtractionOperationReceipt<T>["retry"] | undefined,
 ): ExtractionOperationReceipt<T> {
   return {
     ...identity,
@@ -215,6 +302,7 @@ function failedReceipt<T>(
     startedAt,
     completedAt: new Date().toISOString(),
     failure,
+    ...(retry ? { retry } : {}),
   };
 }
 
@@ -223,6 +311,7 @@ function completedReceipt<T>(
   key: string,
   startedAt: string,
   response: T,
+  retry: ExtractionOperationReceipt<T>["retry"] | undefined,
 ): ExtractionOperationReceipt<T> {
   return {
     ...identity,
@@ -231,6 +320,7 @@ function completedReceipt<T>(
     startedAt,
     completedAt: new Date().toISOString(),
     response,
+    ...(retry ? { retry } : {}),
   };
 }
 
@@ -251,7 +341,7 @@ export async function withExtractionOperationReceipt<T>(
 ): Promise<ExtractionOperationResult<T>> {
   const key = buildExtractionOperationKey(identity);
   return withKeyedLock(`extraction-operation:${key}`, async () => {
-    const existing = await kv.get<ExtractionOperationReceipt<T>>(
+    let existing = await kv.get<ExtractionOperationReceipt<T>>(
       KV.extractionOperationReceipt(key),
       key,
     );
@@ -265,21 +355,39 @@ export async function withExtractionOperationReceipt<T>(
     if (existing?.status === "succeeded" && existing.response !== undefined) {
       return { replayed: true, response: existing.response, receipt: existing };
     }
+    let reopened = false;
     if (existing?.status === "failed") {
-      const failure = existing.failure ?? {
-        class: "unit" as const,
-        cause: "extraction_operation_failed",
-      };
-      return { replayed: true, failure, receipt: existing };
+      if (options.retryFailed && options.requireExisting && canReopenFailedReceipt(existing)) {
+        const running: ExtractionOperationReceipt<T> = {
+          ...existing,
+          status: "running",
+          completedAt: undefined,
+          response: undefined,
+          failure: undefined,
+          retry: {
+            ...existing.retry,
+            epoch: existing.retry.epoch + 1,
+          },
+        };
+        await kv.set(KV.extractionOperationReceipt(key), key, running);
+        existing = running;
+        reopened = true;
+      } else {
+        const failure = existing.failure ?? {
+          class: "unit" as const,
+          cause: "extraction_operation_failed",
+        };
+        return { replayed: true, failure, receipt: existing };
+      }
     }
-    if (existing?.status === "running") {
+    if (existing?.status === "running" && !reopened) {
       const failure: StageFailure = {
         class: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
       };
       return { replayed: true, failure, receipt: existing };
     }
-    if (options.requireExisting) {
+    if (options.requireExisting && !reopened) {
       const failure: StageFailure = {
         class: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
@@ -287,18 +395,35 @@ export async function withExtractionOperationReceipt<T>(
       return { replayed: true, failure };
     }
 
-    const startedAt = new Date().toISOString();
-    const running: ExtractionOperationReceipt<T> = {
-      ...identity,
-      key,
-      status: "running",
-      startedAt,
+    const startedAt = existing?.startedAt ?? new Date().toISOString();
+    const running: ExtractionOperationReceipt<T> = existing ?? {
+      ...identity, key, status: "running", startedAt,
     };
-    await kv.set(KV.extractionOperationReceipt(key), key, running);
+    if (!existing) await kv.set(KV.extractionOperationReceipt(key), key, running);
     let rawResponse: T;
     try {
       rawResponse = await execute();
-    } catch {
+    } catch (error) {
+      if (error instanceof ExtractionOperationResultUncertainError) {
+        const timestamp = new Date().toISOString();
+        const failure: StageFailure = {
+          class: "transient_runtime",
+          cause: "extraction_operation_reconciliation_required",
+          phase: "final_result_persistence",
+        };
+        const uncertain: ExtractionOperationReceipt<T> = {
+          ...running,
+          failure,
+          uncertainty: {
+            phase: "final_result_persistence",
+            errorClass: "transient_runtime",
+            cause: "extraction_operation_reconciliation_required",
+            timestamp,
+          },
+        };
+        await kv.set(KV.extractionOperationReceipt(key), key, uncertain);
+        return { replayed: false, failure, receipt: uncertain };
+      }
       const failure: StageFailure = {
         class: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
@@ -307,12 +432,24 @@ export async function withExtractionOperationReceipt<T>(
     }
     const responseFailure = failureFromResponse(rawResponse);
     if (responseFailure) {
-      const failed = failedReceipt<T>(identity, key, startedAt, responseFailure);
+      const retry = retryableFailureFromResponse(rawResponse, responseFailure)
+        ? {
+          epoch: running.retry?.epoch ?? 0,
+          lastSafeFailure: {
+            errorClass: responseFailure.class,
+            cause: responseFailure.cause,
+            timestamp: new Date().toISOString(),
+            ...(responseFailure.phase ? { phase: responseFailure.phase } : {}),
+            ...(responseFailure.diagnostics ? { diagnostics: responseFailure.diagnostics } : {}),
+          },
+        }
+        : running.retry;
+      const failed = failedReceipt<T>(identity, key, startedAt, responseFailure, retry);
       await kv.set(KV.extractionOperationReceipt(key), key, failed);
       return { replayed: false, failure: responseFailure, receipt: failed };
     }
     const response = safeResponse(identity.stage, rawResponse);
-    const succeeded = completedReceipt(identity, key, startedAt, response);
+    const succeeded = completedReceipt(identity, key, startedAt, response, running.retry);
     await kv.set(KV.extractionOperationReceipt(key), key, succeeded);
     return { replayed: false, response, receipt: succeeded };
   });
