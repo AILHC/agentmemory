@@ -12,6 +12,7 @@ const SINGLE_EVENTS = new Set([
   'unit_terminal',
   'unit_blocked',
   'unit_reconciliation_resolved',
+  'unit_summary_failed_terminal_retry_authorized',
   'unit_recorded',
   'stage_completed',
 ]);
@@ -50,6 +51,9 @@ function createUnit(unitId) {
     recorded: false,
     active_operation: null,
     completed_operations: [],
+    completed_operation_events: [],
+    superseded_operations: [],
+    superseded_terminals: [],
   };
 }
 
@@ -115,8 +119,67 @@ function validateStageEvents(events, mode) {
       }
       unit.blocked = false;
       unit.blocked_payload = undefined;
+      if (unit.retry_authorization?.operation_id === event.payload.operation_id) {
+        unit.retry_authorization = null;
+      }
       unit.active_operation = null;
       unit.reconciliations = [...(unit.reconciliations || []), event.payload];
+      continue;
+    }
+    if (event.type === 'unit_summary_failed_terminal_retry_authorized') {
+      const completedOperation = unit.completed_operation_events.at(-1);
+      const lastSafeFailure = event.payload?.last_safe_failure;
+      if (
+        mode !== 'single'
+        || unit.blocked
+        || unit.recorded
+        || unit.active_operation
+        || unit.terminal !== 'failed'
+        || event.payload?.stage !== 'summary'
+        || event.payload?.attempt_id !== unit.attempt_id
+        || event.payload?.operation_id !== `${unitId}:reduce`
+        || event.payload?.runner_input_hash !== unit.input_hash
+        || !/^[0-9a-f]{64}$/.test(String(event.payload?.receipt_input_hash || ''))
+        || event.payload?.receipt_status !== 'failed'
+        || !['transient_provider', 'transient_runtime'].includes(event.payload?.failure_class)
+        || typeof event.payload?.failure_cause !== 'string'
+        || !event.payload.failure_cause
+        || !['provider_call', 'before_final_persistence'].includes(event.payload?.failure_phase)
+        || !Number.isSafeInteger(event.payload?.retry_epoch)
+        || event.payload.retry_epoch < 0
+        || lastSafeFailure?.error_class !== event.payload.failure_class
+        || lastSafeFailure?.cause !== event.payload.failure_cause
+        || lastSafeFailure?.phase !== event.payload.failure_phase
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(
+          String(lastSafeFailure?.timestamp || ''),
+        )
+        || !completedOperation
+        || completedOperation.payload?.attempt_id !== unit.attempt_id
+        || completedOperation.payload?.operation_id !== event.payload.operation_id
+        || completedOperation.payload?.status !== 'failed'
+        || completedOperation.payload?.error !== event.payload.failure_cause
+        || completedOperation.payload?.terminal_result?.status !== 'failed'
+        || completedOperation.payload?.terminal_result?.payload?.error
+          !== event.payload.failure_cause
+        || unit.terminal_payload?.error !== event.payload.failure_cause
+        || event.payload?.superseded_operation_seq !== completedOperation.seq
+        || event.payload?.superseded_terminal_seq !== unit.terminal_seq
+        || event.payload?.expected_journal_seq !== unit.terminal_seq
+        || event.seq !== unit.terminal_seq + 1
+      ) {
+        transitionError(mode, event, 'retry_authorization_evidence');
+      }
+      unit.completed_operations.pop();
+      unit.completed_operation_events.pop();
+      unit.superseded_operations.push(completedOperation);
+      unit.superseded_terminals.push({
+        seq: unit.terminal_seq,
+        payload: unit.terminal_payload,
+      });
+      unit.terminal = null;
+      unit.terminal_payload = undefined;
+      unit.terminal_seq = undefined;
+      unit.retry_authorization = event.payload;
       continue;
     }
     if (unit.recorded) transitionError(mode, event, 'after_recorded');
@@ -167,6 +230,7 @@ function validateStageEvents(events, mode) {
         transitionError(mode, event, 'operation_identity');
       }
       unit.completed_operations.push(event.payload);
+      unit.completed_operation_events.push({ seq: event.seq, payload: event.payload });
       unit.active_operation = null;
       continue;
     }
@@ -251,6 +315,7 @@ function validateStageEvents(events, mode) {
       }
       unit.terminal = event.payload.status;
       unit.terminal_payload = event.payload;
+      unit.terminal_seq = event.seq;
       continue;
     }
     if (event.type === 'unit_recorded') {
@@ -427,6 +492,7 @@ export async function runSinglePhaseStage({
         recovered,
         activeOperation: unit.active_operation,
         completedOperations: [...unit.completed_operations],
+        retryAuthorization: unit.retry_authorization || null,
         startOperation,
         completeOperation,
       }));

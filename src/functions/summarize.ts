@@ -24,7 +24,9 @@ import {
   buildExtractionOperationKey,
   completeModelOperationFromVerifiedResult,
   ExtractionOperationResultUncertainError,
+  normalizeFailedExtractionOperationRetryAuthorization,
   withExtractionOperationReceipt,
+  type FailedExtractionOperationRetryAuthorization,
 } from "./extraction-operation-receipts.js";
 import {
   SUMMARY_SYSTEM,
@@ -1188,6 +1190,7 @@ async function runResumableSummaryStep(
     inputHash?: string;
     operationUnitId?: string;
     requireExistingReceipt?: boolean;
+    failedReceiptRetryAuthorization?: FailedExtractionOperationRetryAuthorization;
   } | undefined,
   kv: StateKV,
   provider: MemoryProvider,
@@ -1204,6 +1207,20 @@ async function runResumableSummaryStep(
   const operationUnitId = typeof data.operationUnitId === "string"
     ? data.operationUnitId.trim()
     : "";
+  const failedReceiptRetryAuthorization = data.failedReceiptRetryAuthorization === undefined
+    ? undefined
+    : normalizeFailedExtractionOperationRetryAuthorization(
+      data.failedReceiptRetryAuthorization,
+    );
+  if (failedReceiptRetryAuthorization === null) {
+    return resumableResponse("failed", 0, 0, 0, {
+      error: "invalid extraction operation retry authorization",
+      failure: {
+        class: "hard",
+        cause: "invalid_extraction_operation_retry_authorization",
+      },
+    });
+  }
   if (
     Boolean(attemptId) !== Boolean(externalInputHash)
     || (
@@ -1227,6 +1244,18 @@ async function runResumableSummaryStep(
     ? Number.parseInt(operationUnitId.slice(mapOperationPrefix.length), 10)
     : null;
   const requestedReduce = operationUnitId === `${sessionId}:reduce`;
+  if (
+    failedReceiptRetryAuthorization !== undefined
+    && (data.requireExistingReceipt !== true || !requestedReduce)
+  ) {
+    return resumableResponse("failed", 0, 0, 0, {
+      error: "invalid extraction operation retry authorization",
+      failure: {
+        class: "hard",
+        cause: "invalid_extraction_operation_retry_authorization",
+      },
+    });
+  }
   if (
     operationUnitId
     && !requestedReduce
@@ -2293,6 +2322,9 @@ async function runResumableSummaryStep(
           {
             requireExisting: data.requireExistingReceipt === true,
             retryFailed: true,
+            ...(failedReceiptRetryAuthorization
+              ? { failedRetryAuthorization: failedReceiptRetryAuthorization }
+              : {}),
           },
         );
         if (receipt.failure) {
@@ -2671,7 +2703,9 @@ export function registerSummarizeFunction(
       model?: string;
       attemptId?: string;
       inputHash?: string;
+      operationUnitId?: string;
       requireExistingReceipt?: boolean;
+      failedReceiptRetryAuthorization?: FailedExtractionOperationRetryAuthorization;
     } | undefined) =>
       runResumableSummaryStep(data, kv, provider, retryOptions),
   );

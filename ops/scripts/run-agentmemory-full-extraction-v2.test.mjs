@@ -4,6 +4,9 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { authorizeSummaryFailedTerminalRetry } from './authorize-agentmemory-summary-failed-terminal-retry.mjs';
+import { RunStateJournalV2 } from './lib/run-state-journal-v2.mjs';
+import { reconcileSummaryOrphan } from './reconcile-agentmemory-extraction-orphan.mjs';
 import { mainForTest, stableHash } from './run-agentmemory-full-extraction.mjs';
 
 function mainForEarlyStages(argv, dependencies = {}) {
@@ -36,6 +39,125 @@ function successfulSummaryResponse({ attemptId, inputHash }, title = 'summary') 
       resumableRunId: stableHash({ attemptId, inputHash, source: 'resumable-run' }),
       summary: { title },
     },
+  };
+}
+
+async function prepareAuthorizedLegacySummaryRun({ baseUrl, stateDir, runId }) {
+  const argv = [
+    '--base-url', baseUrl,
+    '--state-dir', stateDir,
+    '--run-id', runId,
+    '--run-state-format', 'v2',
+  ];
+  const lessonsRemote = {
+    start: async ({ attemptId }) => ({
+      ok: true,
+      data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+    }),
+    record: async () => {},
+  };
+  const summaryRemote = {
+    advance: async ({ operationUnitId }) => {
+      if (operationUnitId === 's1:map:0') {
+        return {
+          ok: true,
+          data: {
+            status: 'in_progress',
+            advanced: 'completed',
+            completedChunks: 1,
+            totalChunks: 1,
+            operationUnitId,
+          },
+        };
+      }
+      return {
+        ok: false,
+        status_code: 500,
+        data: {
+          status: 'failed',
+          operationUnitId,
+          failure: {
+            class: 'transient_provider',
+            cause: 'pi_stream_failed',
+          },
+        },
+      };
+    },
+    record: async () => {},
+  };
+
+  assert.equal(await mainForEarlyStages(argv, {
+    v2SummaryRemote: summaryRemote,
+    v2LessonsRemote: lessonsRemote,
+  }), 1);
+  const rootDir = path.join(stateDir, `${runId}.v2`);
+  const journal = new RunStateJournalV2({ rootDir, runId });
+  const failedEvents = await journal.readStage('summary');
+  const planned = failedEvents.find((event) => event.type === 'unit_planned');
+  const started = failedEvents.find((event) => event.type === 'unit_started');
+  const failedTerminal = failedEvents.at(-1);
+  const receiptInputHash = 'c'.repeat(64);
+  const lastSafeTimestamp = '2026-07-28T00:00:00.000Z';
+  assert.equal(failedTerminal.type, 'unit_terminal');
+
+  await authorizeSummaryFailedTerminalRetry({
+    engineUrl: 'ws://127.0.0.1:49134',
+    stateDir,
+    formalRunId: runId,
+    expectedJournalSeq: failedTerminal.seq,
+    unitId: 's1',
+    attemptId: started.payload.attempt_id,
+    operationId: 's1:reduce',
+    runnerInputHash: planned.payload.input_hash,
+    receiptInputHash,
+    expectedFailureClass: 'transient_provider',
+    expectedFailureCause: 'pi_stream_failed',
+    expectedFailurePhase: 'provider_call',
+    expectedRetryEpoch: 0,
+    expectedLastSafeFailure: {
+      errorClass: 'transient_provider',
+      cause: 'pi_stream_failed',
+      phase: 'provider_call',
+      timestamp: lastSafeTimestamp,
+    },
+  }, {
+    lookupReceipt: async () => ({
+      success: true,
+      operation: {
+        runId: started.payload.attempt_id,
+        stage: 'summary',
+        unitId: 's1:reduce',
+        inputHash: receiptInputHash,
+      },
+      receipt: {
+        status: 'failed',
+        startedAt: '2026-07-27T23:59:00.000Z',
+        completedAt: '2026-07-28T00:00:01.000Z',
+        failure: {
+          class: 'transient_provider',
+          cause: 'pi_stream_failed',
+          phase: 'provider_call',
+        },
+        retry: {
+          epoch: 0,
+          lastSafeFailure: {
+            errorClass: 'transient_provider',
+            cause: 'pi_stream_failed',
+            phase: 'provider_call',
+            timestamp: lastSafeTimestamp,
+          },
+        },
+      },
+    }),
+  });
+
+  return {
+    argv,
+    lessonsRemote,
+    rootDir,
+    receiptInputHash,
+    attemptId: started.payload.attempt_id,
+    runnerInputHash: planned.payload.input_hash,
   };
 }
 
@@ -434,6 +556,526 @@ test('v2 summary retains an active reduce operation for a retryable structured f
     )).trim().split('\n').map(JSON.parse);
     assert.equal(events.filter((event) => event.type === 'unit_terminal').length, 1);
     assert.equal(events.some((event) => event.type === 'unit_blocked'), false);
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 summary resumes an authorized legacy failed reduce only through the existing receipt', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-authorized-retry-'));
+  const runId = 'summary-authorized-retry';
+  const receiptInputHash = 'c'.repeat(64);
+  const receiptModes = [];
+  let legacyFailure = true;
+  try {
+    await withServer(async (request, response) => {
+      response.setHeader('content-type', 'application/json');
+      if (request.method === 'GET' && request.url === '/agentmemory/sessions?agentId=*') {
+        response.end(JSON.stringify({
+          success: true,
+          sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+        }));
+        return;
+      }
+      if (request.method === 'POST' && request.url === '/agentmemory/summarize/resumable') {
+        let raw = '';
+        for await (const chunk of request) raw += chunk;
+        const payload = JSON.parse(raw);
+        receiptModes.push({
+          operationUnitId: payload.operationUnitId,
+          requireExistingReceipt: payload.requireExistingReceipt === true,
+          failedReceiptRetryAuthorization: payload.failedReceiptRetryAuthorization,
+        });
+        if (payload.operationUnitId === 's1:map:0') {
+          response.end(JSON.stringify({
+            success: true,
+            status: 'in_progress',
+            advanced: 'completed',
+            completedChunks: 1,
+            totalChunks: 1,
+            operationUnitId: payload.operationUnitId,
+          }));
+          return;
+        }
+        if (legacyFailure) {
+          legacyFailure = false;
+          response.statusCode = 500;
+          response.end(JSON.stringify({
+            success: false,
+            status: 'failed',
+            operationUnitId: payload.operationUnitId,
+            failure: {
+              class: 'transient_provider',
+              cause: 'pi_stream_failed',
+            },
+          }));
+          return;
+        }
+        const succeeded = successfulSummaryResponse({
+          attemptId: payload.attemptId,
+          inputHash: payload.inputHash,
+        }, 'authorized retry').data;
+        response.end(JSON.stringify({
+          success: true,
+          ...succeeded,
+          operationUnitId: payload.operationUnitId,
+        }));
+        return;
+      }
+      if (request.method === 'POST' && request.url === '/agentmemory/extraction-runs/record') {
+        response.end(JSON.stringify({ success: true }));
+        return;
+      }
+      response.statusCode = 404;
+      response.end(JSON.stringify({ success: false }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', runId,
+        '--run-state-format', 'v2',
+      ];
+      const lessonsRemote = {
+        start: async ({ attemptId }) => ({
+          ok: true,
+          data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+        }),
+        record: async () => {},
+      };
+
+      assert.equal(await mainForEarlyStages(argv, {
+        v2LessonsRemote: lessonsRemote,
+      }), 1);
+
+      const rootDir = path.join(stateDir, `${runId}.v2`);
+      const journal = new RunStateJournalV2({ rootDir, runId });
+      const failedEvents = await journal.readStage('summary');
+      const planned = failedEvents.find((event) => event.type === 'unit_planned');
+      const started = failedEvents.find((event) => event.type === 'unit_started');
+      const failedTerminal = failedEvents.at(-1);
+      assert.equal(failedTerminal.type, 'unit_terminal');
+      assert.equal(failedTerminal.payload.status, 'failed');
+
+      const authorization = await authorizeSummaryFailedTerminalRetry({
+        engineUrl: 'ws://127.0.0.1:49134',
+        stateDir,
+        formalRunId: runId,
+        expectedJournalSeq: failedTerminal.seq,
+        unitId: 's1',
+        attemptId: started.payload.attempt_id,
+        operationId: 's1:reduce',
+        runnerInputHash: planned.payload.input_hash,
+        receiptInputHash,
+        expectedFailureClass: 'transient_provider',
+        expectedFailureCause: 'pi_stream_failed',
+        expectedFailurePhase: 'provider_call',
+        expectedRetryEpoch: 0,
+        expectedLastSafeFailure: {
+          errorClass: 'transient_provider',
+          cause: 'pi_stream_failed',
+          phase: 'provider_call',
+          timestamp: '2026-07-28T00:00:00.000Z',
+        },
+      }, {
+        lookupReceipt: async () => ({
+          success: true,
+          operation: {
+            runId: started.payload.attempt_id,
+            stage: 'summary',
+            unitId: 's1:reduce',
+            inputHash: receiptInputHash,
+          },
+          receipt: {
+            status: 'failed',
+            startedAt: '2026-07-27T23:59:00.000Z',
+            completedAt: '2026-07-28T00:00:01.000Z',
+            failure: {
+              class: 'transient_provider',
+              cause: 'pi_stream_failed',
+              phase: 'provider_call',
+            },
+            retry: {
+              epoch: 0,
+              lastSafeFailure: {
+                errorClass: 'transient_provider',
+                cause: 'pi_stream_failed',
+                phase: 'provider_call',
+                timestamp: '2026-07-28T00:00:00.000Z',
+              },
+            },
+          },
+        }),
+      });
+      assert.equal(authorization.replayed, false);
+
+      assert.equal(await mainForEarlyStages([...argv, '--resume'], {
+        v2LessonsRemote: lessonsRemote,
+      }), 0);
+    });
+
+    assert.deepEqual(receiptModes, [
+      {
+        operationUnitId: 's1:map:0',
+        requireExistingReceipt: false,
+        failedReceiptRetryAuthorization: undefined,
+      },
+      {
+        operationUnitId: 's1:reduce',
+        requireExistingReceipt: false,
+        failedReceiptRetryAuthorization: undefined,
+      },
+      {
+        operationUnitId: 's1:reduce',
+        requireExistingReceipt: true,
+        failedReceiptRetryAuthorization: {
+          receiptInputHash,
+          retryEpoch: 0,
+          failureClass: 'transient_provider',
+          failureCause: 'pi_stream_failed',
+          failurePhase: 'provider_call',
+          lastSafeFailure: {
+            errorClass: 'transient_provider',
+            cause: 'pi_stream_failed',
+            phase: 'provider_call',
+            timestamp: '2026-07-28T00:00:00.000Z',
+          },
+        },
+      },
+    ]);
+    const events = (await fs.readFile(
+      path.join(stateDir, `${runId}.v2`, 'summary.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(
+      events.filter((event) => event.type === 'unit_summary_failed_terminal_retry_authorized').length,
+      1,
+    );
+    assert.deepEqual(
+      events.filter((event) => event.type === 'unit_terminal')
+        .map((event) => event.payload.status),
+      ['failed', 'succeeded'],
+    );
+    assert.equal(
+      events.filter((event) =>
+        event.type === 'unit_operation_completed'
+        && event.payload.operation_id === 's1:reduce').length,
+      2,
+    );
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('v2 summary authorized retry preserves recoverable receipt boundaries', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const scenarios = [
+    {
+      name: 'safe failure becomes a new terminal that can be authorized again',
+      responses: [{
+        ok: false,
+        status_code: 500,
+        data: {
+          status: 'failed',
+          operationUnitId: 's1:reduce',
+          failure: {
+            class: 'transient_provider',
+            cause: 'provider_retry_failed',
+            phase: 'provider_call',
+          },
+        },
+      }],
+      expectedCodes: [1],
+      expectedLastType: 'unit_terminal',
+      expectedCause: 'provider_retry_failed',
+      reauthorize: true,
+    },
+    {
+      name: 'lost safe-failure response becomes the real failure terminal on resume',
+      responses: [
+        { ok: false, status_code: 0, error: 'response_lost' },
+        {
+          ok: false,
+          status_code: 500,
+          data: {
+            status: 'failed',
+            operationUnitId: 's1:reduce',
+            failure: {
+              class: 'transient_runtime',
+              cause: 'reduce_retry_failed',
+              phase: 'before_final_persistence',
+            },
+          },
+        },
+      ],
+      expectedCodes: [75, 1],
+      expectedLastType: 'unit_terminal',
+      expectedCause: 'reduce_retry_failed',
+    },
+    {
+      name: 'lost succeeded response replays success',
+      responses: [
+        { ok: false, status_code: 0, error: 'response_lost' },
+        'success',
+      ],
+      expectedCodes: [75, 0],
+      expectedLastType: 'stage_completed',
+      expectedCause: null,
+    },
+    {
+      name: 'lost running response reconciles absent and resumes without stale authorization',
+      responses: [
+        { ok: false, status_code: 0, error: 'response_lost' },
+        {
+          ok: false,
+          status_code: 409,
+          data: {
+            status: 'failed',
+            failure: {
+              class: 'transient_runtime',
+              cause: 'extraction_operation_reconciliation_required',
+            },
+          },
+        },
+        'success',
+      ],
+      expectedCodes: [75, 1],
+      expectedLastType: 'stage_completed',
+      expectedCause: null,
+      reconcileAfterBlock: true,
+    },
+  ];
+
+  try {
+    for (const scenario of scenarios) {
+      await context.test(scenario.name, async () => {
+        const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-authorized-boundary-'));
+        const runId = `authorized-${scenario.name.replaceAll(/[^a-z]+/g, '-').replace(/^-|-$/g, '')}`;
+        try {
+          await withServer((request, response) => {
+            assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+            response.setHeader('content-type', 'application/json');
+            response.end(JSON.stringify({
+              success: true,
+              sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+            }));
+          }, async (baseUrl) => {
+            const prepared = await prepareAuthorizedLegacySummaryRun({
+              baseUrl,
+              stateDir,
+              runId,
+            });
+            let responseIndex = 0;
+            const requests = [];
+            const summaryRemote = {
+              advance: async (request) => {
+                requests.push(request);
+                const response = scenario.responses[responseIndex++];
+                assert.notEqual(response, undefined, 'unexpected authorized summary dispatch');
+                if (response === 'success') {
+                  return {
+                    ...successfulSummaryResponse(request, 'replayed success'),
+                    data: {
+                      ...successfulSummaryResponse(request, 'replayed success').data,
+                      operationUnitId: request.operationUnitId,
+                    },
+                  };
+                }
+                return response;
+              },
+              record: async () => {},
+            };
+
+            for (const expectedCode of scenario.expectedCodes) {
+              const code = await mainForEarlyStages([...prepared.argv, '--resume'], {
+                v2SummaryRemote: summaryRemote,
+                v2LessonsRemote: prepared.lessonsRemote,
+              });
+              assert.equal(code, expectedCode);
+            }
+
+            if (scenario.reconcileAfterBlock) {
+              const journal = new RunStateJournalV2({
+                rootDir: prepared.rootDir,
+                runId,
+              });
+              const blockedEvents = await journal.readStage('summary');
+              const blocked = blockedEvents.at(-1);
+              assert.equal(blocked.type, 'unit_blocked');
+              assert.equal(
+                blocked.payload.reason,
+                'extraction_operation_reconciliation_required',
+              );
+              const receiptStartedAt = '2026-07-28T00:02:00.000Z';
+              const reconciliation = await reconcileSummaryOrphan({
+                stateDir,
+                formalRunId: runId,
+                expectedJournalSeq: blocked.seq,
+                operation: {
+                  runId: prepared.attemptId,
+                  stage: 'summary',
+                  unitId: 's1:reduce',
+                  inputHash: prepared.receiptInputHash,
+                  expectedStatus: 'running',
+                  expectedStartedAt: receiptStartedAt,
+                },
+                result: {
+                  sessionId: 's1',
+                  resumableRunId: `sumr_${'d'.repeat(24)}`,
+                  serviceInputHash: 'e'.repeat(64),
+                  runnerInputHash: prepared.runnerInputHash,
+                  generationConfigHash: 'f'.repeat(64),
+                },
+              }, {
+                reconcileReceipt: async ({ operation }) => ({
+                  success: true,
+                  replayed: false,
+                  operation: {
+                    runId: operation.runId,
+                    stage: operation.stage,
+                    unitId: operation.unitId,
+                    inputHash: operation.inputHash,
+                  },
+                  receipt: {
+                    status: 'reconciled',
+                    startedAt: receiptStartedAt,
+                    completedAt: '2026-07-28T00:02:01.000Z',
+                    failure: {
+                      class: 'transient_runtime',
+                      cause: 'orphaned_operation_result_absent',
+                    },
+                  },
+                  reconciliation: {
+                    id: 'xrec_0123456789abcdef0123456789abcdef',
+                    at: '2026-07-28T00:02:01.000Z',
+                    resultStatus: 'absent',
+                  },
+                }),
+              });
+              assert.equal(reconciliation.success, true);
+
+              const resumedCode = await mainForEarlyStages([...prepared.argv, '--resume'], {
+                v2SummaryRemote: summaryRemote,
+                v2LessonsRemote: prepared.lessonsRemote,
+              });
+              assert.equal(resumedCode, 0);
+            }
+
+            assert.equal(requests.length, scenario.responses.length);
+            for (const [requestIndex, request] of requests.entries()) {
+              assert.equal(request.operationUnitId, 's1:reduce');
+              assert.equal(request.attemptId, prepared.attemptId);
+              assert.equal(request.inputHash, prepared.runnerInputHash);
+              if (scenario.reconcileAfterBlock && requestIndex === requests.length - 1) {
+                assert.equal(request.requireExistingReceipt, false);
+                assert.equal(request.failedReceiptRetryAuthorization, undefined);
+                continue;
+              }
+              assert.equal(request.requireExistingReceipt, true);
+              assert.equal(request.failedReceiptRetryAuthorization.retryEpoch, 0);
+              assert.equal(
+                request.failedReceiptRetryAuthorization.receiptInputHash,
+                prepared.receiptInputHash,
+              );
+            }
+            const events = (await fs.readFile(
+              path.join(prepared.rootDir, 'summary.jsonl'),
+              'utf8',
+            )).trim().split('\n').map(JSON.parse);
+            assert.equal(events.at(-1).type, scenario.expectedLastType);
+            assert.equal(
+              events.some((event) =>
+                event.type === 'unit_terminal'
+                && event.payload.error === 'extraction_operation_retry_authorization_drifted'),
+              false,
+            );
+            if (scenario.expectedLastType === 'unit_terminal') {
+              assert.equal(events.at(-1).payload.error, scenario.expectedCause);
+              const completed = events.at(-2);
+              assert.equal(completed.type, 'unit_operation_completed');
+              assert.equal(completed.payload.error, scenario.expectedCause);
+              assert.equal(completed.payload.terminal_result.payload.error, scenario.expectedCause);
+            }
+            if (scenario.expectedLastType === 'unit_blocked') {
+              assert.equal(events.at(-1).payload.reason, scenario.expectedCause);
+            }
+            if (scenario.reconcileAfterBlock) {
+              assert.equal(
+                events.filter((event) => event.type === 'unit_reconciliation_resolved').length,
+                1,
+              );
+              assert.equal(
+                events.filter((event) =>
+                  event.type === 'unit_operation_started'
+                  && event.payload.operation_id === 's1:reduce').length,
+                3,
+              );
+            }
+            if (scenario.reauthorize) {
+              const terminal = events.at(-1);
+              const secondAuthorization = await authorizeSummaryFailedTerminalRetry({
+                engineUrl: 'ws://127.0.0.1:49134',
+                stateDir,
+                formalRunId: runId,
+                expectedJournalSeq: terminal.seq,
+                unitId: 's1',
+                attemptId: prepared.attemptId,
+                operationId: 's1:reduce',
+                runnerInputHash: prepared.runnerInputHash,
+                receiptInputHash: prepared.receiptInputHash,
+                expectedFailureClass: 'transient_provider',
+                expectedFailureCause: scenario.expectedCause,
+                expectedFailurePhase: 'provider_call',
+                expectedRetryEpoch: 1,
+                expectedLastSafeFailure: {
+                  errorClass: 'transient_provider',
+                  cause: scenario.expectedCause,
+                  phase: 'provider_call',
+                  timestamp: '2026-07-28T00:01:00.000Z',
+                },
+              }, {
+                lookupReceipt: async () => ({
+                  success: true,
+                  operation: {
+                    runId: prepared.attemptId,
+                    stage: 'summary',
+                    unitId: 's1:reduce',
+                    inputHash: prepared.receiptInputHash,
+                  },
+                  receipt: {
+                    status: 'failed',
+                    startedAt: '2026-07-27T23:59:00.000Z',
+                    completedAt: '2026-07-28T00:01:01.000Z',
+                    failure: {
+                      class: 'transient_provider',
+                      cause: scenario.expectedCause,
+                      phase: 'provider_call',
+                    },
+                    retry: {
+                      epoch: 1,
+                      lastSafeFailure: {
+                        errorClass: 'transient_provider',
+                        cause: scenario.expectedCause,
+                        phase: 'provider_call',
+                        timestamp: '2026-07-28T00:01:00.000Z',
+                      },
+                    },
+                  },
+                }),
+              });
+              assert.equal(secondAuthorization.replayed, false);
+            }
+          });
+        } finally {
+          await fs.rm(stateDir, { recursive: true, force: true });
+        }
+      });
+    }
   } finally {
     if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
     else process.env.AGENTMEMORY_SECRET = previousSecret;

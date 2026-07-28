@@ -66,6 +66,96 @@ function Read-AmV2Journal {
   return $events
 }
 
+function Test-AmStatusSafeNonNegativeInteger {
+  param($Value)
+  if ($null -eq $Value) { return $false }
+  $integralTypes = @(
+    [byte], [sbyte],
+    [int16], [uint16],
+    [int32], [uint32],
+    [int64], [uint64]
+  )
+  if ($integralTypes -notcontains $Value.GetType()) { return $false }
+  return [decimal]$Value -ge 0 -and [decimal]$Value -le 9007199254740991
+}
+
+function Test-AmV2SummaryRetryAuthorization {
+  param(
+    [Parameter(Mandatory = $true)]$Event,
+    $CompletedOperation,
+    $FailedTerminal,
+    [string]$PlannedInputHash = '',
+    [string]$StartedAttemptId = ''
+  )
+  if ($null -eq $CompletedOperation -or $null -eq $FailedTerminal) { return $false }
+  $payload = $Event.payload
+  $operationPayload = $CompletedOperation.payload
+  $terminalPayload = $FailedTerminal.payload
+  $lastSafe = Get-AmStatusProperty -Object $payload -Name 'last_safe_failure'
+  $terminalResult = Get-AmStatusProperty -Object $operationPayload -Name 'terminal_result'
+  if ($null -eq $lastSafe -or $null -eq $terminalResult) { return $false }
+  $terminalResultPayload = Get-AmStatusProperty -Object $terminalResult -Name 'payload'
+  if ($null -eq $terminalResultPayload) { return $false }
+
+  $unitId = [string](Get-AmStatusProperty -Object $payload -Name 'unit_id')
+  $attemptId = [string](Get-AmStatusProperty -Object $payload -Name 'attempt_id')
+  $operationId = [string](Get-AmStatusProperty -Object $payload -Name 'operation_id')
+  $failureClass = [string](Get-AmStatusProperty -Object $payload -Name 'failure_class')
+  $failureCause = [string](Get-AmStatusProperty -Object $payload -Name 'failure_cause')
+  $failurePhase = [string](Get-AmStatusProperty -Object $payload -Name 'failure_phase')
+  $retryEpochRaw = Get-AmStatusProperty -Object $payload -Name 'retry_epoch'
+  $completedOperationSeq = Get-AmStatusProperty -Object $CompletedOperation -Name 'seq'
+  $failedTerminalSeq = Get-AmStatusProperty -Object $FailedTerminal -Name 'seq'
+  $authorizationSeq = Get-AmStatusProperty -Object $Event -Name 'seq'
+  $supersededOperationSeq = Get-AmStatusProperty -Object $payload -Name 'superseded_operation_seq'
+  $supersededTerminalSeq = Get-AmStatusProperty -Object $payload -Name 'superseded_terminal_seq'
+  $expectedJournalSeq = Get-AmStatusProperty -Object $payload -Name 'expected_journal_seq'
+  if (
+    -not (Test-AmStatusSafeNonNegativeInteger -Value $retryEpochRaw) -or
+    -not (Test-AmStatusSafeNonNegativeInteger -Value $completedOperationSeq) -or
+    -not (Test-AmStatusSafeNonNegativeInteger -Value $failedTerminalSeq) -or
+    -not (Test-AmStatusSafeNonNegativeInteger -Value $authorizationSeq) -or
+    -not (Test-AmStatusSafeNonNegativeInteger -Value $supersededOperationSeq) -or
+    -not (Test-AmStatusSafeNonNegativeInteger -Value $supersededTerminalSeq) -or
+    -not (Test-AmStatusSafeNonNegativeInteger -Value $expectedJournalSeq)
+  ) { return $false }
+
+  return (
+    [string](Get-AmStatusProperty -Object $payload -Name 'stage') -ceq 'summary' -and
+    -not [string]::IsNullOrWhiteSpace($unitId) -and
+    $operationId -ceq "$unitId`:reduce" -and
+    $attemptId -ceq $StartedAttemptId -and
+    [string](Get-AmStatusProperty -Object $payload -Name 'runner_input_hash') -ceq $PlannedInputHash -and
+    [string](Get-AmStatusProperty -Object $payload -Name 'receipt_input_hash') -cmatch '^[0-9a-f]{64}$' -and
+    [string](Get-AmStatusProperty -Object $payload -Name 'receipt_status') -ceq 'failed' -and
+    @('transient_provider', 'transient_runtime') -ccontains $failureClass -and
+    $failureCause -cmatch '^[a-z0-9][a-z0-9_.:-]{0,127}$' -and
+    @('provider_call', 'before_final_persistence') -ccontains $failurePhase -and
+    [string](Get-AmStatusProperty -Object $lastSafe -Name 'error_class') -ceq $failureClass -and
+    [string](Get-AmStatusProperty -Object $lastSafe -Name 'cause') -ceq $failureCause -and
+    [string](Get-AmStatusProperty -Object $lastSafe -Name 'phase') -ceq $failurePhase -and
+    [string](Get-AmStatusProperty -Object $lastSafe -Name 'timestamp') -cmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$' -and
+    [string]$CompletedOperation.type -ceq 'unit_operation_completed' -and
+    [long]$completedOperationSeq -eq ([long]$failedTerminalSeq - 1) -and
+    [long]$supersededOperationSeq -eq [long]$completedOperationSeq -and
+    [string](Get-AmStatusProperty -Object $operationPayload -Name 'unit_id') -ceq $unitId -and
+    [string](Get-AmStatusProperty -Object $operationPayload -Name 'attempt_id') -ceq $attemptId -and
+    [string](Get-AmStatusProperty -Object $operationPayload -Name 'operation_id') -ceq $operationId -and
+    [string](Get-AmStatusProperty -Object $operationPayload -Name 'status') -ceq 'failed' -and
+    [string](Get-AmStatusProperty -Object $operationPayload -Name 'error') -ceq $failureCause -and
+    [string](Get-AmStatusProperty -Object $terminalResult -Name 'status') -ceq 'failed' -and
+    [string](Get-AmStatusProperty -Object $terminalResultPayload -Name 'error') -ceq $failureCause -and
+    [string]$FailedTerminal.type -ceq 'unit_terminal' -and
+    [long]$failedTerminalSeq -eq ([long]$authorizationSeq - 1) -and
+    [long]$supersededTerminalSeq -eq [long]$failedTerminalSeq -and
+    [long]$expectedJournalSeq -eq [long]$failedTerminalSeq -and
+    [string](Get-AmStatusProperty -Object $terminalPayload -Name 'unit_id') -ceq $unitId -and
+    [string](Get-AmStatusProperty -Object $terminalPayload -Name 'attempt_id') -ceq $attemptId -and
+    [string](Get-AmStatusProperty -Object $terminalPayload -Name 'status') -ceq 'failed' -and
+    [string](Get-AmStatusProperty -Object $terminalPayload -Name 'error') -ceq $failureCause
+  )
+}
+
 function Get-AmV2StageFacts {
   param(
     [Parameter(Mandatory = $true)][string]$Path
@@ -82,10 +172,22 @@ function Get-AmV2StageFacts {
   $terminal = [System.Collections.Generic.Dictionary[string, string]]::new(
     [System.StringComparer]::Ordinal
   )
+  $plannedInputHashes = [System.Collections.Generic.Dictionary[string, string]]::new(
+    [System.StringComparer]::Ordinal
+  )
+  $attemptIds = [System.Collections.Generic.Dictionary[string, string]]::new(
+    [System.StringComparer]::Ordinal
+  )
   $completed = $false
   $lastSeq = -1
   $lastAt = $null
+  $previousEvent = $null
+  $previousPreviousEvent = $null
   foreach ($event in (Read-AmV2Journal -Path $Path)) {
+    $priorEvent = $previousEvent
+    $priorPriorEvent = $previousPreviousEvent
+    $previousPreviousEvent = $previousEvent
+    $previousEvent = $event
     $lastSeq = [Math]::Max($lastSeq, [int]$event.seq)
     if ($null -ne $event.at -and
         ($null -eq $lastAt -or [string]$event.at -gt [string]$lastAt)) {
@@ -99,17 +201,42 @@ function Get-AmV2StageFacts {
     if ([string]::IsNullOrWhiteSpace([string]$unitId)) { continue }
     if ([string]$event.type -eq 'unit_planned') {
       [void]$planned.Add([string]$unitId)
+      $plannedInputHashes[[string]$unitId] = [string](
+        Get-AmStatusProperty -Object $event.payload -Name 'input_hash'
+      )
     } elseif ([string]$event.type -in @(
         'unit_started',
         'unit_prepare_started',
-        'unit_committing'
+        'unit_committing',
+        'unit_operation_started'
       )) {
       [void]$started.Add([string]$unitId)
+      if ([string]$event.type -eq 'unit_started') {
+        $attemptIds[[string]$unitId] = [string](
+          Get-AmStatusProperty -Object $event.payload -Name 'attempt_id'
+        )
+      }
     } elseif ([string]$event.type -eq 'unit_blocked') {
       [void]$blocked.Add([string]$unitId)
     } elseif ([string]$event.type -eq 'unit_reconciliation_resolved') {
       [void]$blocked.Remove([string]$unitId)
       [void]$started.Remove([string]$unitId)
+    } elseif ([string]$event.type -eq 'unit_summary_failed_terminal_retry_authorized') {
+      $plannedInputHash = if ($plannedInputHashes.ContainsKey([string]$unitId)) {
+        $plannedInputHashes[[string]$unitId]
+      } else { '' }
+      $attemptId = if ($attemptIds.ContainsKey([string]$unitId)) {
+        $attemptIds[[string]$unitId]
+      } else { '' }
+      if (Test-AmV2SummaryRetryAuthorization `
+          -Event $event `
+          -CompletedOperation $priorPriorEvent `
+          -FailedTerminal $priorEvent `
+          -PlannedInputHash $plannedInputHash `
+          -StartedAttemptId $attemptId) {
+        [void]$terminal.Remove([string]$unitId)
+        [void]$started.Remove([string]$unitId)
+      }
     } elseif ([string]$event.type -eq 'unit_terminal') {
       $status = [string](Get-AmStatusProperty -Object $event.payload -Name 'status')
       $terminal[[string]$unitId] = $status

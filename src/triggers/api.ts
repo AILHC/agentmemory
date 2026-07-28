@@ -51,8 +51,10 @@ import { resolveOutputLanguage } from "../prompts/output-language.js";
 import {
   buildExtractionOperationKey,
   completeModelOperationFromVerifiedResult,
+  normalizeFailedExtractionOperationRetryAuthorization,
   withExtractionOperationReceipt,
   withIdempotentCommitReceipt,
+  type FailedExtractionOperationRetryAuthorization,
 } from "../functions/extraction-operation-receipts.js";
 import { findMemoryConsolidationProposalResult } from "../functions/consolidate.js";
 import {
@@ -65,6 +67,13 @@ const SUMMARY_FAILURE_CLASSES = new Set([
   "transient_runtime",
   "unit",
   "hard",
+]);
+
+const SUMMARY_FAILURE_PHASES = new Set<NonNullable<StageFailure["phase"]>>([
+  "provider_preflight",
+  "provider_call",
+  "before_final_persistence",
+  "final_result_persistence",
 ]);
 
 type Response = {
@@ -96,6 +105,9 @@ function sanitizeSummaryApiResult(result: unknown): unknown {
     failure: {
       class: source.class,
       cause: source.cause,
+      ...(typeof source.phase === "string" && SUMMARY_FAILURE_PHASES.has(source.phase as NonNullable<StageFailure["phase"]>)
+        ? { phase: source.phase }
+        : {}),
       ...(diagnostics ? { diagnostics } : {}),
     },
   };
@@ -591,6 +603,13 @@ function sessionAttemptInputHash(session: Session): string {
 
 function hasOnlyKeys(body: Record<string, unknown>, allowed: Set<string>): boolean {
   return Object.keys(body).every((key) => allowed.has(key));
+}
+
+function parseFailedReceiptRetryAuthorization(
+  value: unknown,
+): FailedExtractionOperationRetryAuthorization | null | undefined {
+  if (value === undefined) return undefined;
+  return normalizeFailedExtractionOperationRetryAuthorization(value);
 }
 
 function requirePlainBody(raw: unknown): Record<string, unknown> | null {
@@ -2244,6 +2263,7 @@ export function registerApiTriggers(
         inputHash?: string;
         operationUnitId?: string;
         requireExistingReceipt?: boolean;
+        failedReceiptRetryAuthorization?: FailedExtractionOperationRetryAuthorization;
       }>,
     ): Promise<Response> => {
       const body = (req.body as Record<string, unknown>) || {};
@@ -2257,6 +2277,30 @@ export function registerApiTriggers(
       const inputHash = optionalNonEmptyString(body, "inputHash");
       const operationUnitId = optionalNonEmptyString(body, "operationUnitId");
       const requireExistingReceipt = parseOptionalStrictBoolean(body.requireExistingReceipt);
+      const failedReceiptRetryAuthorization = parseFailedReceiptRetryAuthorization(
+        body.failedReceiptRetryAuthorization,
+      );
+      if (
+        failedReceiptRetryAuthorization === null
+        || (
+          failedReceiptRetryAuthorization !== undefined
+          && (
+            requireExistingReceipt !== true
+            || operationUnitId !== `${sessionId}:reduce`
+          )
+        )
+      ) {
+        return {
+          status_code: 400,
+          body: {
+            success: false,
+            failure: {
+              class: "hard",
+              cause: "invalid_extraction_operation_retry_authorization",
+            },
+          },
+        };
+      }
       if (
         attemptId === null
         || inputHash === null
@@ -2276,6 +2320,9 @@ export function registerApiTriggers(
           ...(attemptId ? { attemptId, inputHash } : {}),
           ...(operationUnitId ? { operationUnitId } : {}),
           ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+          ...(failedReceiptRetryAuthorization
+            ? { failedReceiptRetryAuthorization }
+            : {}),
         },
       });
       return { status_code: 200, body: sanitizeSummaryApiResult(result) };

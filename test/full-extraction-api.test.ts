@@ -1,10 +1,22 @@
 import { createHash } from "node:crypto";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import { registerConsolidateFunction } from "../src/functions/consolidate.js";
-import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
+import {
+  buildExtractionOperationKey,
+  registerExtractionOperationReceiptFunctions,
+} from "../src/functions/extraction-operation-receipts.js";
+import { registerSummarizeFunction } from "../src/functions/summarize.js";
 import { fingerprintId, KV } from "../src/state/schema.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
+import {
+  mainForTest as runFullExtractionV2,
+  stableHash as stableV2Hash,
+} from "../ops/scripts/run-agentmemory-full-extraction.mjs";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -20,6 +32,9 @@ function mockKV() {
     list: async <T>(scope: string): Promise<T[]> => {
       const entries = store.get(scope);
       return entries ? (Array.from(entries.values()) as T[]) : [];
+    },
+    delete: async (scope: string, key: string): Promise<void> => {
+      store.get(scope)?.delete(key);
     },
   };
 }
@@ -60,6 +75,25 @@ function stableHash(value: unknown): string {
 
 function sessionInputHash(sessionId: string, startedAt: string): string {
   return stableHash({ session_id: sessionId, started_at: startedAt });
+}
+
+async function readRequestBody(request: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function listen(handler: (request: IncomingMessage, response: ServerResponse) => Promise<void>) {
+  const server = createServer((request, response) => {
+    void handler(request, response);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("test server address unavailable");
+  return {
+    baseUrl: `http://127.0.0.1:${address.port}`,
+    close: () => new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve())),
+  };
 }
 
 describe("full extraction REST wrappers", () => {
@@ -438,6 +472,243 @@ describe("full extraction REST wrappers", () => {
     });
   });
 
+  it("forwards only exact summary failed-receipt retry evidence", async () => {
+    const sdk = mockSdk(async () => ({ success: true, status: "in_progress" }));
+    registerApiTriggers(sdk as never, mockKV() as never, "");
+    const failedReceiptRetryAuthorization = {
+      receiptInputHash: "a".repeat(64),
+      retryEpoch: 0,
+      failureClass: "transient_provider",
+      failureCause: "pi_stream_failed",
+      failurePhase: "provider_call",
+      lastSafeFailure: {
+        errorClass: "transient_provider",
+        cause: "pi_stream_failed",
+        phase: "provider_call",
+        timestamp: "2026-07-28T00:00:00.000Z",
+      },
+    };
+
+    const response = await sdk.getFunction("api::summarize-resumable")({
+      headers: {},
+      body: {
+        sessionId: "session-1",
+        attemptId: "attempt-1",
+        inputHash: "freshness-1",
+        operationUnitId: "session-1:reduce",
+        requireExistingReceipt: true,
+        failedReceiptRetryAuthorization,
+      },
+    });
+
+    expect(response.status_code).toBe(200);
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::summarize-resumable",
+      payload: {
+        sessionId: "session-1",
+        attemptId: "attempt-1",
+        inputHash: "freshness-1",
+        operationUnitId: "session-1:reduce",
+        requireExistingReceipt: true,
+        failedReceiptRetryAuthorization,
+      },
+    });
+  });
+
+  it.each([
+    {
+      name: "unsafe phase",
+      patch: { failurePhase: "provider_preflight" },
+    },
+    {
+      name: "last-safe mismatch",
+      patch: { lastSafeFailure: { cause: "other_failure" } },
+    },
+    {
+      name: "unknown field",
+      patch: { response: "must-not-cross-boundary" },
+    },
+  ])("rejects malformed summary retry authorization: $name", async ({ patch }) => {
+    const sdk = mockSdk(async () => ({ success: true, status: "in_progress" }));
+    registerApiTriggers(sdk as never, mockKV() as never, "");
+    const base = {
+      receiptInputHash: "a".repeat(64),
+      retryEpoch: 0,
+      failureClass: "transient_provider",
+      failureCause: "pi_stream_failed",
+      failurePhase: "provider_call",
+      lastSafeFailure: {
+        errorClass: "transient_provider",
+        cause: "pi_stream_failed",
+        phase: "provider_call",
+        timestamp: "2026-07-28T00:00:00.000Z",
+      },
+    };
+    const failedReceiptRetryAuthorization = {
+      ...base,
+      ...patch,
+      ...(patch.lastSafeFailure
+        ? { lastSafeFailure: { ...base.lastSafeFailure, ...patch.lastSafeFailure } }
+        : {}),
+    };
+
+    const response = await sdk.getFunction("api::summarize-resumable")({
+      headers: {},
+      body: {
+        sessionId: "session-1",
+        attemptId: "attempt-1",
+        inputHash: "freshness-1",
+        operationUnitId: "session-1:reduce",
+        requireExistingReceipt: true,
+        failedReceiptRetryAuthorization,
+      },
+    });
+
+    expect(response.status_code).toBe(400);
+    expect(response.body).toMatchObject({
+      failure: {
+        class: "hard",
+        cause: "invalid_extraction_operation_retry_authorization",
+      },
+    });
+    expect(sdk.trigger).not.toHaveBeenCalled();
+  });
+
+  it("passes API retry evidence into the real summary receipt reopen CAS", async () => {
+    const previousChunkSize = process.env.SUMMARIZE_CHUNK_SIZE;
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const functions = new Map<string, Function>();
+    const responses: Array<string | Error> = [
+      "<summary><title>分片一</title><narrative>分片一</narrative><decisions></decisions><files></files><concepts></concepts></summary>",
+      "<summary><title>分片二</title><narrative>分片二</narrative><decisions></decisions><files></files><concepts></concepts></summary>",
+      new Error("pi_stream_failed"),
+      `<summary>
+<title>授权后摘要</title>
+<narrative>这是授权后生成并通过真实收据重开路径持久化的完整摘要内容。</narrative>
+<decisions></decisions>
+<files></files>
+<concepts></concepts>
+</summary>`,
+    ];
+    let responseIndex = 0;
+    const provider = {
+      name: "test",
+      compress: async () => "",
+      summarize: async () => {
+        const response = responses[responseIndex++] ?? responses.at(-1)!;
+        if (response instanceof Error) throw response;
+        return response;
+      },
+    };
+    const sdk = {
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+      registerTrigger: vi.fn(),
+      trigger: vi.fn(async ({ function_id, payload }: {
+        function_id: string;
+        payload: unknown;
+      }) => {
+        const handler = functions.get(function_id);
+        if (!handler) throw new Error(`No function: ${function_id}`);
+        return handler(payload);
+      }),
+      getFunction: (id: string): Function => {
+        const handler = functions.get(id);
+        if (!handler) throw new Error(`No function: ${id}`);
+        return handler;
+      },
+    };
+    const sessionId = "session-real-receipt";
+    const attemptId = "attempt-real-receipt";
+    const startedAt = "2026-07-28T00:00:00.000Z";
+    const inputHash = sessionInputHash(sessionId, startedAt);
+    await kv.set(KV.sessions, sessionId, {
+      id: sessionId,
+      project: "test",
+      cwd: "/tmp",
+      startedAt,
+      status: "completed",
+      observationCount: 2,
+    });
+    for (let index = 0; index < 2; index += 1) {
+      await kv.set(KV.observations(sessionId), `obs-${index}`, {
+        id: `obs-${index}`,
+        sessionId,
+        timestamp: `2026-07-28T00:00:0${index}.000Z`,
+        type: "conversation",
+        title: `观察 ${index}`,
+        narrative: `观察正文 ${index}`,
+        facts: [],
+        files: [],
+        concepts: [],
+      });
+    }
+    registerSummarizeFunction(sdk as never, kv as never, provider as never);
+    registerExtractionOperationReceiptFunctions(sdk as never, kv as never);
+    registerApiTriggers(sdk as never, kv as never, "");
+    const summarize = sdk.getFunction("api::summarize-resumable");
+    const request = (operationUnitId: string, extra: Record<string, unknown> = {}) => summarize({
+      headers: {},
+      body: {
+        sessionId,
+        attemptId,
+        inputHash,
+        operationUnitId,
+        ...extra,
+      },
+    });
+
+    try {
+      await request(`${sessionId}:map:0`);
+      await request(`${sessionId}:map:1`);
+      const failed = await request(`${sessionId}:reduce`);
+      expect(failed.body).toMatchObject({
+        status: "failed",
+        failure: {
+          class: "transient_provider",
+          cause: "pi_stream_failed",
+          phase: "provider_call",
+        },
+      });
+      expect(responseIndex).toBe(3);
+      const receiptResult = await sdk.getFunction("mem::extraction-operation-receipt-get")({
+        runId: attemptId,
+        stage: "summary",
+        unitId: `${sessionId}:reduce`,
+      });
+      const authorization = {
+        receiptInputHash: receiptResult.operation.inputHash,
+        retryEpoch: receiptResult.receipt.retry.epoch,
+        failureClass: receiptResult.receipt.failure.class,
+        failureCause: receiptResult.receipt.failure.cause,
+        failurePhase: receiptResult.receipt.failure.phase,
+        lastSafeFailure: receiptResult.receipt.retry.lastSafeFailure,
+      };
+      const resumed = await request(`${sessionId}:reduce`, {
+        requireExistingReceipt: true,
+        failedReceiptRetryAuthorization: authorization,
+      });
+
+      expect(resumed.body, `${JSON.stringify(resumed.body)} responseIndex=${responseIndex}`).toMatchObject({
+        status: "succeeded",
+        summary: { title: "授权后摘要" },
+      });
+      expect(responseIndex).toBe(4);
+      const finalReceipt = await sdk.getFunction("mem::extraction-operation-receipt-get")({
+        runId: attemptId,
+        stage: "summary",
+        unitId: `${sessionId}:reduce`,
+      });
+      expect(finalReceipt.receipt).toMatchObject({
+        status: "succeeded",
+        retry: { epoch: 1 },
+      });
+    } finally {
+      if (previousChunkSize === undefined) delete process.env.SUMMARIZE_CHUNK_SIZE;
+      else process.env.SUMMARIZE_CHUNK_SIZE = previousChunkSize;
+    }
+  });
+
   it("rejects receipt-only summary recovery without an exact operation identity", async () => {
     const sdk = mockSdk(async () => ({ success: true, status: "in_progress" }));
     registerApiTriggers(sdk as never, mockKV() as never, "");
@@ -571,6 +842,7 @@ describe("full extraction REST wrappers", () => {
       failure: {
         class: "transient_provider",
         cause: "pi_stream_failed",
+        phase: "provider_call",
         diagnostics: {
           requestPhase: "chunk",
           providerErrorCode: "rate_limited",
@@ -602,6 +874,7 @@ describe("full extraction REST wrappers", () => {
       failure: {
         class: "transient_provider",
         cause: "pi_stream_failed",
+        phase: "provider_call",
         diagnostics: {
           requestPhase: "chunk",
           providerErrorCode: "rate_limited",
@@ -648,6 +921,212 @@ describe("full extraction REST wrappers", () => {
     const serialized = JSON.stringify(response.body);
     for (const marker of ["prompt-marker", "raw-error-marker", "credential-marker", "token-marker"]) {
       expect(serialized).not.toContain(marker);
+    }
+  });
+
+  it("drops an unrecognized summary failure phase at the REST boundary", async () => {
+    const sdk = mockSdk(async () => ({
+      success: false,
+      status: "failed",
+      failure: {
+        class: "transient_runtime",
+        cause: "summary_failed",
+        phase: "unsafe_phase",
+      },
+    }));
+    registerApiTriggers(sdk as never, mockKV() as never, "");
+
+    const response = await sdk.getFunction("api::summarize-resumable")({
+      headers: {},
+      body: { sessionId: "session-1" },
+    });
+
+    expect(response.body).toEqual({
+      success: false,
+      status: "failed",
+      failure: {
+        class: "transient_runtime",
+        cause: "summary_failed",
+      },
+    });
+  });
+
+  it("preserves safe reduce failure phases through REST for v2 retry and reconciliation", async () => {
+    const cases = [
+      {
+        phase: "provider_call",
+        failureClass: "transient_provider",
+        cause: "network_error",
+        initialExitCode: 75,
+        retryable: true,
+      },
+      {
+        phase: "before_final_persistence",
+        failureClass: "transient_runtime",
+        cause: "summary_reduce_before_final_persistence_failed",
+        initialExitCode: 75,
+        retryable: true,
+      },
+      {
+        phase: "provider_preflight",
+        failureClass: "hard",
+        cause: "provider_drift",
+        initialExitCode: 1,
+        retryable: false,
+      },
+      {
+        phase: "final_result_persistence",
+        failureClass: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+        initialExitCode: 1,
+        retryable: false,
+        reconciled: true,
+      },
+    ] as const;
+    const previousSecret = process.env.AGENTMEMORY_SECRET;
+    process.env.AGENTMEMORY_SECRET = "test-secret";
+
+    try {
+      for (const testCase of cases) {
+        const stateDir = await mkdtemp(path.join(os.tmpdir(), "agentmemory-summary-phase-"));
+        let reduceFailed = true;
+        let reduceApiResponse: unknown;
+        const reduceRequests: Array<Record<string, unknown>> = [];
+        const sdk = mockSdk(async (input) => {
+          const payload = input.payload as Record<string, unknown>;
+          if (payload.operationUnitId === "s1:map:0") {
+            return {
+              success: true,
+              status: "in_progress",
+              advanced: "completed",
+              completedChunks: 1,
+              totalChunks: 1,
+              operationUnitId: payload.operationUnitId,
+            };
+          }
+          reduceRequests.push(payload);
+          if (reduceFailed) {
+            return {
+              success: false,
+              status: "failed",
+              operationUnitId: payload.operationUnitId,
+              failure: {
+                class: testCase.failureClass,
+                cause: testCase.cause,
+                phase: testCase.phase,
+              },
+            };
+          }
+          const attemptId = payload.attemptId as string;
+          const inputHash = payload.inputHash as string;
+          return {
+            success: true,
+            status: "succeeded",
+            operationUnitId: payload.operationUnitId,
+            attemptId,
+            runnerInputHash: inputHash,
+            serviceInputHash: stableV2Hash({ attemptId, inputHash, source: "summary-service" }),
+            resumableRunId: stableV2Hash({ attemptId, inputHash, source: "resumable-run" }),
+            summary: { title: "retried summary" },
+          };
+        });
+        registerApiTriggers(sdk as never, mockKV() as never, "");
+        const summarize = sdk.getFunction("api::summarize-resumable");
+        const server = await listen(async (request, response) => {
+          const url = new URL(request.url ?? "/", "http://127.0.0.1");
+          response.setHeader("content-type", "application/json");
+          if (request.method === "GET" && url.pathname === "/agentmemory/sessions") {
+            response.end(JSON.stringify({
+              success: true,
+              sessions: [{ id: "s1", startedAt: "2026-07-22T00:00:00.000Z" }],
+            }));
+            return;
+          }
+          if (request.method === "POST" && url.pathname === "/agentmemory/summarize/resumable") {
+            const body = JSON.parse(await readRequestBody(request));
+            const apiResponse = await summarize({ headers: {}, body });
+            if (body.operationUnitId === "s1:reduce") reduceApiResponse = apiResponse.body;
+            response.statusCode = apiResponse.status_code;
+            response.end(JSON.stringify(apiResponse.body));
+            return;
+          }
+          if (request.method === "POST" && url.pathname === "/agentmemory/extraction-runs/record") {
+            response.end(JSON.stringify({ success: true }));
+            return;
+          }
+          response.statusCode = 404;
+          response.end(JSON.stringify({ success: false }));
+        });
+        const argv = [
+          "--base-url", server.baseUrl,
+          "--state-dir", stateDir,
+          "--run-id", `phase-${testCase.phase}`,
+          "--run-state-format", "v2",
+        ];
+        const dependencies = {
+          v2RuntimeCheck: async () => ({ summarizeChunkConcurrency: 1 }),
+          v2LessonsRemote: {
+            start: async ({ attemptId }: { attemptId: string }) => ({
+              ok: true,
+              data: { runs: [{ id: `lesson-${attemptId}`, status: "succeeded" }] },
+            }),
+            record: async () => {},
+          },
+          v2RemainingStages: false,
+        };
+
+        try {
+          expect(await runFullExtractionV2(argv, dependencies)).toBe(testCase.initialExitCode);
+          expect(reduceApiResponse).toMatchObject({
+            failure: {
+              class: testCase.failureClass,
+              cause: testCase.cause,
+              phase: testCase.phase,
+            },
+          });
+          const events = JSON.parse(await readFile(
+            path.join(stateDir, `phase-${testCase.phase}.v2`, "summary.jsonl"),
+            "utf8",
+          ).then((content) => `[${content.trim().split("\n").join(",")}]`)) as Array<Record<string, unknown>>;
+          const terminalEvents = events.filter((event) => event.type === "unit_terminal");
+          const reduceOperation = events.find(
+            (event) => event.type === "unit_operation_started"
+              && (event.payload as Record<string, unknown>).operation_id === "s1:reduce",
+          );
+          const completedReduceOperation = events.find(
+            (event) => event.type === "unit_operation_completed"
+              && (event.payload as Record<string, unknown>).operation_id === "s1:reduce",
+          );
+
+          expect(reduceOperation).toBeDefined();
+          if (testCase.retryable) {
+            expect(terminalEvents).toHaveLength(0);
+            expect(events.some((event) => event.type === "unit_blocked")).toBe(false);
+            expect(completedReduceOperation).toBeUndefined();
+            reduceFailed = false;
+            expect(await runFullExtractionV2([...argv, "--resume"], dependencies)).toBe(0);
+            expect(reduceRequests).toHaveLength(2);
+            expect(reduceRequests[1]).toMatchObject({
+              operationUnitId: "s1:reduce",
+              attemptId: reduceRequests[0].attemptId,
+              inputHash: reduceRequests[0].inputHash,
+              requireExistingReceipt: true,
+            });
+          } else if (testCase.reconciled) {
+            expect(terminalEvents).toHaveLength(0);
+            expect(events.at(-1)?.type).toBe("unit_blocked");
+          } else {
+            expect(terminalEvents).toHaveLength(1);
+            expect((terminalEvents[0].payload as Record<string, unknown>).status).toBe("failed");
+          }
+        } finally {
+          await server.close();
+          await rm(stateDir, { recursive: true, force: true });
+        }
+      }
+    } finally {
+      if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+      else process.env.AGENTMEMORY_SECRET = previousSecret;
     }
   });
 

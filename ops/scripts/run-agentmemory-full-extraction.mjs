@@ -5694,6 +5694,7 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
       attemptId,
       activeOperation,
       completedOperations,
+      retryAuthorization,
       startOperation,
       completeOperation,
     }) => {
@@ -5703,7 +5704,8 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
         || completedOperations.at(-1)?.next_operation_id
         || `${unit.unit_id}:map:0`;
       let operationStarted = Boolean(activeOperation);
-      let requireExistingReceipt = Boolean(activeOperation);
+      let requireExistingReceipt = Boolean(activeOperation)
+        || retryAuthorization?.operation_id === operationId;
       for (let advance = 0; advance < SUMMARY_ADVANCE_MAX_CALL_LIMIT; advance += 1) {
         if (!operationStarted) {
           await startOperation({ operationId });
@@ -5717,11 +5719,29 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
           inputHash: unit.input_hash,
           operationUnitId: operationId,
           requireExistingReceipt,
+          ...(retryAuthorization?.operation_id === operationId
+            ? {
+                failedReceiptRetryAuthorization: {
+                  receiptInputHash: retryAuthorization.receipt_input_hash,
+                  retryEpoch: retryAuthorization.retry_epoch,
+                  failureClass: retryAuthorization.failure_class,
+                  failureCause: retryAuthorization.failure_cause,
+                  failurePhase: retryAuthorization.failure_phase,
+                  lastSafeFailure: {
+                    errorClass: retryAuthorization.last_safe_failure.error_class,
+                    cause: retryAuthorization.last_safe_failure.cause,
+                    phase: retryAuthorization.last_safe_failure.phase,
+                    timestamp: retryAuthorization.last_safe_failure.timestamp,
+                  },
+                },
+              }
+            : {}),
           request: buildSummaryBody(unit.unit_id, options),
           signal: options.signal,
         });
         const data = result?.data || result || {};
         const failureCause = data?.failure?.cause || data?.failure?.error || data?.error || result?.error;
+        const authorizedOperation = retryAuthorization?.operation_id === operationId;
         if ([
           'extraction_operation_reconciliation_required',
           'extraction_operation_input_hash_conflict',
@@ -5742,6 +5762,19 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
             && ['transient_provider', 'transient_runtime'].includes(failure?.class)
             && ['provider_call', 'before_final_persistence'].includes(failure?.phase)
           ) {
+            if (authorizedOperation) {
+              const terminalResult = {
+                status: 'failed',
+                payload: { error: failure.cause },
+              };
+              await completeOperation({
+                operationId,
+                status: 'failed',
+                error: failure.cause,
+                terminal_result: terminalResult,
+              });
+              return terminalResult;
+            }
             return {
               status: 'pending',
               failure,
@@ -5932,6 +5965,7 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       inputHash,
       operationUnitId,
       requireExistingReceipt,
+      failedReceiptRetryAuthorization,
       request,
       signal,
     }) => requestJson(
@@ -5946,6 +5980,9 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
         inputHash,
         operationUnitId,
         ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+        ...(failedReceiptRetryAuthorization
+          ? { failedReceiptRetryAuthorization }
+          : {}),
       },
       requestOptions({ ...options, signal }),
     ),

@@ -33,6 +33,22 @@ const identity = {
   inputHash: "input-a",
 };
 
+function failedRetryAuthorization(receipt: any) {
+  return {
+    receiptInputHash: receipt.inputHash,
+    retryEpoch: receipt.retry.epoch,
+    failureClass: receipt.failure.class,
+    failureCause: receipt.failure.cause,
+    failurePhase: receipt.failure.phase,
+    lastSafeFailure: {
+      errorClass: receipt.retry.lastSafeFailure.errorClass,
+      cause: receipt.retry.lastSafeFailure.cause,
+      phase: receipt.retry.lastSafeFailure.phase,
+      timestamp: receipt.retry.lastSafeFailure.timestamp,
+    },
+  };
+}
+
 const orphanIdentity = {
   runId: "a".repeat(64),
   stage: "summary",
@@ -358,6 +374,264 @@ describe("extraction operation receipts", () => {
       retry: { lastSafeFailure: { cause: "network_error", phase: "provider_call" } },
     });
     expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("consumes one authorized epoch and replays a newer safe failure without reopening it", async () => {
+    const kv = mockKV();
+    const execute = vi.fn(async () => ({
+      success: false,
+      status: "failed",
+      retryableReceiptFailure: true,
+      failure: {
+        class: "transient_provider" as const,
+        cause: "network_error",
+        phase: "provider_call" as const,
+      },
+    }));
+
+    const first = await withExtractionOperationReceipt(kv as never, identity, execute);
+    const epochZeroAuthorization = failedRetryAuthorization(first.receipt);
+    const epochOneFailure = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      {
+        retryFailed: true,
+        requireExisting: true,
+        failedRetryAuthorization: epochZeroAuthorization,
+      },
+    );
+    const rejected = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      {
+        retryFailed: true,
+        requireExisting: true,
+        failedRetryAuthorization: epochZeroAuthorization,
+      },
+    );
+
+    expect(epochOneFailure.receipt).toMatchObject({
+      status: "failed",
+      retry: { epoch: 1 },
+    });
+    expect(rejected).toMatchObject({
+      replayed: true,
+      failure: {
+        class: "transient_provider",
+        cause: "network_error",
+        phase: "provider_call",
+      },
+      receipt: { status: "failed", retry: { epoch: 1 } },
+    });
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
+  it("replays a succeeded receipt before checking stale retry authorization", async () => {
+    const kv = mockKV();
+    const first = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      async () => ({
+        success: false,
+        retryableReceiptFailure: true,
+        failure: {
+          class: "transient_provider" as const,
+          cause: "network_error",
+          phase: "provider_call" as const,
+        },
+      }),
+    );
+    const authorization = failedRetryAuthorization(first.receipt);
+    const succeeded = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      async () => ({ success: true, summary: { title: "persisted" } }),
+      {
+        retryFailed: true,
+        requireExisting: true,
+        failedRetryAuthorization: authorization,
+      },
+    );
+    const execute = vi.fn(async () => ({ success: true }));
+
+    const replayed = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      {
+        retryFailed: true,
+        requireExisting: true,
+        failedRetryAuthorization: authorization,
+      },
+    );
+
+    expect(succeeded.receipt).toMatchObject({ status: "succeeded", retry: { epoch: 1 } });
+    expect(replayed).toMatchObject({
+      replayed: true,
+      response: { success: true },
+      receipt: { status: "succeeded", retry: { epoch: 1 } },
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("returns reconciliation for a running receipt before checking stale retry authorization", async () => {
+    const kv = mockKV();
+    const first = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      async () => ({
+        success: false,
+        retryableReceiptFailure: true,
+        failure: {
+          class: "transient_provider" as const,
+          cause: "network_error",
+          phase: "provider_call" as const,
+        },
+      }),
+    );
+    const authorization = failedRetryAuthorization(first.receipt);
+    const key = buildExtractionOperationKey(identity);
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...first.receipt,
+      status: "running",
+      completedAt: undefined,
+      failure: undefined,
+    });
+    const execute = vi.fn(async () => ({ success: true }));
+
+    const rejected = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      {
+        retryFailed: true,
+        requireExisting: true,
+        failedRetryAuthorization: authorization,
+      },
+    );
+
+    expect(rejected).toMatchObject({
+      replayed: true,
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+      receipt: { status: "running" },
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("does not consume a second epoch after an authorized dispatch crashes", async () => {
+    const kv = mockKV();
+    const first = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      async () => ({
+        success: false,
+        retryableReceiptFailure: true,
+        failure: {
+          class: "transient_runtime" as const,
+          cause: "network_error",
+          phase: "before_final_persistence" as const,
+        },
+      }),
+    );
+    const authorization = failedRetryAuthorization(first.receipt);
+    const execute = vi.fn(async () => {
+      throw new Error("dispatch_crashed");
+    });
+
+    const crashed = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      {
+        retryFailed: true,
+        requireExisting: true,
+        failedRetryAuthorization: authorization,
+      },
+    );
+    const resumed = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      {
+        retryFailed: true,
+        requireExisting: true,
+        failedRetryAuthorization: authorization,
+      },
+    );
+
+    expect(crashed).toMatchObject({
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+      receipt: { status: "running", retry: { epoch: 1 } },
+    });
+    expect(resumed).toMatchObject({
+      replayed: true,
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+      receipt: { status: "running", retry: { epoch: 1 } },
+    });
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects stale authorization when the current failed receipt is no longer safe", async () => {
+    const kv = mockKV();
+    const first = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      async () => ({
+        success: false,
+        retryableReceiptFailure: true,
+        failure: {
+          class: "transient_provider" as const,
+          cause: "network_error",
+          phase: "provider_call" as const,
+        },
+      }),
+    );
+    const authorization = failedRetryAuthorization(first.receipt);
+    const key = buildExtractionOperationKey(identity);
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...first.receipt,
+      failure: {
+        class: "hard",
+        cause: "provider_auth_failed",
+        phase: "provider_preflight",
+      },
+    });
+    const execute = vi.fn(async () => ({ success: true }));
+
+    const rejected = await withExtractionOperationReceipt(
+      kv as never,
+      identity,
+      execute,
+      {
+        retryFailed: true,
+        requireExisting: true,
+        failedRetryAuthorization: authorization,
+      },
+    );
+
+    expect(rejected).toMatchObject({
+      replayed: true,
+      failure: {
+        class: "hard",
+        cause: "extraction_operation_retry_authorization_drifted",
+      },
+      receipt: {
+        status: "failed",
+        failure: { class: "hard", cause: "provider_auth_failed" },
+      },
+    });
+    expect(execute).not.toHaveBeenCalled();
   });
 
   it.each(["provider_preflight", "final_result_persistence", undefined] as const)(
@@ -711,7 +985,18 @@ describe("extraction operation receipts", () => {
           failure: {
             class: "transient_provider",
             cause: "pi_stream_failed",
+            phase: "provider_call",
             diagnostics: { rawMessage: "must-not-cross-boundary" },
+          },
+          retry: {
+            epoch: 2,
+            lastSafeFailure: {
+              errorClass: "transient_provider",
+              cause: "pi_stream_failed",
+              phase: "provider_call",
+              timestamp: "2026-07-24T00:00:59.000Z",
+              diagnostics: { rawMessage: "must-not-cross-boundary" },
+            },
           },
         },
       },
@@ -752,7 +1037,23 @@ describe("extraction operation receipts", () => {
                 failure: {
                   class: entry.receipt.failure.class,
                   cause: entry.receipt.failure.cause,
+                  ...("phase" in entry.receipt.failure
+                    ? { phase: entry.receipt.failure.phase }
+                    : {}),
                 },
+                ...("retry" in entry.receipt
+                  ? {
+                      retry: {
+                        epoch: entry.receipt.retry.epoch,
+                        lastSafeFailure: {
+                          errorClass: entry.receipt.retry.lastSafeFailure.errorClass,
+                          cause: entry.receipt.retry.lastSafeFailure.cause,
+                          phase: entry.receipt.retry.lastSafeFailure.phase,
+                          timestamp: entry.receipt.retry.lastSafeFailure.timestamp,
+                        },
+                      },
+                    }
+                  : {}),
               }
             : {}),
         },
@@ -834,6 +1135,137 @@ describe("extraction operation receipts", () => {
       receipt: { status: "succeeded" },
     });
     expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("persists a fresh running boundary before re-executing a reconciled receipt", async () => {
+    const kv = mockKV();
+    await seedOrphanedSummaryOperation(kv);
+    const key = buildExtractionOperationKey(orphanIdentity);
+    const seeded = await kv.get<Record<string, unknown>>(
+      KV.extractionOperationReceipt(key),
+      key,
+    );
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...seeded,
+      retry: {
+        epoch: 1,
+        lastSafeFailure: {
+          errorClass: "transient_provider",
+          cause: "pi_stream_failed",
+          phase: "provider_call",
+          timestamp: "2026-07-26T17:44:07.000Z",
+        },
+      },
+      uncertainty: {
+        phase: "final_result_persistence",
+        errorClass: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+        timestamp: "2026-07-26T17:44:07.500Z",
+      },
+    });
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never);
+    const reconcile = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
+    const firstReconciliation = await reconcile(orphanReconciliationInput);
+    let runningBeforeExecute: Record<string, unknown> | null = null;
+
+    const interrupted = await withExtractionOperationReceipt(
+      kv as never,
+      orphanIdentity,
+      async () => {
+        runningBeforeExecute = await kv.get<Record<string, unknown>>(
+          KV.extractionOperationReceipt(key),
+          key,
+        );
+        throw new ExtractionOperationResultUncertainError();
+      },
+    );
+
+    expect(runningBeforeExecute).toMatchObject({
+      ...orphanIdentity,
+      key,
+      status: "running",
+      startedAt: expect.any(String),
+      retry: {
+        epoch: 1,
+        lastSafeFailure: {
+          cause: "pi_stream_failed",
+          phase: "provider_call",
+        },
+      },
+    });
+    expect(runningBeforeExecute?.startedAt).not.toBe(
+      orphanReconciliationInput.operation.expectedStartedAt,
+    );
+    expect(Date.parse(String(runningBeforeExecute?.startedAt))).toBeGreaterThan(
+      Date.parse(firstReconciliation.reconciliation.at),
+    );
+    for (const staleField of [
+      "completedAt",
+      "response",
+      "failure",
+      "reconciliation",
+      "uncertainty",
+    ]) {
+      expect(runningBeforeExecute).not.toHaveProperty(staleField);
+    }
+    expect(interrupted).toMatchObject({
+      replayed: false,
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+        phase: "final_result_persistence",
+      },
+      receipt: {
+        status: "running",
+        startedAt: runningBeforeExecute?.startedAt,
+        retry: { epoch: 1 },
+        uncertainty: {
+          cause: "extraction_operation_reconciliation_required",
+        },
+      },
+    });
+    await expect(kv.get<Record<string, unknown>>(
+      KV.extractionOperationReceipt(key),
+      key,
+    )).resolves.toMatchObject({
+      status: "running",
+      startedAt: runningBeforeExecute?.startedAt,
+      retry: { epoch: 1 },
+    });
+
+    await expect(reconcile(orphanReconciliationInput)).resolves.toEqual({
+      success: false,
+      failure: {
+        class: "hard",
+        cause: "orphan_reconciliation_evidence_drifted",
+      },
+    });
+    const freshReconciliation = await reconcile({
+      ...orphanReconciliationInput,
+      operation: {
+        ...orphanReconciliationInput.operation,
+        expectedStartedAt: runningBeforeExecute!.startedAt,
+      },
+    });
+    expect(freshReconciliation).toMatchObject({
+      success: true,
+      replayed: false,
+      receipt: {
+        status: "reconciled",
+        startedAt: runningBeforeExecute?.startedAt,
+        retry: { epoch: 1 },
+      },
+      reconciliation: {
+        id: expect.stringMatching(/^xrec_[0-9a-f]{32}$/),
+        resultStatus: "absent",
+      },
+    });
+    expect(freshReconciliation.reconciliation.id).not.toBe(
+      firstReconciliation.reconciliation.id,
+    );
   });
 
   it("rejects extra fields inside the exact orphan operation identity", async () => {

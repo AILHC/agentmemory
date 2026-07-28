@@ -29,6 +29,98 @@ function makeHarness() {
 
 const plan = [{ unit_id: 'unit-1', input_hash: 'input-1' }];
 
+function authorizedBlockedEvents(reconciliationOperationId = 'unit-1:reduce') {
+  const attemptId = 'a'.repeat(64);
+  const runnerInputHash = 'b'.repeat(64);
+  return [
+    { seq: 0, type: 'unit_planned', payload: { unit_id: 'unit-1', input_hash: runnerInputHash } },
+    { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
+    { seq: 2, type: 'unit_started', payload: { unit_id: 'unit-1', attempt_id: attemptId } },
+    {
+      seq: 3,
+      type: 'unit_operation_started',
+      payload: { unit_id: 'unit-1', attempt_id: attemptId, operation_id: 'unit-1:reduce' },
+    },
+    {
+      seq: 4,
+      type: 'unit_operation_completed',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: attemptId,
+        operation_id: 'unit-1:reduce',
+        status: 'failed',
+        error: 'pi_stream_failed',
+        terminal_result: { status: 'failed', payload: { error: 'pi_stream_failed' } },
+      },
+    },
+    {
+      seq: 5,
+      type: 'unit_terminal',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: attemptId,
+        status: 'failed',
+        error: 'pi_stream_failed',
+      },
+    },
+    {
+      seq: 6,
+      type: 'unit_summary_failed_terminal_retry_authorized',
+      payload: {
+        stage: 'summary',
+        unit_id: 'unit-1',
+        attempt_id: attemptId,
+        operation_id: 'unit-1:reduce',
+        runner_input_hash: runnerInputHash,
+        receipt_input_hash: 'c'.repeat(64),
+        receipt_status: 'failed',
+        failure_class: 'transient_provider',
+        failure_cause: 'pi_stream_failed',
+        failure_phase: 'provider_call',
+        retry_epoch: 0,
+        last_safe_failure: {
+          error_class: 'transient_provider',
+          cause: 'pi_stream_failed',
+          phase: 'provider_call',
+          timestamp: '2026-07-28T00:00:00.000Z',
+        },
+        superseded_operation_seq: 4,
+        superseded_terminal_seq: 5,
+        expected_journal_seq: 5,
+      },
+    },
+    {
+      seq: 7,
+      type: 'unit_operation_started',
+      payload: { unit_id: 'unit-1', attempt_id: attemptId, operation_id: 'unit-1:reduce' },
+    },
+    {
+      seq: 8,
+      type: 'unit_blocked',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: attemptId,
+        reason: 'extraction_operation_reconciliation_required',
+      },
+    },
+    {
+      seq: 9,
+      type: 'unit_reconciliation_resolved',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: attemptId,
+        operation_id: reconciliationOperationId,
+        reconciliation_id: 'xrec_0123456789abcdef0123456789abcdef',
+        receipt_input_hash: 'c'.repeat(64),
+        receipt_started_at: '2026-07-28T00:00:01.000Z',
+        receipt_status: 'reconciled',
+        result_status: 'absent',
+        cause: 'orphaned_operation_result_absent',
+      },
+    },
+  ];
+}
+
 test('single-phase recovery reuses one attempt and only repeats idempotent boundaries', async () => {
   const harness = makeHarness();
   const executeAttempts = [];
@@ -182,6 +274,16 @@ test('single-phase orphan reconciliation rejects a changed operation identity', 
   );
 });
 
+test('single-phase orphan reconciliation consumes only the matching retry authorization', () => {
+  const state = validateSinglePhaseStage(authorizedBlockedEvents());
+  assert.equal(state.units.get('unit-1').retry_authorization, null);
+
+  assert.throws(
+    () => validateSinglePhaseStage(authorizedBlockedEvents('unit-1:map:0')),
+    /reconciliation_operation_identity/,
+  );
+});
+
 test('single-phase adapters can journal an exact inner operation before dispatch', async () => {
   const harness = makeHarness();
   const receiptModes = [];
@@ -287,6 +389,172 @@ test('single-phase adapters can recover a terminal inner result without redispat
   await assert.rejects(invoke, /crash_after_unit_operation_completed/);
   assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 1 });
   assert.equal(remoteCalls, 1);
+});
+
+test('single-phase summary retry authorization supersedes only the named failed reduce facts', async () => {
+  const harness = makeHarness();
+  const attemptId = 'a'.repeat(64);
+  const runnerInputHash = 'b'.repeat(64);
+  const receiptInputHash = 'c'.repeat(64);
+  const retryPlan = [{ unit_id: 'unit-1', input_hash: runnerInputHash }];
+  const invoke = () => runSinglePhaseStage({
+    events: harness.events,
+    plan: retryPlan,
+    append: harness.append,
+    attemptIdForUnit: () => attemptId,
+    execute: async ({
+      completedOperations,
+      retryAuthorization,
+      startOperation,
+      completeOperation,
+    }) => {
+      assert.deepEqual(
+        completedOperations.map((operation) => operation.operation_id),
+        ['unit-1:map:0'],
+      );
+      assert.equal(retryAuthorization.operation_id, 'unit-1:reduce');
+      assert.equal(retryAuthorization.receipt_input_hash, receiptInputHash);
+      const operation = await startOperation({ operationId: 'unit-1:reduce' });
+      await completeOperation({
+        operationId: operation.operation_id,
+        status: 'succeeded',
+        terminal_result: { status: 'succeeded', payload: { summary_hash: 'd'.repeat(64) } },
+      });
+      return { status: 'succeeded', payload: { summary_hash: 'd'.repeat(64) } };
+    },
+    record: async () => {},
+  });
+
+  await harness.append('unit_planned', retryPlan[0]);
+  await harness.append('stage_plan_completed', { unit_count: 1 });
+  await harness.append('unit_started', {
+    unit_id: 'unit-1',
+    input_hash: runnerInputHash,
+    attempt_id: attemptId,
+  });
+  await harness.append('unit_operation_started', {
+    unit_id: 'unit-1',
+    attempt_id: attemptId,
+    operation_id: 'unit-1:map:0',
+  });
+  await harness.append('unit_operation_completed', {
+    unit_id: 'unit-1',
+    attempt_id: attemptId,
+    operation_id: 'unit-1:map:0',
+    status: 'completed',
+    next_operation_id: 'unit-1:reduce',
+  });
+  await harness.append('unit_operation_started', {
+    unit_id: 'unit-1',
+    attempt_id: attemptId,
+    operation_id: 'unit-1:reduce',
+  });
+  const failedOperation = await harness.append('unit_operation_completed', {
+    unit_id: 'unit-1',
+    attempt_id: attemptId,
+    operation_id: 'unit-1:reduce',
+    status: 'failed',
+    error: 'pi_stream_failed',
+    terminal_result: { status: 'failed', payload: { error: 'pi_stream_failed' } },
+  });
+  const failedTerminal = await harness.append('unit_terminal', {
+    unit_id: 'unit-1',
+    attempt_id: attemptId,
+    status: 'failed',
+    error: 'pi_stream_failed',
+  });
+  await harness.append('unit_summary_failed_terminal_retry_authorized', {
+    stage: 'summary',
+    unit_id: 'unit-1',
+    attempt_id: attemptId,
+    operation_id: 'unit-1:reduce',
+    runner_input_hash: runnerInputHash,
+    receipt_input_hash: receiptInputHash,
+    receipt_status: 'failed',
+    failure_class: 'transient_provider',
+    failure_cause: 'pi_stream_failed',
+    failure_phase: 'provider_call',
+    retry_epoch: 0,
+    last_safe_failure: {
+      error_class: 'transient_provider',
+      cause: 'pi_stream_failed',
+      phase: 'provider_call',
+      timestamp: '2026-07-28T00:00:00.000Z',
+    },
+    superseded_operation_seq: failedOperation.seq,
+    superseded_terminal_seq: failedTerminal.seq,
+    expected_journal_seq: failedTerminal.seq,
+  });
+
+  assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 1 });
+  assert.equal(
+    harness.events.filter((event) =>
+      event.type === 'unit_operation_completed'
+      && event.payload.operation_id === 'unit-1:reduce').length,
+    2,
+  );
+  assert.deepEqual(
+    harness.events.filter((event) => event.type === 'unit_terminal')
+      .map((event) => event.payload.status),
+    ['failed', 'succeeded'],
+  );
+});
+
+test('single-phase retry authorization fails closed outside a safe summary reduce failure shape', () => {
+  const attemptId = 'a'.repeat(64);
+  const events = [
+    { seq: 0, type: 'unit_planned', payload: { unit_id: 'unit-1', input_hash: 'b'.repeat(64) } },
+    { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
+    { seq: 2, type: 'unit_started', payload: { unit_id: 'unit-1', attempt_id: attemptId } },
+    {
+      seq: 3,
+      type: 'unit_operation_started',
+      payload: { unit_id: 'unit-1', attempt_id: attemptId, operation_id: 'unit-1:reduce' },
+    },
+    {
+      seq: 4,
+      type: 'unit_operation_completed',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: attemptId,
+        operation_id: 'unit-1:reduce',
+        terminal_result: { status: 'failed' },
+      },
+    },
+    {
+      seq: 5,
+      type: 'unit_terminal',
+      payload: { unit_id: 'unit-1', attempt_id: attemptId, status: 'failed' },
+    },
+    {
+      seq: 6,
+      type: 'unit_summary_failed_terminal_retry_authorized',
+      payload: {
+        stage: 'summary',
+        unit_id: 'unit-1',
+        attempt_id: attemptId,
+        operation_id: 'unit-1:reduce',
+        runner_input_hash: 'b'.repeat(64),
+        receipt_input_hash: 'c'.repeat(64),
+        receipt_status: 'failed',
+        failure_class: 'transient_provider',
+        failure_cause: 'pi_stream_failed',
+        failure_phase: 'provider_preflight',
+        retry_epoch: 0,
+        last_safe_failure: {
+          error_class: 'transient_provider',
+          cause: 'pi_stream_failed',
+          phase: 'provider_preflight',
+          timestamp: '2026-07-28T00:00:00.000Z',
+        },
+        superseded_operation_seq: 4,
+        superseded_terminal_seq: 5,
+        expected_journal_seq: 5,
+      },
+    },
+  ];
+
+  assert.throws(() => validateSinglePhaseStage(events), /retry_authorization_evidence/);
 });
 
 test('two-phase recovery persists prepare and commit identities at every boundary', async () => {

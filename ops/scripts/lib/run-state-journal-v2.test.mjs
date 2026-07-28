@@ -137,6 +137,10 @@ test('journal fold clears a blocked active operation only after durable reconcil
     { type: 'unit_planned', payload: { unit_id: 's1', input_hash: 'hash' } },
     { type: 'unit_started', payload: { unit_id: 's1', attempt_id: 'attempt-1' } },
     {
+      type: 'unit_summary_failed_terminal_retry_authorized',
+      payload: { unit_id: 's1', operation_id: 's1:reduce' },
+    },
+    {
       type: 'unit_operation_started',
       payload: { unit_id: 's1', attempt_id: 'attempt-1', operation_id: 's1:reduce' },
     },
@@ -165,10 +169,44 @@ test('journal fold clears a blocked active operation only after durable reconcil
   ]);
   assert.equal(state.units.get('s1').blocked, false);
   assert.equal(state.units.get('s1').active_operation, null);
+  assert.equal(state.units.get('s1').retry_authorization, null);
   assert.equal(
     state.units.get('s1').reconciliations[0].reconciliation_id,
     'xrec_0123456789abcdef0123456789abcdef',
   );
+});
+
+test('journal fold does not clear retry authorization for a mismatched reconciliation identity', () => {
+  const state = foldStageEvents([
+    { type: 'unit_planned', payload: { unit_id: 's1', input_hash: 'hash' } },
+    { type: 'unit_started', payload: { unit_id: 's1', attempt_id: 'attempt-1' } },
+    {
+      type: 'unit_summary_failed_terminal_retry_authorized',
+      payload: { unit_id: 's1', operation_id: 's1:reduce' },
+    },
+    {
+      type: 'unit_operation_started',
+      payload: { unit_id: 's1', attempt_id: 'attempt-1', operation_id: 's1:reduce' },
+    },
+    {
+      type: 'unit_blocked',
+      payload: {
+        unit_id: 's1',
+        attempt_id: 'attempt-1',
+        reason: 'extraction_operation_reconciliation_required',
+      },
+    },
+    {
+      type: 'unit_reconciliation_resolved',
+      payload: {
+        unit_id: 's1',
+        attempt_id: 'attempt-1',
+        operation_id: 's1:map:0',
+      },
+    },
+  ]);
+
+  assert.equal(state.units.get('s1').retry_authorization.operation_id, 's1:reduce');
 });
 
 test('v2 journal repairs a complete final line without newline before the next append', async () => {
@@ -264,4 +302,39 @@ test('stale v2 locks require an injected verified takeover and retain the lock o
   await fs.access(lockPath);
   await journal.acquireLock({ takeover: async ({ owner }) => owner.owner_id === 'stale-owner' });
   await journal.releaseLock();
+});
+
+test('v2 journal CAS append requires the writer lock and the exact durable stage sequence', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-cas-'));
+  const journal = new RunStateJournalV2({ rootDir, runId: 'v2-cas' });
+  await assert.rejects(
+    () => journal.appendStageExpectedSeq('summary', -1, 'unit_planned', { unit_id: 's1' }),
+    /v2_writer_lock_required/,
+  );
+  await journal.acquireLock();
+  try {
+    await journal.open();
+    const planned = await journal.appendStageExpectedSeq(
+      'summary',
+      -1,
+      'unit_planned',
+      { unit_id: 's1' },
+    );
+    assert.equal(planned.seq, 0);
+    await assert.rejects(
+      () => journal.appendStageExpectedSeq(
+        'summary',
+        -1,
+        'stage_plan_completed',
+        { unit_count: 1 },
+      ),
+      /v2_stage_journal_seq_drifted/,
+    );
+    assert.deepEqual((await journal.readStage('summary')).map((event) => event.type), [
+      'unit_planned',
+    ]);
+  } finally {
+    await journal.releaseLock();
+    await fs.rm(rootDir, { recursive: true, force: true });
+  }
 });

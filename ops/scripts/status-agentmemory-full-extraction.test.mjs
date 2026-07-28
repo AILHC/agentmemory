@@ -171,6 +171,308 @@ test('v2 journal 在受控协调后把原 blocked 单元恢复为 pending', asyn
   );
 });
 
+test('v2 journal 在追加重试授权后保留旧失败事件并把当前投影恢复为 pending', async (context) => {
+  const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-retry-authorized-'));
+  context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
+  const runId = 'v2-retry-authorized';
+  const runRoot = path.join(runtimeRoot, 'extraction-runs', `${runId}.v2`);
+  await writeJournal(path.join(runRoot, 'control.jsonl'), [
+    event(0, 'run_started', { run_id: runId }),
+    event(1, 'stage_opened', { stage: 'summary' }),
+  ]);
+  await writeJournal(path.join(runRoot, 'summary.jsonl'), [
+    event(0, 'unit_planned', { unit_id: 'session-a', input_hash: 'b'.repeat(64) }),
+    event(1, 'stage_plan_completed', {}),
+    event(2, 'unit_started', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+    }),
+    event(3, 'unit_operation_started', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+    }),
+    event(4, 'unit_operation_completed', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+      status: 'failed',
+      error: 'pi_stream_failed',
+      terminal_result: {
+        status: 'failed',
+        payload: { error: 'pi_stream_failed' },
+      },
+    }),
+    event(5, 'unit_terminal', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      status: 'failed',
+      error: 'pi_stream_failed',
+    }),
+    event(6, 'unit_summary_failed_terminal_retry_authorized', {
+      stage: 'summary',
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+      runner_input_hash: 'b'.repeat(64),
+      receipt_input_hash: 'c'.repeat(64),
+      receipt_status: 'failed',
+      failure_class: 'transient_provider',
+      failure_cause: 'pi_stream_failed',
+      failure_phase: 'provider_call',
+      retry_epoch: 0,
+      last_safe_failure: {
+        error_class: 'transient_provider',
+        cause: 'pi_stream_failed',
+        phase: 'provider_call',
+        timestamp: '2026-07-28T00:00:00.000Z',
+      },
+      superseded_operation_seq: 4,
+      superseded_terminal_seq: 5,
+      expected_journal_seq: 5,
+    }),
+  ]);
+
+  const result = runStatus(runtimeRoot, runId, 'summary');
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(
+    result.stdout,
+    /stage\.summary=succeeded:0,skipped:0,failed:0,pending:1,running:0,blocked:0/,
+  );
+  const persisted = await fs.readFile(path.join(runRoot, 'summary.jsonl'), 'utf8');
+  assert.match(persisted, /"unit_operation_completed"/);
+  assert.match(persisted, /"unit_terminal"/);
+  assert.match(persisted, /"unit_summary_failed_terminal_retry_authorized"/);
+});
+
+test('v2 status 忽略证据不完整的 summary 重试授权并保留 failed', async (context) => {
+  const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-invalid-auth-'));
+  context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
+  const runId = 'v2-invalid-auth';
+  const runRoot = path.join(runtimeRoot, 'extraction-runs', `${runId}.v2`);
+  await writeJournal(path.join(runRoot, 'control.jsonl'), [
+    event(0, 'run_started', { run_id: runId }),
+    event(1, 'stage_opened', { stage: 'summary' }),
+  ]);
+  await writeJournal(path.join(runRoot, 'summary.jsonl'), [
+    event(0, 'unit_planned', { unit_id: 'session-a', input_hash: 'b'.repeat(64) }),
+    event(1, 'stage_plan_completed', {}),
+    event(2, 'unit_started', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+    }),
+    event(3, 'unit_operation_started', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+    }),
+    event(4, 'unit_operation_completed', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+      status: 'failed',
+      error: 'pi_stream_failed',
+      terminal_result: {
+        status: 'failed',
+        payload: { error: 'pi_stream_failed' },
+      },
+    }),
+    event(5, 'unit_terminal', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      status: 'failed',
+      error: 'pi_stream_failed',
+    }),
+    event(6, 'unit_summary_failed_terminal_retry_authorized', {
+      stage: 'summary',
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+      superseded_operation_seq: 4,
+      superseded_terminal_seq: 5,
+    }),
+  ]);
+
+  const result = runStatus(runtimeRoot, runId, 'summary');
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(
+    result.stdout,
+    /stage\.summary=succeeded:0,skipped:0,failed:1,pending:0,running:0,blocked:0/,
+  );
+});
+
+test('v2 status 严格拒绝非整数数值和大小写变体的 summary 重试授权', async () => {
+  const variants = [
+    ['string retry epoch', (authorization) => { authorization.payload.retry_epoch = '0'; }],
+    ['floating retry epoch', (authorization) => { authorization.payload.retry_epoch = 0.5; }],
+    ['failure class case', (authorization) => {
+      authorization.payload.failure_class = 'Transient_provider';
+      authorization.payload.last_safe_failure.error_class = 'Transient_provider';
+    }],
+    ['failure phase case', (authorization) => {
+      authorization.payload.failure_phase = 'Provider_call';
+      authorization.payload.last_safe_failure.phase = 'Provider_call';
+    }],
+    ['string event seq', (authorization) => { authorization.seq = '6'; }],
+    ['string evidence seq', (authorization) => {
+      authorization.payload.superseded_operation_seq = '4';
+    }],
+  ];
+
+  for (const [name, mutate] of variants) {
+    const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-strict-auth-'));
+    const runId = `v2-strict-auth-${name.replaceAll(' ', '-')}`;
+    const runRoot = path.join(runtimeRoot, 'extraction-runs', `${runId}.v2`);
+    try {
+      await writeJournal(path.join(runRoot, 'control.jsonl'), [
+        event(0, 'run_started', { run_id: runId }),
+        event(1, 'stage_opened', { stage: 'summary' }),
+      ]);
+      const authorization = event(6, 'unit_summary_failed_terminal_retry_authorized', {
+        stage: 'summary',
+        unit_id: 'session-a',
+        attempt_id: 'a'.repeat(64),
+        operation_id: 'session-a:reduce',
+        runner_input_hash: 'b'.repeat(64),
+        receipt_input_hash: 'c'.repeat(64),
+        receipt_status: 'failed',
+        failure_class: 'transient_provider',
+        failure_cause: 'pi_stream_failed',
+        failure_phase: 'provider_call',
+        retry_epoch: 0,
+        last_safe_failure: {
+          error_class: 'transient_provider',
+          cause: 'pi_stream_failed',
+          phase: 'provider_call',
+          timestamp: '2026-07-28T00:00:00.000Z',
+        },
+        superseded_operation_seq: 4,
+        superseded_terminal_seq: 5,
+        expected_journal_seq: 5,
+      });
+      mutate(authorization);
+      await writeJournal(path.join(runRoot, 'summary.jsonl'), [
+        event(0, 'unit_planned', { unit_id: 'session-a', input_hash: 'b'.repeat(64) }),
+        event(1, 'stage_plan_completed', {}),
+        event(2, 'unit_started', {
+          unit_id: 'session-a',
+          attempt_id: 'a'.repeat(64),
+        }),
+        event(3, 'unit_operation_started', {
+          unit_id: 'session-a',
+          attempt_id: 'a'.repeat(64),
+          operation_id: 'session-a:reduce',
+        }),
+        event(4, 'unit_operation_completed', {
+          unit_id: 'session-a',
+          attempt_id: 'a'.repeat(64),
+          operation_id: 'session-a:reduce',
+          status: 'failed',
+          error: 'pi_stream_failed',
+          terminal_result: {
+            status: 'failed',
+            payload: { error: 'pi_stream_failed' },
+          },
+        }),
+        event(5, 'unit_terminal', {
+          unit_id: 'session-a',
+          attempt_id: 'a'.repeat(64),
+          status: 'failed',
+          error: 'pi_stream_failed',
+        }),
+        authorization,
+      ]);
+
+      const result = runStatus(runtimeRoot, runId, 'summary');
+
+      assert.equal(result.status, 0, `${name}: ${result.stderr || result.stdout}`);
+      assert.match(
+        result.stdout,
+        /stage\.summary=succeeded:0,skipped:0,failed:1,pending:0,running:0,blocked:0/,
+        name,
+      );
+    } finally {
+      await fs.rm(runtimeRoot, { recursive: true, force: true });
+    }
+  }
+});
+
+test('v2 status 在授权后的新 operation_started 上重新报告 running', async (context) => {
+  const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-auth-running-'));
+  context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
+  const runId = 'v2-auth-running';
+  const runRoot = path.join(runtimeRoot, 'extraction-runs', `${runId}.v2`);
+  await writeJournal(path.join(runRoot, 'control.jsonl'), [
+    event(0, 'run_started', { run_id: runId }),
+    event(1, 'stage_opened', { stage: 'summary' }),
+  ]);
+  const authorizedEvents = [
+    event(0, 'unit_planned', { unit_id: 'session-a', input_hash: 'b'.repeat(64) }),
+    event(1, 'stage_plan_completed', {}),
+    event(2, 'unit_started', { unit_id: 'session-a', attempt_id: 'a'.repeat(64) }),
+    event(3, 'unit_operation_started', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+    }),
+    event(4, 'unit_operation_completed', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+      status: 'failed',
+      error: 'pi_stream_failed',
+      terminal_result: {
+        status: 'failed',
+        payload: { error: 'pi_stream_failed' },
+      },
+    }),
+    event(5, 'unit_terminal', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      status: 'failed',
+      error: 'pi_stream_failed',
+    }),
+    event(6, 'unit_summary_failed_terminal_retry_authorized', {
+      stage: 'summary',
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+      runner_input_hash: 'b'.repeat(64),
+      receipt_input_hash: 'c'.repeat(64),
+      receipt_status: 'failed',
+      failure_class: 'transient_provider',
+      failure_cause: 'pi_stream_failed',
+      failure_phase: 'provider_call',
+      retry_epoch: 0,
+      last_safe_failure: {
+        error_class: 'transient_provider',
+        cause: 'pi_stream_failed',
+        phase: 'provider_call',
+        timestamp: '2026-07-28T00:00:00.000Z',
+      },
+      superseded_operation_seq: 4,
+      superseded_terminal_seq: 5,
+      expected_journal_seq: 5,
+    }),
+    event(7, 'unit_operation_started', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+    }),
+  ];
+  await writeJournal(path.join(runRoot, 'summary.jsonl'), authorizedEvents);
+
+  const result = runStatus(runtimeRoot, runId, 'summary');
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(
+    result.stdout,
+    /stage\.summary=succeeded:0,skipped:0,failed:0,pending:0,running:1,blocked:0/,
+  );
+});
+
 test('v2 全阶段模式仍要求 run_completed', async (context) => {
   const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-full-'));
   context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));

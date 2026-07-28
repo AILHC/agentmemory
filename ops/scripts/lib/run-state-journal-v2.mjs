@@ -280,6 +280,17 @@ export class RunStateJournalV2 {
     return this.stageWriter(stage).append(type, payload);
   }
 
+  async appendStageExpectedSeq(stage, expectedSeq, type, payload = {}) {
+    if (!this.lock) throw new Error('v2_writer_lock_required');
+    if (!Number.isSafeInteger(expectedSeq) || expectedSeq < -1) {
+      throw new Error('v2_expected_stage_seq_invalid');
+    }
+    const events = await this.readStage(stage);
+    const currentSeq = events.at(-1)?.seq ?? -1;
+    if (currentSeq !== expectedSeq) throw new Error('v2_stage_journal_seq_drifted');
+    return this.appendStage(stage, type, payload);
+  }
+
   async readControl() { return readJournal(this.controlPath, this.fs); }
   async readStage(stage) {
     const events = await readJournal(this.stagePath(stage), this.fs);
@@ -362,8 +373,30 @@ export function foldStageEvents(events) {
     if (event.type === 'unit_reconciliation_resolved') {
       unit.blocked = false;
       unit.blocked_payload = undefined;
+      if (
+        unit.active_operation?.operation_id === event.payload.operation_id
+        && unit.retry_authorization?.operation_id === event.payload.operation_id
+      ) {
+        unit.retry_authorization = null;
+      }
       unit.active_operation = null;
       unit.reconciliations = [...(unit.reconciliations || []), event.payload];
+    }
+    if (event.type === 'unit_summary_failed_terminal_retry_authorized') {
+      const supersededOperation = unit.completed_operations.pop();
+      if (supersededOperation) {
+        unit.superseded_operations = [...(unit.superseded_operations || []), {
+          seq: event.payload?.superseded_operation_seq,
+          payload: supersededOperation,
+        }];
+      }
+      unit.superseded_terminals = [...(unit.superseded_terminals || []), {
+        seq: event.payload?.superseded_terminal_seq,
+        payload: unit.terminal_payload,
+      }];
+      unit.terminal = null;
+      unit.terminal_payload = undefined;
+      unit.retry_authorization = event.payload;
     }
     if (event.type === 'unit_recorded') unit.recorded = true;
     units.set(unitId, unit);

@@ -18,10 +18,25 @@ export interface ExtractionOperationResult<T> {
   receipt?: ExtractionOperationReceipt<T>;
 }
 
+export interface FailedExtractionOperationRetryAuthorization {
+  receiptInputHash: string;
+  retryEpoch: number;
+  failureClass: "transient_provider" | "transient_runtime";
+  failureCause: string;
+  failurePhase: "provider_call" | "before_final_persistence";
+  lastSafeFailure: {
+    errorClass: "transient_provider" | "transient_runtime";
+    cause: string;
+    phase: "provider_call" | "before_final_persistence";
+    timestamp: string;
+  };
+}
+
 export interface ExtractionOperationReceiptOptions {
   requireExisting?: boolean;
   /** 仅 summary reduce 显式启用，允许已确认未持久化结果的失败重开同一 receipt。 */
   retryFailed?: boolean;
+  failedRetryAuthorization?: FailedExtractionOperationRetryAuthorization;
 }
 
 /** 表示回调失去确定性时，最终结果可能已经持久化。 */
@@ -43,6 +58,55 @@ const PROVIDER_ERROR_CODES = new Set([
   "network_error", "server_error", "unknown",
 ]);
 const PROVIDER_STOP_REASONS = new Set(["stop", "max_tokens", "tool_use", "error", "aborted"]);
+
+export function normalizeFailedExtractionOperationRetryAuthorization(
+  value: unknown,
+): FailedExtractionOperationRetryAuthorization | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const authorization = value as Record<string, unknown>;
+  if (
+    Object.keys(authorization).sort().join(",")
+      !== "failureCause,failureClass,failurePhase,lastSafeFailure,receiptInputHash,retryEpoch"
+  ) return null;
+  const lastSafeValue = authorization.lastSafeFailure;
+  if (!lastSafeValue || typeof lastSafeValue !== "object" || Array.isArray(lastSafeValue)) {
+    return null;
+  }
+  const lastSafeFailure = lastSafeValue as Record<string, unknown>;
+  if (Object.keys(lastSafeFailure).sort().join(",") !== "cause,errorClass,phase,timestamp") {
+    return null;
+  }
+  if (
+    typeof authorization.receiptInputHash !== "string"
+    || !/^[0-9a-f]{64}$/.test(authorization.receiptInputHash)
+    || !Number.isSafeInteger(authorization.retryEpoch)
+    || Number(authorization.retryEpoch) < 0
+    || !["transient_provider", "transient_runtime"].includes(String(authorization.failureClass))
+    || typeof authorization.failureCause !== "string"
+    || !/^[a-z0-9][a-z0-9_.:-]{0,127}$/i.test(authorization.failureCause)
+    || !["provider_call", "before_final_persistence"].includes(String(authorization.failurePhase))
+    || lastSafeFailure.errorClass !== authorization.failureClass
+    || lastSafeFailure.cause !== authorization.failureCause
+    || lastSafeFailure.phase !== authorization.failurePhase
+    || typeof lastSafeFailure.timestamp !== "string"
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(lastSafeFailure.timestamp)
+  ) {
+    return null;
+  }
+  return {
+    receiptInputHash: authorization.receiptInputHash,
+    retryEpoch: Number(authorization.retryEpoch),
+    failureClass: authorization.failureClass as FailedExtractionOperationRetryAuthorization["failureClass"],
+    failureCause: authorization.failureCause,
+    failurePhase: authorization.failurePhase as FailedExtractionOperationRetryAuthorization["failurePhase"],
+    lastSafeFailure: {
+      errorClass: lastSafeFailure.errorClass as FailedExtractionOperationRetryAuthorization["lastSafeFailure"]["errorClass"],
+      cause: lastSafeFailure.cause as string,
+      phase: lastSafeFailure.phase as FailedExtractionOperationRetryAuthorization["lastSafeFailure"]["phase"],
+      timestamp: lastSafeFailure.timestamp,
+    },
+  };
+}
 
 const COMMON_RECEIPT_RESPONSE_KEYS = new Set([
   "success", "status", "stage", "provider", "providerName", "provider_name",
@@ -260,6 +324,58 @@ function canReopenFailedReceipt(receipt: ExtractionOperationReceipt): boolean {
   );
 }
 
+function freshReceiptStartedAt(receipt: ExtractionOperationReceipt): string {
+  const priorBoundaries = [
+    receipt.startedAt,
+    receipt.completedAt,
+    receipt.reconciliation?.at,
+  ]
+    .map((value) => typeof value === "string" ? Date.parse(value) : Number.NaN)
+    .filter(Number.isFinite);
+  const nextBoundary = priorBoundaries.length > 0
+    ? Math.max(...priorBoundaries) + 1
+    : Date.now();
+  return new Date(Math.max(Date.now(), nextBoundary)).toISOString();
+}
+
+function retryAuthorizationMatches(
+  identity: ExtractionOperationIdentity,
+  receipt: ExtractionOperationReceipt,
+  authorization: FailedExtractionOperationRetryAuthorization,
+): boolean {
+  const failure = receipt.failure;
+  const retry = receipt.retry;
+  const lastSafeFailure = retry?.lastSafeFailure;
+  return Boolean(
+    failure
+    && retry
+    && lastSafeFailure
+    && authorization.receiptInputHash === identity.inputHash
+    && authorization.receiptInputHash === receipt.inputHash
+    && authorization.retryEpoch === retry.epoch
+    && authorization.failureClass === failure.class
+    && authorization.failureCause === failure.cause
+    && authorization.failurePhase === failure.phase
+    && authorization.lastSafeFailure.errorClass === lastSafeFailure.errorClass
+    && authorization.lastSafeFailure.cause === lastSafeFailure.cause
+    && authorization.lastSafeFailure.phase === lastSafeFailure.phase
+    && authorization.lastSafeFailure.timestamp === lastSafeFailure.timestamp
+  );
+}
+
+function retryAuthorizationFailure<T>(
+  receipt: ExtractionOperationReceipt<T> | null | undefined,
+): ExtractionOperationResult<T> {
+  return {
+    replayed: true,
+    failure: {
+      class: "hard",
+      cause: "extraction_operation_retry_authorization_drifted",
+    },
+    ...(receipt ? { receipt } : {}),
+  };
+}
+
 function failureFromResponse(response: unknown): StageFailure | null {
   if (!response || typeof response !== "object" || Array.isArray(response)) return null;
   const record = response as Record<string, unknown>;
@@ -355,6 +471,28 @@ export async function withExtractionOperationReceipt<T>(
     if (existing?.status === "succeeded" && existing.response !== undefined) {
       return { replayed: true, response: existing.response, receipt: existing };
     }
+    if (existing?.status === "running") {
+      const failure: StageFailure = {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      };
+      return { replayed: true, failure, receipt: existing };
+    }
+    if (options.failedRetryAuthorization) {
+      if (
+        existing?.status !== "failed"
+        || !retryAuthorizationMatches(identity, existing, options.failedRetryAuthorization)
+      ) {
+        if (existing?.status === "failed" && canReopenFailedReceipt(existing)) {
+          const failure = existing.failure ?? {
+            class: "unit" as const,
+            cause: "extraction_operation_failed",
+          };
+          return { replayed: true, failure, receipt: existing };
+        }
+        return retryAuthorizationFailure(existing);
+      }
+    }
     let reopened = false;
     if (existing?.status === "failed") {
       if (options.retryFailed && options.requireExisting && canReopenFailedReceipt(existing)) {
@@ -380,13 +518,6 @@ export async function withExtractionOperationReceipt<T>(
         return { replayed: true, failure, receipt: existing };
       }
     }
-    if (existing?.status === "running" && !reopened) {
-      const failure: StageFailure = {
-        class: "transient_runtime",
-        cause: "extraction_operation_reconciliation_required",
-      };
-      return { replayed: true, failure, receipt: existing };
-    }
     if (options.requireExisting && !reopened) {
       const failure: StageFailure = {
         class: "transient_runtime",
@@ -395,11 +526,28 @@ export async function withExtractionOperationReceipt<T>(
       return { replayed: true, failure };
     }
 
-    const startedAt = existing?.startedAt ?? new Date().toISOString();
-    const running: ExtractionOperationReceipt<T> = existing ?? {
-      ...identity, key, status: "running", startedAt,
-    };
-    if (!existing) await kv.set(KV.extractionOperationReceipt(key), key, running);
+    let startedAt: string;
+    let running: ExtractionOperationReceipt<T>;
+    if (existing?.status === "reconciled") {
+      startedAt = freshReceiptStartedAt(existing);
+      running = {
+        runId: existing.runId,
+        stage: existing.stage,
+        unitId: existing.unitId,
+        inputHash: existing.inputHash,
+        key: existing.key,
+        status: "running",
+        startedAt,
+        ...(existing.retry ? { retry: existing.retry } : {}),
+      };
+      await kv.set(KV.extractionOperationReceipt(key), key, running);
+    } else {
+      startedAt = existing?.startedAt ?? new Date().toISOString();
+      running = existing ?? {
+        ...identity, key, status: "running", startedAt,
+      };
+      if (!existing) await kv.set(KV.extractionOperationReceipt(key), key, running);
+    }
     let rawResponse: T;
     try {
       rawResponse = await execute();
@@ -784,6 +932,16 @@ function sanitizeExtractionOperationReceipt(receipt: ExtractionOperationReceipt)
   failure?: {
     class: StageFailure["class"];
     cause: string;
+    phase?: StageFailure["phase"];
+  };
+  retry?: {
+    epoch: number;
+    lastSafeFailure: {
+      errorClass: StageFailure["class"];
+      cause: string;
+      phase: StageFailure["phase"];
+      timestamp: string;
+    };
   };
 } {
   if (
@@ -798,7 +956,36 @@ function sanitizeExtractionOperationReceipt(receipt: ExtractionOperationReceipt)
     && STAGE_FAILURE_CLASSES.has(failure.class)
     && typeof failure.cause === "string"
     && /^[a-z0-9][a-z0-9_.:-]{0,127}$/i.test(failure.cause)
-    ? { class: failure.class, cause: failure.cause }
+    ? {
+      class: failure.class,
+      cause: failure.cause,
+      ...(failure.phase && RECEIPT_FAILURE_PHASES.has(failure.phase)
+        ? { phase: failure.phase }
+        : {}),
+    }
+    : undefined;
+  const retry = receipt.retry;
+  const lastSafeFailure = retry?.lastSafeFailure;
+  const safeRetry = retry
+    && Number.isSafeInteger(retry.epoch)
+    && retry.epoch >= 0
+    && lastSafeFailure
+    && STAGE_FAILURE_CLASSES.has(lastSafeFailure.errorClass)
+    && typeof lastSafeFailure.cause === "string"
+    && /^[a-z0-9][a-z0-9_.:-]{0,127}$/i.test(lastSafeFailure.cause)
+    && lastSafeFailure.phase
+    && RECEIPT_FAILURE_PHASES.has(lastSafeFailure.phase)
+    && typeof lastSafeFailure.timestamp === "string"
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(lastSafeFailure.timestamp)
+    ? {
+      epoch: retry.epoch,
+      lastSafeFailure: {
+        errorClass: lastSafeFailure.errorClass,
+        cause: lastSafeFailure.cause,
+        phase: lastSafeFailure.phase,
+        timestamp: lastSafeFailure.timestamp,
+      },
+    }
     : undefined;
   return {
     status: receipt.status,
@@ -807,6 +994,7 @@ function sanitizeExtractionOperationReceipt(receipt: ExtractionOperationReceipt)
       ? { completedAt: receipt.completedAt }
       : {}),
     ...(safeFailure ? { failure: safeFailure } : {}),
+    ...(safeRetry ? { retry: safeRetry } : {}),
   };
 }
 
