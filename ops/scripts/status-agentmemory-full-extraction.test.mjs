@@ -25,6 +25,10 @@ async function writeJournal(filePath, events) {
 }
 
 function runStatus(runtimeRoot, runId, requiredStages = '') {
+  return runStatusWithShell('powershell.exe', runtimeRoot, runId, requiredStages);
+}
+
+function runStatusWithShell(shell, runtimeRoot, runId, requiredStages = '') {
   const args = [
     '-NoProfile',
     '-File',
@@ -35,7 +39,7 @@ function runStatus(runtimeRoot, runId, requiredStages = '') {
     runtimeRoot,
   ];
   if (requiredStages) args.push('-RequiredStages', requiredStages);
-  return spawnSync('powershell.exe', args, {
+  return spawnSync(shell, args, {
     encoding: 'utf8',
     windowsHide: true,
   });
@@ -244,6 +248,19 @@ test('v2 journal 在追加重试授权后保留旧失败事件并把当前投影
   assert.match(persisted, /"unit_operation_completed"/);
   assert.match(persisted, /"unit_terminal"/);
   assert.match(persisted, /"unit_summary_failed_terminal_retry_authorized"/);
+
+  const pwsh = spawnSync('pwsh', ['-NoProfile', '-Command', 'exit 0'], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  if (pwsh.status === 0) {
+    const modernResult = runStatusWithShell('pwsh', runtimeRoot, runId, 'summary');
+    assert.equal(modernResult.status, 0, modernResult.stderr || modernResult.stdout);
+    assert.match(
+      modernResult.stdout,
+      /stage\.summary=succeeded:0,skipped:0,failed:0,pending:1,running:0,blocked:0/,
+    );
+  }
 });
 
 test('v2 status 忽略证据不完整的 summary 重试授权并保留 failed', async (context) => {

@@ -59,9 +59,15 @@ function Read-AmV2Journal {
   )
   if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return @() }
   $events = [System.Collections.Generic.List[object]]::new()
+  $supportsDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')
   foreach ($line in [System.IO.File]::ReadLines($Path)) {
     if ([string]::IsNullOrWhiteSpace($line)) { continue }
-    $events.Add(($line | ConvertFrom-Json))
+    $event = if ($supportsDateKind) {
+      ConvertFrom-Json -InputObject $line -DateKind String
+    } else {
+      ConvertFrom-Json -InputObject $line
+    }
+    $events.Add($event)
   }
   return $events
 }
