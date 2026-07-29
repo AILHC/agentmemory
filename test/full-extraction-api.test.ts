@@ -797,6 +797,68 @@ describe("full extraction REST wrappers", () => {
     });
   });
 
+  it("forwards only exact lessons failed-receipt retry evidence", async () => {
+    const sdk = mockSdk(async () => ({ success: true, runs: [] }));
+    const kv = mockKV();
+    const startedAt = "2026-07-22T00:00:00.000Z";
+    const inputHash = sessionInputHash("session-1", startedAt);
+    await kv.set(KV.sessions, "session-1", {
+      id: "session-1",
+      startedAt,
+    });
+    registerApiTriggers(sdk as never, kv as never, "");
+    const failedAt = "2026-07-28T16:23:40.115Z";
+    const failedReceiptRetryAuthorization = {
+      receiptInputHash: "a".repeat(64),
+      retryEpoch: 0,
+      failureClass: "transient_provider",
+      failureCause: "lesson_extraction_failed",
+      failurePhase: "provider_call",
+      lastSafeFailure: {
+        errorClass: "transient_provider",
+        cause: "lesson_extraction_failed",
+        phase: "provider_call",
+        timestamp: failedAt,
+      },
+    };
+    const failedLessonRunEvidence = {
+      status: "retryable",
+      inputHash: "b".repeat(64),
+      configHash: "c".repeat(64),
+      failureCause: "timeout",
+      failurePhase: "provider_call",
+      failedAt,
+      createdLessonCount: 0,
+      replacedLessonCount: 0,
+      chunkLessonCount: 0,
+    };
+
+    const response = await sdk.getFunction("api::lesson-extract")({
+      headers: {},
+      body: {
+        sessionIds: ["session-1"],
+        attemptId: "attempt-1",
+        inputHash,
+        requireExistingReceipt: true,
+        failedReceiptRetryAuthorization,
+        failedLessonRunEvidence,
+      },
+    });
+
+    expect(response.status_code).toBe(200);
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::lessons::extract-llm",
+      payload: {
+        sessionIds: ["session-1"],
+        attemptId: "attempt-1",
+        inputHash,
+        requireExistingReceipt: true,
+        failedReceiptRetryAuthorization,
+        failedLessonRunEvidence,
+      },
+    });
+  });
+
   it("maps a service-owned orphaned v2 lesson receipt to a hard stop", async () => {
     const sdk = mockSdk(async () => ({
       success: false,

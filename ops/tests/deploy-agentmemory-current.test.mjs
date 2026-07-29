@@ -216,6 +216,7 @@ Copy-AmReleaseScripts -Source ${quotePowerShell(source)} -Destination ${quotePow
     [
       '_agentmemory-local-common.ps1',
       'agentmemory-deployment-manifest.mjs',
+      'authorize-agentmemory-lessons-failed-terminal-retry.mjs',
       'doctor-agentmemory-console.ps1',
       'doctor-agentmemory.ps1',
       'lib',

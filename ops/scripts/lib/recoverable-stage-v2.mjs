@@ -13,6 +13,7 @@ const SINGLE_EVENTS = new Set([
   'unit_blocked',
   'unit_reconciliation_resolved',
   'unit_summary_failed_terminal_retry_authorized',
+  'unit_lessons_failed_terminal_retry_authorized',
   'unit_recorded',
   'stage_completed',
 ]);
@@ -172,6 +173,60 @@ function validateStageEvents(events, mode) {
       unit.completed_operations.pop();
       unit.completed_operation_events.pop();
       unit.superseded_operations.push(completedOperation);
+      unit.superseded_terminals.push({
+        seq: unit.terminal_seq,
+        payload: unit.terminal_payload,
+      });
+      unit.terminal = null;
+      unit.terminal_payload = undefined;
+      unit.terminal_seq = undefined;
+      unit.retry_authorization = event.payload;
+      continue;
+    }
+    if (event.type === 'unit_lessons_failed_terminal_retry_authorized') {
+      const lastSafeFailure = event.payload?.last_safe_failure;
+      const lessonEvidence = event.payload?.lesson_run_evidence;
+      if (
+        mode !== 'single'
+        || unit.blocked
+        || unit.recorded
+        || unit.active_operation
+        || unit.terminal !== 'failed'
+        || event.payload?.stage !== 'lessons'
+        || event.payload?.attempt_id !== unit.attempt_id
+        || event.payload?.runner_input_hash !== unit.input_hash
+        || !/^[0-9a-f]{64}$/.test(String(event.payload?.receipt_input_hash || ''))
+        || event.payload?.receipt_status !== 'failed'
+        || event.payload?.receipt_failure_class !== 'transient_provider'
+        || event.payload?.receipt_failure_cause !== 'lesson_extraction_failed'
+        || event.payload?.failure_class !== 'transient_provider'
+        || event.payload?.failure_cause !== 'lesson_extraction_failed'
+        || event.payload?.failure_phase !== 'provider_call'
+        || event.payload?.retry_epoch !== 0
+        || lastSafeFailure?.error_class !== event.payload.failure_class
+        || lastSafeFailure?.cause !== event.payload.failure_cause
+        || lastSafeFailure?.phase !== event.payload.failure_phase
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(
+          String(lastSafeFailure?.timestamp || ''),
+        )
+        || lessonEvidence?.status !== 'retryable'
+        || !/^[0-9a-f]{64}$/.test(String(lessonEvidence?.input_hash || ''))
+        || !/^[0-9a-f]{64}$/.test(String(lessonEvidence?.config_hash || ''))
+        || !['rate_limited', 'timeout', 'network_error', 'server_error'].includes(
+          lessonEvidence?.failure_cause,
+        )
+        || lessonEvidence?.failure_phase !== 'provider_call'
+        || lessonEvidence?.failed_at !== lastSafeFailure.timestamp
+        || lessonEvidence?.created_lesson_count !== 0
+        || lessonEvidence?.replaced_lesson_count !== 0
+        || lessonEvidence?.chunk_lesson_count !== 0
+        || unit.terminal_payload?.error !== event.payload.receipt_failure_cause
+        || event.payload?.superseded_terminal_seq !== unit.terminal_seq
+        || event.payload?.expected_journal_seq !== unit.terminal_seq
+        || event.seq !== unit.terminal_seq + 1
+      ) {
+        transitionError(mode, event, 'lessons_retry_authorization_evidence');
+      }
       unit.superseded_terminals.push({
         seq: unit.terminal_seq,
         payload: unit.terminal_payload,

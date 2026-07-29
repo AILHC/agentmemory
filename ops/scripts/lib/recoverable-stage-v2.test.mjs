@@ -500,6 +500,83 @@ test('single-phase summary retry authorization supersedes only the named failed 
   );
 });
 
+test('single-phase lessons retry authorization supersedes only the named failed terminal', async () => {
+  const harness = makeHarness();
+  const attemptId = 'a'.repeat(64);
+  const runnerInputHash = 'b'.repeat(64);
+  const receiptInputHash = 'c'.repeat(64);
+  const lessonRunInputHash = 'd'.repeat(64);
+  const lessonRunConfigHash = 'e'.repeat(64);
+  const retryPlan = [{ unit_id: 'unit-1', input_hash: runnerInputHash }];
+  const invoke = () => runSinglePhaseStage({
+    events: harness.events,
+    plan: retryPlan,
+    append: harness.append,
+    attemptIdForUnit: () => attemptId,
+    execute: async ({ retryAuthorization }) => {
+      assert.equal(retryAuthorization.stage, 'lessons');
+      assert.equal(retryAuthorization.receipt_input_hash, receiptInputHash);
+      assert.equal(retryAuthorization.lesson_run_evidence.input_hash, lessonRunInputHash);
+      return { status: 'succeeded', payload: { run_id: 'lesson-run-1' } };
+    },
+    record: async () => {},
+  });
+
+  await harness.append('unit_planned', retryPlan[0]);
+  await harness.append('stage_plan_completed', { unit_count: 1 });
+  await harness.append('unit_started', {
+    unit_id: 'unit-1',
+    input_hash: runnerInputHash,
+    attempt_id: attemptId,
+  });
+  const failedTerminal = await harness.append('unit_terminal', {
+    unit_id: 'unit-1',
+    attempt_id: attemptId,
+    status: 'failed',
+    error: 'lesson_extraction_failed',
+  });
+  await harness.append('unit_lessons_failed_terminal_retry_authorized', {
+    stage: 'lessons',
+    unit_id: 'unit-1',
+    attempt_id: attemptId,
+    runner_input_hash: runnerInputHash,
+    receipt_input_hash: receiptInputHash,
+    receipt_status: 'failed',
+    receipt_failure_class: 'transient_provider',
+    receipt_failure_cause: 'lesson_extraction_failed',
+    failure_class: 'transient_provider',
+    failure_cause: 'lesson_extraction_failed',
+    failure_phase: 'provider_call',
+    retry_epoch: 0,
+    last_safe_failure: {
+      error_class: 'transient_provider',
+      cause: 'lesson_extraction_failed',
+      phase: 'provider_call',
+      timestamp: '2026-07-28T16:23:40.115Z',
+    },
+    lesson_run_evidence: {
+      status: 'retryable',
+      input_hash: lessonRunInputHash,
+      config_hash: lessonRunConfigHash,
+      failure_cause: 'timeout',
+      failure_phase: 'provider_call',
+      failed_at: '2026-07-28T16:23:40.115Z',
+      created_lesson_count: 0,
+      replaced_lesson_count: 0,
+      chunk_lesson_count: 0,
+    },
+    superseded_terminal_seq: failedTerminal.seq,
+    expected_journal_seq: failedTerminal.seq,
+  });
+
+  assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 1 });
+  assert.deepEqual(
+    harness.events.filter((event) => event.type === 'unit_terminal')
+      .map((event) => event.payload.status),
+    ['failed', 'succeeded'],
+  );
+});
+
 test('single-phase retry authorization fails closed outside a safe summary reduce failure shape', () => {
   const attemptId = 'a'.repeat(64);
   const events = [

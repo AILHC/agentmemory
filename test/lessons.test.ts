@@ -9,9 +9,14 @@ import {
   computeLessonExtractionConfigHash,
   computeLessonExtractionInputHash,
   resolveLlmLessonExtractionRuntimeConfig,
+  runIdForSession,
   stableHash,
 } from "../src/functions/lesson-extraction-runs.js";
-import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
+import {
+  buildExtractionOperationKey,
+  registerExtractionOperationReceiptFunctions,
+} from "../src/functions/extraction-operation-receipts.js";
+import { ProviderCallError } from "../src/providers/provider-call-result.js";
 import type { Lesson, MemoryProvider } from "../src/types.js";
 import { KV } from "../src/state/schema.js";
 
@@ -602,6 +607,247 @@ describe("Lessons", () => {
         },
       });
       expect(provider.compress).not.toHaveBeenCalled();
+    });
+
+    it("marks retryable provider failures as receipt-safe while keeping deterministic failures terminal", async () => {
+      const providerFailure = new ProviderCallError("pi_stream_failed", {
+        providerErrorCode: "timeout",
+        statusCode: 200,
+        elapsedMs: 60_000,
+        inputChars: 120,
+        maxOutputTokens: 4096,
+        responseStarted: true,
+        stopReason: "error",
+      });
+      const provider: MemoryProvider = {
+        name: "mock-llm",
+        compress: vi.fn()
+          .mockRejectedValueOnce(providerFailure)
+          .mockResolvedValueOnce(`
+<lessons>
+  <lesson confidence="0.8">
+    <content>Retry only a receipt-safe provider failure.</content>
+    <context>v2 lesson recovery</context>
+    <tags><tag>retry</tag></tags>
+  </lesson>
+</lessons>`)
+          .mockResolvedValue("<not-lessons />"),
+        summarize: vi.fn(async () => ""),
+      };
+      registerLessonsFunctions(sdk as never, kv as never, provider);
+      registerExtractionOperationReceiptFunctions(sdk as never, kv as never);
+      for (const sessionId of ["session-provider-retry", "session-parse-failure"]) {
+        await kv.set(KV.sessions, sessionId, {
+          id: sessionId,
+          project: "project",
+          cwd: "/tmp/project",
+          startedAt: "2026-07-28T00:00:00.000Z",
+          status: "active",
+          observationCount: 1,
+        });
+        await kv.set(KV.observations(sessionId), "obs-1", {
+          id: "obs-1",
+          sessionId,
+          timestamp: "2026-07-28T00:00:01.000Z",
+          hookType: "user",
+          userPrompt: "Operational test input.",
+          raw: {},
+          sourceEventIndex: 1,
+        });
+      }
+
+      const retryable = await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-provider-retry"],
+        attemptId: "attempt-provider-retry",
+        inputHash: "runner-provider-retry",
+      });
+      expect(retryable).toMatchObject({
+        success: false,
+        failure: {
+          class: "transient_provider",
+          cause: "timeout",
+          phase: "provider_call",
+        },
+      });
+      const retryReceipt = await sdk.trigger("mem::extraction-operation-receipt-get", {
+        runId: "attempt-provider-retry",
+        stage: "lessons",
+        unitId: "session-provider-retry",
+      });
+      expect(retryReceipt).toMatchObject({
+        receipt: {
+          status: "failed",
+          retry: {
+            epoch: 0,
+            lastSafeFailure: {
+              errorClass: "transient_provider",
+              cause: "timeout",
+              phase: "provider_call",
+            },
+          },
+        },
+      });
+      const resumed = await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-provider-retry"],
+        attemptId: "attempt-provider-retry",
+        inputHash: "runner-provider-retry",
+        requireExistingReceipt: true,
+      });
+      expect(resumed).toMatchObject({
+        success: true,
+        runs: [{ status: "succeeded" }],
+      });
+
+      const deterministic = await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-parse-failure"],
+        attemptId: "attempt-parse-failure",
+        inputHash: "runner-parse-failure",
+      });
+      expect(deterministic).toMatchObject({
+        success: false,
+        failure: {
+          class: "unit",
+          cause: "lesson_missing_root",
+        },
+      });
+      expect(deterministic).not.toHaveProperty("retryableReceiptFailure");
+    });
+
+    it("reopens a legacy failed receipt only with matching zero-result lesson evidence", async () => {
+      const xml = `
+<lessons>
+  <lesson confidence="0.8">
+    <content>Resume only from verified zero-result evidence.</content>
+    <context>v2 lesson recovery</context>
+    <tags><tag>receipt</tag></tags>
+  </lesson>
+</lessons>`;
+      const provider: MemoryProvider = {
+        name: "mock-llm",
+        compress: vi.fn(async () => xml),
+        summarize: vi.fn(async () => ""),
+      };
+      registerLessonsFunctions(sdk as never, kv as never, provider);
+      registerExtractionOperationReceiptFunctions(sdk as never, kv as never);
+      const sessionId = "session-legacy-retry";
+      const attemptId = "f".repeat(64);
+      const runnerInputHash = "a".repeat(64);
+      const failedAt = "2026-07-28T16:23:40.115Z";
+      const observation = {
+        id: "obs-1",
+        sessionId,
+        timestamp: "2026-07-28T16:22:00.000Z",
+        hookType: "user",
+        userPrompt: "Operational test input.",
+        raw: {},
+        sourceEventIndex: 1,
+      };
+      await kv.set(KV.sessions, sessionId, {
+        id: sessionId,
+        project: "project",
+        cwd: "/tmp/project",
+        startedAt: "2026-07-28T16:22:00.000Z",
+        status: "active",
+        observationCount: 1,
+      });
+      await kv.set(KV.observations(sessionId), observation.id, observation);
+      const config = resolveLlmLessonExtractionRuntimeConfig(provider);
+      const serviceInputHash = computeLessonExtractionInputHash([observation]);
+      const configHash = computeLessonExtractionConfigHash(config);
+      const runId = runIdForSession(sessionId, serviceInputHash, configHash);
+      await kv.set(KV.lessonExtractionRuns, runId, {
+        id: runId,
+        sessionId,
+        project: "project",
+        strategy: "llm",
+        status: "retryable",
+        inputHash: serviceInputHash,
+        configHash,
+        providerName: provider.name,
+        config,
+        attempts: 1,
+        createdLessonIds: [],
+        replacedLessonIds: [],
+        failureDiagnostics: {
+          requestPhase: "chunk",
+          providerErrorCode: "timeout",
+          statusCode: 200,
+          elapsedMs: 60_002,
+          inputChars: 120,
+          maxOutputTokens: 4096,
+          responseStarted: true,
+          stopReason: "error",
+        },
+        createdAt: "2026-07-28T16:22:40.093Z",
+        updatedAt: failedAt,
+        startedAt: "2026-07-28T16:22:40.100Z",
+        finishedAt: failedAt,
+      });
+      const receiptIdentity = {
+        runId: attemptId,
+        stage: "lessons" as const,
+        unitId: sessionId,
+        inputHash: stableHash({
+          runnerInputHash,
+          serviceInputHash,
+          configHash,
+        }),
+      };
+      const receiptKey = buildExtractionOperationKey(receiptIdentity);
+      await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+        ...receiptIdentity,
+        key: receiptKey,
+        status: "failed",
+        startedAt: "2026-07-28T16:22:40.100Z",
+        completedAt: "2026-07-28T16:23:40.116Z",
+        failure: {
+          class: "transient_provider",
+          cause: "lesson_extraction_failed",
+        },
+      });
+      const authorization = {
+        receiptInputHash: receiptIdentity.inputHash,
+        retryEpoch: 0,
+        failureClass: "transient_provider",
+        failureCause: "lesson_extraction_failed",
+        failurePhase: "provider_call",
+        lastSafeFailure: {
+          errorClass: "transient_provider",
+          cause: "lesson_extraction_failed",
+          phase: "provider_call",
+          timestamp: failedAt,
+        },
+      };
+      const lessonRunEvidence = {
+        status: "retryable",
+        inputHash: serviceInputHash,
+        configHash,
+        failureCause: "timeout",
+        failurePhase: "provider_call",
+        failedAt,
+        createdLessonCount: 0,
+        replacedLessonCount: 0,
+        chunkLessonCount: 0,
+      };
+
+      const resumed = await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: [sessionId],
+        attemptId,
+        inputHash: runnerInputHash,
+        requireExistingReceipt: true,
+        failedReceiptRetryAuthorization: authorization,
+        failedLessonRunEvidence: lessonRunEvidence,
+      });
+
+      expect(resumed).toMatchObject({
+        success: true,
+        runs: [{ status: "succeeded" }],
+      });
+      expect(provider.compress).toHaveBeenCalledTimes(1);
+      expect(await kv.get(KV.extractionOperationReceipt(receiptKey), receiptKey)).toMatchObject({
+        status: "succeeded",
+        retry: { epoch: 1 },
+      });
     });
 
     it("uses explicit model in lesson runtime config and provider call options", async () => {

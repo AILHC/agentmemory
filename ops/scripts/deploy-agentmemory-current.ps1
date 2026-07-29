@@ -310,6 +310,7 @@ function Copy-AmReleaseScripts {
     'stop-agentmemory.ps1',
     'doctor-agentmemory.ps1',
     'request-agentmemory-full-extraction-drain.ps1',
+    'authorize-agentmemory-lessons-failed-terminal-retry.mjs',
     'status-agentmemory-full-extraction.ps1',
     'run-agentmemory-cli-import-batch.mjs',
     'run-agentmemory-full-extraction.mjs'

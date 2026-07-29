@@ -34,9 +34,10 @@ export interface FailedExtractionOperationRetryAuthorization {
 
 export interface ExtractionOperationReceiptOptions {
   requireExisting?: boolean;
-  /** 仅 summary reduce 显式启用，允许已确认未持久化结果的失败重开同一 receipt。 */
+  /** 仅在调用方已确认未持久化结果时启用，允许失败重开同一 receipt。 */
   retryFailed?: boolean;
   failedRetryAuthorization?: FailedExtractionOperationRetryAuthorization;
+  allowLegacyLessonFailedRetry?: boolean;
 }
 
 /** 表示回调失去确定性时，最终结果可能已经持久化。 */
@@ -363,6 +364,32 @@ function retryAuthorizationMatches(
   );
 }
 
+function legacyLessonRetryAuthorizationMatches(
+  identity: ExtractionOperationIdentity,
+  receipt: ExtractionOperationReceipt,
+  authorization: FailedExtractionOperationRetryAuthorization,
+): boolean {
+  const failure = receipt.failure;
+  const lastSafeFailure = authorization.lastSafeFailure;
+  return Boolean(
+    identity.stage === "lessons"
+    && receipt.stage === "lessons"
+    && receipt.status === "failed"
+    && failure
+    && failure.phase === undefined
+    && receipt.retry === undefined
+    && authorization.receiptInputHash === identity.inputHash
+    && authorization.receiptInputHash === receipt.inputHash
+    && authorization.retryEpoch === 0
+    && authorization.failureClass === failure.class
+    && authorization.failureCause === failure.cause
+    && authorization.failurePhase === "provider_call"
+    && lastSafeFailure.errorClass === authorization.failureClass
+    && lastSafeFailure.cause === authorization.failureCause
+    && lastSafeFailure.phase === authorization.failurePhase
+  );
+}
+
 function retryAuthorizationFailure<T>(
   receipt: ExtractionOperationReceipt<T> | null | undefined,
 ): ExtractionOperationResult<T> {
@@ -478,10 +505,25 @@ export async function withExtractionOperationReceipt<T>(
       };
       return { replayed: true, failure, receipt: existing };
     }
+    const failedRetryAuthorizationMatches = Boolean(
+      options.failedRetryAuthorization
+      && existing?.status === "failed"
+      && (
+        retryAuthorizationMatches(identity, existing, options.failedRetryAuthorization)
+        || (
+          options.allowLegacyLessonFailedRetry === true
+          && legacyLessonRetryAuthorizationMatches(
+            identity,
+            existing,
+            options.failedRetryAuthorization,
+          )
+        )
+      ),
+    );
     if (options.failedRetryAuthorization) {
       if (
         existing?.status !== "failed"
-        || !retryAuthorizationMatches(identity, existing, options.failedRetryAuthorization)
+        || !failedRetryAuthorizationMatches
       ) {
         if (existing?.status === "failed" && canReopenFailedReceipt(existing)) {
           const failure = existing.failure ?? {
@@ -495,7 +537,16 @@ export async function withExtractionOperationReceipt<T>(
     }
     let reopened = false;
     if (existing?.status === "failed") {
-      if (options.retryFailed && options.requireExisting && canReopenFailedReceipt(existing)) {
+      if (
+        options.retryFailed
+        && options.requireExisting
+        && (canReopenFailedReceipt(existing) || failedRetryAuthorizationMatches)
+      ) {
+        const retryEpoch = existing.retry?.epoch
+          ?? options.failedRetryAuthorization?.retryEpoch
+          ?? 0;
+        const lastSafeFailure = existing.retry?.lastSafeFailure
+          ?? options.failedRetryAuthorization?.lastSafeFailure;
         const running: ExtractionOperationReceipt<T> = {
           ...existing,
           status: "running",
@@ -504,7 +555,8 @@ export async function withExtractionOperationReceipt<T>(
           failure: undefined,
           retry: {
             ...existing.retry,
-            epoch: existing.retry.epoch + 1,
+            epoch: retryEpoch + 1,
+            ...(lastSafeFailure ? { lastSafeFailure } : {}),
           },
         };
         await kv.set(KV.extractionOperationReceipt(key), key, running);

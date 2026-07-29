@@ -61,6 +61,7 @@ import {
   sanitizeLessonFailureDiagnostics,
   sanitizeStageFailureDiagnostics,
 } from "../functions/summarize.js";
+import { normalizeFailedLessonRunRetryEvidence } from "../functions/lessons.js";
 
 const SUMMARY_FAILURE_CLASSES = new Set([
   "transient_provider",
@@ -4911,6 +4912,8 @@ export function registerApiTriggers(
       "attemptId",
       "inputHash",
       "requireExistingReceipt",
+      "failedReceiptRetryAuthorization",
+      "failedLessonRunEvidence",
     ]);
     const unknown = Object.keys(body).filter((key) => !allowed.has(key));
     if (unknown.length > 0) {
@@ -4918,7 +4921,7 @@ export function registerApiTriggers(
         status_code: 400,
         body: {
           error:
-              "invalid lesson extraction payload: only sessionIds, missingOnly, retryFailed, force, textLimit, saveLimit, chunkSize, chunkConcurrency, timeoutMs, model, attemptId, inputHash, requireExistingReceipt are allowed",
+              "invalid lesson extraction payload: only sessionIds, missingOnly, retryFailed, force, textLimit, saveLimit, chunkSize, chunkConcurrency, timeoutMs, model, attemptId, inputHash, requireExistingReceipt, failedReceiptRetryAuthorization, failedLessonRunEvidence are allowed",
         },
       };
     }
@@ -4978,12 +4981,28 @@ export function registerApiTriggers(
     const attemptId = optionalNonEmptyString(body, "attemptId");
     const inputHash = optionalNonEmptyString(body, "inputHash");
     const requireExistingReceipt = parseOptionalStrictBoolean(body.requireExistingReceipt);
+    const failedReceiptRetryAuthorization =
+      body.failedReceiptRetryAuthorization === undefined
+        ? undefined
+        : normalizeFailedExtractionOperationRetryAuthorization(
+          body.failedReceiptRetryAuthorization,
+        );
+    const failedLessonRunEvidence = body.failedLessonRunEvidence === undefined
+      ? undefined
+      : normalizeFailedLessonRunRetryEvidence(body.failedLessonRunEvidence);
     if (
       attemptId === null
       || inputHash === null
       || requireExistingReceipt === null
       || Boolean(attemptId) !== Boolean(inputHash)
       || (requireExistingReceipt === true && !attemptId)
+      || failedReceiptRetryAuthorization === null
+      || failedLessonRunEvidence === null
+      || Boolean(failedReceiptRetryAuthorization) !== Boolean(failedLessonRunEvidence)
+      || (
+        failedReceiptRetryAuthorization !== undefined
+        && (requireExistingReceipt !== true || !attemptId || sessionIds.length !== 1)
+      )
     ) {
       return invalidExtractionOperationIdentityResponse("lessons");
     }
@@ -5027,6 +5046,10 @@ export function registerApiTriggers(
         attemptId,
         inputHash,
         ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+        ...(failedReceiptRetryAuthorization
+          ? { failedReceiptRetryAuthorization }
+          : {}),
+        ...(failedLessonRunEvidence ? { failedLessonRunEvidence } : {}),
       },
     }) as {
       success?: boolean;

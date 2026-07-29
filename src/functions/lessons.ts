@@ -17,8 +17,142 @@ import {
 import { recordAudit } from "./audit.js";
 import {
   completeModelOperationFromVerifiedResult,
+  normalizeFailedExtractionOperationRetryAuthorization,
   withExtractionOperationReceipt,
+  type FailedExtractionOperationRetryAuthorization,
 } from "./extraction-operation-receipts.js";
+import { sanitizeLessonFailureDiagnostics } from "./summarize.js";
+
+const RETRYABLE_LESSON_PROVIDER_CODES = new Set([
+  "rate_limited",
+  "timeout",
+  "network_error",
+  "server_error",
+]);
+const HARD_LESSON_PROVIDER_CODES = new Set(["auth_failed", "model_not_found"]);
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+
+export interface FailedLessonRunRetryEvidence {
+  status: "retryable";
+  inputHash: string;
+  configHash: string;
+  failureCause: string;
+  failurePhase: "provider_call";
+  failedAt: string;
+  createdLessonCount: 0;
+  replacedLessonCount: 0;
+  chunkLessonCount: 0;
+}
+
+export function normalizeFailedLessonRunRetryEvidence(
+  value: unknown,
+): FailedLessonRunRetryEvidence | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const evidence = value as Record<string, unknown>;
+  if (
+    Object.keys(evidence).sort().join(",")
+      !== "chunkLessonCount,configHash,createdLessonCount,failedAt,failureCause,failurePhase,inputHash,replacedLessonCount,status"
+    || evidence.status !== "retryable"
+    || typeof evidence.inputHash !== "string"
+    || !SHA256_HEX.test(evidence.inputHash)
+    || typeof evidence.configHash !== "string"
+    || !SHA256_HEX.test(evidence.configHash)
+    || typeof evidence.failureCause !== "string"
+    || !RETRYABLE_LESSON_PROVIDER_CODES.has(evidence.failureCause)
+    || evidence.failurePhase !== "provider_call"
+    || typeof evidence.failedAt !== "string"
+    || !ISO_TIMESTAMP.test(evidence.failedAt)
+    || evidence.createdLessonCount !== 0
+    || evidence.replacedLessonCount !== 0
+    || evidence.chunkLessonCount !== 0
+  ) {
+    return null;
+  }
+  return evidence as unknown as FailedLessonRunRetryEvidence;
+}
+
+async function legacyLessonRetryEvidenceMatches(
+  kv: StateKV,
+  run: LessonExtractionRun,
+  receiptInputHash: string,
+  authorization: FailedExtractionOperationRetryAuthorization,
+  evidence: FailedLessonRunRetryEvidence,
+): Promise<boolean> {
+  const diagnostics = sanitizeLessonFailureDiagnostics(run.failureDiagnostics);
+  const chunks = await kv.list<LessonExtractionChunkRun>(
+    KV.lessonExtractionChunks(run.id),
+  );
+  const chunkLessonCount = chunks.reduce(
+    (count, chunk) => count + chunk.lessonIds.length,
+    0,
+  );
+  return run.status === "retryable"
+    && run.inputHash === evidence.inputHash
+    && run.configHash === evidence.configHash
+    && run.finishedAt === evidence.failedAt
+    && run.createdLessonIds.length === evidence.createdLessonCount
+    && run.replacedLessonIds.length === evidence.replacedLessonCount
+    && chunkLessonCount === evidence.chunkLessonCount
+    && diagnostics !== undefined
+    && "providerErrorCode" in diagnostics
+    && diagnostics.providerErrorCode === evidence.failureCause
+    && diagnostics.requestPhase === "chunk"
+    && authorization.receiptInputHash === receiptInputHash
+    && authorization.retryEpoch === 0
+    && authorization.failureClass === "transient_provider"
+    && authorization.failureCause === "lesson_extraction_failed"
+    && authorization.failurePhase === evidence.failurePhase
+    && authorization.lastSafeFailure.errorClass === authorization.failureClass
+    && authorization.lastSafeFailure.cause === authorization.failureCause
+    && authorization.lastSafeFailure.phase === authorization.failurePhase
+    && authorization.lastSafeFailure.timestamp === evidence.failedAt;
+}
+
+function lessonRunFailure(run: LessonExtractionRun): {
+  failure: {
+    class: "transient_provider" | "unit" | "hard";
+    cause: string;
+    phase?: "provider_call";
+    diagnostics?: NonNullable<LessonExtractionRun["failureDiagnostics"]>;
+  };
+  retryableReceiptFailure?: true;
+} {
+  if (run.status !== "retryable") {
+    return { failure: { class: "unit", cause: "lesson_extraction_failed" } };
+  }
+  const diagnostics = sanitizeLessonFailureDiagnostics(run.failureDiagnostics);
+  if (diagnostics && "parseErrorCode" in diagnostics) {
+    return {
+      failure: {
+        class: "unit",
+        cause: diagnostics.parseErrorCode,
+        diagnostics,
+      },
+    };
+  }
+  if (diagnostics && "providerErrorCode" in diagnostics) {
+    if (RETRYABLE_LESSON_PROVIDER_CODES.has(diagnostics.providerErrorCode)) {
+      return {
+        failure: {
+          class: "transient_provider",
+          cause: diagnostics.providerErrorCode,
+          phase: "provider_call",
+          diagnostics,
+        },
+        retryableReceiptFailure: true,
+      };
+    }
+    return {
+      failure: {
+        class: HARD_LESSON_PROVIDER_CODES.has(diagnostics.providerErrorCode) ? "hard" : "unit",
+        cause: diagnostics.providerErrorCode,
+        diagnostics,
+      },
+    };
+  }
+  return { failure: { class: "unit", cause: "lesson_extraction_failed" } };
+}
 
 function reinforceLesson(lesson: Lesson): void {
   const now = new Date().toISOString();
@@ -170,6 +304,8 @@ export function registerLessonsFunctions(
       attemptId?: unknown;
       inputHash?: unknown;
       requireExistingReceipt?: unknown;
+      failedReceiptRetryAuthorization?: unknown;
+      failedLessonRunEvidence?: unknown;
     }) => {
       if (!provider) {
         return { success: false, error: "provider is required for lesson extraction" };
@@ -203,6 +339,33 @@ export function registerLessonsFunctions(
           success: false,
           status: "failed",
           failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+        };
+      }
+      const failedReceiptRetryAuthorization =
+        data.failedReceiptRetryAuthorization === undefined
+          ? undefined
+          : normalizeFailedExtractionOperationRetryAuthorization(
+            data.failedReceiptRetryAuthorization,
+          );
+      const failedLessonRunEvidence = data.failedLessonRunEvidence === undefined
+        ? undefined
+        : normalizeFailedLessonRunRetryEvidence(data.failedLessonRunEvidence);
+      if (
+        failedReceiptRetryAuthorization === null
+        || failedLessonRunEvidence === null
+        || Boolean(failedReceiptRetryAuthorization) !== Boolean(failedLessonRunEvidence)
+        || (
+          failedReceiptRetryAuthorization !== undefined
+          && (data.requireExistingReceipt !== true || sessionIds.length !== 1)
+        )
+      ) {
+        return {
+          success: false,
+          status: "failed",
+          failure: {
+            class: "hard",
+            cause: "invalid_extraction_operation_retry_authorization",
+          },
         };
       }
       if (attemptId && sessionIds.length !== 1) {
@@ -261,6 +424,26 @@ export function registerLessonsFunctions(
             configHash: baseRun.configHash,
           }),
         };
+        const legacyRetryAuthorized = failedReceiptRetryAuthorization
+          && failedLessonRunEvidence
+          ? await legacyLessonRetryEvidenceMatches(
+            kv,
+            baseRun,
+            receiptIdentity.inputHash,
+            failedReceiptRetryAuthorization,
+            failedLessonRunEvidence,
+          )
+          : false;
+        if (failedReceiptRetryAuthorization && !legacyRetryAuthorized) {
+          return {
+            success: false,
+            status: "failed",
+            failure: {
+              class: "hard",
+              cause: "invalid_extraction_operation_retry_authorization",
+            },
+          };
+        }
         const execute = async () => {
           if (baseRun.status === "running" && !isExpiredRunningRun(baseRun, now)) {
             throw new Error("lesson extraction is already running");
@@ -273,13 +456,11 @@ export function registerLessonsFunctions(
             ? await processLlmLessonExtractionRun({ kv, provider, runId: baseRun.id })
             : baseRun;
           if (run.status === "retryable" || run.status === "failed") {
+            const classified = lessonRunFailure(run);
             return {
               success: false,
               status: "failed",
-              failure: {
-                class: "transient_provider" as const,
-                cause: "lesson_extraction_failed",
-              },
+              ...classified,
               runs: [run],
             };
           }
@@ -290,7 +471,14 @@ export function registerLessonsFunctions(
           kv,
           receiptIdentity,
           execute,
-          { requireExisting: data.requireExistingReceipt === true },
+          {
+            requireExisting: data.requireExistingReceipt === true,
+            retryFailed: true,
+            ...(failedReceiptRetryAuthorization
+              ? { failedRetryAuthorization: failedReceiptRetryAuthorization }
+              : {}),
+            ...(legacyRetryAuthorized ? { allowLegacyLessonFailedRetry: true } : {}),
+          },
         );
         if (
           operation.failure?.cause === "extraction_operation_reconciliation_required"

@@ -5855,7 +5855,35 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
 function buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote }) {
   return {
     attemptIdForUnit: (unit) => stableHash({ run_id: runId, stage: 'lessons', unit_id: unit.unit_id }),
-    execute: async ({ unit, attemptId, recovered }) => {
+    execute: async ({ unit, attemptId, recovered, retryAuthorization }) => {
+      const authorizedRetry = retryAuthorization?.stage === 'lessons'
+        ? {
+            failedReceiptRetryAuthorization: {
+              receiptInputHash: retryAuthorization.receipt_input_hash,
+              retryEpoch: retryAuthorization.retry_epoch,
+              failureClass: retryAuthorization.failure_class,
+              failureCause: retryAuthorization.failure_cause,
+              failurePhase: retryAuthorization.failure_phase,
+              lastSafeFailure: {
+                errorClass: retryAuthorization.last_safe_failure.error_class,
+                cause: retryAuthorization.last_safe_failure.cause,
+                phase: retryAuthorization.last_safe_failure.phase,
+                timestamp: retryAuthorization.last_safe_failure.timestamp,
+              },
+            },
+            failedLessonRunEvidence: {
+              status: retryAuthorization.lesson_run_evidence.status,
+              inputHash: retryAuthorization.lesson_run_evidence.input_hash,
+              configHash: retryAuthorization.lesson_run_evidence.config_hash,
+              failureCause: retryAuthorization.lesson_run_evidence.failure_cause,
+              failurePhase: retryAuthorization.lesson_run_evidence.failure_phase,
+              failedAt: retryAuthorization.lesson_run_evidence.failed_at,
+              createdLessonCount: retryAuthorization.lesson_run_evidence.created_lesson_count,
+              replacedLessonCount: retryAuthorization.lesson_run_evidence.replaced_lesson_count,
+              chunkLessonCount: retryAuthorization.lesson_run_evidence.chunk_lesson_count,
+            },
+          }
+        : {};
       const requestResult = await executeReceiptAwareRequest({
         recovered,
         invoke: (requireExistingReceipt) => lessonsRemote.start({
@@ -5865,6 +5893,7 @@ function buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote 
           attemptId,
           inputHash: unit.input_hash,
           requireExistingReceipt,
+          ...authorizedRetry,
           request: buildLessonExtractBody(unit.unit_id, options),
           signal: options.signal,
         }),
@@ -5872,11 +5901,18 @@ function buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote 
       if (requestResult.pending) return { status: 'pending' };
       const result = requestResult.response;
       const data = result?.data || result || {};
+      const failure = data?.failure;
       const failureCause = data?.failure?.cause || data?.failure?.error || data?.error || result?.error;
       if (failureCause === 'extraction_operation_reconciliation_required') {
         return { status: 'blocked', reason: failureCause, payload: { error: failureCause } };
       }
       if (result?.ok === false) {
+        if (
+          ['transient_provider', 'transient_runtime'].includes(failure?.class)
+          && ['provider_call', 'before_final_persistence'].includes(failure?.phase)
+        ) {
+          return { status: 'pending', failure };
+        }
         return { status: 'failed', payload: { error: failureCause || 'lessons extract failed' } };
       }
       const lessonRun = data?.runs?.[0] || data?.run || null;
@@ -6001,6 +6037,8 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       attemptId,
       inputHash,
       requireExistingReceipt,
+      failedReceiptRetryAuthorization,
+      failedLessonRunEvidence,
       request,
       signal,
     }) => requestJson(
@@ -6014,6 +6052,10 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
         attemptId,
         inputHash,
         ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+        ...(failedReceiptRetryAuthorization
+          ? { failedReceiptRetryAuthorization }
+          : {}),
+        ...(failedLessonRunEvidence ? { failedLessonRunEvidence } : {}),
       },
       requestOptions({ ...options, signal }),
     ),

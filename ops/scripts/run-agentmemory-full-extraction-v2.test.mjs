@@ -1889,6 +1889,208 @@ test('v2 lessons hard-stops reconciliation-required receipts without sealing', a
   }
 });
 
+test('v2 lessons keeps safe transient failures pending but seals deterministic failures', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-lessons-failure-contract-'));
+  const summaryRemote = {
+    advance: async (request) => successfulSummaryResponse(request),
+    record: async () => {},
+  };
+  try {
+    await withServer((_request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ success: true, sessions: [{ id: 's1', startedAt: '2026-07-24T00:00:00.000Z' }] }));
+    }, async (baseUrl) => {
+      const pendingCode = await mainForEarlyStages([
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'lessons-transient',
+        '--run-state-format', 'v2',
+      ], {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: {
+          start: async () => ({
+            ok: false,
+            status_code: 503,
+            data: {
+              failure: {
+                class: 'transient_provider',
+                cause: 'timeout',
+                phase: 'provider_call',
+              },
+            },
+          }),
+          record: async () => assert.fail('pending failure must not record'),
+        },
+      });
+      assert.equal(pendingCode, 75);
+
+      const terminalCode = await mainForEarlyStages([
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'lessons-terminal',
+        '--run-state-format', 'v2',
+      ], {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: {
+          start: async () => ({
+            ok: true,
+            data: { runs: [{ id: 'lesson-failed', status: 'failed' }] },
+          }),
+          record: async () => assert.fail('terminal failure must not record'),
+        },
+      });
+      assert.equal(terminalCode, 1);
+    });
+
+    const pendingEvents = (await fs.readFile(
+      path.join(stateDir, 'lessons-transient.v2', 'lessons.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(pendingEvents.some((event) => event.type === 'unit_terminal'), false);
+
+    const terminalEvents = (await fs.readFile(
+      path.join(stateDir, 'lessons-terminal.v2', 'lessons.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(terminalEvents.at(-1).type, 'unit_terminal');
+    assert.equal(terminalEvents.at(-1).payload.status, 'failed');
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 lessons resume forwards append-only legacy retry authorization to the same receipt', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-lessons-authorized-resume-'));
+  const runId = 'lessons-authorized-resume';
+  const summaryRemote = {
+    advance: async (request) => successfulSummaryResponse(request),
+    record: async () => {},
+  };
+  let resumedRequest;
+  try {
+    await withServer((_request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ success: true, sessions: [{ id: 's1', startedAt: '2026-07-24T00:00:00.000Z' }] }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', runId,
+        '--run-state-format', 'v2',
+      ];
+      assert.equal(await mainForEarlyStages(argv, {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: {
+          start: async () => ({
+            ok: false,
+            status_code: 503,
+            data: {
+              failure: {
+                class: 'transient_provider',
+                cause: 'lesson_extraction_failed',
+              },
+            },
+          }),
+          record: async () => assert.fail('failed request must not record'),
+        },
+      }), 1);
+
+      const rootDir = path.join(stateDir, `${runId}.v2`);
+      const journal = new RunStateJournalV2({ rootDir, runId });
+      await journal.acquireLock();
+      try {
+        await journal.open();
+        const events = await journal.readStage('lessons');
+        const started = events.find((event) => event.type === 'unit_started');
+        const terminal = events.at(-1);
+        await journal.appendStage('lessons', 'unit_lessons_failed_terminal_retry_authorized', {
+          stage: 'lessons',
+          unit_id: started.payload.unit_id,
+          attempt_id: started.payload.attempt_id,
+          runner_input_hash: started.payload.input_hash,
+          receipt_input_hash: 'c'.repeat(64),
+          receipt_status: 'failed',
+          receipt_failure_class: 'transient_provider',
+          receipt_failure_cause: 'lesson_extraction_failed',
+          failure_class: 'transient_provider',
+          failure_cause: 'lesson_extraction_failed',
+          failure_phase: 'provider_call',
+          retry_epoch: 0,
+          last_safe_failure: {
+            error_class: 'transient_provider',
+            cause: 'lesson_extraction_failed',
+            phase: 'provider_call',
+            timestamp: '2026-07-28T16:23:40.115Z',
+          },
+          lesson_run_evidence: {
+            status: 'retryable',
+            input_hash: 'd'.repeat(64),
+            config_hash: 'e'.repeat(64),
+            failure_cause: 'timeout',
+            failure_phase: 'provider_call',
+            failed_at: '2026-07-28T16:23:40.115Z',
+            created_lesson_count: 0,
+            replaced_lesson_count: 0,
+            chunk_lesson_count: 0,
+          },
+          superseded_terminal_seq: terminal.seq,
+          expected_journal_seq: terminal.seq,
+        });
+      } finally {
+        await journal.releaseLock();
+      }
+
+      assert.equal(await mainForEarlyStages([...argv, '--resume'], {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: {
+          start: async (request) => {
+            resumedRequest = request;
+            return {
+              ok: true,
+              data: { runs: [{ id: 'lesson-resumed', status: 'succeeded' }] },
+            };
+          },
+          record: async () => {},
+        },
+      }), 0);
+    });
+
+    assert.equal(resumedRequest.requireExistingReceipt, true);
+    assert.deepEqual(resumedRequest.failedReceiptRetryAuthorization, {
+      receiptInputHash: 'c'.repeat(64),
+      retryEpoch: 0,
+      failureClass: 'transient_provider',
+      failureCause: 'lesson_extraction_failed',
+      failurePhase: 'provider_call',
+      lastSafeFailure: {
+        errorClass: 'transient_provider',
+        cause: 'lesson_extraction_failed',
+        phase: 'provider_call',
+        timestamp: '2026-07-28T16:23:40.115Z',
+      },
+    });
+    assert.deepEqual(resumedRequest.failedLessonRunEvidence, {
+      status: 'retryable',
+      inputHash: 'd'.repeat(64),
+      configHash: 'e'.repeat(64),
+      failureCause: 'timeout',
+      failurePhase: 'provider_call',
+      failedAt: '2026-07-28T16:23:40.115Z',
+      createdLessonCount: 0,
+      replacedLessonCount: 0,
+      chunkLessonCount: 0,
+    });
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
 test('v2 summary hard-stops a persisted reconciliation failure without redispatching', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
