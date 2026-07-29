@@ -162,6 +162,86 @@ function Test-AmV2SummaryRetryAuthorization {
   )
 }
 
+function Test-AmV2LessonsRetryAuthorization {
+  param(
+    [Parameter(Mandatory = $true)]$Event,
+    $FailedTerminal,
+    [string]$PlannedInputHash = '',
+    [string]$StartedAttemptId = ''
+  )
+  if ($null -eq $FailedTerminal) { return $false }
+  $payload = $Event.payload
+  $terminalPayload = $FailedTerminal.payload
+  $lastSafe = Get-AmStatusProperty -Object $payload -Name 'last_safe_failure'
+  $lessonEvidence = Get-AmStatusProperty -Object $payload -Name 'lesson_run_evidence'
+  if ($null -eq $lastSafe -or $null -eq $lessonEvidence) { return $false }
+
+  $unitId = [string](Get-AmStatusProperty -Object $payload -Name 'unit_id')
+  $attemptId = [string](Get-AmStatusProperty -Object $payload -Name 'attempt_id')
+  $failureClass = [string](Get-AmStatusProperty -Object $payload -Name 'failure_class')
+  $failureCause = [string](Get-AmStatusProperty -Object $payload -Name 'failure_cause')
+  $failurePhase = [string](Get-AmStatusProperty -Object $payload -Name 'failure_phase')
+  $retryEpoch = Get-AmStatusProperty -Object $payload -Name 'retry_epoch'
+  $failedTerminalSeq = Get-AmStatusProperty -Object $FailedTerminal -Name 'seq'
+  $authorizationSeq = Get-AmStatusProperty -Object $Event -Name 'seq'
+  $supersededTerminalSeq = Get-AmStatusProperty -Object $payload -Name 'superseded_terminal_seq'
+  $expectedJournalSeq = Get-AmStatusProperty -Object $payload -Name 'expected_journal_seq'
+  $createdCount = Get-AmStatusProperty -Object $lessonEvidence -Name 'created_lesson_count'
+  $replacedCount = Get-AmStatusProperty -Object $lessonEvidence -Name 'replaced_lesson_count'
+  $chunkCount = Get-AmStatusProperty -Object $lessonEvidence -Name 'chunk_lesson_count'
+  foreach ($value in @(
+      $retryEpoch,
+      $failedTerminalSeq,
+      $authorizationSeq,
+      $supersededTerminalSeq,
+      $expectedJournalSeq,
+      $createdCount,
+      $replacedCount,
+      $chunkCount
+    )) {
+    if (-not (Test-AmStatusSafeNonNegativeInteger -Value $value)) { return $false }
+  }
+
+  $failedAt = [string](Get-AmStatusProperty -Object $lessonEvidence -Name 'failed_at')
+  return (
+    [string](Get-AmStatusProperty -Object $payload -Name 'stage') -ceq 'lessons' -and
+    -not [string]::IsNullOrWhiteSpace($unitId) -and
+    $attemptId -ceq $StartedAttemptId -and
+    [string](Get-AmStatusProperty -Object $payload -Name 'runner_input_hash') -ceq $PlannedInputHash -and
+    [string](Get-AmStatusProperty -Object $payload -Name 'receipt_input_hash') -cmatch '^[0-9a-f]{64}$' -and
+    [string](Get-AmStatusProperty -Object $payload -Name 'receipt_status') -ceq 'failed' -and
+    [string](Get-AmStatusProperty -Object $payload -Name 'receipt_failure_class') -ceq 'transient_provider' -and
+    [string](Get-AmStatusProperty -Object $payload -Name 'receipt_failure_cause') -ceq 'lesson_extraction_failed' -and
+    $failureClass -ceq 'transient_provider' -and
+    $failureCause -ceq 'lesson_extraction_failed' -and
+    $failurePhase -ceq 'provider_call' -and
+    [long]$retryEpoch -eq 0 -and
+    [string](Get-AmStatusProperty -Object $lastSafe -Name 'error_class') -ceq $failureClass -and
+    [string](Get-AmStatusProperty -Object $lastSafe -Name 'cause') -ceq $failureCause -and
+    [string](Get-AmStatusProperty -Object $lastSafe -Name 'phase') -ceq $failurePhase -and
+    [string](Get-AmStatusProperty -Object $lastSafe -Name 'timestamp') -ceq $failedAt -and
+    $failedAt -cmatch '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$' -and
+    [string](Get-AmStatusProperty -Object $lessonEvidence -Name 'status') -ceq 'retryable' -and
+    [string](Get-AmStatusProperty -Object $lessonEvidence -Name 'input_hash') -cmatch '^[0-9a-f]{64}$' -and
+    [string](Get-AmStatusProperty -Object $lessonEvidence -Name 'config_hash') -cmatch '^[0-9a-f]{64}$' -and
+    @('rate_limited', 'timeout', 'network_error', 'server_error') -ccontains [string](
+      Get-AmStatusProperty -Object $lessonEvidence -Name 'failure_cause'
+    ) -and
+    [string](Get-AmStatusProperty -Object $lessonEvidence -Name 'failure_phase') -ceq 'provider_call' -and
+    [long]$createdCount -eq 0 -and
+    [long]$replacedCount -eq 0 -and
+    [long]$chunkCount -eq 0 -and
+    [string]$FailedTerminal.type -ceq 'unit_terminal' -and
+    [long]$failedTerminalSeq -eq ([long]$authorizationSeq - 1) -and
+    [long]$supersededTerminalSeq -eq [long]$failedTerminalSeq -and
+    [long]$expectedJournalSeq -eq [long]$failedTerminalSeq -and
+    [string](Get-AmStatusProperty -Object $terminalPayload -Name 'unit_id') -ceq $unitId -and
+    [string](Get-AmStatusProperty -Object $terminalPayload -Name 'attempt_id') -ceq $attemptId -and
+    [string](Get-AmStatusProperty -Object $terminalPayload -Name 'status') -ceq 'failed' -and
+    [string](Get-AmStatusProperty -Object $terminalPayload -Name 'error') -ceq $failureCause
+  )
+}
+
 function Get-AmV2StageFacts {
   param(
     [Parameter(Mandatory = $true)][string]$Path
@@ -237,6 +317,21 @@ function Get-AmV2StageFacts {
       if (Test-AmV2SummaryRetryAuthorization `
           -Event $event `
           -CompletedOperation $priorPriorEvent `
+          -FailedTerminal $priorEvent `
+          -PlannedInputHash $plannedInputHash `
+          -StartedAttemptId $attemptId) {
+        [void]$terminal.Remove([string]$unitId)
+        [void]$started.Remove([string]$unitId)
+      }
+    } elseif ([string]$event.type -eq 'unit_lessons_failed_terminal_retry_authorized') {
+      $plannedInputHash = if ($plannedInputHashes.ContainsKey([string]$unitId)) {
+        $plannedInputHashes[[string]$unitId]
+      } else { '' }
+      $attemptId = if ($attemptIds.ContainsKey([string]$unitId)) {
+        $attemptIds[[string]$unitId]
+      } else { '' }
+      if (Test-AmV2LessonsRetryAuthorization `
+          -Event $event `
           -FailedTerminal $priorEvent `
           -PlannedInputHash $plannedInputHash `
           -StartedAttemptId $attemptId) {

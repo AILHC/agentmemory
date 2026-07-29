@@ -263,6 +263,81 @@ test('v2 journal 在追加重试授权后保留旧失败事件并把当前投影
   }
 });
 
+test('v2 lessons 只接受零结果且身份完整的失败终态重试授权', async (context) => {
+  const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-lessons-retry-'));
+  context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
+  const runId = 'v2-lessons-retry-authorized';
+  const runRoot = path.join(runtimeRoot, 'extraction-runs', `${runId}.v2`);
+  await writeJournal(path.join(runRoot, 'control.jsonl'), [
+    event(0, 'run_started', { run_id: runId }),
+    event(1, 'stage_opened', { stage: 'lessons' }),
+  ]);
+  const authorization = event(4, 'unit_lessons_failed_terminal_retry_authorized', {
+    stage: 'lessons',
+    unit_id: 'session-a',
+    attempt_id: 'a'.repeat(64),
+    runner_input_hash: 'b'.repeat(64),
+    receipt_input_hash: 'c'.repeat(64),
+    receipt_status: 'failed',
+    receipt_failure_class: 'transient_provider',
+    receipt_failure_cause: 'lesson_extraction_failed',
+    failure_class: 'transient_provider',
+    failure_cause: 'lesson_extraction_failed',
+    failure_phase: 'provider_call',
+    retry_epoch: 0,
+    last_safe_failure: {
+      error_class: 'transient_provider',
+      cause: 'lesson_extraction_failed',
+      phase: 'provider_call',
+      timestamp: '2026-07-28T00:00:00.000Z',
+    },
+    lesson_run_evidence: {
+      status: 'retryable',
+      input_hash: 'd'.repeat(64),
+      config_hash: 'e'.repeat(64),
+      failure_cause: 'timeout',
+      failure_phase: 'provider_call',
+      failed_at: '2026-07-28T00:00:00.000Z',
+      created_lesson_count: 0,
+      replaced_lesson_count: 0,
+      chunk_lesson_count: 0,
+    },
+    superseded_terminal_seq: 3,
+    expected_journal_seq: 3,
+  });
+  const baseEvents = [
+    event(0, 'unit_planned', { unit_id: 'session-a', input_hash: 'b'.repeat(64) }),
+    event(1, 'stage_plan_completed', {}),
+    event(2, 'unit_started', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+    }),
+    event(3, 'unit_terminal', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      status: 'failed',
+      error: 'lesson_extraction_failed',
+    }),
+  ];
+  await writeJournal(path.join(runRoot, 'lessons.jsonl'), [...baseEvents, authorization]);
+
+  const accepted = runStatus(runtimeRoot, runId, 'lessons');
+  assert.equal(accepted.status, 0, accepted.stderr || accepted.stdout);
+  assert.match(
+    accepted.stdout,
+    /stage\.lessons=succeeded:0,skipped:0,failed:0,pending:1,running:0,blocked:0/,
+  );
+
+  authorization.payload.lesson_run_evidence.created_lesson_count = 1;
+  await writeJournal(path.join(runRoot, 'lessons.jsonl'), [...baseEvents, authorization]);
+  const rejected = runStatus(runtimeRoot, runId, 'lessons');
+  assert.equal(rejected.status, 0, rejected.stderr || rejected.stdout);
+  assert.match(
+    rejected.stdout,
+    /stage\.lessons=succeeded:0,skipped:0,failed:1,pending:0,running:0,blocked:0/,
+  );
+});
+
 test('v2 status 忽略证据不完整的 summary 重试授权并保留 failed', async (context) => {
   const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-invalid-auth-'));
   context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
