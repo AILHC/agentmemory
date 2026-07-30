@@ -86,6 +86,29 @@ describe("lesson commit recovery", () => {
     expect(repeated).toEqual(first);
   });
 
+  it("preserves plan integrity through JSON persistence when project is absent", async () => {
+    const kv = mockKV();
+    const jsonKv = {
+      ...kv,
+      set: async <T>(scope: string, key: string, value: T): Promise<T> => (
+        kv.set(scope, key, JSON.parse(JSON.stringify(value)) as T)
+      ),
+    };
+    const input = staging([{
+      content:"candidate", context:"", confidence:.8, importance:.8, tags:[], evidence:"", source:"llm",
+    }]);
+
+    const frozen = await freezeLessonCommitPlan(jsonKv as never, {
+      staging: input,
+      appliedAt: "2026-01-01T00:00:00.000Z",
+    });
+    expect(frozen.deltas[0]).not.toHaveProperty("project");
+    await expect(freezeLessonCommitPlan(jsonKv as never, {
+      staging: input,
+      appliedAt: "2099-01-01T00:00:00.000Z",
+    })).resolves.toEqual(frozen);
+  });
+
   it("returns an already frozen plan without rebuilding it from later time or live heuristics", async () => {
     const kv = mockKV();
     const input = staging([{ content:"candidate", context:"", confidence:.8, importance:.8, tags:[], evidence:"", source:"llm" }]);

@@ -83,10 +83,18 @@ let faultTriggered = false;
 const functions = new Map<string, Handler>();
 const rawTrigger = sdk.trigger.bind(sdk);
 
-async function terminateAfterAcknowledgedBoundary(boundary: Boundary): Promise<never> {
+async function terminateAfterAcknowledgedBoundary(
+  boundary: Boundary,
+  scope: string,
+  key: string,
+  value: unknown,
+): Promise<never> {
   if (!process.send) throw new Error("test_iii_runtime_ipc_missing");
   await new Promise<void>((resolve, reject) => {
-    process.send?.({ type: "fault-durable", boundary }, (error) => error ? reject(error) : resolve());
+    process.send?.(
+      { type: "fault-acknowledged", boundary, scope, key, value },
+      (error) => error ? reject(error) : resolve(),
+    );
   });
   process.exit(86);
   return new Promise<never>(() => {});
@@ -118,7 +126,12 @@ const faultingSdk = new Proxy(sdk as any, {
       if (armed && !faultTriggered && faultBoundary && functionId === "state::set"
         && matchesBoundary(faultBoundary, data?.scope, data?.value)) {
         faultTriggered = true;
-        return terminateAfterAcknowledgedBoundary(faultBoundary);
+        return terminateAfterAcknowledgedBoundary(
+          faultBoundary,
+          data.scope,
+          data.key,
+          data.value,
+        );
       }
       return result;
     };
@@ -201,14 +214,27 @@ async function stateSnapshot() {
 }
 
 const server = createServer(async (request, response) => {
+  let currentRoute: string | undefined;
   try {
     const url = new URL(request.url ?? "/", "http://127.0.0.1");
+    if (request.method === "GET" && url.pathname === "/__test/value") {
+      const scope = url.searchParams.get("scope");
+      const key = url.searchParams.get("key");
+      if (!scope || !key) {
+        response.writeHead(400).end();
+        return;
+      }
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(JSON.stringify({ value: await kv.get(scope, key) }));
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/__test/state") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(await stateSnapshot()));
       return;
     }
     const id = routes.get(`${request.method} ${url.pathname}`);
+    currentRoute = id;
     if (!id) {
       response.writeHead(404).end();
       return;
@@ -224,10 +250,17 @@ const server = createServer(async (request, response) => {
       query_params: Object.fromEntries(url.searchParams),
       ...(body ? { body: JSON.parse(body) } : {}),
     });
+    process.send?.({ type: "api-response", id, result });
     response.writeHead(result.status_code, { "content-type": "application/json" });
     response.end(JSON.stringify(result.body));
   } catch (error) {
     const message = error instanceof Error ? error.message : "test_iii_runtime_error";
+    process.send?.({
+      type: "api-error",
+      id: currentRoute,
+      message,
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     response.writeHead(500, { "content-type": "application/json" });
     response.end(JSON.stringify({ success: false, error: message }));
   }

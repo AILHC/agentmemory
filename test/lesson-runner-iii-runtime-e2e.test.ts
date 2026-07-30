@@ -14,6 +14,7 @@ import {
   PINNED_III_ENGINE_SHA256,
 } from "../ops/scripts/lib/iii-state-read-only-adapter-v1.mjs";
 import { projectSafeRecoveryStatus } from "../ops/scripts/lib/recovery-status-projection-v1.mjs";
+import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
 import { StateKV } from "../src/state/kv.js";
 import { KV } from "../src/state/schema.js";
 
@@ -27,7 +28,16 @@ type Boundary =
 
 interface FaultCase {
   name: Boundary;
+  expectedOutcome: "completed" | "conservative";
+  expectedOperationStatus?: "running" | "succeeded";
   expectedProviderCalls: number;
+}
+
+interface AcknowledgedBoundary {
+  boundary: Boundary;
+  scope: string;
+  key: string;
+  value: unknown;
 }
 
 interface RuntimeSnapshot {
@@ -39,8 +49,9 @@ interface ChildRuntime {
   child: ChildProcess;
   baseUrl: string;
   port: number;
-  durableBoundaries: Boundary[];
+  acknowledgedBoundaries: AcknowledgedBoundary[];
   providerCalls: () => number;
+  apiResponses: () => any[];
   exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }
 
@@ -101,6 +112,7 @@ function engineConfig(port: number, stateDir: string) {
     "        config:",
     "          store_method: file_based",
     `          file_path: ${JSON.stringify(stateDir.replaceAll("\\", "/"))}`,
+    "          save_interval_ms: 10",
     "",
   ].join("\n");
 }
@@ -207,8 +219,9 @@ async function startRuntime({
   fault?: Boundary;
   port?: number;
 }): Promise<ChildRuntime> {
-  const durableBoundaries: Boundary[] = [];
+  const acknowledgedBoundaries: AcknowledgedBoundary[] = [];
   let providerCallCount = 0;
+  const apiResponses: any[] = [];
   const child = fork(fixturePath, [], {
     execArgv: ["--import", "tsx"],
     silent: true,
@@ -234,8 +247,18 @@ async function startRuntime({
       child.once("error", reject);
       child.stderr?.on("data", (chunk) => stderr.push(chunk.toString()));
       child.on("message", (message: any) => {
-        if (message?.type === "fault-durable") durableBoundaries.push(message.boundary);
+        if (message?.type === "fault-acknowledged") {
+          acknowledgedBoundaries.push({
+            boundary: message.boundary,
+            scope: message.scope,
+            key: message.key,
+            value: message.value,
+          });
+        }
         if (message?.type === "provider-call") providerCallCount += 1;
+        if (message?.type === "api-response" || message?.type === "api-error") {
+          apiResponses.push(message);
+        }
         if (message?.type !== "ready") return;
         clearTimeout(timeout);
         resolve(message.baseUrl);
@@ -254,8 +277,9 @@ async function startRuntime({
     child,
     baseUrl,
     port: Number(new URL(baseUrl).port),
-    durableBoundaries,
+    acknowledgedBoundaries,
     providerCalls: () => providerCallCount,
+    apiResponses: () => [...apiResponses],
     exit,
   };
 }
@@ -295,8 +319,93 @@ async function readRuntimeSnapshot(runtime: ChildRuntime): Promise<RuntimeSnapsh
   return response.json() as Promise<RuntimeSnapshot>;
 }
 
+async function readRuntimeValue(runtime: ChildRuntime, scope: string, key: string) {
+  const url = new URL("/__test/value", runtime.baseUrl);
+  url.searchParams.set("scope", scope);
+  url.searchParams.set("key", key);
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`test_iii_runtime_value_http_${response.status}`);
+  return (await response.json() as { value: unknown }).value;
+}
+
 function values<T = any>(snapshot: RuntimeSnapshot, scope: string) {
   return Object.values(snapshot.scopes[scope] ?? {}) as T[];
+}
+
+function encodeStateScope(scope: string) {
+  return [...Buffer.from(scope, "utf8")]
+    .map((byte) => (
+      (byte >= 0x41 && byte <= 0x5a)
+      || (byte >= 0x61 && byte <= 0x7a)
+      || (byte >= 0x30 && byte <= 0x39)
+      || byte === 0x2d
+      || byte === 0x5f
+      || byte === 0x2e
+        ? String.fromCharCode(byte)
+        : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`
+    ))
+    .join("");
+}
+
+async function stateFileDigest(engine: EngineRuntime, scope: string) {
+  const path = join(engine.stateDir, `${encodeStateScope(scope)}.bin`);
+  return readFile(path)
+    .then((contents) => createHash("sha256").update(contents).digest("hex"))
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+}
+
+async function waitForScopePersistence(
+  engine: EngineRuntime,
+  scope: string,
+) {
+  let previousDigest: string | null = null;
+  let stablePolls = 0;
+  await within(
+    "scope-persistence",
+    (async () => {
+      while (true) {
+        const digest = await stateFileDigest(engine, scope);
+        if (digest) {
+          stablePolls = digest === previousDigest ? stablePolls + 1 : 0;
+          if (stablePolls >= 5) return;
+        } else {
+          stablePolls = 0;
+        }
+        previousDigest = digest;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    })(),
+    10_000,
+  );
+}
+
+async function waitForStateDirectoryStable(engine: EngineRuntime) {
+  let previousDigest: string | null = null;
+  let stablePolls = 0;
+  await within(
+    "state-directory-stable",
+    (async () => {
+      while (true) {
+        const names = (await readdir(engine.stateDir))
+          .filter((name) => name.endsWith(".bin"))
+          .sort();
+        const digest = createHash("sha256");
+        for (const name of names) {
+          digest.update(name);
+          digest.update(await readFile(join(engine.stateDir, name)));
+        }
+        const currentDigest = digest.digest("hex");
+        stablePolls = currentDigest === previousDigest ? stablePolls + 1 : 0;
+        if (names.length > 0 && stablePolls >= 10) return;
+        previousDigest = currentDigest;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+    })(),
+    10_000,
+  );
 }
 
 function summaryResponse({ attemptId, inputHash }: { attemptId: string; inputHash: string }) {
@@ -331,10 +440,32 @@ function testDependencies() {
 
 realDescribe("Lessons real iii file_based recovery seam", () => {
   it.each<FaultCase>([
-    { name: "generation registry", expectedProviderCalls: 0 },
-    { name: "generation run binding", expectedProviderCalls: 0 },
-    { name: "candidate staging", expectedProviderCalls: 1 },
-    { name: "candidate run binding", expectedProviderCalls: 1 },
+    { name: "generation registry", expectedOutcome: "conservative", expectedProviderCalls: 0 },
+    { name: "generation run binding", expectedOutcome: "conservative", expectedProviderCalls: 0 },
+    {
+      name: "candidate staging",
+      expectedOutcome: "conservative",
+      expectedOperationStatus: "running",
+      expectedProviderCalls: 1,
+    },
+    {
+      name: "candidate run binding",
+      expectedOutcome: "completed",
+      expectedOperationStatus: "running",
+      expectedProviderCalls: 1,
+    },
+    {
+      name: "formal lesson watermark",
+      expectedOutcome: "completed",
+      expectedOperationStatus: "succeeded",
+      expectedProviderCalls: 1,
+    },
+    {
+      name: "committed receipt",
+      expectedOutcome: "completed",
+      expectedOperationStatus: "succeeded",
+      expectedProviderCalls: 1,
+    },
   ])("recovers an acknowledged %s boundary through the formal Runner API", async (fault) => {
     if (!enginePath) throw new Error("test_iii_engine_path_missing");
     assertPinnedIiiVersionOutput((await execFileAsync(enginePath, ["--version"], { windowsHide: true })).stdout);
@@ -345,6 +476,18 @@ realDescribe("Lessons real iii file_based recovery seam", () => {
     const root = await mkdtemp(join(tmpdir(), "agentmemory-lessons-real-iii-"));
     const runnerStateDir = join(root, "runner-state");
     const runId = `real-iii-${fault.name.replaceAll(" ", "-")}`;
+    const sessionId = "temporary-real-iii-runtime-session";
+    const attemptId = stableHash({
+      run_id: runId,
+      stage: "lessons",
+      unit_id: sessionId,
+    });
+    const operationKey = buildExtractionOperationKey({
+      runId: attemptId,
+      stage: "lessons",
+      unitId: sessionId,
+    });
+    const operationScope = KV.extractionOperationReceipt(operationKey);
     const argv = [
       "--base-url",
       "placeholder",
@@ -368,6 +511,7 @@ realDescribe("Lessons real iii file_based recovery seam", () => {
       runtime = await startRuntime({ engine, fault: fault.name });
       const runtimePort = runtime.port;
       let providerCalls = 0;
+      const apiResponses: any[] = [];
       const currentRuntime = () => {
         if (!runtime) throw new Error("test_iii_runtime_missing");
         return runtime;
@@ -375,6 +519,7 @@ realDescribe("Lessons real iii file_based recovery seam", () => {
       const restartRuntime = async (nextFault?: Boundary) => {
         const previous = currentRuntime();
         providerCalls += previous.providerCalls();
+        apiResponses.push(...previous.apiResponses());
         await stopRuntime(previous);
         await new Promise((resolve) => setTimeout(resolve, 1_000));
         runtime = await startRuntime({
@@ -384,8 +529,23 @@ realDescribe("Lessons real iii file_based recovery seam", () => {
         });
         argv[1] = runtime.baseUrl;
       };
+      const restartEngineAndRuntime = async () => {
+        const previous = currentRuntime();
+        providerCalls += previous.providerCalls();
+        apiResponses.push(...previous.apiResponses());
+        await stopRuntime(previous);
+        await stopEngine(engine!);
+        engine = await startEngine(root, enginePort);
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        runtime = await startRuntime({
+          engine,
+          port: runtimePort,
+        });
+        argv[1] = runtime.baseUrl;
+      };
       argv[1] = currentRuntime().baseUrl;
       let faultObserved = false;
+      let acknowledgedBoundary: AcknowledgedBoundary | null = null;
       for (let attempt = 0; attempt < 6; attempt += 1) {
         const args = attempt === 0 ? argv : [...argv, "--resume"];
         let exitCode: number | undefined;
@@ -400,10 +560,18 @@ realDescribe("Lessons real iii file_based recovery seam", () => {
           runnerError = error;
         }
         const faultingRuntime = currentRuntime();
-        if (faultingRuntime.durableBoundaries.length > 0) {
+        if (faultingRuntime.acknowledgedBoundaries.length > 0) {
           expect(await within("fault-exit", faultingRuntime.exit, 5_000))
             .toEqual({ code: 86, signal: null });
-          expect(faultingRuntime.durableBoundaries).toEqual([fault.name]);
+          expect(faultingRuntime.acknowledgedBoundaries).toHaveLength(1);
+          const acknowledged = faultingRuntime.acknowledgedBoundaries[0];
+          expect(acknowledged.boundary).toBe(fault.name);
+          await waitForScopePersistence(engine, acknowledged.scope);
+          if (fault.expectedProviderCalls > 0) {
+            await waitForScopePersistence(engine, operationScope);
+          }
+          await waitForStateDirectoryStable(engine);
+          acknowledgedBoundary = acknowledged;
           faultObserved = true;
           break;
         }
@@ -433,7 +601,21 @@ realDescribe("Lessons real iii file_based recovery seam", () => {
         }`);
       }
 
-      await restartRuntime();
+      await restartEngineAndRuntime();
+      const persistedSnapshot = await readRuntimeSnapshot(currentRuntime());
+      expect(persistedSnapshot.scopes[acknowledgedBoundary!.scope]?.[acknowledgedBoundary!.key])
+        .toEqual(acknowledgedBoundary!.value);
+      if (fault.expectedProviderCalls > 0) {
+        expect(await readRuntimeValue(currentRuntime(), operationScope, operationKey))
+          .toMatchObject({ status: fault.expectedOperationStatus });
+        for (const run of values<any>(persistedSnapshot, KV.lessonExtractionRuns)) {
+          if (!run.candidateStagingId) continue;
+          expect(
+            persistedSnapshot.scopes[KV.lessonExtractionCandidates(run.id)]
+              ?.[run.candidateStagingId],
+          ).toBeDefined();
+        }
+      }
       let exitCode = 75;
       for (let attempt = 0; attempt < 6 && exitCode === 75; attempt += 1) {
         exitCode = await within(
@@ -466,10 +648,34 @@ realDescribe("Lessons real iii file_based recovery seam", () => {
         stageEvents: { lessons: journal },
         requiredStages: ["lessons"],
       });
-      expect(exitCode).toBe(75);
-      expect(safeStatus.run_status).not.toBe("completed");
-      expect(lessons).toHaveLength(0);
-      expect(receipts).toHaveLength(0);
+      if (fault.expectedOutcome === "conservative") {
+        expect(exitCode).toBe(75);
+        expect(safeStatus.run_status).not.toBe("completed");
+        expect(lessons).toHaveLength(0);
+        expect(receipts).toHaveLength(0);
+      } else {
+        if (exitCode !== 0) {
+          throw new Error(`test_iii_completed_recovery_not_reached:${
+            JSON.stringify({
+              exitCode,
+              journal: journal.slice(-8),
+              control: control.slice(-8),
+              runs,
+              receipts,
+              apiResponses: apiResponses.slice(-8),
+            })
+          }`);
+        }
+        expect(exitCode).toBe(0);
+        expect(lessons).toHaveLength(2);
+        expect(receipts).toHaveLength(1);
+        expect(receipts[0]).toMatchObject({
+          status: "committed",
+          appliedLessonIds: expect.arrayContaining(lessons.map((lesson: any) => lesson.id)),
+        });
+        expect(receipts[0].appliedLessonIds).toHaveLength(2);
+        expect(safeStatus).toMatchObject({ run_status: "completed", counts: { succeeded: 1 } });
+      }
     } finally {
       try {
         if (runtime) await stopRuntime(runtime);
@@ -481,13 +687,6 @@ realDescribe("Lessons real iii file_based recovery seam", () => {
         }
       }
     }
-  }, 40_000);
+  }, 180_000);
 
-  it.skip.each([
-    "formal lesson watermark",
-    "committed receipt",
-  ] as const)(
-    "requires a durable real-engine list refresh before exercising %s recovery",
-    () => {},
-  );
 });

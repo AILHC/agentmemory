@@ -105,7 +105,8 @@ export function buildSessionLessonDeltas(staging: LessonExtractionCandidateStagi
     const id = existingIdsByContent.get(normalizeLessonIdentityContent(candidate.content))
       ?? lessonIdForContent(candidate.content);
     byId.set(id, { lessonId: id, sessionId: staging.sessionId, generation: staging.generation,
-      mutationId: "", sourceRunId: staging.runId, appliedAt: options.appliedAt, project: options.project,
+      mutationId: "", sourceRunId: staging.runId, appliedAt: options.appliedAt,
+      ...(options.project !== undefined ? { project: options.project } : {}),
       fallbackContext: options.fallbackContext ?? candidate.context,
       candidate, removeHeuristicSource: false });
   }
@@ -114,7 +115,8 @@ export function buildSessionLessonDeltas(staging: LessonExtractionCandidateStagi
     const current = byId.get(lesson.id);
     if (current) current.removeHeuristicSource = true;
     else byId.set(lesson.id, { lessonId: lesson.id, sessionId: staging.sessionId, generation: staging.generation,
-      mutationId: "", sourceRunId: staging.runId, appliedAt: options.appliedAt, project: options.project,
+      mutationId: "", sourceRunId: staging.runId, appliedAt: options.appliedAt,
+      ...(options.project !== undefined ? { project: options.project } : {}),
       fallbackContext: options.fallbackContext ?? "",
       removeHeuristicSource: true });
   }
