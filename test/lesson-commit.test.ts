@@ -13,6 +13,23 @@ function staging(candidates: any[] = []) {
   return { id: "lcs_run_1", runId: "run", sessionId: "session", unitId: "session", attemptId: "attempt", generation: 2,
     inputHash: "a".repeat(64), configHash: "b".repeat(64), operationIdentityHash: "c".repeat(64), candidateHash: "d".repeat(64), candidates, createdAt: "2026-01-01T00:00:00.000Z" } as any;
 }
+
+function clonedKV() {
+  const kv = mockKV();
+  return {
+    get: async <T>(scope: string, key: string): Promise<T | null> => {
+      const value = await kv.get<T>(scope, key);
+      return value === null ? null : structuredClone(value);
+    },
+    set: async <T>(scope: string, key: string, value: T): Promise<T> => {
+      await kv.set(scope, key, structuredClone(value));
+      return structuredClone(value);
+    },
+    delete: kv.delete,
+    list: async <T>(scope: string): Promise<T[]> => structuredClone(await kv.list<T>(scope)),
+  };
+}
+
 describe("lesson commit", () => {
   it("does not remove heuristics for an empty candidate staging", () => {
     expect(buildSessionLessonDeltas(staging(), [{ id:"x", content:"x", context:"", confidence:.4, reinforcements:0, source:"heuristic", origin:"replay-import-heuristic", sourceIds:["session"], tags:[], createdAt:"",updatedAt:"",decayRate:.05 } as any], { appliedAt: "2026-01-01T00:00:00.000Z" })).toEqual([]);
@@ -97,6 +114,9 @@ describe("lesson commit", () => {
       deleted: true,
       updatedAt: "2026-02-03T04:05:06.000Z",
     });
+    const frozenResult = structuredClone(lesson);
+    await executeLessonCommitPlan(kv as never, plan);
+    expect(await kv.get(KV.lessons, id)).toEqual(frozenResult);
   });
   it("preserves a soft-deleted lesson and only applies an old delta once", async () => {
     const kv = mockKV();
@@ -133,7 +153,7 @@ describe("lesson commit", () => {
     });
   });
   it("preserves the extraction watermark when manual, strengthen, decay and heuristic replacement share a lesson", async () => {
-    const kv = mockKV();
+    const kv = clonedKV();
     const sdk = mockSdk();
     registerLessonsFunctions(sdk as never, kv as never);
     const content = "Concurrent shared lesson";

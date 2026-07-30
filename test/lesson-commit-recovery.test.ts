@@ -29,6 +29,17 @@ function failAfterSet(kv: ReturnType<typeof mockKV>, scope: string, onCall = 1) 
   };
 }
 
+function failBeforeSet(kv: ReturnType<typeof mockKV>, scope: string, onCall = 1) {
+  let calls = 0;
+  return {
+    ...kv,
+    set: async <T>(actualScope: string, key: string, value: T): Promise<T> => {
+      if (actualScope === scope && ++calls === onCall) throw new Error("request_not_applied");
+      return kv.set(actualScope, key, value);
+    },
+  };
+}
+
 async function planFor(kv: ReturnType<typeof mockKV>, candidates = ["one", "two"]) {
   return freezeLessonCommitPlan(kv as never, {
     staging: staging(candidates.map((content) => ({
@@ -210,24 +221,31 @@ describe("lesson commit recovery", () => {
     await executeLessonCommitPlan(baselineKv as never, baselinePlan);
     const baseline = await persistedLessonEffects(baselineKv, baselinePlan);
     const boundaries = [
-      { name: "plan persisted", scope: KV.lessonCommitPlans("run"), onCall: 1, phase: "freeze" },
-      { name: "initial receipt persisted", scope: KV.lessonCommitReceipts("run"), onCall: 1, phase: "execute" },
-      { name: "first business effect persisted", scope: KV.lessons, onCall: 1, phase: "execute" },
-      { name: "progress receipt persisted", scope: KV.lessonCommitReceipts("run"), onCall: 2, phase: "execute" },
-      { name: "committed receipt persisted", scope: KV.lessonCommitReceipts("run"), onCall: 4, phase: "execute" },
+      { name: "plan persisted", scope: KV.lessonCommitPlans("run"), onCall: 1, phase: "freeze", timing: "after" },
+      { name: "initial receipt persisted", scope: KV.lessonCommitReceipts("run"), onCall: 1, phase: "execute", timing: "after" },
+      { name: "before first business effect", scope: KV.lessons, onCall: 1, phase: "execute", timing: "before" },
+      { name: "first business effect persisted", scope: KV.lessons, onCall: 1, phase: "execute", timing: "after" },
+      { name: "before second business effect", scope: KV.lessons, onCall: 2, phase: "execute", timing: "before" },
+      { name: "all business effects persisted", scope: KV.lessons, onCall: 2, phase: "execute", timing: "after" },
+      { name: "progress receipt persisted", scope: KV.lessonCommitReceipts("run"), onCall: 2, phase: "execute", timing: "after" },
+      { name: "committed receipt persisted", scope: KV.lessonCommitReceipts("run"), onCall: 4, phase: "execute", timing: "after" },
     ] as const;
 
     for (const index of deterministicOrder(boundaries.length)) {
       const boundary = boundaries[index];
       const kv = mockKV();
-      const flaky = failAfterSet(kv, boundary.scope, boundary.onCall);
+      const flaky = boundary.timing === "before"
+        ? failBeforeSet(kv, boundary.scope, boundary.onCall)
+        : failAfterSet(kv, boundary.scope, boundary.onCall);
       let plan: Awaited<ReturnType<typeof planFor>>;
       if (boundary.phase === "freeze") {
         await expect(planFor(flaky)).rejects.toThrow("response_lost");
         plan = await planFor(flaky);
       } else {
         plan = await planFor(kv);
-        await expect(executeLessonCommitPlan(flaky as never, plan)).rejects.toThrow("response_lost");
+        await expect(executeLessonCommitPlan(flaky as never, plan)).rejects.toThrow(
+          boundary.timing === "before" ? "request_not_applied" : "response_lost",
+        );
       }
 
       const recovered = await executeLessonCommitPlan(flaky as never, plan);

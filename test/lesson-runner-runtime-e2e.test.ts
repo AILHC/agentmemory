@@ -11,8 +11,10 @@ import { mainForTest, stableHash } from "../ops/scripts/run-agentmemory-full-ext
 import { projectSafeRecoveryStatus } from "../ops/scripts/lib/recovery-status-projection-v1.mjs";
 
 type Boundary =
+  | "provider response"
   | "generation registry"
   | "generation run binding"
+  | "candidate staging before write"
   | "candidate staging"
   | "candidate run binding"
   | "commit plan"
@@ -28,6 +30,7 @@ interface StateKvFault {
   expectedProviderCalls: number;
   expectedCrashLessonCount: number;
   expectedCrashCommitReceiptStatuses: Array<"committing" | "committed">;
+  expectedCrashOperationReceiptStatuses?: Array<"running" | "succeeded">;
 }
 
 interface RuntimeSnapshot {
@@ -40,7 +43,7 @@ interface ChildRuntime {
   baseUrl: string;
   port: number;
   stateDir: string;
-  durableBoundaries: Boundary[];
+  observedBoundaries: Boundary[];
   exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }
 
@@ -79,7 +82,7 @@ function errorWithCode(message: string, code: string) {
 }
 
 async function startRuntime({ stateDir, fault, port }: { stateDir: string; fault?: Boundary; port?: number }): Promise<ChildRuntime> {
-  const durableBoundaries: Boundary[] = [];
+  const observedBoundaries: Boundary[] = [];
   const child = fork(fixturePath, [], {
     execArgv: ["--import", "tsx"],
     silent: true,
@@ -105,7 +108,7 @@ async function startRuntime({ stateDir, fault, port }: { stateDir: string; fault
       child.once("error", fail);
       child.stderr?.once("data", (chunk) => fail(new Error(`test_runtime_start_failed:${chunk.toString()}`)));
       child.on("message", (message: any) => {
-        if (message?.type === "fault-durable") durableBoundaries.push(message.boundary);
+        if (message?.type === "fault-observed") observedBoundaries.push(message.boundary);
         if (message?.type !== "ready") return;
         clearTimeout(timeout);
         resolve(message.baseUrl);
@@ -117,7 +120,7 @@ async function startRuntime({ stateDir, fault, port }: { stateDir: string; fault
     await exit;
     throw error;
   }
-  return { child, baseUrl, port: Number(new URL(baseUrl).port), stateDir, durableBoundaries, exit };
+  return { child, baseUrl, port: Number(new URL(baseUrl).port), stateDir, observedBoundaries, exit };
 }
 
 async function stopRuntime(runtime: ChildRuntime) {
@@ -177,7 +180,7 @@ async function runFaultScenario(fault?: StateKvFault) {
     if (fault) {
       crashedExit = await runtime.exit;
       expect(crashedExit).toEqual({ code: 86, signal: null });
-      expect(runtime.durableBoundaries).toEqual([fault.name]);
+      expect(runtime.observedBoundaries).toEqual([fault.name]);
       crashSnapshot = await readPersistedRuntimeSnapshot(runtimeStateDir);
       runtime = await startRuntime({ stateDir: runtimeStateDir, port: runtime.port });
       for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -196,7 +199,7 @@ async function runFaultScenario(fault?: StateKvFault) {
     const control = (await readFile(join(stateDir, `${runId}.v2`, "control.jsonl"), "utf8")).trim().split("\n").filter(Boolean).map(JSON.parse);
     const safeStatus = projectSafeRecoveryStatus({ runId, controlEvents: control, stageEvents: { lessons: journal }, requiredStages: ["lessons"] });
     return {
-      stateDir, runtimeStateDir, exitCodes, initialError, crashedExit, crashSnapshot, durableBoundaries: runtime.durableBoundaries,
+      stateDir, runtimeStateDir, exitCodes, initialError, crashedExit, crashSnapshot, observedBoundaries: runtime.observedBoundaries,
       snapshot, providerCalls: snapshot.metadata.providerCalls, lessons, runs, registry, receipts, journal, safeStatus,
       sessionId: "temporary-runtime-session",
     };
@@ -250,8 +253,24 @@ function faultingJournalFs(kind: "write" | "sync" | "rename") {
 
 describe("Lessons persistent StateKV substitute recovery seam", () => {
   it.each<StateKvFault>([
+    {
+      name: "provider response",
+      expectedOutcome: "conservative",
+      expectedProviderCalls: 1,
+      expectedCrashLessonCount: 0,
+      expectedCrashCommitReceiptStatuses: [],
+      expectedCrashOperationReceiptStatuses: ["running"],
+    },
     { name: "generation registry", expectedOutcome: "conservative", expectedProviderCalls: 0, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
     { name: "generation run binding", expectedOutcome: "conservative", expectedProviderCalls: 0, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
+    {
+      name: "candidate staging before write",
+      expectedOutcome: "conservative",
+      expectedProviderCalls: 1,
+      expectedCrashLessonCount: 0,
+      expectedCrashCommitReceiptStatuses: [],
+      expectedCrashOperationReceiptStatuses: ["running"],
+    },
     { name: "candidate staging", expectedOutcome: "conservative", expectedProviderCalls: 1, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
     { name: "candidate run binding", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
     { name: "commit plan", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
@@ -260,7 +279,7 @@ describe("Lessons persistent StateKV substitute recovery seam", () => {
     { name: "first progress receipt", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 1, expectedCrashCommitReceiptStatuses: ["committing"] },
     { name: "committed receipt", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 2, expectedCrashCommitReceiptStatuses: ["committed"] },
     { name: "extraction operation receipt", expectedOutcome: "conservative", expectedProviderCalls: 0, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
-  ])("restarts after a durable %s StateKV boundary without duplicate formal effects", async (fault) => {
+  ])("restarts after an observed %s boundary without duplicate formal effects", async (fault) => {
     const baseline = await runFaultScenario();
     const recovered = await runFaultScenario(fault);
 
@@ -276,6 +295,13 @@ describe("Lessons persistent StateKV substitute recovery seam", () => {
     const crashReceipts = crashReceiptScope ? values(crashSnapshot, crashReceiptScope) : [];
     expect(crashLessons).toHaveLength(fault.expectedCrashLessonCount);
     expect(crashReceipts.map((receipt: any) => receipt.status)).toEqual(fault.expectedCrashCommitReceiptStatuses);
+    if (fault.expectedCrashOperationReceiptStatuses) {
+      const operationReceipts = Object.keys(crashSnapshot.scopes)
+        .filter((scope) => scope.startsWith("mem:extraction-operation-receipt:"))
+        .flatMap((scope) => values<any>(crashSnapshot, scope));
+      expect(operationReceipts.map((receipt) => receipt.status))
+        .toEqual(fault.expectedCrashOperationReceiptStatuses);
+    }
     expect(crashLessons.length).toBeLessThanOrEqual(2);
     expect(crashReceipts.length).toBeLessThanOrEqual(1);
     expect(new Set(Object.values(recovered.registry?.bindings ?? {}).map((binding: any) => binding.generation)).size)

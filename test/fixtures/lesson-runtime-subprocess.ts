@@ -13,8 +13,10 @@ import type { MemoryProvider } from "../../src/types.js";
 type Handler = (input: any) => Promise<any>;
 
 type Boundary =
+  | "provider response"
   | "generation registry"
   | "generation run binding"
+  | "candidate staging before write"
   | "candidate staging"
   | "candidate run binding"
   | "commit plan"
@@ -67,13 +69,16 @@ async function persist() {
 
 function matchesBoundary(boundary: Boundary, scope: string, value: any) {
   switch (boundary) {
+    case "provider response": return false;
     case "generation registry": return scope.startsWith("mem:lesson-extraction:generation:");
     case "generation run binding":
       return scope === KV.lessonExtractionRuns
         && Number.isSafeInteger(value?.extractionGeneration)
         && value.extractionGeneration > 0
         && value.candidateStagingId === undefined;
-    case "candidate staging": return scope.startsWith("mem:lesson-extraction:candidates:");
+    case "candidate staging before write":
+    case "candidate staging":
+      return scope.startsWith("mem:lesson-extraction:candidates:");
     case "candidate run binding":
       return scope === KV.lessonExtractionRuns
         && value?.status === "succeeded"
@@ -94,12 +99,12 @@ function matchesBoundary(boundary: Boundary, scope: string, value: any) {
 }
 
 let armed = false;
-async function terminateAfterDurableBoundary(boundary: Boundary): Promise<never> {
+async function terminateAfterObservedBoundary(boundary: Boundary): Promise<never> {
   persisted.metadata.faultBoundary = boundary;
   await persist();
   if (!process.send) throw new Error("test_runtime_ipc_missing");
   await new Promise<void>((resolve, reject) => {
-    process.send?.({ type: "fault-durable", boundary }, (error) => error ? reject(error) : resolve());
+    process.send?.({ type: "fault-observed", boundary }, (error) => error ? reject(error) : resolve());
   });
   process.exit(86);
   return new Promise<never>(() => {});
@@ -135,11 +140,16 @@ const sdk = {
       return next;
     }
     if (id === "state::set") {
+      if (armed && faultBoundary === "candidate staging before write"
+        && !persisted.metadata.faultBoundary
+        && matchesBoundary(faultBoundary, data.scope, data.value)) {
+        return await terminateAfterObservedBoundary(faultBoundary);
+      }
       if (!state.has(data.scope)) state.set(data.scope, new Map());
       state.get(data.scope)!.set(data.key, data.value);
       await persist();
       if (armed && faultBoundary && !persisted.metadata.faultBoundary && matchesBoundary(faultBoundary, data.scope, data.value)) {
-        return await terminateAfterDurableBoundary(faultBoundary);
+        return await terminateAfterObservedBoundary(faultBoundary);
       }
       return data.value;
     }
@@ -155,12 +165,16 @@ const provider: MemoryProvider = {
   compress: async () => {
     persisted.metadata.providerCalls += 1;
     await persist();
-    return [
+    const response = [
       "<lessons>",
       '<lesson confidence="0.8"><content>temporary runtime recovery one</content><context>deterministic</context></lesson>',
       '<lesson confidence="0.8"><content>temporary runtime recovery two</content><context>deterministic</context></lesson>',
       "</lessons>",
     ].join("");
+    if (armed && faultBoundary === "provider response" && !persisted.metadata.faultBoundary) {
+      return terminateAfterObservedBoundary(faultBoundary);
+    }
+    return response;
   },
   summarize: async () => "",
 };
