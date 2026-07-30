@@ -1,11 +1,12 @@
 import { execFile, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import fsConstants from 'node:fs';
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { registerWorker } from 'iii-sdk';
+import { verifyOfflineStateKvSnapshot } from './offline-statekv-snapshot-v1.mjs';
 
 export const III_STATE_READ_ONLY_ADAPTER_SCHEMA = 'iii-state-read-only-working-copy/v1';
 export const PINNED_III_ENGINE_VERSION = '0.11.2';
@@ -20,6 +21,7 @@ const STARTUP_TIMEOUT_MS = 10_000;
 const INVOCATION_TIMEOUT_MS = 2_000;
 const PROBE_TIMEOUT_MS = INVOCATION_TIMEOUT_MS + 250;
 const SHUTDOWN_TIMEOUT_MS = 5_000;
+const RUNTIME_OWNER_FILE = '.agentmemory-recovery-runtime-owner';
 const execFileAsync = promisify(execFile);
 
 function delay(milliseconds) {
@@ -85,6 +87,86 @@ function assertSnapshotBinding({ snapshot, snapshotDir, stateDir, enginePath }) 
   ) {
     throw new Error('iii_state_read_only_adapter_snapshot_binding_invalid');
   }
+}
+
+async function verifyBoundSnapshot({ snapshot, snapshotDir }) {
+  const verified = await verifyOfflineStateKvSnapshot({ snapshotDir });
+  if (
+    verified.snapshot_hash !== snapshot.snapshot_hash
+    || verified.state_tree_hash !== snapshot.state_tree_hash
+    || verified.engine.sha256 !== snapshot.engine.sha256
+  ) {
+    throw new Error('iii_state_read_only_adapter_snapshot_binding_invalid');
+  }
+  return verified;
+}
+
+async function copyVerifiedSnapshot({
+  sourceSnapshotDir,
+  runtimeSnapshotDir,
+  expectedSnapshotHash,
+}) {
+  await fs.cp(sourceSnapshotDir, runtimeSnapshotDir, {
+    recursive: true,
+    force: false,
+    errorOnExist: true,
+    verbatimSymlinks: true,
+  });
+  const copied = await verifyOfflineStateKvSnapshot({
+    snapshotDir: runtimeSnapshotDir,
+  });
+  if (copied.snapshot_hash !== expectedSnapshotHash) {
+    throw new Error('iii_state_read_only_adapter_working_copy_drifted');
+  }
+  return copied;
+}
+
+async function createRuntimeOwnership(runtimeDir) {
+  const identity = await fs.lstat(runtimeDir);
+  if (identity.isSymbolicLink() || !identity.isDirectory()) {
+    throw new Error('iii_state_read_only_adapter_runtime_ownership_invalid');
+  }
+  const token = randomBytes(32).toString('hex');
+  await fs.writeFile(
+    path.join(runtimeDir, RUNTIME_OWNER_FILE),
+    `${token}\n`,
+    { encoding: 'utf8', flag: 'wx' },
+  );
+  return {
+    device: identity.dev,
+    inode: identity.ino,
+    token,
+  };
+}
+
+async function assertRuntimeOwnership(runtimeDir, ownership) {
+  const identity = await fs.lstat(runtimeDir);
+  const ownerPath = path.join(runtimeDir, RUNTIME_OWNER_FILE);
+  const ownerIdentity = await fs.lstat(ownerPath);
+  const token = await fs.readFile(ownerPath, 'utf8');
+  if (
+    identity.isSymbolicLink()
+    || !identity.isDirectory()
+    || identity.dev !== ownership.device
+    || identity.ino !== ownership.inode
+    || ownerIdentity.isSymbolicLink()
+    || !ownerIdentity.isFile()
+    || token !== `${ownership.token}\n`
+  ) {
+    throw new Error('iii_state_read_only_adapter_runtime_ownership_invalid');
+  }
+}
+
+async function removeOwnedRuntimeDirectory(runtimeDir, ownership) {
+  await assertRuntimeOwnership(runtimeDir, ownership);
+  const retiredDir = `${runtimeDir}.cleanup-${randomBytes(16).toString('hex')}`;
+  await fs.rename(runtimeDir, retiredDir);
+  try {
+    await assertRuntimeOwnership(retiredDir, ownership);
+  } catch (error) {
+    throw error;
+  }
+  await fs.rm(retiredDir, { recursive: true, force: true });
 }
 
 async function reserveLoopbackPort(requestedPort) {
@@ -326,32 +408,68 @@ export async function openIiiStateReadOnlyWorkingCopy({
       'iii_state_read_only_adapter_state_directory_invalid',
     ),
   ]);
+  const verifiedSnapshot = await verifyBoundSnapshot({
+    snapshot,
+    snapshotDir,
+  });
 
   const workingRoot = path.dirname(snapshotDir);
-  const runtimeDir = path.join(workingRoot, 'runtime');
-  const runtimeEnginePath = path.join(runtimeDir, 'iii.exe');
-  const configPath = path.join(runtimeDir, 'iii-config.yaml');
-  const stdoutPath = path.join(runtimeDir, 'iii.stdout.log');
-  const stderrPath = path.join(runtimeDir, 'iii.stderr.log');
+  const runtimePrefix = path.join(
+    workingRoot,
+    '.iii-state-read-only-runtime-',
+  );
+  let runtimeDir;
+  let runtimeSnapshotDir;
+  let runtimeEnginePath;
+  let configPath;
+  let stdoutPath;
+  let stderrPath;
   let sdk;
   let child;
   let stdoutHandle;
   let stderrHandle;
   let closePromise;
   let runtimeCreated = false;
+  let runtimeOwnership;
 
   try {
-    await fs.mkdir(runtimeDir, { recursive: false });
+    runtimeDir = await fs.mkdtemp(runtimePrefix);
+    try {
+      runtimeOwnership = await createRuntimeOwnership(runtimeDir);
+    } catch (error) {
+      await fs.rmdir(runtimeDir);
+      throw error;
+    }
+    runtimeSnapshotDir = path.join(runtimeDir, 'engine-input-snapshot');
+    runtimeEnginePath = path.join(runtimeDir, 'iii.exe');
+    configPath = path.join(runtimeDir, 'iii-config.yaml');
+    stdoutPath = path.join(runtimeDir, 'iii.stdout.log');
+    stderrPath = path.join(runtimeDir, 'iii.stderr.log');
     runtimeCreated = true;
+    const runtimeSnapshot = await copyVerifiedSnapshot({
+      sourceSnapshotDir: snapshotDir,
+      runtimeSnapshotDir,
+      expectedSnapshotHash: verifiedSnapshot.snapshot_hash,
+    });
+    const sourceAfterCopy = await verifyBoundSnapshot({
+      snapshot: verifiedSnapshot,
+      snapshotDir,
+    });
+    if (sourceAfterCopy.snapshot_hash !== runtimeSnapshot.snapshot_hash) {
+      throw new Error('iii_state_read_only_adapter_working_copy_drifted');
+    }
     await verifyAndCopyEngine({
-      enginePath,
+      enginePath: path.join(runtimeSnapshotDir, 'engine.bin'),
       runtimeEnginePath,
-      snapshot,
+      snapshot: runtimeSnapshot,
     });
     const port = await reserveLoopbackPort(requestedPort);
     await fs.writeFile(
       configPath,
-      stateOnlyConfig({ port, stateDir }),
+      stateOnlyConfig({
+        port,
+        stateDir: path.join(runtimeSnapshotDir, 'state'),
+      }),
       { encoding: 'utf8', flag: 'wx' },
     );
     stdoutHandle = await fs.open(stdoutPath, 'wx');
@@ -395,6 +513,16 @@ export async function openIiiStateReadOnlyWorkingCopy({
       spawnError,
     ]);
     await assertEngineLoadedState({ stdoutPath, stderrPath });
+    await Promise.all([
+      verifyBoundSnapshot({
+        snapshot: verifiedSnapshot,
+        snapshotDir,
+      }),
+      verifyBoundSnapshot({
+        snapshot: runtimeSnapshot,
+        snapshotDir: runtimeSnapshotDir,
+      }),
+    ]);
 
     let closed = false;
     const trigger = async (functionId, payload, code) => {
@@ -442,8 +570,21 @@ export async function openIiiStateReadOnlyWorkingCopy({
         }
         stdoutHandle = null;
         stderrHandle = null;
+        for (const [candidateSnapshot, candidateDir] of [
+          [verifiedSnapshot, snapshotDir],
+          [runtimeSnapshot, runtimeSnapshotDir],
+        ]) {
+          try {
+            await verifyBoundSnapshot({
+              snapshot: candidateSnapshot,
+              snapshotDir: candidateDir,
+            });
+          } catch (error) {
+            errors.push(error);
+          }
+        }
         try {
-          await fs.rm(runtimeDir, { recursive: true, force: true });
+          await removeOwnedRuntimeDirectory(runtimeDir, runtimeOwnership);
         } catch (error) {
           errors.push(error);
         }
@@ -463,9 +604,9 @@ export async function openIiiStateReadOnlyWorkingCopy({
         completeScopeList: true,
         includesDeletedLessons: true,
         workingCopyOnly: true,
-        snapshotHash: snapshot.snapshot_hash,
-        stateTreeHash: snapshot.state_tree_hash,
-        engineHash: snapshot.engine.sha256,
+        snapshotHash: verifiedSnapshot.snapshot_hash,
+        stateTreeHash: verifiedSnapshot.state_tree_hash,
+        engineHash: verifiedSnapshot.engine.sha256,
         engineVersion: PINNED_III_ENGINE_VERSION,
       }),
       runtime: Object.freeze({
@@ -523,9 +664,17 @@ export async function openIiiStateReadOnlyWorkingCopy({
         cleanupErrors.push(cleanupError);
       }
     }
+    try {
+      await verifyBoundSnapshot({
+        snapshot: verifiedSnapshot,
+        snapshotDir,
+      });
+    } catch (cleanupError) {
+      cleanupErrors.push(cleanupError);
+    }
     if (runtimeCreated) {
       try {
-        await fs.rm(runtimeDir, { recursive: true, force: true });
+        await removeOwnedRuntimeDirectory(runtimeDir, runtimeOwnership);
       } catch (cleanupError) {
         cleanupErrors.push(cleanupError);
       }

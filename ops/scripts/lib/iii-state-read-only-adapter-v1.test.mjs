@@ -319,7 +319,10 @@ function durableJournalEvents() {
   });
 }
 
-async function createRealSnapshotFixture(root) {
+async function createRealSnapshotFixture(
+  root,
+  snapshotEnginePath = OFFICIAL_ENGINE_PATH,
+) {
   const stateDir = await seedSyntheticState(root);
   const journalPath = path.join(root, 'lessons.jsonl');
   const snapshotDir = path.join(root, 'snapshot');
@@ -331,7 +334,7 @@ async function createRealSnapshotFixture(root) {
   const manifest = await createOfflineStateKvSnapshot({
     stateDir,
     journalPath,
-    enginePath: OFFICIAL_ENGINE_PATH,
+    enginePath: snapshotEnginePath,
     destinationDir: snapshotDir,
     capturedAt: '2026-07-30T00:00:04.000Z',
     expectedJournal: {
@@ -342,6 +345,15 @@ async function createRealSnapshotFixture(root) {
     },
   });
   return { events, manifest, snapshotDir };
+}
+
+async function adapterRuntimeDirectories(root) {
+  return (await fs.readdir(root, { withFileTypes: true }))
+    .filter((entry) => (
+      entry.isDirectory()
+      && entry.name.startsWith('.iii-state-read-only-runtime-')
+    ))
+    .map((entry) => path.join(root, entry.name));
 }
 
 async function stateBytes(snapshotDir) {
@@ -355,22 +367,17 @@ async function stateBytes(snapshotDir) {
   ])));
 }
 
-async function directAdapterInput(root, engineHash = PINNED_III_ENGINE_SHA256) {
-  const snapshotDir = path.join(root, 'snapshot');
-  const stateDir = path.join(snapshotDir, 'state');
-  const enginePath = path.join(snapshotDir, 'engine.bin');
-  await fs.mkdir(stateDir, { recursive: true });
-  await fs.copyFile(OFFICIAL_ENGINE_PATH, enginePath);
+async function directAdapterInput(
+  root,
+  snapshotEnginePath = OFFICIAL_ENGINE_PATH,
+) {
+  const fixture = await createRealSnapshotFixture(root, snapshotEnginePath);
+  const snapshotDir = fixture.snapshotDir;
   return {
-    snapshot: {
-      schema: 'agentmemory-recovery-evidence-snapshot/v1',
-      snapshot_hash: 'd'.repeat(64),
-      state_tree_hash: 'e'.repeat(64),
-      engine: { sha256: engineHash },
-    },
+    snapshot: fixture.manifest,
     snapshotDir,
-    stateDir,
-    enginePath,
+    stateDir: path.join(snapshotDir, 'state'),
+    enginePath: path.join(snapshotDir, 'engine.bin'),
   };
 }
 
@@ -395,12 +402,14 @@ realTest('real 0.11.2 state-only engine reads a verified working snapshot withou
   let runtime;
   let runtimeConfig;
   let workingRoot;
+  let sourceWorkingStateDir;
   let closeEvidence;
   let deletedLessonVisible = false;
   const verifier = createLegacyLessonEvidenceProvenanceVerifier({
     snapshotDir: fixture.snapshotDir,
     openReadOnlyWorkingCopy: async (input) => {
       workingRoot = path.dirname(input.snapshotDir);
+      sourceWorkingStateDir = input.stateDir;
       const view = await openIiiStateReadOnlyWorkingCopy(input);
       runtime = view.runtime;
       deletedLessonVisible = (await view.list('mem:lessons')).some(
@@ -442,7 +451,11 @@ realTest('real 0.11.2 state-only engine reads a verified working snapshot withou
   assert.equal(runtimeConfig.workers[0].config.port, runtime.port);
   assert.equal(
     path.resolve(runtimeConfig.workers[1].config.adapter.config.file_path),
-    path.join(workingRoot, 'snapshot', 'state'),
+    path.join(runtime.directory, 'engine-input-snapshot', 'state'),
+  );
+  assert.notEqual(
+    path.resolve(runtimeConfig.workers[1].config.adapter.config.file_path),
+    path.resolve(sourceWorkingStateDir),
   );
   assert.equal(runtimeConfig.workers[1].config.adapter.name, 'kv');
   assert.equal(
@@ -488,21 +501,41 @@ test('adapter exposes no writer and validates the pinned engine version output',
   );
 });
 
+realTest('forged state tree hash is rejected before the engine starts', async (context) => {
+  const root = await fs.mkdtemp(path.join(
+    os.tmpdir(),
+    'iii-state-read-only-forged-tree-',
+  ));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const input = await directAdapterInput(root);
+  await assert.rejects(
+    () => openIiiStateReadOnlyWorkingCopy({
+      ...input,
+      snapshot: {
+        ...input.snapshot,
+        state_tree_hash: '0'.repeat(64),
+      },
+    }),
+    /iii_state_read_only_adapter_snapshot_binding_invalid/,
+  );
+  assert.deepEqual(await adapterRuntimeDirectories(root), []);
+  await verifyOfflineStateKvSnapshot({ snapshotDir: input.snapshotDir });
+});
+
 realTest('engine hash mismatch fails before any runtime remains', async (context) => {
   const root = await fs.mkdtemp(path.join(
     os.tmpdir(),
     'iii-state-read-only-hash-',
   ));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
-  const input = await directAdapterInput(root, '0'.repeat(64));
+  const wrongEnginePath = path.join(root, 'wrong-engine.bin');
+  await fs.writeFile(wrongEnginePath, 'not the pinned iii engine');
+  const input = await directAdapterInput(root, wrongEnginePath);
   await assert.rejects(
     () => openIiiStateReadOnlyWorkingCopy(input),
     /iii_state_read_only_adapter_engine_hash_mismatch/,
   );
-  await assert.rejects(
-    () => fs.access(path.join(root, 'runtime')),
-    { code: 'ENOENT' },
-  );
+  assert.deepEqual(await adapterRuntimeDirectories(root), []);
 });
 
 realTest('occupied loopback port fails closed and removes its runtime', async (context) => {
@@ -530,13 +563,10 @@ realTest('occupied loopback port fails closed and removes its runtime', async (c
   } finally {
     await new Promise((resolve) => server.close(resolve));
   }
-  await assert.rejects(
-    () => fs.access(path.join(root, 'runtime')),
-    { code: 'ENOENT' },
-  );
+  assert.deepEqual(await adapterRuntimeDirectories(root), []);
 });
 
-realTest('a pre-existing runtime directory is preserved when startup is refused', async (context) => {
+realTest('a pre-existing legacy runtime directory is preserved and isolated', async (context) => {
   const root = await fs.mkdtemp(path.join(
     os.tmpdir(),
     'iii-state-read-only-existing-runtime-',
@@ -547,14 +577,17 @@ realTest('a pre-existing runtime directory is preserved when startup is refused'
   const sentinelPath = path.join(runtimeDir, 'owner-sentinel.txt');
   await fs.mkdir(runtimeDir);
   await fs.writeFile(sentinelPath, 'belongs to another owner');
-  await assert.rejects(
-    () => openIiiStateReadOnlyWorkingCopy(input),
-    { code: 'EEXIST' },
+  const view = await openIiiStateReadOnlyWorkingCopy(input);
+  assert.notEqual(
+    path.resolve(view.runtime.directory),
+    path.resolve(runtimeDir),
   );
+  await view.close();
   assert.equal(
     await fs.readFile(sentinelPath, 'utf8'),
     'belongs to another owner',
   );
+  assert.deepEqual(await adapterRuntimeDirectories(root), []);
 });
 
 realTest('corrupt StateKV fails closed instead of returning incomplete values', async (context) => {
@@ -570,12 +603,9 @@ realTest('corrupt StateKV fails closed instead of returning incomplete values', 
   );
   await assert.rejects(
     () => openIiiStateReadOnlyWorkingCopy(input),
-    /iii_state_read_only_adapter_state_corrupt/,
+    /offline_snapshot_content_drifted/,
   );
-  await assert.rejects(
-    () => fs.access(path.join(root, 'runtime')),
-    { code: 'ENOENT' },
-  );
+  assert.deepEqual(await adapterRuntimeDirectories(root), []);
 });
 
 realTest('an engine process exit makes subsequent reads fail closed and close stays idempotent', async (context) => {
@@ -607,6 +637,61 @@ realTest('an engine process exit makes subsequent reads fail closed and close st
     () => fs.access(view.runtime.directory),
     { code: 'ENOENT' },
   );
+});
+
+realTest('runtime state drift fails close without mutating the input snapshot', async (context) => {
+  const root = await fs.mkdtemp(path.join(
+    os.tmpdir(),
+    'iii-state-read-only-runtime-drift-',
+  ));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const input = await directAdapterInput(root);
+  const originalBytes = await stateBytes(input.snapshotDir);
+  const view = await openIiiStateReadOnlyWorkingCopy(input);
+  const runtimeConfig = YAML.parse(await fs.readFile(
+    view.runtime.configPath,
+    'utf8',
+  ));
+  const runtimeStateDir =
+    runtimeConfig.workers[1].config.adapter.config.file_path;
+  const runtimeStateFiles = (await fs.readdir(runtimeStateDir)).sort();
+  await fs.appendFile(
+    path.join(runtimeStateDir, runtimeStateFiles[0]),
+    'injected-runtime-state-drift',
+  );
+  await assert.rejects(
+    () => view.close(),
+    /iii_state_read_only_adapter_close_failed/,
+  );
+  assert.deepEqual(await adapterRuntimeDirectories(root), []);
+  await verifyOfflineStateKvSnapshot({ snapshotDir: input.snapshotDir });
+  assert.deepEqual(await stateBytes(input.snapshotDir), originalBytes);
+});
+
+realTest('runtime ownership drift refuses recursive cleanup', async (context) => {
+  const root = await fs.mkdtemp(path.join(
+    os.tmpdir(),
+    'iii-state-read-only-runtime-owner-',
+  ));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const input = await directAdapterInput(root);
+  const view = await openIiiStateReadOnlyWorkingCopy(input);
+  const ownerPath = path.join(
+    view.runtime.directory,
+    '.agentmemory-recovery-runtime-owner',
+  );
+  await fs.writeFile(ownerPath, 'belongs to a different owner\n');
+  await assert.rejects(
+    () => view.close(),
+    /iii_state_read_only_adapter_close_failed/,
+  );
+  assert.equal(processExists(view.runtime.pid), false);
+  await assertPortReleased(view.runtime.port);
+  assert.equal(
+    await fs.readFile(ownerPath, 'utf8'),
+    'belongs to a different owner\n',
+  );
+  await verifyOfflineStateKvSnapshot({ snapshotDir: input.snapshotDir });
 });
 
 realTest('verifier rejects injected working-copy state mutation after adapter close', async (context) => {
