@@ -24,6 +24,7 @@ type Boundary =
   | "initial committing receipt"
   | "first progress receipt"
   | "committed receipt"
+  | "committed receipt without lesson durability"
   | "extraction operation receipt";
 
 interface PersistedRuntime {
@@ -49,8 +50,14 @@ try {
 const state = new Map<string, Map<string, unknown>>(
   Object.entries(persisted.scopes).map(([scope, values]) => [scope, new Map(Object.entries(values))]),
 );
+let withheldDurableLessons: Record<string, unknown> | null = null;
 const snapshot = (): PersistedRuntime => ({
-  scopes: Object.fromEntries([...state.entries()].map(([scope, values]) => [scope, Object.fromEntries(values)])),
+  scopes: Object.fromEntries([...state.entries()].map(([scope, values]) => [
+    scope,
+    scope === KV.lessons && withheldDurableLessons !== null
+      ? withheldDurableLessons
+      : Object.fromEntries(values),
+  ])),
   metadata: persisted.metadata,
 });
 
@@ -93,7 +100,9 @@ function matchesBoundary(boundary: Boundary, scope: string, value: any) {
       return scope.startsWith("mem:lesson-commit:receipts:")
         && value?.status === "committing"
         && value?.appliedLessonIds?.length === 1;
-    case "committed receipt": return scope.startsWith("mem:lesson-commit:receipts:") && value?.status === "committed";
+    case "committed receipt":
+    case "committed receipt without lesson durability":
+      return scope.startsWith("mem:lesson-commit:receipts:") && value?.status === "committed";
     case "extraction operation receipt": return scope.startsWith("mem:extraction-operation-receipt:");
   }
 }
@@ -144,6 +153,11 @@ const sdk = {
         && !persisted.metadata.faultBoundary
         && matchesBoundary(faultBoundary, data.scope, data.value)) {
         return await terminateAfterObservedBoundary(faultBoundary);
+      }
+      if (faultBoundary === "committed receipt without lesson durability"
+        && data.scope === KV.lessons
+        && withheldDurableLessons === null) {
+        withheldDurableLessons = Object.fromEntries(state.get(KV.lessons) ?? []);
       }
       if (!state.has(data.scope)) state.set(data.scope, new Map());
       state.get(data.scope)!.set(data.key, data.value);

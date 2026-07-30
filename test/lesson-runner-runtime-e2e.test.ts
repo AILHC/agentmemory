@@ -22,6 +22,7 @@ type Boundary =
   | "initial committing receipt"
   | "first progress receipt"
   | "committed receipt"
+  | "committed receipt without lesson durability"
   | "extraction operation receipt";
 
 interface StateKvFault {
@@ -278,6 +279,13 @@ describe("Lessons persistent StateKV substitute recovery seam", () => {
     { name: "initial committing receipt", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: ["committing"] },
     { name: "first progress receipt", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 1, expectedCrashCommitReceiptStatuses: ["committing"] },
     { name: "committed receipt", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 2, expectedCrashCommitReceiptStatuses: ["committed"] },
+    {
+      name: "committed receipt without lesson durability",
+      expectedOutcome: "completed",
+      expectedProviderCalls: 1,
+      expectedCrashLessonCount: 0,
+      expectedCrashCommitReceiptStatuses: ["committed"],
+    },
     { name: "extraction operation receipt", expectedOutcome: "conservative", expectedProviderCalls: 0, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
   ])("restarts after an observed %s boundary without duplicate formal effects", async (fault) => {
     const baseline = await runFaultScenario();
