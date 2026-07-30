@@ -12,10 +12,13 @@ import { projectSafeRecoveryStatus } from "../ops/scripts/lib/recovery-status-pr
 
 type Boundary =
   | "generation registry"
+  | "generation run binding"
   | "candidate staging"
+  | "candidate run binding"
   | "commit plan"
   | "formal lesson watermark"
-  | "committing receipt"
+  | "initial committing receipt"
+  | "first progress receipt"
   | "committed receipt"
   | "extraction operation receipt";
 
@@ -91,22 +94,29 @@ async function startRuntime({ stateDir, fault, port }: { stateDir: string; fault
   const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     child.once("exit", (code, signal) => resolve({ code, signal }));
   });
-  const baseUrl = await new Promise<string>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("test_runtime_start_timeout")), 10_000);
-    const fail = (error: Error) => {
-      clearTimeout(timeout);
-      reject(error);
-    };
-    child.once("error", fail);
-    child.stderr?.once("data", (chunk) => fail(new Error(`test_runtime_start_failed:${chunk.toString()}`)));
-    child.on("message", (message: any) => {
-      if (message?.type === "fault-durable") durableBoundaries.push(message.boundary);
-      if (message?.type !== "ready") return;
-      clearTimeout(timeout);
-      resolve(message.baseUrl);
+  let baseUrl: string;
+  try {
+    baseUrl = await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("test_runtime_start_timeout")), 10_000);
+      const fail = (error: Error) => {
+        clearTimeout(timeout);
+        reject(error);
+      };
+      child.once("error", fail);
+      child.stderr?.once("data", (chunk) => fail(new Error(`test_runtime_start_failed:${chunk.toString()}`)));
+      child.on("message", (message: any) => {
+        if (message?.type === "fault-durable") durableBoundaries.push(message.boundary);
+        if (message?.type !== "ready") return;
+        clearTimeout(timeout);
+        resolve(message.baseUrl);
+      });
+      exit.then(({ code, signal }) => fail(new Error(`test_runtime_exited_before_ready:${code ?? signal}`)));
     });
-    exit.then(({ code, signal }) => fail(new Error(`test_runtime_exited_before_ready:${code ?? signal}`)));
-  });
+  } catch (error) {
+    if (child.exitCode === null && child.signalCode === null) child.kill();
+    await exit;
+    throw error;
+  }
   return { child, baseUrl, port: Number(new URL(baseUrl).port), stateDir, durableBoundaries, exit };
 }
 
@@ -151,13 +161,14 @@ async function runFaultScenario(fault?: StateKvFault) {
   const stateDir = await mkdtemp(join(tmpdir(), "agentmemory-lessons-runtime-e2e-"));
   const runtimeStateDir = join(stateDir, "persistent-statekv-substitute");
   const runId = "runtime-e2e-matrix";
-  let runtime = await startRuntime({ stateDir: runtimeStateDir, fault: fault?.name });
-  const argv = ["--base-url", runtime.baseUrl, "--state-dir", stateDir, "--run-id", runId, "--mark", runId, "--run-state-format", "v2"];
+  let runtime: ChildRuntime | null = null;
   const exitCodes: number[] = [];
   let initialError: unknown = null;
   let crashedExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
   let crashSnapshot: RuntimeSnapshot | null = null;
   try {
+    runtime = await startRuntime({ stateDir: runtimeStateDir, fault: fault?.name });
+    const argv = ["--base-url", runtime.baseUrl, "--state-dir", stateDir, "--run-id", runId, "--mark", runId, "--run-state-format", "v2"];
     try {
       exitCodes.push(await invokeRunner(argv));
     } catch (error) {
@@ -190,8 +201,11 @@ async function runFaultScenario(fault?: StateKvFault) {
       sessionId: "temporary-runtime-session",
     };
   } finally {
-    await stopRuntime(runtime);
-    await rm(stateDir, { recursive: true, force: true });
+    try {
+      if (runtime) await stopRuntime(runtime);
+    } finally {
+      await rm(stateDir, { recursive: true, force: true });
+    }
   }
 }
 
@@ -237,11 +251,14 @@ function faultingJournalFs(kind: "write" | "sync" | "rename") {
 describe("Lessons persistent StateKV substitute recovery seam", () => {
   it.each<StateKvFault>([
     { name: "generation registry", expectedOutcome: "conservative", expectedProviderCalls: 0, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
+    { name: "generation run binding", expectedOutcome: "conservative", expectedProviderCalls: 0, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
     { name: "candidate staging", expectedOutcome: "conservative", expectedProviderCalls: 1, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
+    { name: "candidate run binding", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
     { name: "commit plan", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
     { name: "formal lesson watermark", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 1, expectedCrashCommitReceiptStatuses: ["committing"] },
-    { name: "committing receipt", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: ["committing"] },
-    { name: "committed receipt", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 1, expectedCrashCommitReceiptStatuses: ["committed"] },
+    { name: "initial committing receipt", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: ["committing"] },
+    { name: "first progress receipt", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 1, expectedCrashCommitReceiptStatuses: ["committing"] },
+    { name: "committed receipt", expectedOutcome: "completed", expectedProviderCalls: 1, expectedCrashLessonCount: 2, expectedCrashCommitReceiptStatuses: ["committed"] },
     { name: "extraction operation receipt", expectedOutcome: "conservative", expectedProviderCalls: 0, expectedCrashLessonCount: 0, expectedCrashCommitReceiptStatuses: [] },
   ])("restarts after a durable %s StateKV boundary without duplicate formal effects", async (fault) => {
     const baseline = await runFaultScenario();
@@ -259,11 +276,11 @@ describe("Lessons persistent StateKV substitute recovery seam", () => {
     const crashReceipts = crashReceiptScope ? values(crashSnapshot, crashReceiptScope) : [];
     expect(crashLessons).toHaveLength(fault.expectedCrashLessonCount);
     expect(crashReceipts.map((receipt: any) => receipt.status)).toEqual(fault.expectedCrashCommitReceiptStatuses);
-    expect(crashLessons.length).toBeLessThanOrEqual(1);
+    expect(crashLessons.length).toBeLessThanOrEqual(2);
     expect(crashReceipts.length).toBeLessThanOrEqual(1);
     expect(new Set(Object.values(recovered.registry?.bindings ?? {}).map((binding: any) => binding.generation)).size)
       .toBe(Object.keys(recovered.registry?.bindings ?? {}).length);
-    expect(recovered.lessons.length).toBeLessThanOrEqual(1);
+    expect(recovered.lessons.length).toBeLessThanOrEqual(2);
     expect(recovered.receipts.length).toBeLessThanOrEqual(1);
     expect(recovered.journal.some((event: any) => event.type === "unit_terminal" && event.payload?.status === "failed")).toBe(false);
     if (fault.expectedOutcome === "conservative") {
@@ -285,7 +302,11 @@ describe("Lessons persistent StateKV substitute recovery seam", () => {
     }));
     expect(project(recovered)).toEqual(project(baseline));
     expect(recovered.receipts).toHaveLength(1);
-    expect(recovered.receipts[0]).toMatchObject({ status: "committed", appliedLessonIds: [recovered.lessons[0].id] });
+    expect(recovered.receipts[0]).toMatchObject({
+      status: "committed",
+      appliedLessonIds: expect.arrayContaining(recovered.lessons.map((lesson: any) => lesson.id)),
+    });
+    expect(recovered.receipts[0].appliedLessonIds).toHaveLength(recovered.lessons.length);
     expect(recovered.safeStatus).toMatchObject({ run_status: "completed", counts: { succeeded: 1 } });
   }, 20_000);
 
@@ -293,11 +314,12 @@ describe("Lessons persistent StateKV substitute recovery seam", () => {
     process.env.AGENTMEMORY_SECRET = "temporary-test-secret";
     process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
     const stateDir = await mkdtemp(join(tmpdir(), "agentmemory-lessons-runtime-journal-fault-"));
-    const runtime = await startRuntime({ stateDir: join(stateDir, "persistent-statekv-substitute") });
+    let runtime: ChildRuntime | null = null;
     const runId = `runtime-journal-${kind}`;
-    const argv = ["--base-url", runtime.baseUrl, "--state-dir", stateDir, "--run-id", runId, "--mark", runId, "--run-state-format", "v2"];
     const fault = faultingJournalFs(kind);
     try {
+      runtime = await startRuntime({ stateDir: join(stateDir, "persistent-statekv-substitute") });
+      const argv = ["--base-url", runtime.baseUrl, "--state-dir", stateDir, "--run-id", runId, "--mark", runId, "--run-state-format", "v2"];
       await expect(invokeRunner(argv, testDependencies(fault.fsApi))).rejects.toThrow(kind === "write"
         ? /injected_journal_append_enospc/
         : kind === "sync"
@@ -320,8 +342,11 @@ describe("Lessons persistent StateKV substitute recovery seam", () => {
       expect(safeStatus).toMatchObject({ run_status: "completed", counts: { succeeded: 1 } });
       expect(journal.some((event: any) => event.type === "unit_terminal" && event.payload?.status === "failed")).toBe(false);
     } finally {
-      await stopRuntime(runtime);
-      await rm(stateDir, { recursive: true, force: true });
+      try {
+        if (runtime) await stopRuntime(runtime);
+      } finally {
+        await rm(stateDir, { recursive: true, force: true });
+      }
     }
   });
 });

@@ -14,10 +14,13 @@ type Handler = (input: any) => Promise<any>;
 
 type Boundary =
   | "generation registry"
+  | "generation run binding"
   | "candidate staging"
+  | "candidate run binding"
   | "commit plan"
   | "formal lesson watermark"
-  | "committing receipt"
+  | "initial committing receipt"
+  | "first progress receipt"
   | "committed receipt"
   | "extraction operation receipt";
 
@@ -65,10 +68,26 @@ async function persist() {
 function matchesBoundary(boundary: Boundary, scope: string, value: any) {
   switch (boundary) {
     case "generation registry": return scope.startsWith("mem:lesson-extraction:generation:");
+    case "generation run binding":
+      return scope === KV.lessonExtractionRuns
+        && Number.isSafeInteger(value?.extractionGeneration)
+        && value.extractionGeneration > 0
+        && value.candidateStagingId === undefined;
     case "candidate staging": return scope.startsWith("mem:lesson-extraction:candidates:");
+    case "candidate run binding":
+      return scope === KV.lessonExtractionRuns
+        && value?.status === "succeeded"
+        && typeof value?.candidateStagingId === "string";
     case "commit plan": return scope.startsWith("mem:lesson-commit:plans:");
     case "formal lesson watermark": return scope === KV.lessons;
-    case "committing receipt": return scope.startsWith("mem:lesson-commit:receipts:") && value?.status === "committing";
+    case "initial committing receipt":
+      return scope.startsWith("mem:lesson-commit:receipts:")
+        && value?.status === "committing"
+        && value?.appliedLessonIds?.length === 0;
+    case "first progress receipt":
+      return scope.startsWith("mem:lesson-commit:receipts:")
+        && value?.status === "committing"
+        && value?.appliedLessonIds?.length === 1;
     case "committed receipt": return scope.startsWith("mem:lesson-commit:receipts:") && value?.status === "committed";
     case "extraction operation receipt": return scope.startsWith("mem:extraction-operation-receipt:");
   }
@@ -136,7 +155,12 @@ const provider: MemoryProvider = {
   compress: async () => {
     persisted.metadata.providerCalls += 1;
     await persist();
-    return '<lessons><lesson confidence="0.8"><content>temporary runtime recovery</content><context>deterministic</context></lesson></lessons>';
+    return [
+      "<lessons>",
+      '<lesson confidence="0.8"><content>temporary runtime recovery one</content><context>deterministic</context></lesson>',
+      '<lesson confidence="0.8"><content>temporary runtime recovery two</content><context>deterministic</context></lesson>',
+      "</lessons>",
+    ].join("");
   },
   summarize: async () => "",
 };
