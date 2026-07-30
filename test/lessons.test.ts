@@ -18,7 +18,7 @@ import {
 } from "../src/functions/extraction-operation-receipts.js";
 import { ProviderCallError } from "../src/providers/provider-call-result.js";
 import type { Lesson, MemoryProvider } from "../src/types.js";
-import { KV } from "../src/state/schema.js";
+import { KV, fingerprintId } from "../src/state/schema.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -122,6 +122,34 @@ describe("Lessons", () => {
       expect(second.lesson.confidence).toBeGreaterThan(0.5);
     });
 
+    it("strengthens a legacy manual lesson without creating a canonical duplicate", async () => {
+      const content = "Legacy manual lesson";
+      const legacyId = fingerprintId("lsn", content.toLowerCase());
+      await kv.set(KV.lessons, legacyId, {
+        id: legacyId,
+        content,
+        context: "",
+        confidence: 0.5,
+        reinforcements: 0,
+        source: "manual",
+        sourceIds: [],
+        tags: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        decayRate: 0.05,
+      });
+
+      const result = (await sdk.trigger("mem::lesson-save", { content })) as {
+        success: boolean;
+        action: string;
+        lesson: Lesson;
+      };
+
+      expect(result).toMatchObject({ success: true, action: "strengthened" });
+      expect(result.lesson.id).toBe(legacyId);
+      expect(await kv.get(KV.lessons, fingerprintId("lesson", content.toLowerCase()))).toBeNull();
+    });
+
     it("rejects empty content", async () => {
       const result = (await sdk.trigger("mem::lesson-save", {
         content: "",
@@ -141,6 +169,19 @@ describe("Lessons", () => {
       expect(result.lesson.source).toBe("crystal");
       expect(result.lesson.sourceIds).toEqual(["crys_123"]);
       expect(result.lesson.confidence).toBe(0.6);
+    });
+
+    it("preserves source watermarks when manually reviving a soft-deleted lesson", async () => {
+      const first = (await sdk.trigger("mem::lesson-save", { content: "Revive safely" })) as { lesson: Lesson };
+      await kv.set(KV.lessons, first.lesson.id, {
+        ...first.lesson,
+        deleted: true,
+        sourceWatermarks: { session: { generation: 7, mutationId: "frozen" } },
+      });
+
+      const revived = (await sdk.trigger("mem::lesson-save", { content: "Revive safely" })) as { lesson: Lesson };
+      expect(revived.lesson.deleted).toBeUndefined();
+      expect(revived.lesson.sourceWatermarks).toEqual({ session: { generation: 7, mutationId: "frozen" } });
     });
   });
 
@@ -360,6 +401,45 @@ describe("Lessons", () => {
       const after = await kv.get<Lesson>("mem:lessons", saved.lesson.id);
       expect(after!.confidence).toBeCloseTo(0.55, 2);
       expect(after!.confidence).toBeGreaterThan(0.4);
+    });
+
+    it("reports only changes applied after re-reading the locked lesson", async () => {
+      const saved = (await sdk.trigger("mem::lesson-save", {
+        content: "Concurrent strengthen before decay",
+        confidence: 0.8,
+      })) as { lesson: Lesson };
+      const old = {
+        ...saved.lesson,
+        createdAt: new Date(Date.now() - 14 * 24 * 60 * 60 * 1000).toISOString(),
+      };
+      await kv.set(KV.lessons, old.id, old);
+
+      const originalList = kv.list;
+      let injected = false;
+      kv.list = async <T>(scope: string): Promise<T[]> => {
+        const listed = await originalList<T>(scope);
+        if (!injected && scope === KV.lessons) {
+          injected = true;
+          await kv.set(KV.lessons, old.id, {
+            ...old,
+            confidence: 0.9,
+            reinforcements: 1,
+            lastReinforcedAt: new Date().toISOString(),
+          });
+        }
+        return listed;
+      };
+
+      const result = (await sdk.trigger("mem::lesson-decay-sweep", {})) as {
+        decayed: number;
+        softDeleted: number;
+      };
+      const after = await kv.get<Lesson>(KV.lessons, old.id);
+      const audits = await kv.list<{ functionId: string }>(KV.audit);
+
+      expect(result).toMatchObject({ decayed: 0, softDeleted: 0 });
+      expect(after).toMatchObject({ confidence: 0.9, reinforcements: 1 });
+      expect(audits.filter((entry) => entry.functionId === "mem::lesson-decay-sweep")).toEqual([]);
     });
   });
 

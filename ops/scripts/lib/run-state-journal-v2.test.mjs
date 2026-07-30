@@ -83,10 +83,14 @@ test('v2 journal redacts and bounds error payloads before durable append', async
       unit_id: 's1',
       status: 'failed',
       provider_key: 'hidden',
+      authorization: 'hidden',
+      authorization_source_type: 'change_ticket',
       error: 'x'.repeat(5000),
     });
     const [event] = await journal.readStage('summary');
     assert.equal(event.payload.provider_key, '[REDACTED]');
+    assert.equal(event.payload.authorization, '[REDACTED]');
+    assert.equal(event.payload.authorization_source_type, 'change_ticket');
     assert.match(event.payload.error, /\[truncated\]$/);
     await assert.rejects(
       () => journal.appendStage('summary', 'unit_terminal', { unit_id: 's2', detail: 'x'.repeat(70 * 1024) }),
@@ -337,4 +341,15 @@ test('v2 journal CAS append requires the writer lock and the exact durable stage
     await journal.releaseLock();
     await fs.rm(rootDir, { recursive: true, force: true });
   }
+});
+
+test('legacy journal fold explicitly rejects a recovery contract fence', () => {
+  assert.throws(
+    () => foldStageEvents([{
+      seq: 0,
+      type: 'stage_recovery_contract_fenced',
+      payload: {},
+    }]),
+    /legacy_runner_recovery_contract_fenced_at_seq_0/,
+  );
 });

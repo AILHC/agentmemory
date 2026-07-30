@@ -26,6 +26,8 @@ import { logger } from "../logger.js";
 import type { LlmLessonExtractionRuntimeConfig } from "./lesson-extraction-runs.js";
 import { resolveStageModelCallOptions } from "../config.js";
 import { ProviderCallError } from "../providers/provider-call-result.js";
+import { stageLessonCandidates } from "./lesson-candidate-staging.js";
+import { withLessonKeyLock } from "./lesson-commit.js";
 import {
   sanitizeLessonFailureDiagnostics,
   sanitizeStageFailureDiagnostics,
@@ -85,6 +87,12 @@ export interface ExtractLlmLessonsInput {
   firstPrompt?: string;
   config: LlmLessonExtractionRuntimeConfig;
   sourceRunId: string;
+  generation: number;
+  inputHash: string;
+  configHash: string;
+  unitId: string;
+  attemptId: string;
+  operationIdentityHash: string;
 }
 
 export interface ExtractLlmLessonsResult {
@@ -96,6 +104,7 @@ export interface ExtractLlmLessonsResult {
   promptChars?: number;
   parseFailures?: number;
   failureDiagnostics?: LessonFailureDiagnostics;
+  candidateStagingId?: string;
 }
 
 export interface ExtractLessonsInput {
@@ -937,7 +946,6 @@ function sortLlmCandidates(
 export async function extractLlmLessonsFromObservations(
   input: ExtractLlmLessonsInput,
 ): Promise<ExtractLlmLessonsResult> {
-  const createdAt = new Date().toISOString();
   const {
     kv,
     provider,
@@ -970,6 +978,30 @@ export async function extractLlmLessonsFromObservations(
   const errors = [...extractionErrors];
 
   if (candidates.length === 0) {
+    if (errors.length === 0) {
+      const staging = await stageLessonCandidates(kv, {
+        runId: sourceRunId,
+        sessionId,
+        generation: input.generation,
+        inputHash: input.inputHash,
+        configHash: input.configHash,
+        unitId: input.unitId,
+        attemptId: input.attemptId,
+        operationIdentityHash: input.operationIdentityHash,
+        candidates: [],
+      });
+      return {
+        lessonIds: [],
+        created: 0,
+        reinforced: 0,
+        skipped: errors.length,
+        errors,
+        promptChars,
+        parseFailures,
+        candidateStagingId: staging.id,
+        ...(failureDiagnostics ? { failureDiagnostics } : {}),
+      };
+    }
     return {
       lessonIds: [],
       created: 0,
@@ -992,71 +1024,38 @@ export async function extractLlmLessonsFromObservations(
   const limit = config.saveLimit <= 0 ? Number.POSITIVE_INFINITY : config.saveLimit;
   const selected = applyCandidateLimit(prioritized, limit);
 
-  let created = 0;
-  let reinforced = 0;
-  const lessonIds: string[] = [];
-
-  for (const candidate of selected) {
-    const lessonId = fingerprintId("lesson", normalizeContent(candidate.content));
-    try {
-      const previous = await kv.get<Lesson>(KV.lessons, lessonId);
-      if (previous) {
-        const existing = { ...previous };
-        existing.tags = uniqueStrings([...existing.tags, ...candidate.tags]);
-        existing.confidence = Math.max(existing.confidence, candidate.confidence);
-        existing.sourceRunId = sourceRunId;
-        if (!existing.sourceIds.includes(sessionId)) {
-          existing.sourceIds.push(sessionId);
-          existing.reinforcements += 1;
-          existing.lastReinforcedAt = createdAt;
-          reinforced += 1;
-        }
-        if (!existing.context && candidate.context) {
-          existing.context = candidate.context;
-        } else if (!existing.context) {
-          existing.context = fallbackContext;
-        }
-        existing.updatedAt = createdAt;
-        await kv.set(KV.lessons, lessonId, existing);
-        lessonIds.push(lessonId);
-        continue;
-      }
-
-      const lesson: Lesson = {
-        id: lessonId,
-        content: candidate.content,
-        context: candidate.context || fallbackContext,
-        confidence: candidate.confidence,
-        reinforcements: 0,
-        source: "llm",
-        origin: "llm-session-extraction",
-        sourceIds: [sessionId],
-        sourceRunId,
-        project,
-        tags: uniqueStrings(candidate.tags),
-        createdAt,
-        updatedAt: createdAt,
-        decayRate: 0.05,
-      };
-      await kv.set(KV.lessons, lessonId, lesson);
-      lessonIds.push(lessonId);
-      created += 1;
-    } catch {
-      errors.push("lesson_persist_failed");
-    }
-  }
-
+  const staging = await stageLessonCandidates(kv, {
+    runId: sourceRunId,
+    sessionId,
+    generation: input.generation,
+    inputHash: input.inputHash,
+    configHash: input.configHash,
+    unitId: input.unitId,
+    attemptId: input.attemptId,
+    operationIdentityHash: input.operationIdentityHash,
+    candidates: selected.map((candidate) => ({
+      content: candidate.content,
+      context: candidate.context || fallbackContext,
+      confidence: candidate.confidence,
+      importance: candidate.importance,
+      tags: candidate.tags,
+      evidence: candidate.evidence,
+      source: candidate.source,
+    })),
+  });
   return {
-    lessonIds,
-    created,
-    reinforced,
-    skipped: errors.length,
+    lessonIds: [],
+    created: 0,
+    reinforced: 0,
+    skipped: 0,
     errors,
     promptChars,
     parseFailures,
+    candidateStagingId: staging.id,
     ...(failureDiagnostics ? { failureDiagnostics } : {}),
   };
 }
+
 
 function applyCandidateLimit<T>(items: T[], limit: number): T[] {
   if (limit <= 0) return items;
@@ -1165,6 +1164,7 @@ export async function extractLessonsFromReplay(
   for (const candidate of candidates) {
     const lessonId = fingerprintId("lesson", normalizeContent(candidate.content));
     try {
+      await withLessonKeyLock(lessonId, async () => {
       const previous = await kv.get<Lesson>(KV.lessons, lessonId);
       if (previous) {
         const existing = { ...previous };
@@ -1184,7 +1184,7 @@ export async function extractLessonsFromReplay(
         existing.updatedAt = createdAt;
         await kv.set(KV.lessons, lessonId, existing);
         lessonIds.push(lessonId);
-        continue;
+        return;
       }
 
       const lesson: Lesson = {
@@ -1205,6 +1205,7 @@ export async function extractLessonsFromReplay(
       await kv.set(KV.lessons, lessonId, lesson);
       lessonIds.push(lessonId);
       created += 1;
+      });
     } catch (err) {
       errors.push(
         err instanceof Error ? err.message : `failed to save lesson candidate: ${String(err)}`,

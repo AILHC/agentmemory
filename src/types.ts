@@ -143,6 +143,8 @@ export interface ResumableSummaryRun {
   chunkObservationCounts: number[];
   completedChunks: number;
   skippedChunks: number;
+  /** 已确认写入正式摘要存储的次数；新合同只允许 0 或 1。 */
+  completedFinalWrites?: 0 | 1;
   status: ResumableSummaryRunStatus;
   /** v2 摘要生成所用 provider、有效模型和提示词契约的稳定哈希。 */
   generationConfigHash?: string;
@@ -207,6 +209,8 @@ export interface ExtractionOperationIdentity {
 
 export interface ExtractionOperationReceipt<T = unknown>
   extends ExtractionOperationIdentity {
+  /** 持久化回执结构版本；旧回执可能缺少该字段。 */
+  version?: number;
   key: string;
   status: "running" | "succeeded" | "failed" | "reconciled";
   startedAt: string;
@@ -1242,6 +1246,8 @@ export interface Lesson {
   origin?: "replay-import-heuristic" | "llm-session-extraction";
   sourceIds: string[];
   sourceRunId?: string;
+  /** 每个来源会话独立的正式提交水位，避免共享 Lesson 覆盖另一个会话的代次。 */
+  sourceWatermarks?: Record<string, { generation: number; mutationId: string }>;
   project?: string;
   tags: string[];
   createdAt: string;
@@ -1268,6 +1274,10 @@ export interface LessonExtractionRun {
   status: LessonExtractionRunStatus;
   inputHash: string;
   configHash: string;
+  /** 同一会话内不可复用的经验提取代次。 */
+  extractionGeneration?: number;
+  /** 候选暂存制品的稳定引用；模型计算不得直接写正式经验。 */
+  candidateStagingId?: string;
   providerName: string;
   config: {
     textLimit: number;
@@ -1296,6 +1306,88 @@ export interface LessonExtractionRun {
   runningLeaseUntil?: string;
   finishedAt?: string;
   createdAt: string;
+  updatedAt: string;
+}
+
+export interface LessonExtractionGenerationRegistry {
+  sessionId: string;
+  nextGeneration: number;
+  bindings: Record<string, {
+    generation: number;
+    sessionId: string;
+    inputHash: string;
+    configHash: string;
+  }>;
+  updatedAt: string;
+}
+
+export interface LessonExtractionCandidateStaging {
+  id: string;
+  runId: string;
+  sessionId: string;
+  unitId: string;
+  attemptId: string;
+  generation: number;
+  inputHash: string;
+  configHash: string;
+  operationIdentityHash: string;
+  candidateHash: string;
+  candidates: Array<{
+    content: string;
+    context: string;
+    confidence: number;
+    importance: number;
+    tags: string[];
+    evidence: string;
+    source: "heuristic" | "llm";
+  }>;
+  createdAt: string;
+}
+
+export interface ApplySessionLessonDelta {
+  lessonId: string;
+  sessionId: string;
+  generation: number;
+  mutationId: string;
+  sourceRunId: string;
+  appliedAt: string;
+  project?: string;
+  fallbackContext: string;
+  candidate?: LessonExtractionCandidateStaging["candidates"][number];
+  removeHeuristicSource: boolean;
+}
+
+export interface LessonCommitPlan {
+  id: string;
+  runId: string;
+  sessionId: string;
+  unitId: string;
+  attemptId: string;
+  generation: number;
+  inputHash: string;
+  configHash: string;
+  operationIdentityHash: string;
+  recoveryPolicyVersion: string;
+  stagingId: string;
+  stagingCandidateHash: string;
+  effectHash: string;
+  deltas: ApplySessionLessonDelta[];
+  createdAt: string;
+}
+
+export interface LessonCommitReceipt {
+  version: 1;
+  stage: "lessons";
+  key: string;
+  planId: string;
+  runId: string;
+  unitId: string;
+  inputHash: string;
+  configHash: string;
+  recoveryPolicyVersion: string;
+  effectHash: string;
+  appliedLessonIds: string[];
+  status: "committing" | "committed";
   updatedAt: string;
 }
 

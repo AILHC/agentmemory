@@ -31,6 +31,7 @@ import { VERSION } from "../version.js";
 import { recordAudit } from "./audit.js";
 import { logger } from "../logger.js";
 import { ExtractionRunStore } from "./extraction-run-store.js";
+import { withLessonKeyLock } from "./lesson-commit.js";
 
 export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
   const extractionRunStore = new ExtractionRunStore(kv);
@@ -316,7 +317,10 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
           await kv.delete(KV.facets, f.id);
         }
         for (const l of await kv.list<Lesson>(KV.lessons).catch(() => [])) {
-          await kv.delete(KV.lessons, l.id);
+          await withLessonKeyLock(l.id, async () => {
+            const current = await kv.get<Lesson>(KV.lessons, l.id);
+            if (current) await kv.delete(KV.lessons, l.id);
+          });
         }
         for (const i of await kv.list<Insight>(KV.insights).catch(() => [])) {
           await kv.delete(KV.insights, i.id);
@@ -546,11 +550,20 @@ export function registerExportImportFunction(sdk: ISdk, kv: StateKV): void {
       }
       if (importData.lessons) {
         for (const lesson of importData.lessons) {
-          if (strategy === "skip") {
-            const existing = await kv.get(KV.lessons, lesson.id).catch(() => null);
-            if (existing) { stats.skipped++; continue; }
-          }
-          await kv.set(KV.lessons, lesson.id, lesson);
+          const imported = await withLessonKeyLock(lesson.id, async () => {
+            const existing = await kv.get<Lesson>(KV.lessons, lesson.id).catch(() => null);
+            if (strategy === "skip") {
+              if (existing) return false;
+            }
+            await kv.set(KV.lessons, lesson.id, {
+              ...lesson,
+              ...(existing?.sourceWatermarks
+                ? { sourceWatermarks: existing.sourceWatermarks }
+                : {}),
+            });
+            return true;
+          });
+          if (!imported) stats.skipped++;
         }
       }
       if (importData.insights) {

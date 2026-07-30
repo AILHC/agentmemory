@@ -6,6 +6,11 @@ import path from 'node:path';
 import test from 'node:test';
 import { authorizeSummaryFailedTerminalRetry } from './authorize-agentmemory-summary-failed-terminal-retry.mjs';
 import { RunStateJournalV2 } from './lib/run-state-journal-v2.mjs';
+import {
+  appendRecoveryContractFence,
+  buildRecoveryMigrationManifest,
+} from './lib/recovery-frontier-migration-v1.mjs';
+import { RECOVERY_POLICY_VERSION } from './lib/recovery-policy-v1.mjs';
 import { reconcileSummaryOrphan } from './reconcile-agentmemory-extraction-orphan.mjs';
 import { mainForTest, stableHash } from './run-agentmemory-full-extraction.mjs';
 
@@ -29,6 +34,8 @@ async function withServer(handler, run) {
 }
 
 function successfulSummaryResponse({ attemptId, inputHash }, title = 'summary') {
+  const summary = { title };
+  const resumableRunId = stableHash({ attemptId, inputHash, source: 'resumable-run' });
   return {
     ok: true,
     data: {
@@ -36,11 +43,148 @@ function successfulSummaryResponse({ attemptId, inputHash }, title = 'summary') 
       attemptId,
       runnerInputHash: inputHash,
       serviceInputHash: stableHash({ attemptId, inputHash, source: 'summary-service' }),
-      resumableRunId: stableHash({ attemptId, inputHash, source: 'resumable-run' }),
-      summary: { title },
+      resumableRunId,
+      summary,
+      recoveryEvidence: {
+        kind: 'committed',
+        receiptKey: `xop_${stableHash({ attemptId, inputHash }).slice(0, 32)}`,
+        receiptVersion: 1,
+        resultRef: `summary-resumable-runs:${resumableRunId}`,
+        effectHash: stableHash({
+          title,
+          narrative: '',
+          keyDecisions: [],
+          filesModified: [],
+          concepts: [],
+        }),
+      },
     },
   };
 }
+
+function committedLessonResponse(runId = 'lesson-run-1') {
+  const planId = `plan-${runId}`;
+  return {
+    ok: true,
+    data: {
+      runs: [{ id: runId, status: 'succeeded' }],
+      lessonEvidence: [{
+        kind: 'committed',
+        runId,
+        stagingId: `staging-${runId}`,
+        planId,
+        receiptKey: `lcr_${stableHash({ runId, planId }).slice(0, 32)}`,
+        receiptVersion: 1,
+        resultRef: `lesson-commit-plans:${planId}`,
+        effectHash: stableHash({ runId, planId, effect: 'lessons' }),
+      }],
+    },
+  };
+}
+
+test('new runner refuses business APIs while a fenced migration is incomplete', async (context) => {
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-fenced-runner-'));
+  context.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  const runId = 'fenced-runner';
+  const journal = new RunStateJournalV2({
+    rootDir: path.join(stateDir, `${runId}.v2`),
+    runId,
+  });
+  await journal.acquireLock();
+  try {
+    await journal.appendStage('lessons', 'unit_planned', {
+      unit_id: 'lesson-a',
+      input_hash: 'input-a',
+    });
+    await journal.appendStage('lessons', 'stage_plan_completed', { unit_count: 1 });
+    await journal.appendStage('lessons', 'unit_started', {
+      unit_id: 'lesson-a',
+      attempt_id: 'attempt-a',
+    });
+    await journal.appendStage('lessons', 'unit_terminal', {
+      unit_id: 'lesson-a',
+      attempt_id: 'attempt-a',
+      status: 'failed',
+    });
+  } finally {
+    await journal.releaseLock();
+  }
+  const manifest = buildRecoveryMigrationManifest({
+    runId,
+    stage: 'lessons',
+    events: await journal.readStage('lessons'),
+    safeEvidenceByUnit: {
+      'lesson-a': {
+        adapter: 'lessons/legacy-safe-facts-v1',
+        attempt_id: 'attempt-a',
+        operation_id: 'lesson-a:legacy',
+        safe_facts: { failure: { cause: 'response_lost' } },
+      },
+    },
+    originalContractVersion: 'run-state-journal-v2/legacy',
+    targetContractVersion: RECOVERY_POLICY_VERSION,
+    originalPolicyVersion: 'legacy-stage-recovery/v2',
+    targetPolicyVersion: RECOVERY_POLICY_VERSION,
+    upgradeAt: '2026-07-30T00:00:00.000Z',
+    authorizedAt: '2026-07-30T00:00:00.000Z',
+    authorizationSourceType: 'change_ticket',
+  });
+  await appendRecoveryContractFence({
+    journal,
+    stage: 'lessons',
+    manifest,
+    verifyOfflineWritersAbsent: async () => ({
+      oldRunnerAbsent: true,
+      writerLockAbsent: true,
+      otherWritersAbsent: true,
+    }),
+    verifyEvidenceProvenance: async () => ({
+      source_type: 'trusted_read_only_collector',
+      safeEvidenceByUnit: {
+        'lesson-a': {
+          adapter: 'lessons/legacy-safe-facts-v1',
+          attempt_id: 'attempt-a',
+          operation_id: 'lesson-a:legacy',
+          safe_facts: { failure: { cause: 'response_lost' } },
+        },
+      },
+    }),
+  });
+  let businessCalls = 0;
+  const result = await mainForEarlyStages([
+    '--base-url', 'http://127.0.0.1:9',
+    '--state-dir', stateDir,
+    '--run-id', runId,
+    '--run-state-format', 'v2',
+    '--resume',
+  ], {
+    v2RuntimeCheck: async () => {
+      businessCalls += 1;
+      throw new Error('runtime API must not be called');
+    },
+    v2SummaryRemote: {
+      advance: async () => {
+        businessCalls += 1;
+      },
+      record: async () => {
+        businessCalls += 1;
+      },
+    },
+    v2LessonsRemote: {
+      start: async () => {
+        businessCalls += 1;
+      },
+      record: async () => {
+        businessCalls += 1;
+      },
+    },
+  });
+  assert.equal(result, 1);
+  assert.equal(businessCalls, 0);
+  const status = JSON.parse(await fs.readFile(journal.statusPath, 'utf8'));
+  assert.equal(status.status, 'blocked');
+  assert.equal(status.system_block_reason_code, 'recovery_migration_incomplete');
+});
 
 async function prepareAuthorizedLegacySummaryRun({ baseUrl, stateDir, runId }) {
   const argv = [
@@ -56,49 +200,72 @@ async function prepareAuthorizedLegacySummaryRun({ baseUrl, stateDir, runId }) {
     }),
     record: async () => {},
   };
-  const summaryRemote = {
-    advance: async ({ operationUnitId }) => {
-      if (operationUnitId === 's1:map:0') {
-        return {
-          ok: true,
-          data: {
-            status: 'in_progress',
-            advanced: 'completed',
-            completedChunks: 1,
-            totalChunks: 1,
-            operationUnitId,
-          },
-        };
-      }
-      return {
-        ok: false,
-        status_code: 500,
-        data: {
-          status: 'failed',
-          operationUnitId,
-          failure: {
-            class: 'transient_provider',
-            cause: 'pi_stream_failed',
-          },
-        },
-      };
+  assert.equal(await mainForEarlyStages([...argv, '--dry-run'], {
+    v2SummaryRemote: {
+      advance: async () => assert.fail('dry-run must not dispatch Summary'),
+      record: async () => assert.fail('dry-run must not record Summary'),
     },
-    record: async () => {},
-  };
-
-  assert.equal(await mainForEarlyStages(argv, {
-    v2SummaryRemote: summaryRemote,
     v2LessonsRemote: lessonsRemote,
-  }), 1);
+  }), 0);
   const rootDir = path.join(stateDir, `${runId}.v2`);
   const journal = new RunStateJournalV2({ rootDir, runId });
-  const failedEvents = await journal.readStage('summary');
-  const planned = failedEvents.find((event) => event.type === 'unit_planned');
-  const started = failedEvents.find((event) => event.type === 'unit_started');
-  const failedTerminal = failedEvents.at(-1);
+  await journal.acquireLock();
+  let planned;
+  let attemptId;
+  let failedTerminal;
+  try {
+    await journal.open();
+    const plannedEvents = await journal.readStage('summary');
+    planned = plannedEvents.find((event) => event.type === 'unit_planned');
+    attemptId = stableHash({ run_id: runId, stage: 'summary', unit_id: 's1' });
+    await journal.appendStage('summary', 'unit_started', {
+      unit_id: 's1',
+      input_hash: planned.payload.input_hash,
+      attempt_id: attemptId,
+    });
+    await journal.appendStage('summary', 'unit_operation_started', {
+      unit_id: 's1',
+      attempt_id: attemptId,
+      operation_id: 's1:map:0',
+    });
+    await journal.appendStage('summary', 'unit_operation_completed', {
+      unit_id: 's1',
+      attempt_id: attemptId,
+      operation_id: 's1:map:0',
+      status: 'completed',
+      completed_chunks: 1,
+      total_chunks: 1,
+      skipped_chunks: 0,
+      next_operation_id: 's1:reduce',
+    });
+    await journal.appendStage('summary', 'unit_operation_started', {
+      unit_id: 's1',
+      attempt_id: attemptId,
+      operation_id: 's1:reduce',
+    });
+    const completed = await journal.appendStage('summary', 'unit_operation_completed', {
+      unit_id: 's1',
+      attempt_id: attemptId,
+      operation_id: 's1:reduce',
+      status: 'failed',
+      error: 'pi_stream_failed',
+      terminal_result: {
+        status: 'failed',
+        payload: { error: 'pi_stream_failed' },
+      },
+    });
+    failedTerminal = await journal.appendStage('summary', 'unit_terminal', {
+      unit_id: 's1',
+      attempt_id: attemptId,
+      status: 'failed',
+      error: 'pi_stream_failed',
+    });
+    assert.equal(completed.seq + 1, failedTerminal.seq);
+  } finally {
+    await journal.releaseLock();
+  }
   const receiptInputHash = 'c'.repeat(64);
   const lastSafeTimestamp = '2026-07-28T00:00:00.000Z';
-  assert.equal(failedTerminal.type, 'unit_terminal');
 
   await authorizeSummaryFailedTerminalRetry({
     engineUrl: 'ws://127.0.0.1:49134',
@@ -106,7 +273,7 @@ async function prepareAuthorizedLegacySummaryRun({ baseUrl, stateDir, runId }) {
     formalRunId: runId,
     expectedJournalSeq: failedTerminal.seq,
     unitId: 's1',
-    attemptId: started.payload.attempt_id,
+    attemptId,
     operationId: 's1:reduce',
     runnerInputHash: planned.payload.input_hash,
     receiptInputHash,
@@ -124,7 +291,7 @@ async function prepareAuthorizedLegacySummaryRun({ baseUrl, stateDir, runId }) {
     lookupReceipt: async () => ({
       success: true,
       operation: {
-        runId: started.payload.attempt_id,
+        runId: attemptId,
         stage: 'summary',
         unitId: 's1:reduce',
         inputHash: receiptInputHash,
@@ -156,7 +323,7 @@ async function prepareAuthorizedLegacySummaryRun({ baseUrl, stateDir, runId }) {
     lessonsRemote,
     rootDir,
     receiptInputHash,
-    attemptId: started.payload.attempt_id,
+    attemptId,
     runnerInputHash: planned.payload.input_hash,
   };
 }
@@ -276,11 +443,11 @@ test('v2 summary treats unit_started without an inner operation as not yet dispa
         },
         v2LessonsRemote: lessonsRemote,
       });
-      assert.equal(code, 1);
+      assert.equal(code, 75);
       const root = path.join(stateDir, 'summary-recovery.v2');
       const stage = (await fs.readFile(path.join(root, 'summary.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
-      assert.equal(stage.at(-1).type, 'unit_blocked');
-      assert.equal(stage.at(-1).payload.reason, 'summary_source_unproven');
+      assert.equal(stage.at(-1).type, 'unit_reconciliation_requested');
+      assert.equal(stage.at(-1).payload.decision.action, 'reconcile');
       assert.equal(stage.some((event) => event.type === 'unit_terminal'), false);
     });
     assert.equal(attempts.length, 1);
@@ -299,7 +466,7 @@ test('v2 summary treats unit_started without an inner operation as not yet dispa
   }
 });
 
-test('v2 summary recovery hard-stops when no durable result is visible', async () => {
+test('v2 summary recovery waits when no durable result is visible', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-missing-'));
@@ -352,17 +519,287 @@ test('v2 summary recovery hard-stops when no durable result is visible', async (
           record: async () => {},
         },
       });
-      assert.equal(code, 1);
+      assert.equal(code, 75);
     });
     const events = (await fs.readFile(
       path.join(stateDir, 'summary-missing.v2', 'summary.jsonl'),
       'utf8',
     )).trim().split('\n').map(JSON.parse);
-    assert.equal(events.at(-1).type, 'unit_blocked');
-    assert.equal(events.at(-1).payload.reason, 'extraction_operation_reconciliation_required');
+    assert.equal(events.at(-1).type, 'unit_reconciliation_requested');
+    assert.equal(events.at(-1).payload.decision.action, 'reconcile');
   } finally {
     if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
     else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 Summary routes structured domain and unknown outcomes through recovery evidence', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  try {
+    const scenarios = [
+      {
+        name: 'skipped',
+        status: 'skipped',
+        expectedCode: 0,
+        expectedObservation: 'business_empty',
+        expectedAction: 'skipped',
+      },
+      {
+        name: 'infeasible',
+        status: 'infeasible',
+        expectedCode: 1,
+        expectedObservation: 'business_rejected',
+        expectedAction: 'isolate',
+      },
+      {
+        name: 'unknown',
+        status: 'future_summary_state',
+        expectedCode: 75,
+        expectedObservation: null,
+        expectedAction: 'reconcile',
+      },
+      {
+        name: 'proved-no-effect',
+        status: 'preflight_unavailable',
+        expectedCode: 75,
+        expectedObservation: 'execution_error',
+        expectedAction: 'retry',
+        expectedNotBefore: '2099-07-30T00:00:00.000Z',
+      },
+    ];
+
+    for (const scenario of scenarios) {
+      await context.test(scenario.name, async () => {
+        const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-contract-'));
+        try {
+          await withServer((request, response) => {
+            assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+            response.setHeader('content-type', 'application/json');
+            response.end(JSON.stringify({
+              success: true,
+              sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+            }));
+          }, async (baseUrl) => {
+            const argv = [
+              '--base-url', baseUrl,
+              '--state-dir', stateDir,
+              '--run-id', `summary-contract-${scenario.name}`,
+              '--run-state-format', 'v2',
+            ];
+            const summaryRemote = {
+              advance: async ({ attemptId, operationUnitId }) => ({
+                ok: true,
+                data: {
+                  status: scenario.status,
+                  error: scenario.status,
+                  operationUnitId,
+                  ...(scenario.expectedObservation
+                    ? {
+                        recoveryEvidence: {
+                          kind: 'no_effect',
+                          observation: scenario.expectedObservation,
+                          reasonCode: scenario.status,
+                          ...(scenario.expectedNotBefore
+                            ? { retryHint: { notBefore: scenario.expectedNotBefore } }
+                            : {}),
+                          proof: {
+                            kind: 'receipt_before_formal_effect',
+                            receiptKey: 'receipt-1',
+                            receiptVersion: 1,
+                            phase: 'preflight',
+                            commitPlanAbsent: true,
+                          },
+                        },
+                      }
+                    : {}),
+                },
+              }),
+              record: async () => {},
+            };
+            const lessonsRemote = {
+              start: async ({ attemptId }) => ({
+                ok: true,
+                data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+              }),
+              record: async () => {},
+            };
+            assert.equal(await mainForEarlyStages(argv, {
+              v2SummaryRemote: summaryRemote,
+              v2LessonsRemote: lessonsRemote,
+            }), scenario.expectedCode);
+          });
+
+          const journalPath = path.join(
+            stateDir,
+            `summary-contract-${scenario.name}.v2`,
+            'summary.jsonl',
+          );
+          const events = (await fs.readFile(journalPath, 'utf8'))
+            .trim()
+            .split('\n')
+            .map(JSON.parse);
+          const observed = events.find((event) => event.type === 'unit_outcome_observed');
+          assert.equal(observed.payload.decision.action, scenario.expectedAction);
+          if (scenario.expectedObservation) {
+            assert.equal(observed.payload.evidence.kind, 'no_effect');
+            assert.equal(observed.payload.evidence.observation, scenario.expectedObservation);
+          } else {
+            assert.equal(observed.payload.evidence.kind, 'unknown');
+          }
+          assert.equal(
+            events.some((event) => event.type.startsWith('unit_summary_')),
+            false,
+          );
+          if (scenario.expectedAction === 'retry') {
+            assert.equal(events.at(-1).type, 'unit_retry_scheduled');
+            assert.equal(
+              events.at(-1).payload.decision.notBefore,
+              scenario.expectedNotBefore,
+            );
+            assert.equal(events.at(-1).payload.retry_at, scenario.expectedNotBefore);
+          }
+        } finally {
+          await fs.rm(stateDir, { recursive: true, force: true });
+        }
+      });
+    }
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 Summary isolates one permanent failure without stopping an independent unit', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-independent-'));
+  const recorded = [];
+  const lessonStarts = [];
+  const lessonRecords = [];
+  try {
+    await withServer((request, response) => {
+      assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [
+          { id: 'failed-session', startedAt: '2026-07-22T00:00:00.000Z' },
+          { id: 'healthy-session', startedAt: '2026-07-22T00:01:00.000Z' },
+        ],
+      }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'independent-summary-units',
+        '--run-state-format', 'v2',
+      ];
+      const code = await mainForEarlyStages(argv, {
+        v2SummaryRemote: {
+          advance: async (request) => {
+            if (request.sessionId === 'healthy-session') {
+              return successfulSummaryResponse(request, 'healthy');
+            }
+            return {
+              ok: true,
+              data: {
+                status: 'infeasible',
+                error: 'infeasible',
+                operationUnitId: request.operationUnitId,
+                recoveryEvidence: {
+                  kind: 'no_effect',
+                  observation: 'business_rejected',
+                  reasonCode: 'infeasible',
+                  proof: {
+                    kind: 'receipt_before_formal_effect',
+                    receiptKey: 'receipt-failed-session',
+                    receiptVersion: 1,
+                    phase: 'preflight',
+                    commitPlanAbsent: true,
+                  },
+                },
+              },
+            };
+          },
+          record: async ({ sessionId }) => recorded.push(sessionId),
+        },
+        v2LessonsRemote: {
+          start: async ({ sessionId, attemptId }) => {
+            lessonStarts.push(sessionId);
+            assert.equal(sessionId, 'healthy-session');
+            return {
+              ok: true,
+              data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+            };
+          },
+          record: async ({ runId }) => lessonRecords.push(runId),
+        },
+      });
+      assert.equal(code, 1);
+      assert.equal(await mainForEarlyStages([...argv, '--resume'], {
+        v2SummaryRemote: {
+          advance: async () => assert.fail('isolated Summary must not redispatch'),
+          record: async () => assert.fail('recorded Summary must not record again'),
+        },
+        v2LessonsRemote: {
+          start: async () => assert.fail('reduced dependencies must not redispatch'),
+          record: async () => assert.fail('recorded Lesson must not record again'),
+        },
+      }), 1);
+    });
+
+    const root = path.join(stateDir, 'independent-summary-units.v2');
+    const events = (await fs.readFile(path.join(root, 'summary.jsonl'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map(JSON.parse);
+    assert.deepEqual(recorded, ['healthy-session']);
+    assert.deepEqual(lessonStarts, ['healthy-session']);
+    assert.equal(lessonRecords.length, 1);
+    assert.equal(events.at(-1).type, 'run_attention_required');
+    assert.equal(
+      events.some((event) => (
+        event.type === 'unit_resolution'
+        && event.payload.unit_id === 'healthy-session'
+        && event.payload.status === 'succeeded'
+      )),
+      true,
+    );
+    const status = JSON.parse(await fs.readFile(path.join(root, 'status.json'), 'utf8'));
+    assert.equal(status.status, 'attention_required');
+    assert.equal(status.summary.status, 'attention_required');
+    assert.equal(status.summary.acceptance_ready, false);
+    assert.equal(status.summary.recovery.isolated, 1);
+    assert.equal(status.summary.recovery.succeeded, 1);
+    const lessons = (await fs.readFile(path.join(root, 'lessons.jsonl'), 'utf8'))
+      .trim()
+      .split('\n')
+      .map(JSON.parse);
+    const dependencyBlock = lessons.find((event) => (
+      event.type === 'unit_dependency_blocked'
+    ));
+    assert.equal(dependencyBlock.payload.unit_id, 'failed-session');
+    assert.deepEqual(dependencyBlock.payload.dependencies, [{
+      stage: 'summary',
+      unit_id: 'failed-session',
+      state: 'isolated',
+      terminal: 'failed',
+      recorded: false,
+      source_seq: events.find((event) => event.type === 'unit_isolated').seq,
+    }]);
+    assert.equal(
+      lessons.some((event) => (
+        event.type === 'unit_terminal'
+        && event.payload.unit_id === 'healthy-session'
+        && event.payload.status === 'succeeded'
+      )),
+      true,
+    );
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
   }
 });
 
@@ -453,7 +890,9 @@ test('v2 summary recovery reconciles one durable chunk before advancing the next
       'unit_operation_completed',
       'unit_operation_started',
       'unit_operation_completed',
-      'unit_terminal',
+      'unit_outcome_observed',
+      'unit_effect_committed',
+      'unit_resolution',
       'unit_recorded',
       'stage_completed',
     ]);
@@ -463,7 +902,7 @@ test('v2 summary recovery reconciles one durable chunk before advancing the next
   }
 });
 
-test('v2 summary retains an active reduce operation for a retryable structured failure', async () => {
+test('v2 summary does not retry a provider failure without persisted no-effect evidence', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-retryable-reduce-'));
@@ -539,37 +978,32 @@ test('v2 summary retains an active reduce operation for a retryable structured f
         path.join(stateDir, 'summary-retryable-reduce.v2', 'status.json'),
         'utf8',
       ));
-      assert.deepEqual(status.summary.failure, {
-        class: 'transient_provider',
-        cause: 'network_error',
-        phase: 'provider_call',
-      });
+      assert.equal(status.summary.recovery.reconciling, 1);
       assert.equal(await mainForEarlyStages([...argv, '--resume'], {
         v2SummaryRemote: summaryRemote,
         v2LessonsRemote: lessonsRemote,
-      }), 0);
+      }), 75);
     });
-    assert.deepEqual(receiptModes, [false, false, false, true]);
+    assert.deepEqual(receiptModes, [false, false, false]);
     const events = (await fs.readFile(
       path.join(stateDir, 'summary-retryable-reduce.v2', 'summary.jsonl'),
       'utf8',
     )).trim().split('\n').map(JSON.parse);
-    assert.equal(events.filter((event) => event.type === 'unit_terminal').length, 1);
-    assert.equal(events.some((event) => event.type === 'unit_blocked'), false);
+    assert.equal(events.at(-1).type, 'unit_reconciliation_requested');
+    assert.equal(events.some((event) => event.type === 'unit_terminal'), false);
   } finally {
     if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
     else process.env.AGENTMEMORY_SECRET = previousSecret;
   }
 });
 
-test('v2 summary resumes an authorized legacy failed reduce only through the existing receipt', async () => {
+test('v2 summary consumes an authorized legacy failed terminal through the existing receipt', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-authorized-retry-'));
   const runId = 'summary-authorized-retry';
   const receiptInputHash = 'c'.repeat(64);
   const receiptModes = [];
-  let legacyFailure = true;
   try {
     await withServer(async (request, response) => {
       response.setHeader('content-type', 'application/json');
@@ -589,31 +1023,6 @@ test('v2 summary resumes an authorized legacy failed reduce only through the exi
           requireExistingReceipt: payload.requireExistingReceipt === true,
           failedReceiptRetryAuthorization: payload.failedReceiptRetryAuthorization,
         });
-        if (payload.operationUnitId === 's1:map:0') {
-          response.end(JSON.stringify({
-            success: true,
-            status: 'in_progress',
-            advanced: 'completed',
-            completedChunks: 1,
-            totalChunks: 1,
-            operationUnitId: payload.operationUnitId,
-          }));
-          return;
-        }
-        if (legacyFailure) {
-          legacyFailure = false;
-          response.statusCode = 500;
-          response.end(JSON.stringify({
-            success: false,
-            status: 'failed',
-            operationUnitId: payload.operationUnitId,
-            failure: {
-              class: 'transient_provider',
-              cause: 'pi_stream_failed',
-            },
-          }));
-          return;
-        }
         const succeeded = successfulSummaryResponse({
           attemptId: payload.attemptId,
           inputHash: payload.inputHash,
@@ -646,70 +1055,11 @@ test('v2 summary resumes an authorized legacy failed reduce only through the exi
         record: async () => {},
       };
 
-      assert.equal(await mainForEarlyStages(argv, {
-        v2LessonsRemote: lessonsRemote,
-      }), 1);
-
-      const rootDir = path.join(stateDir, `${runId}.v2`);
-      const journal = new RunStateJournalV2({ rootDir, runId });
-      const failedEvents = await journal.readStage('summary');
-      const planned = failedEvents.find((event) => event.type === 'unit_planned');
-      const started = failedEvents.find((event) => event.type === 'unit_started');
-      const failedTerminal = failedEvents.at(-1);
-      assert.equal(failedTerminal.type, 'unit_terminal');
-      assert.equal(failedTerminal.payload.status, 'failed');
-
-      const authorization = await authorizeSummaryFailedTerminalRetry({
-        engineUrl: 'ws://127.0.0.1:49134',
+      await prepareAuthorizedLegacySummaryRun({
+        baseUrl,
         stateDir,
-        formalRunId: runId,
-        expectedJournalSeq: failedTerminal.seq,
-        unitId: 's1',
-        attemptId: started.payload.attempt_id,
-        operationId: 's1:reduce',
-        runnerInputHash: planned.payload.input_hash,
-        receiptInputHash,
-        expectedFailureClass: 'transient_provider',
-        expectedFailureCause: 'pi_stream_failed',
-        expectedFailurePhase: 'provider_call',
-        expectedRetryEpoch: 0,
-        expectedLastSafeFailure: {
-          errorClass: 'transient_provider',
-          cause: 'pi_stream_failed',
-          phase: 'provider_call',
-          timestamp: '2026-07-28T00:00:00.000Z',
-        },
-      }, {
-        lookupReceipt: async () => ({
-          success: true,
-          operation: {
-            runId: started.payload.attempt_id,
-            stage: 'summary',
-            unitId: 's1:reduce',
-            inputHash: receiptInputHash,
-          },
-          receipt: {
-            status: 'failed',
-            startedAt: '2026-07-27T23:59:00.000Z',
-            completedAt: '2026-07-28T00:00:01.000Z',
-            failure: {
-              class: 'transient_provider',
-              cause: 'pi_stream_failed',
-              phase: 'provider_call',
-            },
-            retry: {
-              epoch: 0,
-              lastSafeFailure: {
-                errorClass: 'transient_provider',
-                cause: 'pi_stream_failed',
-                phase: 'provider_call',
-                timestamp: '2026-07-28T00:00:00.000Z',
-              },
-            },
-          },
-        }),
+        runId,
       });
-      assert.equal(authorization.replayed, false);
 
       assert.equal(await mainForEarlyStages([...argv, '--resume'], {
         v2LessonsRemote: lessonsRemote,
@@ -717,16 +1067,6 @@ test('v2 summary resumes an authorized legacy failed reduce only through the exi
     });
 
     assert.deepEqual(receiptModes, [
-      {
-        operationUnitId: 's1:map:0',
-        requireExistingReceipt: false,
-        failedReceiptRetryAuthorization: undefined,
-      },
-      {
-        operationUnitId: 's1:reduce',
-        requireExistingReceipt: false,
-        failedReceiptRetryAuthorization: undefined,
-      },
       {
         operationUnitId: 's1:reduce',
         requireExistingReceipt: true,
@@ -756,7 +1096,12 @@ test('v2 summary resumes an authorized legacy failed reduce only through the exi
     assert.deepEqual(
       events.filter((event) => event.type === 'unit_terminal')
         .map((event) => event.payload.status),
-      ['failed', 'succeeded'],
+      ['failed'],
+    );
+    assert.deepEqual(
+      events.filter((event) => event.type === 'unit_resolution')
+        .map((event) => event.payload.status),
+      ['succeeded'],
     );
     assert.equal(
       events.filter((event) =>
@@ -844,7 +1189,7 @@ test('v2 summary authorized retry preserves recoverable receipt boundaries', asy
         },
         'success',
       ],
-      expectedCodes: [75, 1],
+      expectedCodes: [75, 75],
       expectedLastType: 'stage_completed',
       expectedCause: null,
       reconcileAfterBlock: true,
@@ -1082,68 +1427,105 @@ test('v2 summary authorized retry preserves recoverable receipt boundaries', asy
   }
 });
 
-test('v2 summary recovers a completed final inner operation without another remote call', async () => {
+test('v2 summary recovery appends each accepted outcome fact once across final boundaries', async (context) => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-terminal-'));
-  let summaryCalls = 0;
-  let crashAfterOperation = true;
-  const lessonsRemote = {
-    start: async ({ attemptId }) => ({
-      ok: true,
-      data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
-    }),
-    record: async () => {},
-  };
-  try {
-    await withServer((request, response) => {
-      assert.equal(request.url, '/agentmemory/sessions?agentId=*');
-      response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify({
-        success: true,
-        sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
-      }));
-    }, async (baseUrl) => {
-      const argv = [
-        '--base-url', baseUrl,
-        '--state-dir', stateDir,
-        '--run-id', 'summary-terminal',
-        '--run-state-format', 'v2',
-      ];
-      const summaryRemote = {
-        advance: async ({ attemptId, inputHash, operationUnitId }) => {
-          summaryCalls += 1;
-          return {
-            ...successfulSummaryResponse({ attemptId, inputHash }, 'terminal summary'),
-            data: {
-              ...successfulSummaryResponse({ attemptId, inputHash }, 'terminal summary').data,
-              operationUnitId,
-            },
-          };
-        },
-        record: async () => {},
-      };
-
-      await assert.rejects(() => mainForEarlyStages(argv, {
-        v2SummaryRemote: summaryRemote,
-        v2LessonsRemote: lessonsRemote,
-        onV2DurableEvent: async ({ type }) => {
-          if (crashAfterOperation && type === 'unit_operation_completed') {
-            crashAfterOperation = false;
-            throw new Error('crash_after_final_operation');
-          }
-        },
-      }), /crash_after_final_operation/);
-
-      assert.equal(await mainForEarlyStages([...argv, '--resume'], {
-        v2SummaryRemote: summaryRemote,
-        v2LessonsRemote: lessonsRemote,
-      }), 0);
-    });
-    assert.equal(summaryCalls, 1);
-  } finally {
+  context.after(() => {
     if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
     else process.env.AGENTMEMORY_SECRET = previousSecret;
+  });
+
+  for (const crashType of [
+    'unit_operation_completed',
+    'unit_outcome_observed',
+    'unit_effect_committed',
+    'unit_resolution',
+  ]) {
+    await context.test(`crash after ${crashType}`, async () => {
+      const stateDir = await fs.mkdtemp(path.join(
+        os.tmpdir(),
+        `agentmemory-v2-summary-${crashType}-`,
+      ));
+      const runId = `summary-${crashType}`;
+      let summaryCalls = 0;
+      let providerCalls = 0;
+      let crashPending = true;
+      const lessonsRemote = {
+        start: async ({ attemptId }) => ({
+          ok: true,
+          data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+        }),
+        record: async () => {},
+      };
+      try {
+        await withServer((request, response) => {
+          assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+          response.setHeader('content-type', 'application/json');
+          response.end(JSON.stringify({
+            success: true,
+            sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+          }));
+        }, async (baseUrl) => {
+          const argv = [
+            '--base-url', baseUrl,
+            '--state-dir', stateDir,
+            '--run-id', runId,
+            '--run-state-format', 'v2',
+          ];
+          const summaryRemote = {
+            advance: async ({
+              attemptId,
+              inputHash,
+              operationUnitId,
+              requireExistingReceipt,
+            }) => {
+              summaryCalls += 1;
+              if (!requireExistingReceipt) providerCalls += 1;
+              return {
+                ...successfulSummaryResponse({ attemptId, inputHash }, 'terminal summary'),
+                data: {
+                  ...successfulSummaryResponse({ attemptId, inputHash }, 'terminal summary').data,
+                  operationUnitId,
+                },
+              };
+            },
+            record: async () => {},
+          };
+
+          await assert.rejects(() => mainForEarlyStages(argv, {
+            v2SummaryRemote: summaryRemote,
+            v2LessonsRemote: lessonsRemote,
+            onV2DurableEvent: async ({ type }) => {
+              if (crashPending && type === crashType) {
+                crashPending = false;
+                throw new Error(`crash_after_${crashType}`);
+              }
+            },
+          }), new RegExp(`crash_after_${crashType}`));
+
+          assert.equal(await mainForEarlyStages([...argv, '--resume'], {
+            v2SummaryRemote: summaryRemote,
+            v2LessonsRemote: lessonsRemote,
+          }), 0);
+        });
+
+        const events = (await fs.readFile(
+          path.join(stateDir, `${runId}.v2`, 'summary.jsonl'),
+          'utf8',
+        )).trim().split('\n').map(JSON.parse);
+        for (const type of [
+          'unit_outcome_observed',
+          'unit_effect_committed',
+          'unit_resolution',
+        ]) {
+          assert.equal(events.filter((event) => event.type === type).length, 1);
+        }
+        assert.equal(summaryCalls, 2);
+        assert.equal(providerCalls, 1);
+      } finally {
+        await fs.rm(stateDir, { recursive: true, force: true });
+      }
+    });
   }
 });
 
@@ -1851,7 +2233,7 @@ test('v2 lessons recovers every durable boundary with one stable remote operatio
   }
 });
 
-test('v2 lessons hard-stops reconciliation-required receipts without sealing', async () => {
+test('v2 lessons waits on reconciliation-required receipts without sealing', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-lessons-reconcile-'));
@@ -1874,12 +2256,16 @@ test('v2 lessons hard-stops reconciliation-required receipts without sealing', a
           record: async () => assert.fail('must not record a reconciled failure'),
         },
       });
-      assert.equal(code, 1);
+      assert.equal(code, 75);
     });
     const root = path.join(stateDir, 'lessons-reconcile.v2');
     const lessons = (await fs.readFile(path.join(root, 'lessons.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
-    assert.equal(lessons.at(-1).type, 'unit_blocked');
-    assert.equal(lessons.at(-1).payload.reason, 'extraction_operation_reconciliation_required');
+    assert.equal(lessons.at(-1).type, 'unit_reconciliation_requested');
+    assert.equal(lessons.at(-1).payload.decision.action, 'reconcile');
+    assert.equal(
+      lessons.at(-1).payload.evidence.reasonCode,
+      'legacy_lessons_effect_unknown',
+    );
     assert.equal(lessons.some((event) => event.type === 'unit_terminal'), false);
     const control = (await fs.readFile(path.join(root, 'control.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
     assert.equal(control.some((event) => event.type === 'stage_sealed' && event.payload.stage === 'lessons'), false);
@@ -1988,7 +2374,7 @@ test('v2 lessons resume forwards append-only legacy retry authorization to the s
         v2LessonsRemote: {
           start: async () => ({
             ok: false,
-            status_code: 503,
+            status_code: 400,
             data: {
               failure: {
                 class: 'transient_provider',
@@ -2091,7 +2477,177 @@ test('v2 lessons resume forwards append-only legacy retry authorization to the s
   }
 });
 
-test('v2 summary hard-stops a persisted reconciliation failure without redispatching', async () => {
+test('v2 Lessons resumes every committed recovery boundary without repeating Provider work', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  context.after(() => {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  });
+
+  for (const crashType of [
+    'unit_operation_completed',
+    'unit_outcome_observed',
+    'unit_effect_committed',
+    'unit_resolution',
+  ]) {
+    await context.test(`crash after ${crashType}`, async () => {
+      const stateDir = await fs.mkdtemp(path.join(
+        os.tmpdir(),
+        `agentmemory-v2-lessons-${crashType}-`,
+      ));
+      const runId = `lessons-${crashType}`;
+      let lessonCalls = 0;
+      let providerCalls = 0;
+      let recordCalls = 0;
+      let crashPending = true;
+      try {
+        await withServer((_request, response) => {
+          response.setHeader('content-type', 'application/json');
+          response.end(JSON.stringify({
+            success: true,
+            sessions: [{ id: 's1', startedAt: '2026-07-24T00:00:00.000Z' }],
+          }));
+        }, async (baseUrl) => {
+          const argv = [
+            '--base-url', baseUrl,
+            '--state-dir', stateDir,
+            '--run-id', runId,
+            '--run-state-format', 'v2',
+          ];
+          const lessonsRemote = {
+            start: async ({ requireExistingReceipt }) => {
+              lessonCalls += 1;
+              if (!requireExistingReceipt) providerCalls += 1;
+              return committedLessonResponse('lesson-run-1');
+            },
+            record: async () => {
+              recordCalls += 1;
+            },
+          };
+          await assert.rejects(() => mainForEarlyStages(argv, {
+            v2SummaryRemote: {
+              advance: async (request) => successfulSummaryResponse(request),
+              record: async () => {},
+            },
+            v2LessonsRemote: lessonsRemote,
+            onV2DurableEvent: async ({ scope, type }) => {
+              if (scope === 'lessons' && crashPending && type === crashType) {
+                crashPending = false;
+                throw new Error(`crash_after_${crashType}`);
+              }
+            },
+          }), new RegExp(`crash_after_${crashType}`));
+
+          assert.equal(await mainForEarlyStages([...argv, '--resume'], {
+            v2SummaryRemote: {
+              advance: async (request) => successfulSummaryResponse(request),
+              record: async () => {},
+            },
+            v2LessonsRemote: lessonsRemote,
+          }), 0);
+        });
+
+        const events = (await fs.readFile(
+          path.join(stateDir, `${runId}.v2`, 'lessons.jsonl'),
+          'utf8',
+        )).trim().split('\n').map(JSON.parse);
+        for (const type of [
+          'unit_operation_completed',
+          'unit_outcome_observed',
+          'unit_effect_committed',
+          'unit_resolution',
+        ]) {
+          assert.equal(events.filter((event) => event.type === type).length, 1);
+        }
+        assert.equal(
+          events.some((event) => event.type.startsWith('unit_lessons_')),
+          false,
+        );
+        assert.equal(lessonCalls, 2);
+        assert.equal(providerCalls, 1);
+        assert.equal(recordCalls, 1);
+      } finally {
+        await fs.rm(stateDir, { recursive: true, force: true });
+      }
+    });
+  }
+});
+
+test('v2 Lessons persists staged recovery and resumes the same commit operation', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-lessons-staged-'));
+  const runId = 'lessons-staged-resume';
+  const receiptModes = [];
+  let calls = 0;
+  try {
+    await withServer((_request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [{ id: 's1', startedAt: '2026-07-24T00:00:00.000Z' }],
+      }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', runId,
+        '--run-state-format', 'v2',
+      ];
+      const lessonsRemote = {
+        start: async ({ requireExistingReceipt }) => {
+          receiptModes.push(requireExistingReceipt);
+          calls += 1;
+          if (calls === 1) {
+            return {
+              ok: true,
+              data: {
+                runs: [{ id: 'lesson-run-1', status: 'succeeded' }],
+                lessonEvidence: [{
+                  kind: 'staged',
+                  resultRef: 'lesson-candidate-staging:staging-1',
+                  effectHash: 'a'.repeat(64),
+                }],
+              },
+            };
+          }
+          return committedLessonResponse('lesson-run-1');
+        },
+        record: async () => {},
+      };
+      const summaryRemote = {
+        advance: async (request) => successfulSummaryResponse(request),
+        record: async () => {},
+      };
+
+      assert.equal(await mainForEarlyStages(argv, {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: lessonsRemote,
+      }), 75);
+      assert.equal(await mainForEarlyStages([...argv, '--resume'], {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: lessonsRemote,
+      }), 0);
+    });
+
+    const events = (await fs.readFile(
+      path.join(stateDir, `${runId}.v2`, 'lessons.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    const resumed = events.filter((event) => event.type === 'unit_commit_resumed');
+    assert.equal(resumed.length, 1);
+    assert.equal(resumed[0].payload.decision.action, 'resume_commit');
+    assert.deepEqual(receiptModes, [false, true]);
+    assert.equal(events.filter((event) => event.type === 'unit_resolution').length, 1);
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('v2 summary waits on a persisted reconciliation failure without redispatching', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-reconcile-'));
@@ -2112,17 +2668,17 @@ test('v2 summary hard-stops a persisted reconciliation failure without redispatc
         },
         v2LessonsRemote: { start: async () => assert.fail('lessons must not start'), record: async () => {} },
       });
-      assert.equal(code, 1);
+      assert.equal(code, 75);
       const resumed = await mainForEarlyStages([...argv, '--resume'], {
         v2SummaryRemote: { advance: async () => assert.fail('persisted failed summary must not redispatch'), record: async () => {} },
         v2LessonsRemote: { start: async () => assert.fail('lessons must not start'), record: async () => {} },
       });
-      assert.equal(resumed, 1);
+      assert.equal(resumed, 75);
     });
     const root = path.join(stateDir, 'summary-reconcile.v2');
     const summary = (await fs.readFile(path.join(root, 'summary.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
-    assert.equal(summary.at(-1).type, 'unit_blocked');
-    assert.equal(summary.at(-1).payload.reason, 'extraction_operation_reconciliation_required');
+    assert.equal(summary.at(-1).type, 'unit_reconciliation_requested');
+    assert.equal(summary.at(-1).payload.decision.action, 'reconcile');
     assert.equal(summary.some((event) => event.type === 'unit_terminal'), false);
     const control = (await fs.readFile(path.join(root, 'control.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
     assert.equal(control.some((event) => event.type === 'stage_sealed' && event.payload.stage === 'summary'), false);

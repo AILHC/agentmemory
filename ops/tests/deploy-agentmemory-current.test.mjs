@@ -217,9 +217,12 @@ Copy-AmReleaseScripts -Source ${quotePowerShell(source)} -Destination ${quotePow
       '_agentmemory-local-common.ps1',
       'agentmemory-deployment-manifest.mjs',
       'authorize-agentmemory-lessons-failed-terminal-retry.mjs',
+      'create-agentmemory-recovery-evidence-snapshot.mjs',
       'doctor-agentmemory-console.ps1',
       'doctor-agentmemory.ps1',
       'lib',
+      'migrate-agentmemory-recovery-frontier.mjs',
+      'project-agentmemory-recovery-status.mjs',
       'request-agentmemory-full-extraction-drain.ps1',
       'run-agentmemory-cli-import-batch.mjs',
       'run-agentmemory-full-extraction.mjs',
@@ -237,10 +240,20 @@ Copy-AmReleaseScripts -Source ${quotePowerShell(source)} -Destination ${quotePow
     [
       'adaptive-provider-limiter.mjs',
       'full-extraction-stage-adapters-v2.mjs',
+      'iii-state-read-only-adapter-v1.mjs',
+      'legacy-lesson-safe-facts-collector-v1.mjs',
+      'lesson-recovery-adapter-v1.mjs',
+      'offline-statekv-snapshot-v1.mjs',
       'recoverable-stage-v2.mjs',
+      'recovery-frontier-migration-v1.mjs',
+      'recovery-journal-reducer-v1.mjs',
+      'recovery-migration-contract-v1.mjs',
+      'recovery-policy-v1.mjs',
+      'recovery-status-projection-v1.mjs',
       'run-state-journal-v2.mjs',
       'run-state-store.mjs',
       'stage-pipeline.mjs',
+      'summary-recovery-adapter-v1.mjs',
       'v2-release-gate.mjs',
     ],
   );
@@ -255,6 +268,26 @@ Copy-AmReleaseScripts -Source ${quotePowerShell(source)} -Destination ${quotePow
     { encoding: 'utf8', windowsHide: true },
   );
   assert.equal(runnerImport.status, 0, runnerImport.stderr || runnerImport.stdout);
+
+  await fs.symlink(
+    path.resolve('node_modules'),
+    path.join(root, 'node_modules'),
+    'junction',
+  );
+  const migrationImport = spawnSync(
+    process.execPath,
+    [
+      '--input-type=module',
+      '--eval',
+      `await import(${JSON.stringify(pathToFileURL(path.join(root, 'migrate-agentmemory-recovery-frontier.mjs')).href)})`,
+    ],
+    { encoding: 'utf8', windowsHide: true },
+  );
+  assert.equal(
+    migrationImport.status,
+    0,
+    migrationImport.stderr || migrationImport.stdout,
+  );
 });
 
 test('只读状态入口优先读取 manifest 并校验 lock PID', async (context) => {

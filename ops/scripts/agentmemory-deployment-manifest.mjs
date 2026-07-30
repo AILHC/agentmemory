@@ -2,6 +2,10 @@ import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  RECOVERY_POLICY_HASH,
+  RECOVERY_POLICY_VERSION,
+} from './lib/recovery-policy-v1.mjs';
 
 const MANIFEST_NAME = 'DEPLOYMENT.json';
 const ALLOWED_TOP_LEVEL = new Set([
@@ -28,14 +32,27 @@ const KEY_FILE_PATHS = [
   'scripts/agentmemory-deployment-manifest.mjs',
   'scripts/doctor-agentmemory-console.ps1',
   'scripts/doctor-agentmemory.ps1',
+  'scripts/create-agentmemory-recovery-evidence-snapshot.mjs',
   'scripts/lib/adaptive-provider-limiter.mjs',
   'scripts/lib/full-extraction-stage-adapters-v2.mjs',
+  'scripts/lib/iii-state-read-only-adapter-v1.mjs',
+  'scripts/lib/legacy-lesson-safe-facts-collector-v1.mjs',
+  'scripts/lib/lesson-recovery-adapter-v1.mjs',
+  'scripts/lib/offline-statekv-snapshot-v1.mjs',
   'scripts/lib/recoverable-stage-v2.mjs',
+  'scripts/lib/recovery-frontier-migration-v1.mjs',
+  'scripts/lib/recovery-journal-reducer-v1.mjs',
+  'scripts/lib/recovery-migration-contract-v1.mjs',
+  'scripts/lib/recovery-policy-v1.mjs',
+  'scripts/lib/recovery-status-projection-v1.mjs',
   'scripts/lib/run-state-journal-v2.mjs',
   'scripts/lib/run-state-store.mjs',
   'scripts/lib/stage-pipeline.mjs',
+  'scripts/lib/summary-recovery-adapter-v1.mjs',
   'scripts/lib/v2-release-gate.mjs',
   'scripts/run-agentmemory-full-extraction.mjs',
+  'scripts/project-agentmemory-recovery-status.mjs',
+  'scripts/migrate-agentmemory-recovery-frontier.mjs',
   'scripts/start-agentmemory-console.ps1',
   'scripts/start-agentmemory.ps1',
   'scripts/stop-agentmemory-console.ps1',
@@ -169,6 +186,11 @@ export async function createDeploymentManifest({
     sourceCommit: sourceCommit.toLowerCase(),
     packageVersion: await readPackageVersion(root),
     builtAt,
+    recoveryContract: {
+      minVersion: RECOVERY_POLICY_VERSION,
+      maxVersion: RECOVERY_POLICY_VERSION,
+      policyHash: RECOVERY_POLICY_HASH,
+    },
     content: summarizeFiles(files),
     keyFiles,
   };
@@ -201,6 +223,13 @@ function assertManifestShape(manifest) {
   if (!Array.isArray(manifest.keyFiles)) {
     throw new Error('DEPLOYMENT.json keyFiles must be an array');
   }
+  if (
+    manifest.recoveryContract?.minVersion !== RECOVERY_POLICY_VERSION
+    || manifest.recoveryContract?.maxVersion !== RECOVERY_POLICY_VERSION
+    || manifest.recoveryContract?.policyHash !== RECOVERY_POLICY_HASH
+  ) {
+    throw new Error('DEPLOYMENT.json recovery contract range is incompatible');
+  }
 }
 
 export async function verifyDeploymentManifest(rootPath) {
@@ -224,6 +253,7 @@ export async function verifyDeploymentManifest(rootPath) {
     sourceCommit: manifest.sourceCommit,
     packageVersion: manifest.packageVersion,
     builtAt: manifest.builtAt,
+    recoveryContract: manifest.recoveryContract,
     fileCount: manifest.content.fileCount,
     byteCount: manifest.content.byteCount,
     contentSha256: manifest.content.sha256,
@@ -261,6 +291,7 @@ async function main(argv = process.argv.slice(2)) {
       sourceCommit: result.sourceCommit,
       packageVersion: result.packageVersion,
       builtAt: result.builtAt,
+      recoveryContract: result.recoveryContract,
       fileCount: result.content.fileCount,
       byteCount: result.content.byteCount,
       contentSha256: result.content.sha256,
@@ -277,6 +308,7 @@ async function main(argv = process.argv.slice(2)) {
       sourceCommit: manifest.sourceCommit,
       packageVersion: manifest.packageVersion,
       builtAt: manifest.builtAt,
+      recoveryContract: manifest.recoveryContract,
       fileCount: manifest.content.fileCount,
       byteCount: manifest.content.byteCount,
       contentSha256: manifest.content.sha256,

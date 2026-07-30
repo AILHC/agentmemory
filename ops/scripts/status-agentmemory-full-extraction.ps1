@@ -388,89 +388,23 @@ if (-not $v2Root.StartsWith("$runsPath\", [System.StringComparison]::OrdinalIgno
   throw 'v2 run state path must stay under extraction-runs'
 }
 if (Test-Path -LiteralPath $v2Root -PathType Container) {
-  $stageNames = @(
-    'summary',
-    'lessons',
-    'memory_consolidate',
-    'semantic_rollup',
-    'skill_extract',
-    'crystal',
-    'consolidation_procedural',
-    'reflect_insight'
+  $projector = Join-Path $PSScriptRoot 'project-agentmemory-recovery-status.mjs'
+  if (-not (Test-Path -LiteralPath $projector -PathType Leaf)) {
+    throw 'safe recovery status projector is missing'
+  }
+  $arguments = @(
+    $projector,
+    '--runtime-root', $RuntimeRoot,
+    '--run-id', $RunId
   )
-  $coverageNames = @{
-    summary = 'summary'
-    lessons = 'lessons'
-    memory_consolidate = 'memory_consolidate_windows'
-    semantic_rollup = 'semantic_windows'
-    skill_extract = 'skill_extract'
-    crystal = 'crystal_groups'
-    consolidation_procedural = 'consolidation_procedural_windows'
-    reflect_insight = 'reflect_insight_windows'
+  if (-not [string]::IsNullOrWhiteSpace($RequiredStages)) {
+    $arguments += @('--required-stages', $RequiredStages)
   }
-  $controlPath = Join-Path $v2Root 'control.jsonl'
-  $control = @(Read-AmV2Journal -Path $controlPath)
-  $runStarted = @($control | Where-Object { [string]$_.type -eq 'run_started' }) |
-    Select-Object -First 1
-  if ($null -eq $runStarted -or
-      [string]$runStarted.payload.run_id -cne $RunId) {
-    throw 'v2 control journal run_id does not match requested run'
+  $rawProjection = @(& node @arguments)
+  if ($LASTEXITCODE -ne 0) {
+    throw 'safe recovery status projection failed'
   }
-  $runCompleted = $null -ne (
-    @($control | Where-Object { [string]$_.type -eq 'run_completed' }) |
-      Select-Object -Last 1
-  )
-  $openedStages = @(
-    $control |
-      Where-Object { [string]$_.type -eq 'stage_opened' } |
-      ForEach-Object { [string]$_.payload.stage }
-  )
-  $facts = @{}
-  $journalSeq = -1
-  $snapshotAt = [string]$runStarted.at
-  foreach ($stageName in $stageNames) {
-    $stageFacts = Get-AmV2StageFacts -Path (Join-Path $v2Root "$stageName.jsonl")
-    $facts[$stageName] = $stageFacts
-    $journalSeq = [Math]::Max($journalSeq, [int]$stageFacts.last_seq)
-    if ($null -ne $stageFacts.last_at -and
-        [string]$stageFacts.last_at -gt $snapshotAt) {
-      $snapshotAt = [string]$stageFacts.last_at
-    }
-  }
-  $controlSeq = ($control | Measure-Object -Property seq -Maximum).Maximum
-  if ($null -eq $controlSeq) { $controlSeq = -1 }
-  $currentStage = $null
-  foreach ($stageName in $openedStages) {
-    if (-not $facts[$stageName].completed) { $currentStage = $stageName }
-  }
-  $required = if ([string]::IsNullOrWhiteSpace($RequiredStages)) {
-    @($stageNames)
-  } else {
-    @(
-      $RequiredStages.Split(',') |
-        ForEach-Object { $_.Trim() } |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-    )
-  }
-  foreach ($stageName in $required) {
-    if ($stageName -notin $stageNames) {
-      throw "unsupported required v2 stage: $stageName"
-    }
-  }
-  $completionReady = $true
-  foreach ($stageName in $required) {
-    $stageFacts = $facts[$stageName]
-    if (-not $stageFacts.completed -or
-        $stageFacts.failed -ne 0 -or
-        $stageFacts.pending -ne 0 -or
-        $stageFacts.running -ne 0 -or
-        $stageFacts.blocked -ne 0) {
-      $completionReady = $false
-    }
-  }
-  if ([string]::IsNullOrWhiteSpace($RequiredStages) -and -not $runCompleted) {
-    $completionReady = $false
-  }
+  $projection = ($rawProjection -join [Environment]::NewLine) | ConvertFrom-Json
   $lockPath = Join-Path $v2Root 'writer.lock.json'
   $lockPresent = Test-Path -LiteralPath $lockPath -PathType Leaf
   $lockPidAlive = $false
@@ -483,44 +417,55 @@ if (Test-Path -LiteralPath $v2Root -PathType Container) {
       Get-Process -Id ([int]$lock.pid) -ErrorAction SilentlyContinue
     )
   }
-  $journalAgeSeconds = [Math]::Max(
-    0,
-    [Math]::Floor(
-      ((Get-Date).ToUniversalTime() - [DateTime]::Parse($snapshotAt).ToUniversalTime()).TotalSeconds
+  $journalAgeSeconds = if ($null -eq $projection.last_progress_at) { 0 } else {
+    [Math]::Max(
+      0,
+      [Math]::Floor(
+        ((Get-Date).ToUniversalTime() -
+          [DateTime]::Parse([string]$projection.last_progress_at).ToUniversalTime()).TotalSeconds
+      )
     )
-  )
+  }
   Write-Output "run_id=$RunId"
   Write-Output 'source=v2_journal'
+  Write-Output "run_status=$($projection.run_status)"
+  Write-Output "recovery_contract_version=$($projection.recovery_contract_version)"
   Write-Output 'status_manifest_stale=false'
   Write-Output "status_journal_stale=$(($journalAgeSeconds -gt $StatusStaleAfterSeconds).ToString().ToLowerInvariant())"
   Write-Output "status_journal_age_seconds=$journalAgeSeconds"
   Write-Output "lock_present=$($lockPresent.ToString().ToLowerInvariant())"
   Write-Output "lock_pid_alive=$($lockPidAlive.ToString().ToLowerInvariant())"
-  Write-Output "current_stage=$currentStage"
+  $currentStage = @(
+    $projection.stages | Where-Object { $_.acceptance_ready -ne $true }
+  ) | Select-Object -Last 1
+  Write-Output "current_stage=$(if ($null -eq $currentStage) { '' } else { $currentStage.stage })"
   Write-Output 'scheduler_epoch='
-  Write-Output "journal_seq=$journalSeq"
-  Write-Output "control_seq=$controlSeq"
-  Write-Output "snapshot_at=$snapshotAt"
-  Write-Output 'next_retry_at='
+  Write-Output "snapshot_at=$($projection.last_progress_at)"
+  Write-Output "next_retry_at=$($projection.next_retry_at)"
   Write-Output "completion_mode=$(if ([string]::IsNullOrWhiteSpace($RequiredStages)) { 'full_run' } else { 'required_stages' })"
-  Write-Output "required_stages=$($required -join ',')"
-  Write-Output "acceptance_ready=$($completionReady.ToString().ToLowerInvariant())"
-  foreach ($stageName in $stageNames) {
-    $stageFacts = $facts[$stageName]
-    if ($stageName -notin $openedStages -and
-        $stageFacts.succeeded -eq 0 -and
-        $stageFacts.skipped -eq 0 -and
-        $stageFacts.failed -eq 0 -and
-        $stageFacts.pending -eq 0 -and
-        $stageFacts.running -eq 0 -and
-        $stageFacts.blocked -eq 0) {
-      continue
-    }
+  Write-Output "required_stages=$RequiredStages"
+  Write-Output "acceptance_ready=$(([string]$projection.acceptance_ready).ToLowerInvariant())"
+  Write-Output (
+    "recovery_counts=runnable:$($projection.counts.runnable)," +
+    "running:$($projection.counts.running)," +
+    "retry_wait:$($projection.counts.retry_wait)," +
+    "reconciling:$($projection.counts.reconciling)," +
+    "isolated:$($projection.counts.isolated)," +
+    "dependency_blocked:$($projection.counts.dependency_blocked)," +
+    "system_blocked:$($projection.counts.system_blocked)"
+  )
+  Write-Output "system_block_reason_codes=$($projection.system_block_reason_codes -join ',')"
+  foreach ($stageFacts in $projection.stages) {
+    $failed = [int]$stageFacts.counts.isolated
+    $pending = [int]$stageFacts.counts.runnable + [int]$stageFacts.counts.retry_wait
+    $running = [int]$stageFacts.counts.running
+    $blocked = [int]$stageFacts.counts.reconciling +
+      [int]$stageFacts.counts.system_blocked
     Write-Output (
-      "stage.$($coverageNames[$stageName])=succeeded:$($stageFacts.succeeded)," +
-      "skipped:$($stageFacts.skipped),failed:$($stageFacts.failed)," +
-      "pending:$($stageFacts.pending),running:$($stageFacts.running)," +
-      "blocked:$($stageFacts.blocked)"
+      "stage.$($stageFacts.stage)=succeeded:$($stageFacts.counts.succeeded)," +
+      "skipped:$($stageFacts.counts.skipped),failed:$failed," +
+      "pending:$pending,running:$running," +
+      "blocked:$blocked"
     )
   }
   return

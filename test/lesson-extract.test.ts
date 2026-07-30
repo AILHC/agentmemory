@@ -509,6 +509,12 @@ describe("lesson extraction end-to-end", () => {
         timeoutMs: 60000,
       },
       sourceRunId: "run-provider-failure",
+      generation: 1,
+      inputHash: "a".repeat(64),
+      configHash: "b".repeat(64),
+      unitId: "provider-failure-session",
+      attemptId: "attempt-provider-failure",
+      operationIdentityHash: "c".repeat(64),
     });
 
     expect(provider.compress).toHaveBeenCalledTimes(1);

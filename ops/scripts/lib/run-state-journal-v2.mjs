@@ -1,11 +1,15 @@
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import {
+  assertLegacyRecoveryContractCompatible,
+} from './recovery-migration-contract-v1.mjs';
 
 const LARGE_EVENTS = new Set(['stage_plan_completed', 'unit_planned', 'unit_prepared', 'unit_split']);
 const MAX_NORMAL_LINE_BYTES = 64 * 1024;
 const MAX_LARGE_LINE_BYTES = 1024 * 1024;
 const SENSITIVE_KEY = /(?:token|secret|password|authorization|api[_-]?key|provider[_-]?key|cookie)/i;
+const SAFE_AUTHORIZATION_METADATA_KEYS = new Set(['authorization_source_type']);
 const ERROR_KEYS = new Set(['error', 'message', 'error_text', 'provider_error']);
 const MAX_ERROR_CHARS = 2000;
 const STAGE_NAME = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -26,7 +30,10 @@ function canonicalEvent(event) {
 }
 
 function sanitize(value, key = '') {
-  if (SENSITIVE_KEY.test(key)) return '[REDACTED]';
+  if (
+    SENSITIVE_KEY.test(key)
+    && !SAFE_AUTHORIZATION_METADATA_KEYS.has(key)
+  ) return '[REDACTED]';
   if (typeof value === 'string') {
     return ERROR_KEYS.has(key) && value.length > MAX_ERROR_CHARS
       ? `${value.slice(0, MAX_ERROR_CHARS)}...[truncated]`
@@ -318,14 +325,18 @@ export class RunStateJournalV2 {
 
 }
 
-export function foldStageEvents(events) {
+function foldStageEventsUnchecked(events) {
   const units = new Map();
   let planCompleted = false;
   let completed = false;
+  let runBlocked = null;
+  let runAttentionRequired = null;
   for (const event of events) {
     const unitId = event.payload?.unit_id;
     if (event.type === 'stage_plan_completed') planCompleted = true;
     if (event.type === 'stage_completed') completed = true;
+    if (event.type === 'run_blocked') runBlocked = event.payload;
+    if (event.type === 'run_attention_required') runAttentionRequired = event.payload;
     if (!unitId) continue;
     const unit = units.get(unitId) || {
       unit_id: unitId,
@@ -343,6 +354,18 @@ export function foldStageEvents(events) {
       unit.started = true;
       unit.attempt_id = event.payload.attempt_id;
     }
+    if (event.type === 'unit_attempt_started') {
+      unit.started = true;
+      unit.attempt_id = event.payload.attempt_id;
+      unit.attempt_number = event.payload.attempt_number;
+      unit.retry_attempts_used = event.payload.attempts_used;
+      unit.retry_max_attempts = event.payload.max_attempts;
+      unit.retry_scheduled = null;
+      unit.active_operation = null;
+      unit.blocked = false;
+      unit.blocked_payload = undefined;
+      unit.recovery_state = 'running';
+    }
     if (event.type === 'unit_prepare_started') {
       unit.started = true;
       unit.prepare_attempt_id = event.payload.attempt_id;
@@ -354,6 +377,22 @@ export function foldStageEvents(events) {
       unit.completed_operations.push(event.payload);
       unit.active_operation = null;
     }
+    if (event.type === 'unit_outcome_observed') {
+      unit.recovery_outcomes = [...(unit.recovery_outcomes || []), event.payload];
+    }
+    if (event.type === 'unit_retry_scheduled') {
+      unit.retry_scheduled = event.payload;
+      unit.recovery_state = 'retry_wait';
+    }
+    if (event.type === 'unit_reconciliation_requested') {
+      unit.blocked = true;
+      unit.blocked_payload = event.payload;
+      unit.recovery_state = 'reconciling';
+    }
+    if (event.type === 'unit_effect_committed') {
+      unit.effect_committed = event.payload;
+      unit.recovery_state = 'committed';
+    }
     if (event.type === 'unit_prepared') {
       unit.prepared = true;
       unit.prepared_payload = event.payload;
@@ -362,9 +401,19 @@ export function foldStageEvents(events) {
       unit.committing = true;
       unit.commit_attempt_id = event.payload.attempt_id;
     }
-    if (event.type === 'unit_terminal') {
+    if (event.type === 'unit_terminal' || event.type === 'unit_resolution') {
       unit.terminal = event.payload.status;
       unit.terminal_payload = event.payload;
+    }
+    if (event.type === 'unit_isolated') {
+      unit.terminal = 'failed';
+      unit.terminal_payload = event.payload;
+      unit.recovery_state = 'isolated';
+    }
+    if (event.type === 'unit_dependency_blocked') {
+      unit.blocked = true;
+      unit.blocked_payload = event.payload;
+      unit.recovery_state = 'dependency_blocked';
     }
     if (event.type === 'unit_blocked') {
       unit.blocked = true;
@@ -401,5 +450,20 @@ export function foldStageEvents(events) {
     if (event.type === 'unit_recorded') unit.recorded = true;
     units.set(unitId, unit);
   }
-  return { units, planCompleted, completed };
+  return {
+    units,
+    planCompleted,
+    completed,
+    runBlocked,
+    runAttentionRequired,
+  };
+}
+
+export function foldStageEvents(events) {
+  assertLegacyRecoveryContractCompatible(events);
+  return foldStageEventsUnchecked(events);
+}
+
+export function foldRecoveryStageEvents(events) {
+  return foldStageEventsUnchecked(events);
 }

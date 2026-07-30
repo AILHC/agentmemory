@@ -311,6 +311,9 @@ function Copy-AmReleaseScripts {
     'doctor-agentmemory.ps1',
     'request-agentmemory-full-extraction-drain.ps1',
     'authorize-agentmemory-lessons-failed-terminal-retry.mjs',
+    'create-agentmemory-recovery-evidence-snapshot.mjs',
+    'migrate-agentmemory-recovery-frontier.mjs',
+    'project-agentmemory-recovery-status.mjs',
     'status-agentmemory-full-extraction.ps1',
     'run-agentmemory-cli-import-batch.mjs',
     'run-agentmemory-full-extraction.mjs'
@@ -328,10 +331,20 @@ function Copy-AmReleaseScripts {
   $requiredLib = @(
     'adaptive-provider-limiter.mjs',
     'full-extraction-stage-adapters-v2.mjs',
+    'iii-state-read-only-adapter-v1.mjs',
+    'legacy-lesson-safe-facts-collector-v1.mjs',
+    'lesson-recovery-adapter-v1.mjs',
+    'offline-statekv-snapshot-v1.mjs',
     'recoverable-stage-v2.mjs',
+    'recovery-journal-reducer-v1.mjs',
+    'recovery-frontier-migration-v1.mjs',
+    'recovery-migration-contract-v1.mjs',
+    'recovery-policy-v1.mjs',
+    'recovery-status-projection-v1.mjs',
     'run-state-journal-v2.mjs',
     'run-state-store.mjs',
     'stage-pipeline.mjs',
+    'summary-recovery-adapter-v1.mjs',
     'v2-release-gate.mjs'
   )
   New-Item -ItemType Directory -Path $destinationLib -Force | Out-Null

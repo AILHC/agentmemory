@@ -15,6 +15,14 @@ import {
 } from './lib/recoverable-stage-v2.mjs';
 import { RunStateStore } from './lib/run-state-store.mjs';
 import { RunStateJournalV2 } from './lib/run-state-journal-v2.mjs';
+import {
+  RECOVERY_POLICY_HASH,
+  RECOVERY_POLICY_VERSION,
+} from './lib/recovery-policy-v1.mjs';
+import { reduceRecoveryJournal } from './lib/recovery-journal-reducer-v1.mjs';
+import { inspectRecoveryMigrationGate } from './lib/recovery-migration-contract-v1.mjs';
+import { adaptSummaryOperationEvidence } from './lib/summary-recovery-adapter-v1.mjs';
+import { adaptLessonOperationEvidence } from './lib/lesson-recovery-adapter-v1.mjs';
 import { runStagePipeline } from './lib/stage-pipeline.mjs';
 import { assertV1ReleaseGate } from './lib/v2-release-gate.mjs';
 
@@ -5472,6 +5480,7 @@ async function runV2JournalSingleStage({
   plan,
   adapter,
   planOnly,
+  dependencyStates = new Map(),
 }) {
   const opened = control.some((event) => event.type === 'stage_opened' && event.payload?.stage === stage);
   if (!opened) await durable('control', 'stage_opened', { stage });
@@ -5489,24 +5498,51 @@ async function runV2JournalSingleStage({
     planMetadata,
     append: (type, payload) => durable(stage, type, payload),
     planOnly,
+    stage,
+    dependencyStates,
     ...adapter,
   });
+  const recoveryProjection = reduceRecoveryJournal(await journal.readStage(stage)).run;
+  let statusEntry;
   if (result.status === 'completed') {
+    statusEntry = {
+      status: 'completed',
+      accepted: result.acceptedCount,
+      ...(recoveryProjection
+        ? {
+            recovery_policy_version: RECOVERY_POLICY_VERSION,
+            recovery: recoveryProjection.projection,
+            acceptance_ready: recoveryProjection.acceptance_ready,
+          }
+        : {}),
+    };
     await journal.writeStatus({
       current_stage: null,
-      [stage]: { status: 'completed', accepted: result.acceptedCount },
+      [stage]: statusEntry,
     });
   } else {
+    statusEntry = {
+      status: result.status,
+      ...(result.unitId ? { unit_id: result.unitId } : {}),
+      ...(result.failure ? { failure: normalizeFailureClassification(result.failure) } : {}),
+      ...(recoveryProjection
+        ? {
+            recovery_policy_version: RECOVERY_POLICY_VERSION,
+            recovery: recoveryProjection.projection,
+            acceptance_ready: recoveryProjection.acceptance_ready,
+          }
+        : {}),
+    };
     await journal.writeStatus({
       current_stage: stage,
-      [stage]: {
-        status: result.status,
-        ...(result.unitId ? { unit_id: result.unitId } : {}),
-        ...(result.failure ? { failure: normalizeFailureClassification(result.failure) } : {}),
-      },
+      [stage]: statusEntry,
     });
   }
-  return { ...result, control: await journal.readControl() };
+  return {
+    ...result,
+    statusEntry,
+    control: await journal.readControl(),
+  };
 }
 
 async function runV2JournalTwoPhaseStage({
@@ -5643,7 +5679,26 @@ function buildV2LessonsPlan(sessions, baseUrl, options) {
       stage: 'lessons',
       request: buildLessonExtractBody(session.id, options),
     }),
+    depends_on: [{
+      stage: 'summary',
+      unit_id: session.id,
+    }],
   }));
+}
+
+function recoveryDependencyStates(stage, events) {
+  const reduced = reduceRecoveryJournal(events);
+  return new Map([...reduced.units.values()].map((unit) => [
+    `${stage}:${unit.unit_id}`,
+    {
+      state: unit.recovery.state,
+      terminal: unit.terminal,
+      recorded: unit.recorded,
+      ...(Number.isSafeInteger(unit.terminal_seq)
+        ? { source_seq: unit.terminal_seq }
+        : {}),
+    },
+  ]));
 }
 
 function verifiedV2SummaryResult(data, unit, attemptId) {
@@ -5688,25 +5743,158 @@ function nextV2SummaryOperationId(unitId, operationId, data) {
 
 function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote }) {
   return {
-    attemptIdForUnit: (unit) => stableHash({ run_id: runId, stage: 'summary', unit_id: unit.unit_id }),
+    attemptIdForUnit: (unit, attemptNumber = 0) => stableHash({
+      run_id: runId,
+      stage: 'summary',
+      unit_id: unit.unit_id,
+      ...(attemptNumber > 0 ? { attempt_number: attemptNumber } : {}),
+    }),
+    verifyRecoveredTerminal: async ({
+      unit,
+      attemptId,
+      terminal,
+      completedOperations,
+      recoveryBudget,
+    }) => {
+      const operationId = completedOperations.at(-1)?.operation_id;
+      const result = await summaryRemote.advance({
+        baseUrl,
+        secret,
+        sessionId: unit.unit_id,
+        attemptId,
+        inputHash: unit.input_hash,
+        operationUnitId: operationId,
+        requireExistingReceipt: true,
+        request: buildSummaryBody(unit.unit_id, options),
+        signal: options.signal,
+      });
+      const data = result?.data || result || {};
+      const payload = verifiedV2SummaryResult(data, unit, attemptId);
+      const recovery = adaptSummaryOperationEvidence({
+        result,
+        unit,
+        attemptId,
+        operationId,
+        budget: recoveryBudget,
+      });
+      const terminalMatches = terminal?.status === 'succeeded'
+        && payload
+        && terminal.summary_hash === payload.summary_hash
+        && terminal.service_input_hash === payload.service_input_hash
+        && terminal.resumable_run_id === payload.resumable_run_id
+        && terminal.runner_input_hash === payload.runner_input_hash;
+      if (terminalMatches && recovery.decision.action === 'replay') {
+        return { recovery };
+      }
+      return {
+        recovery: adaptSummaryOperationEvidence({
+          result: {
+            ok: false,
+            error: 'summary_recovered_terminal_unverified',
+            data: {
+              status: 'failed',
+              error: 'summary_recovered_terminal_unverified',
+            },
+          },
+          unit,
+          attemptId,
+          operationId,
+          budget: recoveryBudget,
+        }),
+      };
+    },
     execute: async ({
       unit,
       attemptId,
       activeOperation,
       completedOperations,
+      observedOutcomes = [],
       retryAuthorization,
+      recoveryBudget,
       startOperation,
       completeOperation,
+      observeOutcome,
     }) => {
       const completedTerminal = completedOperations.at(-1)?.terminal_result;
-      if (completedTerminal) return completedTerminal;
       let operationId = activeOperation?.operation_id
+        || (completedTerminal ? completedOperations.at(-1)?.operation_id : null)
         || completedOperations.at(-1)?.next_operation_id
         || `${unit.unit_id}:map:0`;
       let operationStarted = Boolean(activeOperation);
       let requireExistingReceipt = Boolean(activeOperation)
         || retryAuthorization?.operation_id === operationId;
       for (let advance = 0; advance < SUMMARY_ADVANCE_MAX_CALL_LIMIT; advance += 1) {
+        if (completedTerminal) {
+          const result = await summaryRemote.advance({
+            baseUrl,
+            secret,
+            sessionId: unit.unit_id,
+            attemptId,
+            inputHash: unit.input_hash,
+            operationUnitId: operationId,
+            requireExistingReceipt: true,
+            request: buildSummaryBody(unit.unit_id, options),
+            signal: options.signal,
+          });
+          const data = result?.data || result || {};
+          const payload = verifiedV2SummaryResult(data, unit, attemptId);
+          const recovery = adaptSummaryOperationEvidence({
+            result,
+            unit,
+            attemptId,
+            operationId,
+            budget: recoveryBudget,
+          });
+          const terminalMatches = completedTerminal.status === 'succeeded'
+            && payload
+            && completedTerminal.payload?.summary_hash === payload.summary_hash
+            && completedTerminal.payload?.service_input_hash === payload.service_input_hash
+            && completedTerminal.payload?.resumable_run_id === payload.resumable_run_id
+            && completedTerminal.payload?.runner_input_hash === payload.runner_input_hash;
+          if (terminalMatches && recovery.decision.action === 'replay') {
+            const outcomeAlreadyObserved = observedOutcomes.some((outcome) => (
+              outcome.operation_id === operationId
+              && outcome.policy_version === recovery.policyVersion
+              && JSON.stringify(outcome.evidence) === JSON.stringify(recovery.evidence)
+              && JSON.stringify(outcome.decision) === JSON.stringify(recovery.decision)
+            ));
+            if (!outcomeAlreadyObserved) {
+              await observeOutcome({
+                operationId,
+                verification: true,
+                policy_version: recovery.policyVersion,
+                evidence: recovery.evidence,
+                decision: recovery.decision,
+                budget: recovery.budget,
+                ...(recovery.effectVerification
+                  ? { effect_verification: recovery.effectVerification }
+                  : {}),
+              });
+            }
+            return { ...completedTerminal, recovery };
+          }
+          return {
+            status: 'blocked',
+            reason: 'summary_recovered_terminal_unverified',
+            payload: { error: 'summary_recovered_terminal_unverified' },
+            recovery: recovery.decision.action === 'reconcile'
+              ? recovery
+              : adaptSummaryOperationEvidence({
+                  result: {
+                    ok: false,
+                    error: 'summary_recovered_terminal_unverified',
+                    data: {
+                      status: 'failed',
+                      error: 'summary_recovered_terminal_unverified',
+                    },
+                  },
+                  unit,
+                  attemptId,
+                  operationId,
+                  budget: recoveryBudget,
+                }),
+          };
+        }
         if (!operationStarted) {
           await startOperation({ operationId });
           operationStarted = true;
@@ -5742,39 +5930,136 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
         const data = result?.data || result || {};
         const failureCause = data?.failure?.cause || data?.failure?.error || data?.error || result?.error;
         const authorizedOperation = retryAuthorization?.operation_id === operationId;
+        const observeRecovery = async () => {
+          const recovery = adaptSummaryOperationEvidence({
+            result,
+            unit,
+            attemptId,
+            operationId,
+            budget: recoveryBudget,
+          });
+          await observeOutcome({
+            operationId,
+            policy_version: recovery.policyVersion,
+            evidence: recovery.evidence,
+            decision: recovery.decision,
+            budget: recovery.budget,
+            ...(recovery.effectVerification
+              ? { effect_verification: recovery.effectVerification }
+              : {}),
+          });
+          return recovery;
+        };
+        const legacyAuthorizedFailure = data?.failure;
+        if (
+          authorizedOperation
+          && failureCause === 'extraction_operation_reconciliation_required'
+        ) {
+          return {
+            status: 'blocked',
+            reason: failureCause,
+            payload: { error: failureCause },
+          };
+        }
+        if (
+          authorizedOperation
+          && result?.ok === false
+          && Number(result?.status_code ?? result?.statusCode ?? 0) === 0
+        ) {
+          return { status: 'pending' };
+        }
+        if (
+          authorizedOperation
+          && operationId.endsWith(':reduce')
+          && ['transient_provider', 'transient_runtime'].includes(legacyAuthorizedFailure?.class)
+          && ['provider_call', 'before_final_persistence'].includes(legacyAuthorizedFailure?.phase)
+        ) {
+          const terminalResult = {
+            status: 'failed',
+            payload: { error: legacyAuthorizedFailure.cause },
+          };
+          await completeOperation({
+            operationId,
+            status: 'failed',
+            error: legacyAuthorizedFailure.cause,
+            terminal_result: terminalResult,
+          });
+          return terminalResult;
+        }
         if ([
           'extraction_operation_reconciliation_required',
           'extraction_operation_input_hash_conflict',
         ].includes(failureCause)) {
-          return { status: 'blocked', reason: failureCause, payload: { error: failureCause } };
+          const recovery = await observeRecovery();
+          return {
+            status: 'blocked',
+            reason: failureCause,
+            payload: { error: failureCause },
+            recovery,
+          };
         }
         if (result?.ok === false && Number(result?.status_code ?? result?.statusCode ?? 0) === 0) {
-          if (!requireExistingReceipt) {
-            requireExistingReceipt = true;
-            continue;
+          const recovery = await observeRecovery();
+          if (recovery.decision.action !== 'reconcile') {
+            throw new Error('v2_summary_recovery_decision_invalid');
           }
-          return { status: 'pending' };
+          return { status: 'pending', recovery };
         }
-        if (result?.ok === false || ['failed', 'infeasible', 'preflight_unavailable'].includes(data.status)) {
+        if (
+          result?.ok === false
+          || ['failed', 'infeasible', 'preflight_unavailable', 'skipped'].includes(data.status)
+        ) {
+          const recovery = await observeRecovery();
+          if (recovery.decision.action === 'skipped') {
+            const terminalResult = {
+              status: 'skipped',
+              payload: { reason: recovery.evidence.reasonCode },
+            };
+            await completeOperation({
+              operationId,
+              status: 'skipped',
+              terminal_result: terminalResult,
+            });
+            return { ...terminalResult, recovery };
+          }
+          if (recovery.decision.action === 'retry') {
+            return { status: 'pending', recovery };
+          }
+          if (recovery.decision.action === 'reconcile') {
+            return {
+              status: 'blocked',
+              reason: 'summary_reconciliation_required',
+              payload: { error: 'summary_reconciliation_required' },
+              recovery,
+            };
+          }
+          if (recovery.decision.action === 'isolate') {
+            const terminalResult = {
+              status: 'failed',
+              payload: { error: recovery.evidence.reasonCode },
+            };
+            await completeOperation({
+              operationId,
+              status: 'failed',
+              error: recovery.evidence.reasonCode,
+              terminal_result: terminalResult,
+            });
+            return { ...terminalResult, recovery };
+          }
+          if (recovery.decision.action === 'block_run') {
+            return {
+              status: 'blocked',
+              reason: recovery.decision.code,
+              payload: { error: recovery.decision.code },
+              recovery,
+            };
+          }
           const failure = data?.failure;
           if (
             operationId.endsWith(':reduce')
             && ['transient_provider', 'transient_runtime'].includes(failure?.class)
             && ['provider_call', 'before_final_persistence'].includes(failure?.phase)
           ) {
-            if (authorizedOperation) {
-              const terminalResult = {
-                status: 'failed',
-                payload: { error: failure.cause },
-              };
-              await completeOperation({
-                operationId,
-                status: 'failed',
-                error: failure.cause,
-                terminal_result: terminalResult,
-              });
-              return terminalResult;
-            }
             return {
               status: 'pending',
               failure,
@@ -5793,19 +6078,47 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
           return terminalResult;
         }
         if (data.operationUnitId && data.operationUnitId !== operationId) {
+          const recovery = await observeRecovery();
           return {
             status: 'blocked',
             reason: 'summary_operation_identity_conflict',
             payload: { error: 'summary_operation_identity_conflict', operation_id: operationId },
+            recovery,
           };
         }
         if (data.status === 'succeeded') {
           const payload = verifiedV2SummaryResult(data, unit, attemptId);
           if (!payload) {
+            const recovery = await observeRecovery();
             return {
               status: 'blocked',
               reason: 'summary_source_unproven',
               payload: { error: 'summary_source_unproven' },
+              recovery,
+            };
+          }
+          const recovery = adaptSummaryOperationEvidence({
+            result,
+            unit,
+            attemptId,
+            operationId,
+            budget: recoveryBudget,
+          });
+          if (recovery.decision.action !== 'replay') {
+            await observeOutcome({
+              operationId,
+              policy_version: recovery.policyVersion,
+              evidence: recovery.evidence,
+              decision: recovery.decision,
+              budget: recovery.budget,
+              ...(recovery.effectVerification
+                ? { effect_verification: recovery.effectVerification }
+                : {}),
+            });
+            return {
+              status: 'blocked',
+              reason: 'summary_recovery_contract_invalid',
+              payload: { error: 'summary_recovery_contract_invalid' },
             };
           }
           const terminalResult = {
@@ -5817,10 +6130,37 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
             status: 'succeeded',
             terminal_result: terminalResult,
           });
-          return terminalResult;
+          await observeOutcome({
+            operationId,
+            verification: true,
+            policy_version: recovery.policyVersion,
+            evidence: recovery.evidence,
+            decision: recovery.decision,
+            budget: recovery.budget,
+            ...(recovery.effectVerification
+              ? { effect_verification: recovery.effectVerification }
+              : {}),
+          });
+          return { ...terminalResult, recovery };
         }
         if (data.status !== 'in_progress' || !['completed', 'skipped', 'none'].includes(data.advanced)) {
-          throw new Error(`v2_summary_invalid_status:${String(data.status || '<missing>')}`);
+          const recovery = await observeRecovery();
+          if (recovery.decision.action === 'reconcile') {
+            return {
+              status: 'blocked',
+              reason: 'summary_reconciliation_required',
+              payload: { error: 'summary_reconciliation_required' },
+              recovery,
+            };
+          }
+          return {
+            status: 'blocked',
+            reason: recovery.decision.code || 'summary_recovery_contract_invalid',
+            payload: {
+              error: recovery.decision.code || 'summary_recovery_contract_invalid',
+            },
+            recovery,
+          };
         }
         if (data.advanced === 'none') return { status: 'pending' };
         const nextOperationId = nextV2SummaryOperationId(unit.unit_id, operationId, data);
@@ -5854,8 +6194,66 @@ function buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote 
 
 function buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote }) {
   return {
-    attemptIdForUnit: (unit) => stableHash({ run_id: runId, stage: 'lessons', unit_id: unit.unit_id }),
-    execute: async ({ unit, attemptId, recovered, retryAuthorization }) => {
+    attemptIdForUnit: (unit, attemptNumber = 0) => stableHash({
+      run_id: runId,
+      stage: 'lessons',
+      unit_id: unit.unit_id,
+      ...(attemptNumber > 0 ? { attempt_number: attemptNumber } : {}),
+    }),
+    verifyRecoveredTerminal: async ({
+      unit,
+      attemptId,
+      terminal,
+      completedOperations,
+      recoveryBudget,
+    }) => {
+      const operationId = completedOperations.at(-1)?.operation_id;
+      const result = await lessonsRemote.start({
+        baseUrl,
+        secret,
+        sessionId: unit.unit_id,
+        attemptId,
+        inputHash: unit.input_hash,
+        requireExistingReceipt: true,
+        request: buildLessonExtractBody(unit.unit_id, options),
+        signal: options.signal,
+      });
+      const data = result?.data || result || {};
+      const lessonRun = data?.runs?.[0] || data?.run || null;
+      const recovery = adaptLessonOperationEvidence({
+        result,
+        unit,
+        attemptId,
+        operationId,
+        budget: recoveryBudget,
+      });
+      if (
+        recovery.decision.action === 'replay'
+        && terminal?.status === 'succeeded'
+        && terminal.run_id === lessonRun?.id
+      ) {
+        return { recovery };
+      }
+      return {
+        recovery: adaptLessonOperationEvidence({
+          result: {
+            ok: false,
+            data: {
+              failure: { cause: 'lessons_recovered_terminal_unverified' },
+            },
+          },
+          unit,
+          attemptId,
+          operationId,
+          budget: recoveryBudget,
+        }),
+      };
+    },
+    execute: async ({ unit, attemptId, recovered, retryAuthorization, activeOperation, completedOperations, observedOutcomes, recoveryBudget, startOperation, completeOperation, observeOutcome }) => {
+      const operationId = activeOperation?.operation_id
+        || completedOperations?.at(-1)?.operation_id
+        || `${unit.unit_id}:lessons`;
+      let operationStarted = Boolean(activeOperation);
       const authorizedRetry = retryAuthorization?.stage === 'lessons'
         ? {
             failedReceiptRetryAuthorization: {
@@ -5903,34 +6301,163 @@ function buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote 
       const data = result?.data || result || {};
       const failure = data?.failure;
       const failureCause = data?.failure?.cause || data?.failure?.error || data?.error || result?.error;
+      const hasRecoveryContract = Boolean(data?.lessonEvidence)
+        || data?.failure?.cause === 'lesson_no_blocks'
+        || failureCause === 'extraction_operation_reconciliation_required';
+      const statusCode = Number(result?.status_code ?? result?.statusCode ?? 0);
+      if (result?.ok === false && statusCode >= 500 && !hasRecoveryContract) {
+        return { status: 'pending' };
+      }
+      const recovery = hasRecoveryContract
+        ? adaptLessonOperationEvidence({ result, unit, attemptId, operationId, budget: recoveryBudget })
+        : null;
+      if (
+        recovery
+        && !operationStarted
+        && !completedOperations?.at(-1)?.terminal_result
+      ) {
+        await startOperation({ operationId });
+        operationStarted = true;
+      }
+      const outcomeAlreadyObserved = recovery
+        ? observedOutcomes?.some((outcome) => (
+            outcome.operation_id === operationId
+            && JSON.stringify(outcome.evidence) === JSON.stringify(recovery.evidence)
+            && JSON.stringify(outcome.decision) === JSON.stringify(recovery.decision)
+          ))
+        : false;
+      const observeRecovery = async ({ verification = false } = {}) => {
+        if (outcomeAlreadyObserved) return;
+        await observeOutcome({
+          operationId,
+          ...(verification ? { verification: true } : {}),
+          policy_version: recovery.policyVersion,
+          evidence: recovery.evidence,
+          decision: recovery.decision,
+          budget: recovery.budget,
+          ...(recovery.effectVerification
+            ? { effect_verification: recovery.effectVerification }
+            : {}),
+        });
+      };
+      if (recovery && [
+        'resume_commit',
+        'reconcile_commit',
+        'retry',
+        'reconcile',
+      ].includes(recovery.decision.action)) {
+        await observeRecovery();
+        return {
+          status: recovery.decision.action === 'reconcile' ? 'blocked' : 'pending',
+          ...(recovery.decision.action === 'reconcile'
+            ? {
+                reason: 'lessons_reconciliation_required',
+                payload: { error: 'lessons_reconciliation_required' },
+              }
+            : {}),
+          recovery,
+        };
+      }
+      if (recovery?.decision.action === 'skipped') {
+        await observeRecovery();
+        const terminalResult = {
+          status: 'skipped',
+          payload: { reason: recovery.evidence.reasonCode },
+        };
+        await completeOperation({
+          operationId,
+          status: 'skipped',
+          terminal_result: terminalResult,
+        });
+        return { ...terminalResult, recovery };
+      }
+      if (recovery?.decision.action === 'isolate') {
+        await observeRecovery();
+        const terminalResult = {
+          status: 'failed',
+          payload: { error: recovery.evidence.reasonCode },
+        };
+        await completeOperation({
+          operationId,
+          status: 'failed',
+          terminal_result: terminalResult,
+        });
+        return { ...terminalResult, recovery };
+      }
+      if (recovery?.decision.action === 'block_run') {
+        await observeRecovery();
+        return {
+          status: 'blocked',
+          reason: recovery.decision.code,
+          payload: { error: recovery.decision.code },
+          recovery,
+        };
+      }
       if (failureCause === 'extraction_operation_reconciliation_required') {
-        return { status: 'blocked', reason: failureCause, payload: { error: failureCause } };
+        return { status: 'blocked', reason: failureCause, payload: { error: failureCause }, recovery };
       }
       if (result?.ok === false) {
         if (
           ['transient_provider', 'transient_runtime'].includes(failure?.class)
-          && ['provider_call', 'before_final_persistence'].includes(failure?.phase)
+            && ['provider_call', 'before_final_persistence'].includes(failure?.phase)
         ) {
-          return { status: 'pending', failure };
+          return { status: 'pending', failure, recovery };
         }
-        return { status: 'failed', payload: { error: failureCause || 'lessons extract failed' } };
+        if (recovery?.decision.action === 'replay') {
+          return {
+            status: 'blocked',
+            reason: 'lessons_recovery_contract_invalid',
+            payload: { error: 'lessons_recovery_contract_invalid' },
+          };
+        }
+        return { status: 'failed', payload: { error: failureCause || 'lessons extract failed' }, recovery };
       }
       const lessonRun = data?.runs?.[0] || data?.run || null;
       const lessonRunId = lessonRun?.id || lessonRun?.runId || lessonRun?.run_id || null;
       if (!lessonRunId) {
-        return { status: 'failed', payload: { error: 'lessons extract returned no run id' } };
+        return { status: 'blocked', payload: { error: 'lessons extract returned no run id' }, recovery };
       }
       const lessonStatus = lessonRun.status || data.status || 'running';
       if (['succeeded', 'skipped'].includes(lessonStatus)) {
-        return { status: lessonStatus, payload: { run_id: lessonRunId } };
+        const terminalResult = { status: lessonStatus, payload: { run_id: lessonRunId } };
+        if (recovery) {
+          if (operationStarted) {
+            await completeOperation({
+              operationId,
+              status: lessonStatus,
+              terminal_result: terminalResult,
+            });
+          }
+          if (recovery.decision.action === 'replay') {
+            await observeRecovery({ verification: true });
+          }
+        } else if (operationStarted) {
+          await completeOperation({
+            operationId,
+            status: lessonStatus,
+            terminal_result: terminalResult,
+          });
+        }
+        return { ...terminalResult, ...(recovery ? { recovery } : {}) };
       }
       if (['failed', 'retryable', 'infeasible'].includes(lessonStatus)) {
-        return {
+        const terminalResult = {
           status: 'failed',
           payload: {
             run_id: lessonRunId,
             error: lessonRun.error || lessonRun.lastError || failureCause || 'lesson run failed',
           },
+        };
+        if (operationStarted) {
+          await completeOperation({
+            operationId,
+            status: 'failed',
+            terminal_result: terminalResult,
+          });
+        }
+        return {
+          ...terminalResult,
+          ...(recovery ? { recovery } : {}),
         };
       }
       return { status: 'pending' };
@@ -5977,9 +6504,71 @@ async function ensureV2CompletedStatus({ journal, fsApi, runId, control }) {
 }
 
 async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
-  const secret = requireSecret();
   const baseUrl = normalizeBaseUrl(options.baseUrl);
   const fsApi = dependencies.fsApi || fs;
+  const journal = new RunStateJournalV2({
+    rootDir: path.join(options.stateDir, `${runId}.v2`),
+    runId,
+    fsApi,
+  });
+  const durable = async (scope, type, payload) => {
+    const event = scope === 'control'
+      ? await journal.appendControl(type, payload)
+      : await journal.appendStage(scope, type, payload);
+    await dependencies.onV2DurableEvent?.({ scope, type, payload, event });
+    return event;
+  };
+  try {
+    for (const v1Path of [
+      path.join(options.stateDir, `${runId}.json`),
+      path.join(options.stateDir, `${runId}.journal.jsonl`),
+      path.join(options.stateDir, `${runId}.status.json`),
+      path.join(options.stateDir, `${runId}.json.lock`),
+    ]) {
+      const exists = await fsApi.access(v1Path).then(() => true).catch((error) => {
+        if (error?.code === 'ENOENT') return false;
+        throw error;
+      });
+      if (exists) throw new Error('v2_v1_state_collision: 该 run_id 已有 v1 状态或锁');
+    }
+    await assertV1ReleaseGate(options.stateDir, { fsApi });
+    const verifiedTakeover = dependencies.v2VerifiedTakeover
+      || (options.resume ? async ({ owner }) => owner.run_id === runId : null);
+    await journal.acquireLock({ takeover: verifiedTakeover });
+    let control = await journal.open();
+    const migrationGates = [];
+    for (const stage of [
+      'summary',
+      'lessons',
+      'memory_consolidate',
+      'semantic_rollup',
+      'skill_extract',
+      'crystal',
+      'consolidation_procedural',
+      'reflect_insight',
+    ]) {
+      const stagePath = journal.stagePath(stage);
+      const exists = await fsApi.access(stagePath).then(
+        () => true,
+        (error) => error?.code === 'ENOENT' ? false : Promise.reject(error),
+      );
+      if (!exists) continue;
+      const gate = inspectRecoveryMigrationGate(await journal.readStage(stage));
+      if (gate.state !== 'open') migrationGates.push({ stage, ...gate });
+    }
+    const incompleteMigration = migrationGates.find((gate) => gate.state === 'fenced');
+    if (incompleteMigration) {
+      await journal.writeStatus({
+        status: 'blocked',
+        current_stage: incompleteMigration.stage,
+        recovery_contract_version:
+          incompleteMigration.manifest.recovery_contract_version,
+        system_block_reason_code: 'recovery_migration_incomplete',
+        acceptance_ready: false,
+      });
+      return 1;
+    }
+    const secret = requireSecret();
   if (options.doctorScript) {
     await runDoctorGate(path.resolve(options.doctorScript), options.doctorOk);
   }
@@ -6068,36 +6657,6 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       if (!response.ok) throw new Error(response.error || 'v2_lessons_record_failed');
     },
   };
-  const journal = new RunStateJournalV2({
-    rootDir: path.join(options.stateDir, `${runId}.v2`),
-    runId,
-    fsApi,
-  });
-  const durable = async (scope, type, payload) => {
-    const event = scope === 'control'
-      ? await journal.appendControl(type, payload)
-      : await journal.appendStage(scope, type, payload);
-    await dependencies.onV2DurableEvent?.({ scope, type, payload, event });
-    return event;
-  };
-  try {
-    for (const v1Path of [
-      path.join(options.stateDir, `${runId}.json`),
-      path.join(options.stateDir, `${runId}.journal.jsonl`),
-      path.join(options.stateDir, `${runId}.status.json`),
-      path.join(options.stateDir, `${runId}.json.lock`),
-    ]) {
-      const exists = await fsApi.access(v1Path).then(() => true).catch((error) => {
-        if (error?.code === 'ENOENT') return false;
-        throw error;
-      });
-      if (exists) throw new Error('v2_v1_state_collision: 该 run_id 已有 v1 状态或锁');
-    }
-    await assertV1ReleaseGate(options.stateDir, { fsApi });
-    const verifiedTakeover = dependencies.v2VerifiedTakeover
-      || (options.resume ? async ({ owner }) => owner.run_id === runId : null);
-    await journal.acquireLock({ takeover: verifiedTakeover });
-    let control = await journal.open();
     const allSessions = await loadSessions(baseUrl, secret, options.agentId, options);
     const excludedSessionIds = await loadExcludedSessionIds(options.excludeRecords);
     const selection = selectFullExtractionSessions(allSessions, excludedSessionIds);
@@ -6115,6 +6674,13 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
         || started.payload?.schema_version !== 2
         || started.payload?.base_url !== baseUrl
         || started.payload?.config_hash !== configHash
+        || (
+          started.payload?.recovery_policy_version !== undefined
+          && (
+            started.payload.recovery_policy_version !== RECOVERY_POLICY_VERSION
+            || started.payload.recovery_policy_hash !== RECOVERY_POLICY_HASH
+          )
+        )
       ) {
         throw new Error('v2_run_input_drifted: 请创建新的 run_id');
       }
@@ -6143,6 +6709,8 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
         base_url: baseUrl,
         config_hash: configHash,
         inventory_hash: inventoryHash,
+        recovery_policy_version: RECOVERY_POLICY_VERSION,
+        recovery_policy_hash: RECOVERY_POLICY_HASH,
       });
       control = await journal.readControl();
     }
@@ -6158,9 +6726,13 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       planOnly: options.dryRun,
     });
     control = summaryResult.control;
-    if (!['completed', 'planned'].includes(summaryResult.status)) {
-      return summaryResult.status === 'pending' ? 75 : 1;
+    if (summaryResult.status === 'blocked') {
+      return 1;
     }
+    const summaryDependencyStates = recoveryDependencyStates(
+      'summary',
+      await journal.readStage('summary'),
+    );
     const lessonsResult = await runV2JournalSingleStage({
       stage: 'lessons',
       control,
@@ -6169,12 +6741,37 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       plan: buildV2LessonsPlan(sessions, baseUrl, options),
       adapter: buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote }),
       planOnly: options.dryRun,
+      dependencyStates: summaryDependencyStates,
     });
-    if (!['completed', 'planned'].includes(lessonsResult.status)) {
-      return lessonsResult.status === 'pending' ? 75 : 1;
+    control = lessonsResult.control;
+    const earlyStageStatuses = [summaryResult.status, lessonsResult.status];
+    await journal.writeStatus({
+      status: earlyStageStatuses.includes('blocked')
+        ? 'blocked'
+        : earlyStageStatuses.includes('attention_required')
+          ? 'attention_required'
+          : 'running',
+      current_stage: !['completed', 'planned'].includes(lessonsResult.status)
+        ? 'lessons'
+        : !['completed', 'planned'].includes(summaryResult.status)
+          ? 'summary'
+          : null,
+      summary: summaryResult.statusEntry,
+      lessons: lessonsResult.statusEntry,
+    });
+    if (lessonsResult.status === 'blocked') {
+      return 1;
+    }
+    if (earlyStageStatuses.includes('attention_required')) {
+      return 1;
+    }
+    if (earlyStageStatuses.includes('pending')) {
+      return 75;
+    }
+    if (earlyStageStatuses.some((status) => !['completed', 'planned'].includes(status))) {
+      return 1;
     }
     if (dependencies.v2RemainingStages === false) return 0;
-    control = lessonsResult.control;
     const request = (endpoint, body) => requestJson(
       baseUrl,
       secret,

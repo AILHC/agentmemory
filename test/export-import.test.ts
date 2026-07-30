@@ -191,6 +191,44 @@ describe("Export/Import Functions", () => {
     expect(allSessions.length).toBe(2);
   });
 
+  it("does not erase extraction watermarks when import overwrites a lesson", async () => {
+    const lesson = {
+      id: "lesson-watermark",
+      content: "existing",
+      context: "",
+      confidence: 0.5,
+      reinforcements: 0,
+      source: "llm" as const,
+      sourceIds: ["session-1"],
+      sourceWatermarks: {
+        "session-1": { generation: 3, mutationId: "mutation-3" },
+      },
+      tags: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      decayRate: 0.05,
+    };
+    await kv.set(KV.lessons, lesson.id, lesson);
+
+    await sdk.trigger("mem::import", {
+      exportData: {
+        version: "0.3.0",
+        exportedAt: "2026-07-30T00:00:00.000Z",
+        sessions: [],
+        observations: {},
+        memories: [],
+        summaries: [],
+        lessons: [{ ...lesson, content: "imported", sourceWatermarks: undefined }],
+      },
+      strategy: "merge",
+    });
+
+    expect(await kv.get(KV.lessons, lesson.id)).toMatchObject({
+      content: "imported",
+      sourceWatermarks: lesson.sourceWatermarks,
+    });
+  });
+
   it("import with skip strategy does not overwrite existing", async () => {
     const exportData: ExportData = {
       version: "0.3.0",

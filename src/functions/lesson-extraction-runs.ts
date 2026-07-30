@@ -11,6 +11,15 @@ import type {
 import { KV, fingerprintId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
 import { resolveStageModel, resolveStageModelMetadata } from "../config.js";
+import {
+  bindLessonExtractionGeneration,
+  LessonExtractionGenerationConflictError,
+} from "./lesson-extraction-generation.js";
+import {
+  lessonCandidateOperationIdentityHash,
+  readStagedLessonCandidates,
+} from "./lesson-candidate-staging.js";
+import { withLessonKeyLock } from "./lesson-commit.js";
 
 export interface LlmLessonExtractionRuntimeConfig {
   providerName: string;
@@ -36,6 +45,7 @@ export interface ProcessLlmLessonExtractionRunInput {
   kv: StateKV;
   provider: MemoryProvider;
   runId: string;
+  attemptId?: string;
 }
 
 export function stableStringify(value: unknown): string {
@@ -239,21 +249,15 @@ export async function replaceSessionHeuristicLessons(
     if (lesson.origin !== "replay-import-heuristic") continue;
     if (!lesson.sourceIds.includes(sessionId)) continue;
 
-    const sourceIds = lesson.sourceIds.filter((id) => id !== sessionId);
-    if (sourceIds.length === lesson.sourceIds.length) continue;
-
-    const next: Lesson = {
-      ...lesson,
-      sourceIds,
-      updatedAt: now,
-    };
-
-    if (sourceIds.length === 0) {
-      next.deleted = true;
-    }
-
-    await kv.set(KV.lessons, lesson.id, next);
-    replacedLessonIds.push(lesson.id);
+    await withLessonKeyLock(lesson.id, async () => {
+      const current = await kv.get<Lesson>(KV.lessons, lesson.id);
+      if (!current || current.source !== "heuristic" || current.origin !== "replay-import-heuristic" || !current.sourceIds.includes(sessionId)) return;
+      const sourceIds = current.sourceIds.filter((id) => id !== sessionId);
+      const next: Lesson = { ...current, sourceIds, updatedAt: now };
+      if (sourceIds.length === 0) next.deleted = true;
+      await kv.set(KV.lessons, lesson.id, next);
+      replacedLessonIds.push(lesson.id);
+    });
   }
 
   return replacedLessonIds;
@@ -295,9 +299,11 @@ export async function enqueueLlmLessonExtractionRun(
   }
 
   if (existing && !force) {
-    if (existing.status === "succeeded" && missingOnly) return existing;
+    if (existing.status === "succeeded" && missingOnly) {
+      return bindLessonExtractionGeneration(kv, existing);
+    }
     if (existing.status === "pending" || existing.status === "running" || existing.status === "retryable") {
-      return existing;
+      return bindLessonExtractionGeneration(kv, existing);
     }
     if (existing.status === "failed" && !retryFailed) {
       const skipped: LessonExtractionRun = {
@@ -308,7 +314,7 @@ export async function enqueueLlmLessonExtractionRun(
       };
       delete skipped.failureDiagnostics;
       await kv.set(KV.lessonExtractionRuns, runId, skipped);
-      return skipped;
+      return bindLessonExtractionGeneration(kv, skipped);
     }
   }
 
@@ -329,7 +335,7 @@ export async function enqueueLlmLessonExtractionRun(
     updatedAt: now,
   };
   await kv.set(KV.lessonExtractionRuns, runId, next);
-  return next;
+  return bindLessonExtractionGeneration(kv, next);
 }
 
 export async function processLlmLessonExtractionRun(
@@ -337,13 +343,37 @@ export async function processLlmLessonExtractionRun(
 ): Promise<LessonExtractionRun> {
   const { kv, provider, runId } = input;
   const startedMs = Date.now();
-  const run = await kv.get<LessonExtractionRun>(KV.lessonExtractionRuns, runId);
-  if (!run) {
+  const storedRun = await kv.get<LessonExtractionRun>(KV.lessonExtractionRuns, runId);
+  if (!storedRun) {
     throw new Error(`run ${runId} not found`);
   }
+  const run = await bindLessonExtractionGeneration(kv, storedRun);
 
   if (run.status === "succeeded" || run.status === "skipped") {
     return run;
+  }
+
+  if (!Number.isSafeInteger(run.extractionGeneration) || run.extractionGeneration <= 0) {
+    throw new LessonExtractionGenerationConflictError();
+  }
+  const attemptId = input.attemptId ?? `legacy-lesson-attempt:${run.id}`;
+  const stagingIdentity = {
+    runId: run.id,
+    sessionId: run.sessionId,
+    unitId: run.sessionId,
+    attemptId,
+    generation: run.extractionGeneration,
+    inputHash: run.inputHash,
+    configHash: run.configHash,
+  };
+  const operationIdentityHash = lessonCandidateOperationIdentityHash(stagingIdentity);
+  const staged = await readStagedLessonCandidates(kv, { ...stagingIdentity, operationIdentityHash });
+  if (staged) {
+    return saveRunStatus(kv, run, "succeeded", {
+      candidateStagingId: staged.id,
+      createdLessonIds: [],
+      replacedLessonIds: [],
+    });
   }
 
   const now = new Date();
@@ -374,6 +404,12 @@ export async function processLlmLessonExtractionRun(
     firstPrompt: session.firstPrompt,
     config: { ...run.config, providerName: run.providerName },
     sourceRunId: run.id,
+    generation: run.extractionGeneration,
+    inputHash: run.inputHash,
+    configHash: run.configHash,
+    unitId: stagingIdentity.unitId,
+    attemptId: stagingIdentity.attemptId,
+    operationIdentityHash,
   });
   const stageMetadata = resolveStageModelMetadata(
     "lesson",
@@ -407,14 +443,10 @@ export async function processLlmLessonExtractionRun(
     });
   }
 
-  let replacedLessonIds: string[] = [];
-  if (extraction.lessonIds.length > 0) {
-    replacedLessonIds = await replaceSessionHeuristicLessons(kv, run.sessionId);
-  }
-
   return saveRunStatus(kv, runningPatch, "succeeded", {
     createdLessonIds: extraction.lessonIds,
-    replacedLessonIds,
+    replacedLessonIds: [],
+    ...(extraction.candidateStagingId ? { candidateStagingId: extraction.candidateStagingId } : {}),
     ...extractionMetadata,
   });
 }

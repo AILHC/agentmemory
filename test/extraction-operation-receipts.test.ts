@@ -962,6 +962,7 @@ describe("extraction operation receipts", () => {
           ...identity,
           unitId: "succeeded-unit",
           key: buildExtractionOperationKey({ ...identity, unitId: "succeeded-unit" }),
+          version: 1,
           status: "succeeded",
           startedAt: "2026-07-24T00:00:00.000Z",
           completedAt: "2026-07-24T00:01:00.000Z",
@@ -1027,6 +1028,7 @@ describe("extraction operation receipts", () => {
         success: true,
         operation: entry.identity,
         receipt: {
+          ...("version" in entry.receipt ? { version: entry.receipt.version } : {}),
           status: entry.receipt.status,
           startedAt: entry.receipt.startedAt,
           ...("completedAt" in entry.receipt

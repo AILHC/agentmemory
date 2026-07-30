@@ -6,6 +6,7 @@ import {
   validateSinglePhaseStage,
   validateTwoPhaseStage,
 } from './recoverable-stage-v2.mjs';
+import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
 
 function makeHarness() {
   const events = [];
@@ -28,6 +29,35 @@ function makeHarness() {
 }
 
 const plan = [{ unit_id: 'unit-1', input_hash: 'input-1' }];
+
+function noEffectRecovery({
+  attemptsUsed,
+  maxAttempts,
+  notBefore,
+}) {
+  const retryAvailable = attemptsUsed < maxAttempts;
+  return {
+    policyVersion: 'effect-state-recovery/v1',
+    evidence: {
+      kind: 'no_effect',
+      observation: 'execution_error',
+      reasonCode: 'provider_unavailable',
+      ...(notBefore ? { retryHint: { notBefore } } : {}),
+      proof: {
+        kind: 'request_not_dispatched',
+        attemptId: 'attempt-proof',
+        journalSeq: 0,
+      },
+    },
+    decision: {
+      policyVersion: 'effect-state-recovery/v1',
+      action: retryAvailable ? 'retry' : 'isolate',
+      reasonCode: 'provider_unavailable',
+      ...(retryAvailable && notBefore ? { notBefore } : {}),
+    },
+    budget: { attemptsUsed, maxAttempts },
+  };
+}
 
 function authorizedBlockedEvents(reconciliationOperationId = 'unit-1:reduce') {
   const attemptId = 'a'.repeat(64);
@@ -169,7 +199,7 @@ test('single-phase recovery reuses one attempt and only repeats idempotent bound
   ]);
 });
 
-test('single-phase blocked is durable and never becomes a failed terminal', async () => {
+test('single-phase reconciliation wait is durable and never becomes a failed terminal', async () => {
   const harness = makeHarness();
   let calls = 0;
   const invoke = (execute) => runSinglePhaseStage({
@@ -184,11 +214,279 @@ test('single-phase blocked is durable and never becomes a failed terminal', asyn
   assert.equal((await invoke(async () => {
     calls += 1;
     return { status: 'blocked', reason: 'extraction_operation_reconciliation_required' };
-  })).status, 'blocked');
-  assert.equal((await invoke(async () => assert.fail('blocked unit must not redispatch'))).status, 'blocked');
+  })).status, 'pending');
+  assert.equal((await invoke(async () => assert.fail('blocked unit must not redispatch'))).status, 'pending');
   assert.equal(calls, 1);
   assert.equal(harness.events.some((event) => event.type === 'unit_terminal'), false);
   assert.equal(harness.events.at(-1).type, 'unit_blocked');
+});
+
+test('single-phase generic run blocks are durable and never redispatch', async () => {
+  const harness = makeHarness();
+  let calls = 0;
+  const recovery = {
+    policyVersion: 'effect-state-recovery/v1',
+    evidence: { kind: 'system_fault', code: 'receipt_integrity_error' },
+    decision: {
+      policyVersion: 'effect-state-recovery/v1',
+      action: 'block_run',
+      code: 'receipt_integrity_error',
+    },
+    budget: { attemptsUsed: 0, maxAttempts: 0 },
+  };
+  const invoke = (execute) => runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'attempt-run-blocked',
+    execute,
+    record: async () => assert.fail('blocked run must not be recorded'),
+  });
+
+  assert.equal((await invoke(async ({ startOperation }) => {
+    calls += 1;
+    await startOperation({ operationId: 'unit-1:system-check' });
+    return { status: 'blocked', recovery };
+  })).status, 'blocked');
+  assert.equal((await invoke(async () => assert.fail('blocked run must not redispatch'))).status, 'blocked');
+  assert.equal(calls, 1);
+  assert.equal(harness.events.at(-1).type, 'run_blocked');
+});
+
+for (const [kind, action, reference] of [
+  ['staged', 'resume_commit', { resultRef: 'staging:unit-1' }],
+  ['committing', 'reconcile_commit', { commitPlanRef: 'commit-plan:unit-1' }],
+]) {
+  test(`single-phase ${kind} evidence journals the generic commit-resume action`, async () => {
+    const harness = makeHarness();
+    const recovery = {
+      policyVersion: 'effect-state-recovery/v1',
+      evidence: {
+        kind,
+        ...reference,
+        effectHash: 'a'.repeat(64),
+      },
+      decision: {
+        policyVersion: 'effect-state-recovery/v1',
+        action,
+      },
+      budget: { attemptsUsed: 0, maxAttempts: 0 },
+    };
+
+    const result = await runSinglePhaseStage({
+      events: harness.events,
+      plan,
+      append: harness.append,
+      attemptIdForUnit: () => 'attempt-commit-resume',
+      execute: async ({ startOperation }) => {
+        await startOperation({ operationId: 'unit-1:lessons' });
+        return { status: 'pending', recovery };
+      },
+      record: async () => assert.fail('commit-resume unit must not be recorded'),
+    });
+
+    assert.equal(result.status, 'pending');
+    assert.deepEqual(
+      harness.events.slice(-2).map((event) => event.type),
+      ['unit_outcome_observed', 'unit_commit_resumed'],
+    );
+    assert.equal(harness.events.at(-1).payload.decision.action, action);
+  });
+}
+
+test('single-phase drains independent work and blocks only actual dependents', async () => {
+  const harness = makeHarness();
+  const multiPlan = [
+    { unit_id: 'upstream', input_hash: 'input-upstream' },
+    {
+      unit_id: 'dependent',
+      input_hash: 'input-dependent',
+      depends_on: ['upstream'],
+    },
+    { unit_id: 'independent', input_hash: 'input-independent' },
+  ];
+  const executed = [];
+  const recorded = [];
+
+  const result = await runSinglePhaseStage({
+    events: harness.events,
+    plan: multiPlan,
+    append: harness.append,
+    attemptIdForUnit: (unit) => `attempt-${unit.unit_id}`,
+    execute: async ({ unit, startOperation }) => {
+      executed.push(unit.unit_id);
+      if (unit.unit_id === 'upstream') {
+        await startOperation({ operationId: 'upstream:dispatch' });
+        return {
+          status: 'failed',
+          recovery: noEffectRecovery({ attemptsUsed: 0, maxAttempts: 0 }),
+        };
+      }
+      return { status: 'succeeded' };
+    },
+    record: async ({ unit }) => recorded.push(unit.unit_id),
+  });
+
+  assert.equal(result.status, 'attention_required');
+  assert.deepEqual(executed, ['upstream', 'independent']);
+  assert.deepEqual(recorded, ['independent']);
+  assert.deepEqual(
+    harness.events
+      .filter((event) => event.type === 'unit_dependency_blocked')
+      .map((event) => event.payload.unit_id),
+    ['dependent'],
+  );
+  assert.equal(
+    harness.events.some((event) => (
+      event.type === 'unit_dependency_blocked'
+      && event.payload.unit_id === 'independent'
+    )),
+    false,
+  );
+  assert.equal(harness.events.at(-1).type, 'run_attention_required');
+});
+
+test('single-phase persists retry budget and Retry-After only extends backoff', async () => {
+  const harness = makeHarness();
+  const retryPlan = [
+    { unit_id: 'retrying', input_hash: 'input-retrying' },
+    { unit_id: 'independent', input_hash: 'input-independent' },
+  ];
+  let clock = Date.parse('2026-07-30T00:00:00.000Z');
+  let configuredMaxRetryAttempts = 1;
+  const retryAfter = '2026-07-30T00:00:10.000Z';
+  const calls = [];
+
+  const invoke = () => runSinglePhaseStage({
+    events: harness.events,
+    plan: retryPlan,
+    append: harness.append,
+    attemptIdForUnit: (unit, attemptNumber = 0) => (
+      `attempt-${unit.unit_id}-${attemptNumber}`
+    ),
+    now: () => new Date(clock),
+    retryBackoffMs: 5_000,
+    maxRetryAttempts: configuredMaxRetryAttempts,
+    execute: async ({ unit, attemptId, recoveryBudget, startOperation }) => {
+      calls.push({ unitId: unit.unit_id, attemptId, recoveryBudget });
+      if (unit.unit_id === 'independent') return { status: 'succeeded' };
+      await startOperation({ operationId: 'retrying:dispatch' });
+      return {
+        status: recoveryBudget.attemptsUsed === 0 ? 'pending' : 'failed',
+        recovery: noEffectRecovery({
+          attemptsUsed: recoveryBudget.attemptsUsed,
+          maxAttempts: recoveryBudget.maxAttempts,
+          notBefore: retryAfter,
+        }),
+      };
+    },
+    record: async () => {},
+  });
+
+  assert.equal((await invoke()).status, 'pending');
+  const scheduled = harness.events.find((event) => event.type === 'unit_retry_scheduled');
+  assert.equal(scheduled.payload.attempts_used, 1);
+  assert.equal(scheduled.payload.max_attempts, 1);
+  assert.equal(scheduled.payload.retry_at, retryAfter);
+  assert.deepEqual(calls.map((call) => call.unitId), ['retrying', 'independent']);
+
+  clock = Date.parse('2026-07-30T00:00:09.999Z');
+  assert.equal((await invoke()).status, 'pending');
+  assert.equal(calls.length, 2);
+
+  clock = Date.parse(retryAfter);
+  configuredMaxRetryAttempts = 99;
+  assert.equal((await invoke()).status, 'attention_required');
+  const retryCall = calls.at(-1);
+  assert.deepEqual(retryCall.recoveryBudget, { attemptsUsed: 1, maxAttempts: 1 });
+  assert.equal(retryCall.attemptId, 'attempt-retrying-1');
+  assert.equal(
+    harness.events.filter((event) => event.type === 'unit_attempt_started').length,
+    1,
+  );
+});
+
+test('single-phase recovery is scheduling-equivalent after every new journal boundary', async () => {
+  const boundaries = [
+    'unit_retry_scheduled',
+    'unit_attempt_started',
+    'unit_isolated',
+    'unit_dependency_blocked',
+    'run_attention_required',
+  ];
+  const recoveryPlan = [
+    { unit_id: 'upstream', input_hash: 'input-upstream' },
+    {
+      unit_id: 'dependent',
+      input_hash: 'input-dependent',
+      depends_on: ['upstream'],
+    },
+    { unit_id: 'independent', input_hash: 'input-independent' },
+  ];
+
+  const runScenario = async (crashBoundary = null) => {
+    const harness = makeHarness();
+    let clock = Date.parse('2026-07-30T00:00:00.000Z');
+    const invoke = () => runSinglePhaseStage({
+      events: harness.events,
+      plan: recoveryPlan,
+      append: harness.append,
+      attemptIdForUnit: (unit, attemptNumber = 0) => (
+        `attempt-${unit.unit_id}-${attemptNumber}`
+      ),
+      now: () => new Date(clock),
+      retryBackoffMs: 1_000,
+      maxRetryAttempts: 1,
+      execute: async ({ unit, recoveryBudget, startOperation }) => {
+        if (unit.unit_id === 'independent') return { status: 'succeeded' };
+        assert.equal(unit.unit_id, 'upstream');
+        await startOperation({ operationId: 'upstream:dispatch' });
+        return {
+          status: recoveryBudget.attemptsUsed === 0 ? 'pending' : 'failed',
+          recovery: noEffectRecovery(recoveryBudget),
+        };
+      },
+      record: async () => {},
+    });
+
+    if (crashBoundary) harness.failAfter(crashBoundary);
+    try {
+      await invoke();
+    } catch (error) {
+      assert.match(error.message, /^crash_after_/);
+    }
+    clock += 1_000;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      try {
+        const result = await invoke();
+        if (result.status === 'attention_required') break;
+      } catch (error) {
+        assert.match(error.message, /^crash_after_/);
+      }
+    }
+    const eventTypeCounts = Object.fromEntries(
+      [...new Set(harness.events.map((event) => event.type))]
+        .sort()
+        .map((type) => [
+          type,
+          harness.events.filter((event) => event.type === type).length,
+        ]),
+    );
+    return {
+      status: (await invoke()).status,
+      eventTypeCounts,
+      independentTerminal: harness.events.some((event) => (
+        event.type === 'unit_terminal'
+        && event.payload.unit_id === 'independent'
+        && event.payload.status === 'succeeded'
+      )),
+    };
+  };
+
+  const baseline = await runScenario();
+  for (const boundary of boundaries) {
+    assert.deepEqual(await runScenario(boundary), baseline, boundary);
+  }
 });
 
 test('single-phase orphan reconciliation clears only the matching blocked active operation', async () => {
@@ -208,7 +506,7 @@ test('single-phase orphan reconciliation clears only the matching blocked active
       status: 'blocked',
       reason: 'extraction_operation_reconciliation_required',
     };
-  })).status, 'blocked');
+  })).status, 'pending');
 
   await harness.append('unit_reconciliation_resolved', {
     unit_id: 'unit-1',
@@ -270,7 +568,7 @@ test('single-phase orphan reconciliation rejects a changed operation identity', 
 
   assert.throws(
     () => validateSinglePhaseStage(harness.events),
-    /reconciliation_operation_identity/,
+    /reconciliation_(?:operation_identity|resolution)/,
   );
 });
 
@@ -280,7 +578,7 @@ test('single-phase orphan reconciliation consumes only the matching retry author
 
   assert.throws(
     () => validateSinglePhaseStage(authorizedBlockedEvents('unit-1:map:0')),
-    /reconciliation_operation_identity/,
+    /reconciliation_(?:operation_identity|resolution)/,
   );
 });
 
@@ -841,7 +1139,7 @@ test('recovery executors reject illegal lifecycle order instead of guessing', ()
     { seq: 0, type: 'unit_planned', payload: { unit_id: 'unit-1' } },
     { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
     { seq: 2, type: 'unit_terminal', payload: { unit_id: 'unit-1', status: 'succeeded' } },
-  ]), /before_started/);
+  ]), /before_started|legacy_terminal/);
   assert.throws(() => validateTwoPhaseStage([
     { seq: 0, type: 'unit_planned', payload: { unit_id: 'unit-1' } },
     { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
@@ -863,4 +1161,179 @@ test('recovery executors reject illegal lifecycle order instead of guessing', ()
       payload: { unit_id: 'unit-1', attempt_id: 'prepare-other', prepared_handle: 'handle-1' },
     },
   ]), /prepared_attempt_identity/);
+});
+
+test('reducer and Runner validator fail closed on the same generic transition violations', () => {
+  const plannedPrefix = [
+    { seq: 0, type: 'unit_planned', payload: { unit_id: 'unit-1' } },
+    { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
+    {
+      seq: 2,
+      type: 'unit_started',
+      payload: { unit_id: 'unit-1', attempt_id: 'attempt-1' },
+    },
+  ];
+  const operationPrefix = [
+    ...plannedPrefix,
+    {
+      seq: 3,
+      type: 'unit_operation_started',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'attempt-1',
+        operation_id: 'unit-1:reduce',
+      },
+    },
+  ];
+  const isolateRecovery = noEffectRecovery({ attemptsUsed: 0, maxAttempts: 0 });
+  const isolateOutcome = {
+    unit_id: 'unit-1',
+    attempt_id: 'attempt-1',
+    operation_id: 'unit-1:reduce',
+    policy_version: isolateRecovery.policyVersion,
+    evidence: isolateRecovery.evidence,
+    decision: isolateRecovery.decision,
+    budget: isolateRecovery.budget,
+  };
+  const replayOutcome = {
+    unit_id: 'unit-1',
+    attempt_id: 'attempt-1',
+    operation_id: 'unit-1:reduce',
+    policy_version: 'effect-state-recovery/v1',
+    evidence: {
+      kind: 'committed',
+      receiptKey: 'receipt-1',
+      receiptVersion: 1,
+      resultRef: 'summary-resumable-runs:run-1',
+      effectHash: 'a'.repeat(64),
+    },
+    decision: {
+      policyVersion: 'effect-state-recovery/v1',
+      action: 'replay',
+    },
+    budget: { attemptsUsed: 0, maxAttempts: 0 },
+    effect_verification: 'all_applied',
+  };
+  const unknownOutcome = {
+    unit_id: 'unit-1',
+    attempt_id: 'attempt-1',
+    operation_id: 'unit-1:reduce',
+    policy_version: 'effect-state-recovery/v1',
+    evidence: {
+      kind: 'unknown',
+      receiptKey: 'receipt-1',
+      reasonCode: 'response_lost',
+    },
+    decision: {
+      policyVersion: 'effect-state-recovery/v1',
+      action: 'reconcile',
+    },
+    budget: { attemptsUsed: 0, maxAttempts: 0 },
+  };
+  const cases = [
+    [
+      'attempt without retry',
+      [
+        ...plannedPrefix,
+        {
+          seq: 3,
+          type: 'unit_attempt_started',
+          payload: {
+            unit_id: 'unit-1',
+            attempt_id: 'attempt-2',
+            previous_attempt_id: 'attempt-1',
+            attempt_number: 1,
+          },
+        },
+      ],
+    ],
+    [
+      'wrong operation',
+      [
+        ...operationPrefix,
+        {
+          seq: 4,
+          type: 'unit_outcome_observed',
+          payload: { ...isolateOutcome, operation_id: 'unit-1:other' },
+        },
+      ],
+    ],
+    [
+      'resolution before effect',
+      [
+        ...operationPrefix,
+        { seq: 4, type: 'unit_outcome_observed', payload: replayOutcome },
+        {
+          seq: 5,
+          type: 'unit_resolution',
+          payload: {
+            unit_id: 'unit-1',
+            attempt_id: 'attempt-1',
+            status: 'succeeded',
+          },
+        },
+      ],
+    ],
+    [
+      'fake dependency',
+      [
+        {
+          seq: 0,
+          type: 'unit_planned',
+          payload: { unit_id: 'unit-1', depends_on: ['upstream'] },
+        },
+        { seq: 1, type: 'unit_planned', payload: { unit_id: 'upstream' } },
+        { seq: 2, type: 'stage_plan_completed', payload: { unit_count: 2 } },
+        {
+          seq: 3,
+          type: 'unit_dependency_blocked',
+          payload: {
+            unit_id: 'unit-1',
+            dependency_unit_ids: ['forged'],
+            dependencies: [{
+              stage: 'summary',
+              unit_id: 'forged',
+              state: 'isolated',
+              terminal: 'failed',
+              recorded: false,
+            }],
+          },
+        },
+      ],
+    ],
+    [
+      'isolation with reconciliation decision',
+      [
+        ...operationPrefix,
+        { seq: 4, type: 'unit_outcome_observed', payload: unknownOutcome },
+        { seq: 5, type: 'unit_isolated', payload: unknownOutcome },
+      ],
+    ],
+    [
+      'reconciliation with isolation decision',
+      [
+        ...operationPrefix,
+        { seq: 4, type: 'unit_outcome_observed', payload: isolateOutcome },
+        { seq: 5, type: 'unit_reconciliation_requested', payload: isolateOutcome },
+      ],
+    ],
+  ];
+
+  for (const [name, events] of cases) {
+    let reducerError;
+    let validatorError;
+    try {
+      reduceRecoveryJournal(events);
+    } catch (error) {
+      reducerError = error;
+    }
+    try {
+      validateSinglePhaseStage(events);
+    } catch (error) {
+      validatorError = error;
+    }
+    assert.ok(reducerError, `${name}: reducer must reject`);
+    assert.ok(validatorError, `${name}: validator must reject`);
+    assert.equal(validatorError.message, reducerError.message, name);
+  }
 });

@@ -5,6 +5,7 @@ import type {
   Lesson,
   LessonExtractionChunkRun,
   LessonExtractionRun,
+  LessonExtractionCandidateStaging,
   MemoryProvider,
 } from "../types.js";
 import {
@@ -22,6 +23,14 @@ import {
   type FailedExtractionOperationRetryAuthorization,
 } from "./extraction-operation-receipts.js";
 import { sanitizeLessonFailureDiagnostics } from "./summarize.js";
+import {
+  executeLessonCommitPlan,
+  freezeLessonCommitPlan,
+  lessonIdForContent,
+  normalizeLessonIdentityContent,
+  reconcileLessonCommit,
+  withLessonKeyLock,
+} from "./lesson-commit.js";
 
 const RETRYABLE_LESSON_PROVIDER_CODES = new Set([
   "rate_limited",
@@ -231,7 +240,16 @@ export function registerLessonsFunctions(
         return { success: false, error: "content is required" };
       }
 
-      const fp = fingerprintId("lsn", data.content.trim().toLowerCase());
+      const normalizedContent = normalizeLessonIdentityContent(data.content);
+      const canonicalId = lessonIdForContent(normalizedContent);
+      const legacyId = fingerprintId("lsn", normalizedContent);
+      const canonical = await kv.get<Lesson>(KV.lessons, canonicalId);
+      const legacy = await kv.get<Lesson>(KV.lessons, legacyId);
+      if (canonical && legacy) {
+        return { success: false, error: "lesson identity conflict" };
+      }
+      const fp = canonical?.id ?? legacy?.id ?? canonicalId;
+      return withLessonKeyLock(fp, async () => {
       const existing = await kv.get<Lesson>(KV.lessons, fp);
 
       if (existing && !existing.deleted) {
@@ -263,20 +281,23 @@ export function registerLessonsFunctions(
 
       const now = new Date().toISOString();
       const lesson: Lesson = {
+        ...(existing ?? {}),
         id: fp,
         content: data.content.trim(),
-        context: data.context?.trim() || "",
-        confidence,
-        reinforcements: 0,
+        context: data.context?.trim() || existing?.context || "",
+        confidence: existing ? Math.max(existing.confidence, confidence) : confidence,
+        reinforcements: existing?.reinforcements ?? 0,
         source: data.source || "manual",
-        origin: data.origin,
-        sourceRunId: data.sourceRunId,
-        sourceIds: data.sourceIds || [],
-        project: data.project,
-        tags: data.tags || [],
-        createdAt: now,
+        origin: data.origin ?? existing?.origin,
+        sourceRunId: data.sourceRunId ?? existing?.sourceRunId,
+        sourceIds: [...new Set([...(existing?.sourceIds ?? []), ...(data.sourceIds ?? [])])],
+        sourceWatermarks: existing?.sourceWatermarks,
+        project: data.project ?? existing?.project,
+        tags: [...new Set([...(existing?.tags ?? []), ...(data.tags ?? [])])],
+        createdAt: existing?.createdAt ?? now,
         updatedAt: now,
         decayRate: 0.05,
+        deleted: undefined,
       };
 
       await kv.set(KV.lessons, lesson.id, lesson);
@@ -286,6 +307,7 @@ export function registerLessonsFunctions(
       } catch {}
 
       return { success: true, action: "created", lesson };
+      });
     },
   );
 
@@ -389,6 +411,7 @@ export function registerLessonsFunctions(
       });
 
       const runs: LessonExtractionRun[] = [];
+      const lessonEvidence: Array<Record<string, unknown>> = [];
       const now = new Date();
 
       for (const sessionId of sessionIds) {
@@ -453,7 +476,12 @@ export function registerLessonsFunctions(
             baseRun.status === "retryable" ||
             isExpiredRunningRun(baseRun, now)
           )
-            ? await processLlmLessonExtractionRun({ kv, provider, runId: baseRun.id })
+            ? await processLlmLessonExtractionRun({
+              kv,
+              provider,
+              runId: baseRun.id,
+              attemptId,
+            })
             : baseRun;
           if (run.status === "retryable" || run.status === "failed") {
             const classified = lessonRunFailure(run);
@@ -494,10 +522,51 @@ export function registerLessonsFunctions(
           return { success: false, status: "failed", failure: operation.failure };
         }
         const response = operation.response as { runs?: LessonExtractionRun[] } | undefined;
-        runs.push(...(response?.runs ?? []));
+        const responseRun = response?.runs?.[0];
+        const completedRun = await kv.get<LessonExtractionRun>(
+          KV.lessonExtractionRuns,
+          baseRun.id,
+        );
+        if (!completedRun) {
+          return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_run_missing" } };
+        }
+        if (responseRun?.id && responseRun.id !== completedRun.id) {
+          return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_run_identity_conflict" } };
+        }
+        if (completedRun.status === "succeeded" && completedRun.candidateStagingId) {
+          const staging = await kv.get<LessonExtractionCandidateStaging>(
+            KV.lessonExtractionCandidates(completedRun.id),
+            completedRun.candidateStagingId,
+          );
+          if (!staging) {
+            return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_candidate_staging_missing" } };
+          }
+          const plan = await freezeLessonCommitPlan(kv, { staging });
+          const reconciliation = await reconcileLessonCommit(kv, plan);
+          if (reconciliation === "conflict") {
+            return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_commit_conflict" } };
+          }
+          const receipt = await executeLessonCommitPlan(kv, plan);
+          if (!receipt || receipt.status !== "committed") {
+            return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_commit_receipt_missing" } };
+          }
+          lessonEvidence.push({
+            kind: "committed",
+            runId: completedRun.id,
+            stagingId: staging.id,
+            planId: plan.id,
+            receiptKey: receipt.key,
+            effectHash: plan.effectHash,
+            receiptVersion: receipt.version,
+            resultRef: `lesson-commit-plans:${plan.id}`,
+          });
+          runs.push(responseRun ?? completedRun);
+          continue;
+        }
+        runs.push(responseRun ?? completedRun);
       }
 
-      return { success: true, runs };
+      return { success: true, runs, lessonEvidence };
     },
   );
 
@@ -669,6 +738,7 @@ export function registerLessonsFunctions(
         return { success: false, error: "lessonId is required" };
       }
 
+      return withLessonKeyLock(data.lessonId, async () => {
       const lesson = await kv.get<Lesson>(KV.lessons, data.lessonId);
       if (!lesson || lesson.deleted) {
         return { success: false, error: "lesson not found" };
@@ -685,65 +755,46 @@ export function registerLessonsFunctions(
       } catch {}
 
       return { success: true, lesson };
+      });
     },
   );
 
   sdk.registerFunction("mem::lesson-decay-sweep", 
     async () => {
       const lessons = await kv.list<Lesson>(KV.lessons);
-      let decayed = 0;
-      let softDeleted = 0;
       const now = Date.now();
       const timestamp = new Date().toISOString();
-      const dirty: Lesson[] = [];
-      const auditEvents: Array<{
+      type DecayAuditEvent = {
         id: string;
         action: "decay" | "soft-delete";
         beforeConfidence: number;
         afterConfidence: number;
         beforeDeleted: boolean;
         afterDeleted: boolean;
-      }> = [];
-
-      for (const lesson of lessons) {
-        if (lesson.deleted) continue;
-
-        const baseline = lesson.lastDecayedAt || lesson.lastReinforcedAt || lesson.createdAt;
-        const weeksSinceBaseline =
-          (now - new Date(baseline).getTime()) / (1000 * 60 * 60 * 24 * 7);
-
-        if (weeksSinceBaseline < 1) continue;
-
-        const decay = lesson.decayRate * weeksSinceBaseline;
-        const newConfidence = Math.max(0.05, lesson.confidence - decay);
-
-        if (newConfidence !== lesson.confidence) {
-          const beforeConfidence = lesson.confidence;
-          const beforeDeleted = !!lesson.deleted;
-          lesson.confidence = Math.round(newConfidence * 1000) / 1000;
-          lesson.lastDecayedAt = timestamp;
-          lesson.updatedAt = timestamp;
-
-          if (lesson.confidence <= 0.1 && lesson.reinforcements === 0) {
-            lesson.deleted = true;
-            softDeleted++;
-          } else {
-            decayed++;
-          }
-
-          dirty.push(lesson);
-          auditEvents.push({
-            id: lesson.id,
-            action: lesson.deleted ? "soft-delete" : "decay",
-            beforeConfidence,
-            afterConfidence: lesson.confidence,
-            beforeDeleted,
-            afterDeleted: !!lesson.deleted,
-          });
-        }
-      }
-
-      await Promise.all(dirty.map((l) => kv.set(KV.lessons, l.id, l)));
+      };
+      const results = await Promise.all(lessons.map(({ id }) => withLessonKeyLock(id, async (): Promise<DecayAuditEvent | null> => {
+        const current = await kv.get<Lesson>(KV.lessons, id);
+        if (!current || current.deleted) return null;
+        const baseline = current.lastDecayedAt || current.lastReinforcedAt || current.createdAt;
+        const weeks = (now - new Date(baseline).getTime()) / (1000 * 60 * 60 * 24 * 7);
+        if (weeks < 1) return null;
+        const confidence = Math.round(Math.max(0.05, current.confidence - current.decayRate * weeks) * 1000) / 1000;
+        if (confidence === current.confidence) return null;
+        const next = { ...current, confidence, lastDecayedAt: timestamp, updatedAt: timestamp };
+        if (confidence <= 0.1 && next.reinforcements === 0) next.deleted = true;
+        await kv.set(KV.lessons, next.id, next);
+        return {
+          id: next.id,
+          action: next.deleted ? "soft-delete" : "decay",
+          beforeConfidence: current.confidence,
+          afterConfidence: next.confidence,
+          beforeDeleted: !!current.deleted,
+          afterDeleted: !!next.deleted,
+        };
+      })));
+      const auditEvents = results.filter((event): event is DecayAuditEvent => event !== null);
+      const decayed = auditEvents.filter((event) => event.action === "decay").length;
+      const softDeleted = auditEvents.filter((event) => event.action === "soft-delete").length;
       await Promise.all(
         auditEvents.map((event) =>
           recordAudit(kv, "lesson_strengthen", "mem::lesson-decay-sweep", [event.id], {

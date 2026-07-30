@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -12,14 +13,60 @@ const statusScript = path.resolve(
 );
 
 function event(seq, type, payload = {}, at = '2026-07-26T14:00:00.000Z') {
-  return { seq, at, type, payload, checksum: `test-${seq}` };
+  const durablePayload = { ...payload };
+  if (
+    ['unit_started', 'unit_terminal', 'unit_blocked'].includes(type)
+    && durablePayload.unit_id
+    && !durablePayload.attempt_id
+  ) {
+    durablePayload.attempt_id = `attempt-${durablePayload.unit_id}`;
+  }
+  const item = { seq, at, type, payload: durablePayload };
+  return {
+    ...item,
+    checksum: createHash('sha256').update(JSON.stringify(item)).digest('hex'),
+  };
 }
 
 async function writeJournal(filePath, events) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const expandLegacyStage = events.some((item) => item.type === 'stage_completed');
+  const startedUnits = new Set(events
+    .filter((item) => item.type === 'unit_started')
+    .map((item) => item.payload.unit_id));
+  const withRecords = expandLegacyStage
+    ? events.flatMap((item) => {
+        if (
+          item.type !== 'unit_terminal'
+          || !['succeeded', 'skipped'].includes(item.payload.status)
+        ) return [item];
+        const prefix = startedUnits.has(item.payload.unit_id)
+          ? []
+          : [event(-1, 'unit_started', {
+              unit_id: item.payload.unit_id,
+              attempt_id: item.payload.attempt_id,
+            }, item.at)];
+        return [
+          ...prefix,
+          item,
+          event(-1, 'unit_recorded', {
+            unit_id: item.payload.unit_id,
+            attempt_id: item.payload.attempt_id,
+          }, item.at),
+        ];
+      })
+    : events;
+  const durableEvents = withRecords.map(({ seq: sourceSeq, at, type, payload }, index) => {
+    const seq = expandLegacyStage ? index : sourceSeq;
+    const item = { seq, at, type, payload };
+    return {
+      ...item,
+      checksum: createHash('sha256').update(JSON.stringify(item)).digest('hex'),
+    };
+  });
   await fs.writeFile(
     filePath,
-    `${events.map((item) => JSON.stringify(item)).join('\n')}\n`,
+    `${durableEvents.map((item) => JSON.stringify(item)).join('\n')}\n`,
     'utf8',
   );
 }
@@ -479,6 +526,11 @@ test('v2 status 严格拒绝非整数数值和大小写变体的 summary 重试�
 
       const result = runStatus(runtimeRoot, runId, 'summary');
 
+      if (name === 'string event seq') {
+        assert.notEqual(result.status, 0, name);
+        assert.match(result.stderr, /safe recovery status projection failed/, name);
+        continue;
+      }
       assert.equal(result.status, 0, `${name}: ${result.stderr || result.stdout}`);
       assert.match(
         result.stdout,

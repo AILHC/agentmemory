@@ -440,7 +440,7 @@ describe("lesson extraction run helpers", () => {
     });
   });
 
-  it("saves llm provenance and replaces only target replay-import-heuristic heuristics on success", async () => {
+  it("stages llm candidates without changing formal lessons during model calculation", async () => {
     const kv = mockKV();
     await kv.set(KV.sessions, "session-success", session({
       id: "session-success",
@@ -523,16 +523,15 @@ describe("lesson extraction run helpers", () => {
       runId: pending.id,
     });
     expect(processed.status).toBe("succeeded");
-    expect(processed.createdLessonIds).toHaveLength(1);
-    expect(processed.replacedLessonIds).toEqual(expect.arrayContaining(["shared", "single"]));
+    expect(processed.createdLessonIds).toEqual([]);
+    expect(processed.replacedLessonIds).toEqual([]);
+    expect(processed.extractionGeneration).toBe(1);
+    expect(processed.candidateStagingId).toMatch(new RegExp(`^lcs_${processed.id}_`));
 
     const lessons = await kv.list<Lesson>(KV.lessons);
-    const sessionSuccess = lessons.find((item) => item.source === "llm");
-    expect(sessionSuccess).toBeDefined();
-    expect(sessionSuccess?.source).toBe("llm");
-    expect(sessionSuccess?.origin).toBe("llm-session-extraction");
-    expect(sessionSuccess?.sourceRunId).toBe(processed.id);
-    expect(sessionSuccess?.sourceIds).toEqual(["session-success"]);
+    expect(lessons.some((item) => item.source === "llm")).toBe(false);
+    const staging = await kv.get<any>(KV.lessonExtractionCandidates(processed.id), processed.candidateStagingId!);
+    expect(staging).toMatchObject({ runId: processed.id, generation: 1, candidates: [{ source: "llm" }] });
 
     const shared = lessons.find((item) => item.id === "shared");
     const single = lessons.find((item) => item.id === "single");
@@ -540,10 +539,10 @@ describe("lesson extraction run helpers", () => {
     const otherSession = lessons.find((item) => item.id === "other-session");
     const manual = lessons.find((item) => item.id === "manual");
 
-    expect(shared?.sourceIds).toEqual(["session-other"]);
+    expect(shared?.sourceIds).toEqual(["session-success", "session-other"]);
     expect(shared?.deleted).toBeUndefined();
-    expect(single?.sourceIds).toEqual([]);
-    expect(single?.deleted).toBe(true);
+    expect(single?.sourceIds).toEqual(["session-success"]);
+    expect(single?.deleted).toBeUndefined();
     expect(otherOrigin?.sourceIds).toEqual(["session-success"]);
     expect(otherSession?.sourceIds).toEqual(["session-other"]);
     expect(manual?.sourceIds).toEqual(["session-success"]);

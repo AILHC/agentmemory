@@ -92,6 +92,12 @@ export const KV = {
   graphEdgeHistory: "mem:graph:edge-history",
   lessonExtractionRuns: "mem:lesson-extraction:runs",
   lessonExtractionChunks: (runId: string) => `mem:lesson-extraction:chunks:${runId}`,
+  lessonExtractionGeneration: (sessionId: string) =>
+    `mem:lesson-extraction:generation:${sessionId}`,
+  lessonExtractionCandidates: (runId: string) =>
+    `mem:lesson-extraction:candidates:${runId}`,
+  lessonCommitPlans: (runId: string) => `mem:lesson-commit:plans:${runId}`,
+  lessonCommitReceipts: (runId: string) => `mem:lesson-commit:receipts:${runId}`,
   enrichedChunks: (sessionId: string) => `mem:enriched:${sessionId}`,
   latentEmbeddings: (obsId: string) => `mem:latent:${obsId}`,
   retentionScores: "mem:retention",

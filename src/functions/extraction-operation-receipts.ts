@@ -11,6 +11,8 @@ import type { StateKV } from "../state/kv.js";
 import { KV } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 
+export const EXTRACTION_OPERATION_RECEIPT_VERSION = 1;
+
 export interface ExtractionOperationResult<T> {
   replayed: boolean;
   response?: T;
@@ -441,6 +443,7 @@ function failedReceipt<T>(
   return {
     ...identity,
     key,
+    version: EXTRACTION_OPERATION_RECEIPT_VERSION,
     status: "failed",
     startedAt,
     completedAt: new Date().toISOString(),
@@ -459,6 +462,7 @@ function completedReceipt<T>(
   return {
     ...identity,
     key,
+    version: EXTRACTION_OPERATION_RECEIPT_VERSION,
     status: "succeeded",
     startedAt,
     completedAt: new Date().toISOString(),
@@ -549,6 +553,7 @@ export async function withExtractionOperationReceipt<T>(
           ?? options.failedRetryAuthorization?.lastSafeFailure;
         const running: ExtractionOperationReceipt<T> = {
           ...existing,
+          version: existing.version ?? EXTRACTION_OPERATION_RECEIPT_VERSION,
           status: "running",
           completedAt: undefined,
           response: undefined,
@@ -588,6 +593,7 @@ export async function withExtractionOperationReceipt<T>(
         unitId: existing.unitId,
         inputHash: existing.inputHash,
         key: existing.key,
+        version: existing.version ?? EXTRACTION_OPERATION_RECEIPT_VERSION,
         status: "running",
         startedAt,
         ...(existing.retry ? { retry: existing.retry } : {}),
@@ -596,7 +602,11 @@ export async function withExtractionOperationReceipt<T>(
     } else {
       startedAt = existing?.startedAt ?? new Date().toISOString();
       running = existing ?? {
-        ...identity, key, status: "running", startedAt,
+        ...identity,
+        key,
+        version: EXTRACTION_OPERATION_RECEIPT_VERSION,
+        status: "running",
+        startedAt,
       };
       if (!existing) await kv.set(KV.extractionOperationReceipt(key), key, running);
     }
@@ -679,6 +689,7 @@ export async function completeModelOperationFromVerifiedResult<T>(
         receipt: existing ?? {
           ...identity,
           key,
+          version: EXTRACTION_OPERATION_RECEIPT_VERSION,
           status: "failed",
           startedAt: new Date().toISOString(),
           completedAt: new Date().toISOString(),
@@ -737,6 +748,7 @@ export async function withIdempotentCommitReceipt<T>(
       await kv.set<ExtractionOperationReceipt<T>>(KV.extractionOperationReceipt(key), key, {
         ...identity,
         key,
+        version: EXTRACTION_OPERATION_RECEIPT_VERSION,
         status: "running",
         startedAt,
       });
@@ -750,6 +762,7 @@ export async function withIdempotentCommitReceipt<T>(
       const running: ExtractionOperationReceipt<T> = {
         ...identity,
         key,
+        version: EXTRACTION_OPERATION_RECEIPT_VERSION,
         status: "running",
         startedAt,
       };
@@ -978,6 +991,7 @@ function normalizeExtractionOperationLookup(value: unknown): (
 }
 
 function sanitizeExtractionOperationReceipt(receipt: ExtractionOperationReceipt): {
+  version?: number;
   status: ExtractionOperationReceipt["status"];
   startedAt: string;
   completedAt?: string;
@@ -1040,6 +1054,9 @@ function sanitizeExtractionOperationReceipt(receipt: ExtractionOperationReceipt)
     }
     : undefined;
   return {
+    ...(Number.isSafeInteger(receipt.version) && receipt.version! > 0
+      ? { version: receipt.version }
+      : {}),
     status: receipt.status,
     startedAt: receipt.startedAt,
     ...(typeof receipt.completedAt === "string" && receipt.completedAt

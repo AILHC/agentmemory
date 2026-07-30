@@ -23,6 +23,7 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import {
   buildExtractionOperationKey,
   completeModelOperationFromVerifiedResult,
+  EXTRACTION_OPERATION_RECEIPT_VERSION,
   ExtractionOperationResultUncertainError,
   normalizeFailedExtractionOperationRetryAuthorization,
   withExtractionOperationReceipt,
@@ -260,7 +261,44 @@ type ResumableSummaryResponse = {
   failureCause?: SummaryFailureCause;
   failure?: StageFailure;
   telemetry?: ProviderCallTelemetry[];
+  recoveryEvidence?: SummaryRecoveryEvidence;
 };
+
+type SummaryRecoveryEvidence =
+  | {
+    kind: "no_effect";
+    observation: "execution_error" | "business_empty" | "business_rejected";
+    reasonCode: string;
+    retryHint?: {
+      notBefore: string;
+    };
+    proof:
+      | {
+        kind: "receipt_before_formal_effect";
+        receiptKey: string;
+        receiptVersion: number;
+        phase: "preflight" | "provider_call" | "candidate_staging";
+        commitPlanAbsent: true;
+      }
+      | {
+        kind: "legacy_summary_before_final_write";
+        summaryRunId: string;
+        receiptKey: string;
+        inputHash: string;
+        completedFinalWrites: 0;
+      };
+  }
+  | {
+    kind: "committed";
+    receiptKey: string;
+    receiptVersion: number;
+    resultRef: string;
+    effectHash: string;
+  }
+  | {
+    kind: "system_fault";
+    code: "receipt_integrity_error" | "commit_plan_conflict";
+  };
 
 function summaryFailureCause(error: unknown): SummaryFailureCause {
   const message = error instanceof Error ? error.message : String(error);
@@ -964,6 +1002,28 @@ function isRecoverableLegacySummaryRun(run: ResumableSummaryRun): boolean {
   );
 }
 
+function canRebindFailedSummaryAttempt(
+  run: ResumableSummaryRun,
+  receipts: ExtractionOperationReceipt[],
+): boolean {
+  const failedReceipts = receipts.filter((receipt) => receipt.status === "failed");
+  return (
+    run.status !== "succeeded"
+    && run.completedFinalWrites === 0
+    && failedReceipts.length > 0
+    && failedReceipts.every((receipt) => (
+      ["transient_provider", "transient_runtime"].includes(
+        receipt.failure?.class ?? "",
+      )
+      && [
+        "provider_preflight",
+        "provider_call",
+        "before_final_persistence",
+      ].includes(receipt.failure?.phase ?? "")
+    ))
+  );
+}
+
 async function clearActiveSummaryRun(
   kv: StateKV,
   run: ResumableSummaryRun,
@@ -994,6 +1054,7 @@ function resumableResponse(
     serviceInputHash?: string;
     resumableRunId?: string;
     operationUnitId?: string;
+    recoveryEvidence?: SummaryRecoveryEvidence;
   } = {},
 ): ResumableSummaryResponse {
   const failure = options.failure
@@ -1018,6 +1079,7 @@ function resumableResponse(
       : {}),
     ...(options.error ? { error: options.error } : {}),
     ...(options.operationUnitId ? { operationUnitId: options.operationUnitId } : {}),
+    ...(options.recoveryEvidence ? { recoveryEvidence: options.recoveryEvidence } : {}),
     ...(options.failureCause ? { failureCause: options.failureCause } : {}),
     ...(failure ? { failure } : {}),
     ...(options.telemetry
@@ -1057,6 +1119,109 @@ function resumableSummaryRequestProof(
   };
 }
 
+function summaryEffectHash(summary: SessionSummary): string {
+  return createHash("sha256")
+    .update(stableStringify({
+      title: summary.title,
+      narrative: summary.narrative,
+      keyDecisions: summary.keyDecisions,
+      filesModified: summary.filesModified,
+      concepts: summary.concepts,
+    }))
+    .digest("hex");
+}
+
+function summaryCommittedRecoveryEvidence(
+  receipt: ExtractionOperationReceipt<Record<string, unknown>> | undefined,
+  run: ResumableSummaryRun,
+): SummaryRecoveryEvidence | undefined {
+  const resultRef = receipt?.response?.resultRef;
+  const resultRefRecord = resultRef && typeof resultRef === "object" && !Array.isArray(resultRef)
+    ? resultRef as Record<string, unknown>
+    : undefined;
+  if (
+    receipt?.version !== EXTRACTION_OPERATION_RECEIPT_VERSION
+    || receipt.status !== "succeeded"
+    || run.status !== "succeeded"
+    || run.completedFinalWrites !== 1
+    || !run.summary
+    || !resultRefRecord
+    || resultRefRecord.scope !== KV.summaryResumableRuns
+    || resultRefRecord.key !== run.id
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "committed",
+    receiptKey: receipt.key,
+    receiptVersion: receipt.version,
+    resultRef: `${KV.summaryResumableRuns}:${run.id}`,
+    effectHash: summaryEffectHash(run.summary),
+  };
+}
+
+async function summaryNoEffectRecoveryEvidence(
+  kv: StateKV,
+  receipt: ExtractionOperationReceipt | undefined,
+  run: ResumableSummaryRun,
+): Promise<SummaryRecoveryEvidence | undefined> {
+  const failure = receipt?.failure;
+  if (
+    receipt?.version !== EXTRACTION_OPERATION_RECEIPT_VERSION
+    || receipt.status !== "failed"
+    || !failure
+    || !/^[a-z0-9][a-z0-9_.:-]{0,127}$/i.test(failure.cause)
+  ) {
+    return undefined;
+  }
+  const retryAfterMs = failure.diagnostics?.retryAfterMs;
+  const receiptTime = receipt.completedAt ?? receipt.startedAt;
+  const receiptTimeMs = Date.parse(receiptTime);
+  const retryHint = (
+    Number.isSafeInteger(retryAfterMs)
+    && Number(retryAfterMs) >= 0
+    && Number.isFinite(receiptTimeMs)
+  )
+    ? { notBefore: new Date(receiptTimeMs + Number(retryAfterMs)).toISOString() }
+    : undefined;
+  if (failure.phase === "provider_preflight" || failure.phase === "provider_call") {
+    return {
+      kind: "no_effect",
+      observation: "execution_error",
+      reasonCode: failure.cause,
+      ...(retryHint ? { retryHint } : {}),
+      proof: {
+        kind: "receipt_before_formal_effect",
+        receiptKey: receipt.key,
+        receiptVersion: receipt.version,
+        phase: failure.phase === "provider_preflight" ? "preflight" : "provider_call",
+        commitPlanAbsent: true,
+      },
+    };
+  }
+  if (
+    failure.phase === "before_final_persistence"
+    && run.completedFinalWrites === 0
+  ) {
+    const formalSummary = await kv.get<SessionSummary>(KV.summaries, run.sessionId);
+    if (formalSummary) return undefined;
+    return {
+      kind: "no_effect",
+      observation: "execution_error",
+      reasonCode: failure.cause,
+      ...(retryHint ? { retryHint } : {}),
+      proof: {
+        kind: "legacy_summary_before_final_write",
+        summaryRunId: run.id,
+        receiptKey: receipt.key,
+        inputHash: run.inputHash,
+        completedFinalWrites: 0,
+      },
+    };
+  }
+  return undefined;
+}
+
 async function bindSucceededSummaryReuseReceipt(
   kv: StateKV,
   run: ResumableSummaryRun,
@@ -1071,6 +1236,7 @@ async function bindSucceededSummaryReuseReceipt(
       ResumableSummaryResponse,
       "attemptId" | "runnerInputHash" | "serviceInputHash" | "resumableRunId"
     >;
+    receipt: ExtractionOperationReceipt<Record<string, unknown>>;
   }
   | { failure: StageFailure }
 > {
@@ -1123,6 +1289,7 @@ async function bindSucceededSummaryReuseReceipt(
   }
   return {
     proof: resumableSummaryRequestProof(run, attemptId, runnerInputHash),
+    receipt: receipt.receipt as ExtractionOperationReceipt<Record<string, unknown>>,
   };
 }
 
@@ -1156,13 +1323,20 @@ async function persistResumableSummary(
     status: "succeeded",
     completedChunks,
     skippedChunks,
+    completedFinalWrites: 0,
     summary,
     lastError: undefined,
     updatedAt,
   };
   await kv.set(KV.summaryResumableRuns, run.id, succeededRun);
   await kv.set(KV.summaries, run.sessionId, summary);
-  await clearActiveSummaryRun(kv, succeededRun);
+  const finalizedRun: ResumableSummaryRun = {
+    ...succeededRun,
+    completedFinalWrites: 1,
+    updatedAt: new Date().toISOString(),
+  };
+  await kv.set(KV.summaryResumableRuns, run.id, finalizedRun);
+  await clearActiveSummaryRun(kv, finalizedRun);
   await safeAudit(kv, "compress", "mem::summarize-resumable", [run.sessionId], {
     title: summary.title,
     observationCount: summary.observationCount,
@@ -1176,7 +1350,7 @@ async function persistResumableSummary(
     {
       summary,
       advanced,
-      ...resumableSummarySourceProof(succeededRun),
+      ...resumableSummarySourceProof(finalizedRun),
       ...(telemetry ? { telemetry } : {}),
     },
   );
@@ -1475,6 +1649,7 @@ async function runResumableSummaryStep(
           chunkObservationCounts: summaryChunkObservationCounts(chunks),
           completedChunks: 0,
           skippedChunks: 0,
+          completedFinalWrites: 0,
           status: "in_progress",
           ...(generationConfigHash ? { generationConfigHash } : {}),
           createdAt: now,
@@ -1537,10 +1712,21 @@ async function runResumableSummaryStep(
               failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
             });
           }
+          if (!canRebindFailedSummaryAttempt(run, priorReceipts)) {
+            return resumableResponse("failed", 0, totalChunks, 0, {
+              error: "extraction_operation_reconciliation_required",
+              failure: {
+                class: "transient_runtime",
+                cause: "extraction_operation_reconciliation_required",
+              },
+            });
+          }
           run = {
             ...run,
             attemptId,
             attemptInputHash: externalInputHash,
+            status: "in_progress",
+            lastError: undefined,
             updatedAt: new Date().toISOString(),
           };
           await kv.set(KV.summaryResumableRuns, runId, run);
@@ -1612,6 +1798,9 @@ async function runResumableSummaryStep(
           );
         }
         let proof = resumableSummarySourceProof(run);
+        let recoveryReceipt:
+          | ExtractionOperationReceipt<Record<string, unknown>>
+          | undefined;
         if (attemptId) {
           const reuse = await bindSucceededSummaryReuseReceipt(
             kv,
@@ -1632,9 +1821,21 @@ async function runResumableSummaryStep(
             );
           }
           proof = reuse.proof;
+          recoveryReceipt = reuse.receipt;
         }
         await kv.set(KV.summaries, sessionId, run.summary);
+        if (run.completedFinalWrites !== 1) {
+          run = {
+            ...run,
+            completedFinalWrites: 1,
+            updatedAt: new Date().toISOString(),
+          };
+          await kv.set(KV.summaryResumableRuns, run.id, run);
+        }
         await clearActiveSummaryRun(kv, run);
+        const recoveryEvidence = recoveryReceipt
+          ? summaryCommittedRecoveryEvidence(recoveryReceipt, run)
+          : undefined;
         return resumableResponse(
           "succeeded",
           completedChunks,
@@ -1644,6 +1845,7 @@ async function runResumableSummaryStep(
             summary: run.summary,
             operationUnitId: operationUnitId || undefined,
             ...proof,
+            ...(recoveryEvidence ? { recoveryEvidence } : {}),
           },
         );
       }
@@ -1970,10 +2172,16 @@ async function runResumableSummaryStep(
             { requireExisting: data.requireExistingReceipt === true },
           );
           if (receipt.failure) {
+            const recoveryEvidence = await summaryNoEffectRecoveryEvidence(
+              kv,
+              receipt.receipt,
+              run,
+            );
             return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
               error: receipt.failure.cause,
               failure: receipt.failure,
               telemetry,
+              ...(recoveryEvidence ? { recoveryEvidence } : {}),
             });
           }
           if (totalChunks === 1) {
@@ -1990,6 +2198,10 @@ async function runResumableSummaryStep(
                 },
               });
             }
+            const recoveryEvidence = summaryCommittedRecoveryEvidence(
+              receipt.receipt as ExtractionOperationReceipt<Record<string, unknown>>,
+              succeededRun,
+            );
             return resumableResponse(
               "succeeded",
               succeededRun.completedChunks,
@@ -2001,6 +2213,7 @@ async function runResumableSummaryStep(
                 operationUnitId: operationUnitId || undefined,
                 telemetry,
                 ...resumableSummarySourceProof(succeededRun),
+                ...(recoveryEvidence ? { recoveryEvidence } : {}),
               },
             );
           }
@@ -2168,6 +2381,7 @@ async function runResumableSummaryStep(
 
       const persistReduceFailure = async (
         failure: StageFailure,
+        recoveryEvidence?: SummaryRecoveryEvidence,
       ): Promise<ResumableSummaryResponse> => {
         run = {
           ...run!,
@@ -2188,6 +2402,7 @@ async function runResumableSummaryStep(
             failureCause: summaryFailureCause(failure.cause),
             failure,
             telemetry,
+            ...(recoveryEvidence ? { recoveryEvidence } : {}),
           },
         );
       };
@@ -2329,13 +2544,22 @@ async function runResumableSummaryStep(
         );
         if (receipt.failure) {
           if (receipt.failure.class === "hard" || receipt.failure.cause === "extraction_operation_reconciliation_required") {
+            const recoveryEvidence = await summaryNoEffectRecoveryEvidence(
+              kv,
+              receipt.receipt,
+              run,
+            );
             return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
               error: receipt.failure.cause,
               failure: receipt.failure,
               telemetry,
+              ...(recoveryEvidence ? { recoveryEvidence } : {}),
             });
           }
-          return persistReduceFailure(receipt.failure);
+          return persistReduceFailure(
+            receipt.failure,
+            await summaryNoEffectRecoveryEvidence(kv, receipt.receipt, run),
+          );
         }
         const succeededRun = await kv.get<ResumableSummaryRun>(
           KV.summaryResumableRuns,
@@ -2350,6 +2574,10 @@ async function runResumableSummaryStep(
             },
           });
         }
+        const recoveryEvidence = summaryCommittedRecoveryEvidence(
+          receipt.receipt as ExtractionOperationReceipt<Record<string, unknown>>,
+          succeededRun,
+        );
         return resumableResponse(
           "succeeded",
           succeededRun.completedChunks,
@@ -2361,6 +2589,7 @@ async function runResumableSummaryStep(
             operationUnitId: operationUnitId || undefined,
             telemetry,
             ...resumableSummarySourceProof(succeededRun),
+            ...(recoveryEvidence ? { recoveryEvidence } : {}),
           },
         );
       }

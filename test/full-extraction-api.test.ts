@@ -1040,7 +1040,7 @@ describe("full extraction REST wrappers", () => {
         phase: "final_result_persistence",
         failureClass: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
-        initialExitCode: 1,
+        initialExitCode: 75,
         retryable: false,
         reconciled: true,
       },
@@ -1077,10 +1077,34 @@ describe("full extraction REST wrappers", () => {
                 cause: testCase.cause,
                 phase: testCase.phase,
               },
+              ...(!testCase.reconciled
+                ? {
+                    recoveryEvidence: {
+                      kind: "no_effect",
+                      observation: testCase.retryable
+                        ? "execution_error"
+                        : "business_rejected",
+                      reasonCode: testCase.cause,
+                      proof: {
+                        kind: "receipt_before_formal_effect",
+                        receiptKey: `receipt-${testCase.phase}`,
+                        receiptVersion: 1,
+                        phase: "provider_call",
+                        commitPlanAbsent: true,
+                      },
+                    },
+                  }
+                : {}),
             };
           }
           const attemptId = payload.attemptId as string;
           const inputHash = payload.inputHash as string;
+          const resumableRunId = stableV2Hash({
+            attemptId,
+            inputHash,
+            source: "resumable-run",
+          });
+          const summary = { title: "retried summary" };
           return {
             success: true,
             status: "succeeded",
@@ -1088,8 +1112,21 @@ describe("full extraction REST wrappers", () => {
             attemptId,
             runnerInputHash: inputHash,
             serviceInputHash: stableV2Hash({ attemptId, inputHash, source: "summary-service" }),
-            resumableRunId: stableV2Hash({ attemptId, inputHash, source: "resumable-run" }),
-            summary: { title: "retried summary" },
+            resumableRunId,
+            summary,
+            recoveryEvidence: {
+              kind: "committed",
+              receiptKey: `receipt-${attemptId}`,
+              receiptVersion: 1,
+              resultRef: `summary-resumable-runs:${resumableRunId}`,
+              effectHash: stableV2Hash({
+                title: summary.title,
+                narrative: "",
+                keyDecisions: [],
+                filesModified: [],
+                concepts: [],
+              }),
+            },
           };
         });
         registerApiTriggers(sdk as never, mockKV() as never, "");
@@ -1166,20 +1203,45 @@ describe("full extraction REST wrappers", () => {
             expect(events.some((event) => event.type === "unit_blocked")).toBe(false);
             expect(completedReduceOperation).toBeUndefined();
             reduceFailed = false;
-            expect(await runFullExtractionV2([...argv, "--resume"], dependencies)).toBe(0);
+            const retryScheduled = events.find(
+              (event) => event.type === "unit_retry_scheduled",
+            );
+            const retryAt = Date.parse(
+              String((retryScheduled?.payload as Record<string, unknown>)?.retry_at),
+            );
+            expect(Number.isFinite(retryAt)).toBe(true);
+            await new Promise((resolve) => {
+              setTimeout(resolve, Math.max(0, retryAt - Date.now() + 10));
+            });
+            const resumedExitCode = await runFullExtractionV2(
+              [...argv, "--resume"],
+              dependencies,
+            );
+            expect(reduceApiResponse).toMatchObject({
+              status: "succeeded",
+              recoveryEvidence: { kind: "committed" },
+            });
+            expect(resumedExitCode).toBe(0);
             expect(reduceRequests).toHaveLength(2);
             expect(reduceRequests[1]).toMatchObject({
               operationUnitId: "s1:reduce",
-              attemptId: reduceRequests[0].attemptId,
               inputHash: reduceRequests[0].inputHash,
-              requireExistingReceipt: true,
             });
+            expect(reduceRequests[1].attemptId).not.toBe(reduceRequests[0].attemptId);
+            expect(reduceRequests[1].requireExistingReceipt).toBeUndefined();
           } else if (testCase.reconciled) {
             expect(terminalEvents).toHaveLength(0);
-            expect(events.at(-1)?.type).toBe("unit_blocked");
+            expect(events.some(
+              (event) => event.type === "unit_reconciliation_requested",
+            )).toBe(true);
+            expect(events.some((event) => event.type === "unit_blocked")).toBe(false);
           } else {
-            expect(terminalEvents).toHaveLength(1);
-            expect((terminalEvents[0].payload as Record<string, unknown>).status).toBe("failed");
+            expect(terminalEvents).toHaveLength(0);
+            const isolated = events.find((event) => event.type === "unit_isolated");
+            expect(isolated?.payload).toMatchObject({
+              unit_id: "s1",
+              decision: { action: "isolate" },
+            });
           }
         } finally {
           await server.close();
@@ -1190,7 +1252,7 @@ describe("full extraction REST wrappers", () => {
       if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
       else process.env.AGENTMEMORY_SECRET = previousSecret;
     }
-  });
+  }, 15_000);
 
   it("replays each formal write endpoint from a succeeded operation receipt", async () => {
     const sdk = mockSdk(async (input) => ({
