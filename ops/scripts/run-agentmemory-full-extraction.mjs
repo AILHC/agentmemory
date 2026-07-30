@@ -1679,13 +1679,22 @@ export async function requestJson(baseUrl, secret, method, apiPath, body, option
   }
   const endedAt = new Date().toISOString();
   let parsed = null;
-  try {
-    parsed = rawText ? JSON.parse(rawText) : null;
-  } catch {
-    parsed = { raw: redactSensitiveText(rawText) };
+  let responseContractError = '';
+  if (!rawText.trim()) {
+    responseContractError = 'empty_response';
+  } else {
+    try {
+      parsed = JSON.parse(rawText);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        responseContractError = 'invalid_json_response';
+      }
+    } catch {
+      parsed = { raw: redactSensitiveText(rawText) };
+      responseContractError = 'invalid_json_response';
+    }
   }
 
-  const ok = response.ok && parsed?.success !== false;
+  const ok = response.ok && !responseContractError && parsed?.success !== false;
   const result = {
     ok,
     method,
@@ -1697,6 +1706,7 @@ export async function requestJson(baseUrl, secret, method, apiPath, body, option
     error: '',
   };
   if (!response.ok) result.error = compactStateError(parsed?.error || `HTTP ${response.status}`, `HTTP ${response.status}`);
+  else if (responseContractError) result.error = responseContractError;
   else if (parsed?.success === false) result.error = compactStateError(parsed?.error, 'application reported success=false');
   Object.defineProperty(result, 'data', { value: parsed, enumerable: false });
   return result;

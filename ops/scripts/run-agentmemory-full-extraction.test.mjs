@@ -2972,6 +2972,95 @@ test('requestJson timeout also covers a response body that never ends', async ()
   }
 });
 
+test('requestJson fails closed for invalid response envelopes and transport errors', async (context) => {
+  const scenarios = [
+    {
+      name: 'empty 2xx body',
+      respond: (_req, res) => {
+        res.statusCode = 200;
+        res.end();
+      },
+      expectedStatus: 200,
+      expectedError: /empty_response/,
+    },
+    {
+      name: 'whitespace-only 2xx body',
+      respond: (_req, res) => {
+        res.statusCode = 200;
+        res.end('  \r\n');
+      },
+      expectedStatus: 200,
+      expectedError: /empty_response/,
+    },
+    {
+      name: 'malformed 2xx JSON',
+      respond: (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('{"success":');
+      },
+      expectedStatus: 200,
+      expectedError: /invalid_json_response/,
+    },
+    {
+      name: 'null 2xx JSON',
+      respond: (_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end('null');
+      },
+      expectedStatus: 200,
+      expectedError: /invalid_json_response/,
+    },
+    {
+      name: 'server error',
+      respond: (_req, res) => {
+        res.writeHead(503, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'runtime_unavailable' }));
+      },
+      expectedStatus: 503,
+      expectedError: /runtime_unavailable/,
+    },
+    {
+      name: 'unknown HTTP error code',
+      respond: (_req, res) => {
+        res.writeHead(520, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: 'future_runtime_error' }));
+      },
+      expectedStatus: 520,
+      expectedError: /future_runtime_error/,
+    },
+    {
+      name: 'connection closes before response',
+      respond: (req) => req.socket.destroy(),
+      expectedStatus: 0,
+      expectedError: /request failed|fetch failed/i,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await context.test(scenario.name, async () => {
+      const server = http.createServer(scenario.respond);
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      try {
+        const { port } = server.address();
+        const response = await requestJson(
+          `http://127.0.0.1:${port}`,
+          'secret',
+          'POST',
+          '/response-contract',
+          {},
+          { timeoutMs: 1_000 },
+        );
+
+        assert.equal(response.ok, false);
+        assert.equal(response.status_code, scenario.expectedStatus);
+        assert.match(response.error, scenario.expectedError);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    });
+  }
+});
+
 test('normalizeSessions sorts by startedAt then id', () => {
   const sessions = normalizeSessions([
     { id: 'b', startedAt: '2026-01-02T00:00:00.000Z' },

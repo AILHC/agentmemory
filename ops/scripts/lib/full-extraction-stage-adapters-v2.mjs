@@ -6,7 +6,10 @@ function firstArray(value, keys) {
 }
 
 function responseData(response) {
-  return response?.data || response?.response || response || {};
+  if (!response || typeof response !== 'object') return response ?? null;
+  if (Object.prototype.hasOwnProperty.call(response, 'data')) return response.data;
+  if (Object.prototype.hasOwnProperty.call(response, 'response')) return response.response;
+  return response;
 }
 
 function failureCause(response, data = responseData(response)) {
@@ -36,18 +39,28 @@ function resultIdsFromData(data, resultFields) {
     .flatMap((item) => firstArray(item, resultFields));
 }
 
-function classifyResponse(response, resultFields) {
+function hasResultField(data, resultFields) {
+  if (resultFields.some((field) => Array.isArray(data?.[field]))) return true;
+  return firstArray(data, ['groups', 'items', 'units'])
+    .some((item) => resultFields.some((field) => Array.isArray(item?.[field])));
+}
+
+export function classifyResponse(response, resultFields) {
+  const statusCode = Number(response?.status_code ?? response?.statusCode ?? 0);
   const data = responseData(response);
   const cause = failureCause(response, data);
   if (cause === 'extraction_operation_reconciliation_required') {
     return { status: 'blocked', reason: cause, payload: { error: cause } };
   }
-  if (response?.ok === false && Number(response?.status_code ?? response?.statusCode ?? 0) === 0) {
+  if (response?.ok === false && statusCode === 0) {
     return {
       status: 'blocked',
       reason: 'request_transport_failed',
       payload: { error: 'request_transport_failed' },
     };
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return { status: 'failed', payload: { error: 'invalid_stage_response' } };
   }
   const text = [
     data?.status,
@@ -57,14 +70,43 @@ function classifyResponse(response, resultFields) {
     response?.error,
   ].filter(Boolean).join(' ').toLowerCase();
   const resultIds = resultIdsFromData(data, resultFields);
-  if (data?.skipped || /skipped|no eligible|none|too few observations/.test(text)) {
+  const declaredStatus = typeof data.status === 'string'
+    ? data.status.toLowerCase()
+    : (typeof data.result === 'string' ? data.result.toLowerCase() : '');
+  const successfulStatuses = ['succeeded', 'committed', 'completed'];
+  if (response?.ok === false) {
+    return { status: 'failed', payload: { error: cause || 'stage request failed' } };
+  }
+  if (cause || data.failure) {
+    return { status: 'failed', payload: { error: cause || 'stage request failed' } };
+  }
+  if (
+    declaredStatus
+    && ![...successfulStatuses, 'skipped'].includes(declaredStatus)
+  ) {
+    return { status: 'failed', payload: { error: 'invalid_stage_response' } };
+  }
+  if (
+    data.success === true
+    && (data.skipped === true || declaredStatus === 'skipped')
+  ) {
     return {
       status: 'skipped',
       payload: { result_ids: resultIds, reason: data?.reason || data?.status || 'skipped' },
     };
   }
-  if (response?.ok === false || data?.success === false || /failed|error|infeasible/.test(text)) {
+  if (
+    data.success === false
+    || /failed|error|infeasible/.test(text)
+  ) {
     return { status: 'failed', payload: { error: cause || 'stage request failed' } };
+  }
+  if (
+    data.success !== true
+    && !successfulStatuses.includes(declaredStatus)
+    && !hasResultField(data, resultFields)
+  ) {
+    return { status: 'failed', payload: { error: 'invalid_stage_response' } };
   }
   return { status: 'succeeded', payload: { result_ids: resultIds } };
 }

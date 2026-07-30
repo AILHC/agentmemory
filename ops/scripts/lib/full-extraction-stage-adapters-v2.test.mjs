@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
+  classifyResponse,
   classifyIdempotentCommitResponse,
   executeReceiptAwareRequest,
   runV2RemainingStages,
@@ -376,6 +377,237 @@ test('idempotent commit response loss stays retryable with the same identity', (
     }, ['memoryIds']),
     { status: 'pending' },
   );
+});
+
+test('v2 stage response classification fails closed on ambiguous and failed envelopes', () => {
+  const cases = [
+    {
+      name: 'missing response body',
+      response: { ok: true, status_code: 200, data: null },
+      expected: { status: 'failed', payload: { error: 'invalid_stage_response' } },
+    },
+    {
+      name: 'malformed response body',
+      response: { ok: true, status_code: 200, data: { raw: '{"success":' } },
+      expected: { status: 'failed', payload: { error: 'invalid_stage_response' } },
+    },
+    {
+      name: 'unknown failure cause',
+      response: {
+        ok: true,
+        status_code: 200,
+        data: { failure: { cause: 'future_failure_code' } },
+      },
+      expected: { status: 'failed', payload: { error: 'future_failure_code' } },
+    },
+    {
+      name: 'unknown status',
+      response: { ok: true, status_code: 200, data: { status: 'future_status' } },
+      expected: { status: 'failed', payload: { error: 'invalid_stage_response' } },
+    },
+    {
+      name: 'HTTP failure with an explicit skip',
+      response: {
+        ok: false,
+        status_code: 409,
+        data: { success: true, status: 'skipped' },
+      },
+      expected: { status: 'failed', payload: { error: 'stage request failed' } },
+    },
+    {
+      name: 'explicit skip with a failure cause',
+      response: {
+        ok: true,
+        status_code: 200,
+        data: {
+          success: true,
+          status: 'skipped',
+          failure: { cause: 'future_failure_code' },
+        },
+      },
+      expected: { status: 'failed', payload: { error: 'future_failure_code' } },
+    },
+    {
+      name: 'skip flag with a conflicting status',
+      response: {
+        ok: true,
+        status_code: 200,
+        data: { success: true, skipped: true, status: 'future_status' },
+      },
+      expected: { status: 'failed', payload: { error: 'invalid_stage_response' } },
+    },
+    {
+      name: 'server failure that contains skip-like text',
+      response: {
+        ok: false,
+        status_code: 503,
+        data: { success: false, reason: 'none eligible; skipped' },
+      },
+      expected: { status: 'failed', payload: { error: 'stage request failed' } },
+    },
+    {
+      name: 'transport failure',
+      response: { ok: false, status_code: 0, error: 'connection lost' },
+      expected: {
+        status: 'blocked',
+        reason: 'request_transport_failed',
+        payload: { error: 'request_transport_failed' },
+      },
+    },
+    {
+      name: 'explicit skip',
+      response: {
+        ok: true,
+        status_code: 200,
+        data: { success: true, status: 'skipped', reason: 'no eligible inputs' },
+      },
+      expected: {
+        status: 'skipped',
+        payload: { result_ids: [], reason: 'no eligible inputs' },
+      },
+    },
+    {
+      name: 'explicit success with no result ids',
+      response: {
+        ok: true,
+        status_code: 200,
+        data: { success: true, status: 'succeeded', memoryIds: [] },
+      },
+      expected: { status: 'succeeded', payload: { result_ids: [] } },
+    },
+    {
+      name: 'non-enumerable valid data',
+      response: Object.defineProperty(
+        { ok: true, status_code: 200 },
+        'data',
+        {
+          value: { success: true, status: 'succeeded', memoryIds: [] },
+          enumerable: false,
+        },
+      ),
+      expected: { status: 'succeeded', payload: { result_ids: [] } },
+    },
+    {
+      name: 'explicit null data does not fall back to response',
+      response: Object.defineProperty(
+        {
+          ok: true,
+          status_code: 200,
+          response: { success: true, status: 'succeeded', memoryIds: ['wrong'] },
+        },
+        'data',
+        { value: null, enumerable: false },
+      ),
+      expected: { status: 'failed', payload: { error: 'invalid_stage_response' } },
+    },
+  ];
+
+  for (const { name, response, expected } of cases) {
+    assert.deepEqual(classifyResponse(response, ['memoryIds']), expected, name);
+  }
+});
+
+test('v2 remaining-stage adapters never promote an ambiguous response', async (context) => {
+  const common = {
+    options: { mark: 'test-mark' },
+    runId: 'ambiguous-response-run',
+    config: {
+      semantic_window_size: 20,
+      semantic_rollup_target_prompt_chars: 64000,
+      memory_consolidate_char_budget: 64000,
+      reflect_insight_char_budget: 64000,
+    },
+    configHash: 'config-1',
+    inventoryHash: 'inventory-1',
+    stableHash,
+  };
+
+  await context.test('two-phase prepare', async () => {
+    const result = await runV2RemainingStages({
+      ...common,
+      request: async (endpoint, body) => {
+        if (endpoint === '/agentmemory/full/memory-consolidate-windows/plan') {
+          return body.sessionOffset !== undefined
+            ? {
+                ok: true,
+                data: {
+                  success: true,
+                  plannerId: body.plannerId,
+                  descriptors: [{ id: 'descriptor-1' }],
+                  totalSessions: 1,
+                  sessionOffset: 0,
+                  nextSessionOffset: null,
+                  sessionInventoryHash: 'inventory-1',
+                },
+              }
+            : {
+                ok: true,
+                data: {
+                  success: true,
+                  plannerId: body.plannerId,
+                  windows: [{
+                    windowId: 'mcw-1',
+                    sourceObservationIds: ['obs-1'],
+                    inputHash: 'memory-input',
+                  }],
+                  totalWindows: 1,
+                  windowOffset: 0,
+                  nextWindowOffset: null,
+                },
+              };
+        }
+        assert.equal(endpoint, '/agentmemory/full/memory-consolidate-window/prepare');
+        return { ok: true, status_code: 200, data: null };
+      },
+      loadSelectedSessions: async () => assert.fail('must stop after memory prepare'),
+      runTwoPhaseStage: async ({ plan, adapter }) => {
+        const units = await plan();
+        const prepared = await adapter.prepare({
+          unit: units[0],
+          attemptId: adapter.prepareAttemptIdForUnit(units[0]),
+          recovered: false,
+        });
+        assert.deepEqual(prepared, {
+          status: 'failed',
+          payload: { error: 'invalid_stage_response' },
+        });
+        return { status: 'failed' };
+      },
+      runSingleStage: async () => assert.fail('must stop after memory prepare'),
+    });
+    assert.equal(result.status, 'failed');
+  });
+
+  await context.test('single-stage execute', async () => {
+    const result = await runV2RemainingStages({
+      ...common,
+      request: async (endpoint) => {
+        assert.equal(endpoint, '/agentmemory/semantic-rollup');
+        return { ok: true, status_code: 200, data: { status: 'future_status' } };
+      },
+      loadSelectedSessions: async () => [{
+        id: 's1',
+        status: 'completed',
+        summary: { title: 'summary' },
+      }],
+      runTwoPhaseStage: async () => ({ status: 'completed', acceptedCount: 0 }),
+      runSingleStage: async ({ stage, plan, adapter }) => {
+        assert.equal(stage, 'semantic_rollup');
+        const units = await plan();
+        const executed = await adapter.execute({
+          unit: units[0],
+          attemptId: adapter.attemptIdForUnit(units[0]),
+          recovered: false,
+        });
+        assert.deepEqual(executed, {
+          status: 'failed',
+          payload: { error: 'invalid_stage_response' },
+        });
+        return { status: 'failed' };
+      },
+    });
+    assert.equal(result.status, 'failed');
+  });
 });
 
 test('model operation transport loss performs receipt-only reconciliation', async () => {
