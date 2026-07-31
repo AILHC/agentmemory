@@ -22,7 +22,27 @@ import {
   RECOVERY_POLICY_VERSION,
   decideRecovery,
 } from './recovery-policy-v1.mjs';
+import {
+  EFFECT_STATE_RECOVERY_STAGES,
+} from './effect-state-recovery-stage-catalog-v1.mjs';
+import {
+  openIiiStateReadOnlyWorkingCopy,
+} from './iii-state-read-only-adapter-v1.mjs';
+import {
+  createRealLegacyLessonSnapshotFixture,
+  readFileTreeBytes,
+  REAL_LEGACY_LESSON_UNIT_ID,
+} from './iii-state-read-only-test-fixture-v1.mjs';
+import {
+  createLegacyLessonEvidenceProvenanceVerifier,
+} from './legacy-lesson-safe-facts-collector-v1.mjs';
+import {
+  verifyOfflineStateKvSnapshot,
+} from './offline-statekv-snapshot-v1.mjs';
 import { main as runMigrationCli } from '../migrate-agentmemory-recovery-frontier.mjs';
+
+const OFFICIAL_ENGINE_PATH = process.env.AGENTMEMORY_TEST_III_BIN;
+const realIiiTest = OFFICIAL_ENGINE_PATH ? test : test.skip;
 
 const MIGRATION_METADATA = Object.freeze({
   originalContractVersion: 'run-state-journal-v2/legacy',
@@ -832,8 +852,367 @@ test('legacy runner rejects the fence and migration resumes an interrupted manif
   assert.equal(inspectRecoveryMigrationGate(events).state, 'migrated');
   const reduced = reduceRecoveryJournal(events);
   assert.equal(reduced.units.get('lesson-b').terminal, 'skipped');
-  assert.equal(reduced.run.acceptance_ready, true);
+  assert.equal(reduced.run.acceptance_ready, false);
+  assert.equal(reduced.completed, false);
   assert.equal(events.filter((event) => event.type === 'unit_resolution').length, 1);
+});
+
+test('migration reenters after every manifest append boundary', async (context) => {
+  const roots = [];
+  context.after(async () => {
+    await Promise.all(roots.map((rootDir) =>
+      fs.rm(rootDir, { recursive: true, force: true })));
+  });
+  let stepCount;
+  for (let completedSteps = 0; completedSteps <= (stepCount ?? 0); completedSteps += 1) {
+    const { rootDir, journal } = await fixture(
+      `agentmemory-migration-every-boundary-${completedSteps}`,
+    );
+    roots.push(rootDir);
+    const manifest = buildRecoveryMigrationManifest({
+      runId: 'migration-run',
+      stage: 'lessons',
+      events: await journal.readStage('lessons'),
+      safeEvidenceByUnit: { 'lesson-b': zeroEffectEvidence('lesson-b') },
+      ...MIGRATION_METADATA,
+    });
+    stepCount ??= manifest.steps.length;
+    assert.equal(manifest.steps.length, stepCount);
+    await appendRecoveryContractFence({
+      journal,
+      stage: 'lessons',
+      manifest,
+      verifyOfflineWritersAbsent: async () => ({
+        oldRunnerAbsent: true,
+        writerLockAbsent: true,
+        otherWritersAbsent: true,
+      }),
+      verifyEvidenceProvenance: testOnlyTrustedEvidenceVerifier({
+        'lesson-b': zeroEffectEvidence('lesson-b'),
+      }),
+    });
+    await journal.acquireLock();
+    try {
+      for (const step of manifest.steps.slice(0, completedSteps)) {
+        await journal.appendStageExpectedSeq(
+          'lessons',
+          step.expected_seq,
+          step.type,
+          step.payload,
+        );
+      }
+    } finally {
+      await journal.releaseLock();
+    }
+
+    const resumed = await resumeRecoveryMigration({ journal, stage: 'lessons' });
+    assert.equal(resumed.appended_steps, manifest.steps.length - completedSteps);
+    assert.equal((await resumeRecoveryMigration({
+      journal,
+      stage: 'lessons',
+    })).appended_steps, 0);
+    assert.equal(
+      inspectRecoveryMigrationGate(await journal.readStage('lessons')).state,
+      'migrated',
+    );
+  }
+});
+
+realIiiTest('migration appends recovery events without rewriting legacy events receipts or business records', async (context) => {
+  const rootDir = await fs.mkdtemp(path.join(
+    os.tmpdir(),
+    'agentmemory-migration-real-read-only-',
+  ));
+  context.after(() => fs.rm(rootDir, { recursive: true, force: true }));
+  const fixtureState = await createRealLegacyLessonSnapshotFixture({
+    root: rootDir,
+    enginePath: OFFICIAL_ENGINE_PATH,
+  });
+  const legacyJournalBytes = await fs.readFile(fixtureState.journalPath);
+  const sourceStateBytes = await readFileTreeBytes(fixtureState.stateDir);
+  const snapshotStateBytes = await readFileTreeBytes(path.join(
+    fixtureState.snapshotDir,
+    'state',
+  ));
+  const beforeSnapshot = await verifyOfflineStateKvSnapshot({
+    snapshotDir: fixtureState.snapshotDir,
+  });
+  const verifier = createLegacyLessonEvidenceProvenanceVerifier({
+    snapshotDir: fixtureState.snapshotDir,
+    openReadOnlyWorkingCopy: openIiiStateReadOnlyWorkingCopy,
+  });
+  const evidenceProof = await verifier(fixtureState.request);
+  const scopeProofs = new Map(
+    evidenceProof.safeEvidenceByUnit[REAL_LEGACY_LESSON_UNIT_ID]
+      .safe_facts.collection.scope_proofs
+      .map((proof) => [proof.scope, proof]),
+  );
+  assert.equal(scopeProofs.get(fixtureState.scopes.receipt)?.exact_count, 1);
+  assert.equal(
+    scopeProofs.get(fixtureState.scopes.businessRecords)?.exact_count,
+    1,
+  );
+  assert.deepEqual(
+    await readFileTreeBytes(fixtureState.stateDir),
+    sourceStateBytes,
+  );
+  assert.deepEqual(
+    await readFileTreeBytes(path.join(fixtureState.snapshotDir, 'state')),
+    snapshotStateBytes,
+  );
+
+  const inputPath = path.join(rootDir, 'caller-evidence.json');
+  await fs.writeFile(inputPath, JSON.stringify({
+    safeEvidenceByUnit: evidenceProof.safeEvidenceByUnit,
+  }));
+  let fenceOutput = '';
+  await runMigrationCli(migrationCliArgs({
+    command: 'fence',
+    rootDir,
+    inputPath,
+    snapshotPath: fixtureState.snapshotDir,
+  }), {
+    writeOutput: (value) => {
+      fenceOutput += value;
+    },
+  });
+  let migrateOutput = '';
+  await runMigrationCli([
+    'migrate',
+    '--run-root', rootDir,
+    '--run-id', 'migration-run',
+    '--stage', 'lessons',
+  ], {
+    writeOutput: (value) => {
+      migrateOutput += value;
+    },
+  });
+
+  const migratedJournalBytes = await fs.readFile(fixtureState.journalPath);
+  assert.equal(migratedJournalBytes.length > legacyJournalBytes.length, true);
+  assert.deepEqual(
+    migratedJournalBytes.subarray(0, legacyJournalBytes.length),
+    legacyJournalBytes,
+  );
+  assert.deepEqual(
+    await readFileTreeBytes(fixtureState.stateDir),
+    sourceStateBytes,
+  );
+  assert.deepEqual(
+    await readFileTreeBytes(path.join(fixtureState.snapshotDir, 'state')),
+    snapshotStateBytes,
+  );
+  const afterSnapshot = await verifyOfflineStateKvSnapshot({
+    snapshotDir: fixtureState.snapshotDir,
+  });
+  assert.equal(afterSnapshot.snapshot_hash, beforeSnapshot.snapshot_hash);
+  assert.equal(afterSnapshot.state_tree_hash, beforeSnapshot.state_tree_hash);
+  assert.deepEqual(
+    (await fs.readdir(rootDir, { withFileTypes: true }))
+      .filter((entry) => (
+        entry.isDirectory()
+        && entry.name.startsWith('.iii-state-read-only-runtime-')
+      ))
+      .map((entry) => entry.name),
+    [],
+  );
+
+  const migratedJournal = new RunStateJournalV2({
+    rootDir,
+    runId: 'migration-run',
+  });
+  assert.equal(
+    inspectRecoveryMigrationGate(
+      await migratedJournal.readStage('lessons'),
+    ).state,
+    'migrated',
+  );
+  assert.equal(
+    JSON.parse(fenceOutput).fence_seq,
+    fixtureState.request.journal_seq + 1,
+  );
+  assert.equal(JSON.parse(migrateOutput).completed_steps > 0, true);
+});
+
+test('migration implementation uses only declared append journal capabilities', async (context) => {
+  const { rootDir, journal } = await fixture('agentmemory-migration-append-only');
+  context.after(() => fs.rm(rootDir, { recursive: true, force: true }));
+  const legacyEvents = await journal.readStage('lessons');
+  const allowedJournalCapabilities = new Set([
+    'runId',
+    'lockPath',
+    'acquireLock',
+    'releaseLock',
+    'readStage',
+    'appendStageExpectedSeq',
+  ]);
+  const accessedJournalCapabilities = new Set();
+  const migrationJournal = new Proxy(journal, {
+    get(target, property) {
+      assert.equal(
+        allowedJournalCapabilities.has(property),
+        true,
+        `migration accessed undeclared journal capability: ${String(property)}`,
+      );
+      accessedJournalCapabilities.add(property);
+      const value = Reflect.get(target, property);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  const manifest = buildRecoveryMigrationManifest({
+    runId: 'migration-run',
+    stage: 'lessons',
+    events: legacyEvents,
+    safeEvidenceByUnit: { 'lesson-b': zeroEffectEvidence('lesson-b') },
+    ...MIGRATION_METADATA,
+  });
+
+  await appendRecoveryContractFence({
+    journal: migrationJournal,
+    stage: 'lessons',
+    manifest,
+    verifyOfflineWritersAbsent: async () => ({
+      oldRunnerAbsent: true,
+      writerLockAbsent: true,
+      otherWritersAbsent: true,
+    }),
+    verifyEvidenceProvenance: testOnlyTrustedEvidenceVerifier({
+      'lesson-b': zeroEffectEvidence('lesson-b'),
+    }),
+  });
+  await resumeRecoveryMigration({ journal: migrationJournal, stage: 'lessons' });
+
+  assert.deepEqual(
+    (await journal.readStage('lessons')).slice(0, legacyEvents.length),
+    legacyEvents,
+  );
+  assert.deepEqual(
+    [...accessedJournalCapabilities].sort(),
+    [...allowedJournalCapabilities].sort(),
+  );
+});
+
+test('all eight legacy stage evidence adapters fail closed on unproved effects', () => {
+  for (const stage of EFFECT_STATE_RECOVERY_STAGES) {
+    const unitId = `${stage}-unit`;
+    const attemptId = `${stage}-attempt`;
+    const manifest = buildRecoveryMigrationManifest({
+      runId: 'migration-run',
+      stage,
+      events: [
+        {
+          seq: 0,
+          type: 'unit_planned',
+          payload: { unit_id: unitId, input_hash: 'a'.repeat(64) },
+        },
+        {
+          seq: 1,
+          type: 'stage_plan_completed',
+          payload: { unit_count: 1 },
+        },
+        {
+          seq: 2,
+          type: 'unit_started',
+          payload: { unit_id: unitId, attempt_id: attemptId },
+        },
+        {
+          seq: 3,
+          type: 'unit_terminal',
+          payload: {
+            unit_id: unitId,
+            attempt_id: attemptId,
+            status: 'failed',
+          },
+        },
+      ],
+      safeEvidenceByUnit: {
+        [unitId]: {
+          adapter: `${stage}/legacy-safe-facts-v1`,
+          attempt_id: attemptId,
+          operation_id: `${unitId}:legacy`,
+          safe_facts: { failure: { cause: 'response_lost' } },
+        },
+      },
+      ...MIGRATION_METADATA,
+    });
+    assert.equal(manifest.entries[0].evidence.kind, 'unknown', stage);
+    assert.equal(manifest.entries[0].decision.action, 'reconcile', stage);
+    assert.equal(
+      manifest.steps.some((step) => (
+        step.type === 'unit_resolution'
+        && step.payload.unit_id === unitId
+      )),
+      false,
+      stage,
+    );
+  }
+});
+
+test('lesson_no_blocks migration requires and preserves a closed zero-effect proof', async (context) => {
+  const { rootDir, journal } = await fixture(
+    'agentmemory-migration-lesson-no-blocks-proof',
+  );
+  context.after(() => fs.rm(rootDir, { recursive: true, force: true }));
+  const evidence = zeroEffectEvidence('lesson-b');
+  const unsafeEvidence = structuredClone(evidence);
+  unsafeEvidence.safe_facts.formalLessonWrites.push({
+    sourceRunId: 'lesson-b-run',
+  });
+  const unsafeManifest = buildRecoveryMigrationManifest({
+    runId: 'migration-run',
+    stage: 'lessons',
+    events: await journal.readStage('lessons'),
+    safeEvidenceByUnit: { 'lesson-b': unsafeEvidence },
+    ...MIGRATION_METADATA,
+  });
+  assert.equal(unsafeManifest.entries[0].decision.action, 'reconcile');
+  assert.equal(
+    unsafeManifest.steps.some((step) => step.type === 'unit_resolution'),
+    false,
+  );
+
+  const manifest = buildRecoveryMigrationManifest({
+    runId: 'migration-run',
+    stage: 'lessons',
+    events: await journal.readStage('lessons'),
+    safeEvidenceByUnit: { 'lesson-b': evidence },
+    ...MIGRATION_METADATA,
+  });
+  assert.deepEqual(manifest.entries[0].evidence.proof, {
+    kind: 'legacy_lessons_zero_effect',
+    lessonRunId: 'lesson-b-run',
+    receiptKey: evidence.safe_facts.receipt.key,
+    inputHash: 'a'.repeat(64),
+    configHash: 'b'.repeat(64),
+    createdLessonCount: 0,
+    replacedLessonCount: 0,
+    chunkLessonCount: 0,
+    finishedAt: '2026-07-30T00:00:00.000Z',
+  });
+  assert.equal(manifest.entries[0].decision.action, 'skipped');
+  await appendRecoveryContractFence({
+    journal,
+    stage: 'lessons',
+    manifest,
+    verifyOfflineWritersAbsent: async () => ({
+      oldRunnerAbsent: true,
+      writerLockAbsent: true,
+      otherWritersAbsent: true,
+    }),
+    verifyEvidenceProvenance: testOnlyTrustedEvidenceVerifier({
+      'lesson-b': evidence,
+    }),
+  });
+  await resumeRecoveryMigration({ journal, stage: 'lessons' });
+  const migratedEvents = await journal.readStage('lessons');
+  assert.equal(
+    reduceRecoveryJournal(migratedEvents).units.get('lesson-b').terminal,
+    'skipped',
+  );
+  assert.equal(
+    migratedEvents.filter((event) => event.type === 'unit_resolution').length,
+    1,
+  );
 });
 
 test('preview rejects caller-authored evidence and derives unknown evidence through the adapter', async (context) => {

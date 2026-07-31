@@ -4,6 +4,7 @@ import {
   RECOVERY_POLICY_HASH,
   RECOVERY_POLICY_VERSION,
   decideRecovery,
+  normalizeOperationEvidence,
 } from './recovery-policy-v1.mjs';
 import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
 import {
@@ -17,6 +18,44 @@ import {
 } from './recovery-migration-contract-v1.mjs';
 import { adaptLessonOperationEvidence } from './lesson-recovery-adapter-v1.mjs';
 import { adaptSummaryOperationEvidence } from './summary-recovery-adapter-v1.mjs';
+import {
+  adaptMemoryConsolidateOperationEvidence,
+  adaptSkillExtractOperationEvidence,
+} from './safe-stage-recovery-adapters-v1.mjs';
+import {
+  adaptSemanticRollupOperationEvidence,
+} from './semantic-rollup-recovery-adapter-v1.mjs';
+import {
+  adaptCrystalOperationEvidence,
+} from './crystal-recovery-adapter-v1.mjs';
+import {
+  adaptConsolidationProceduralOperationEvidence,
+} from './consolidation-procedural-recovery-adapter-v1.mjs';
+import {
+  adaptReflectInsightOperationEvidence,
+} from './reflect-insight-recovery-adapter-v1.mjs';
+
+const LEGACY_STAGE_EVIDENCE_ADAPTERS = new Map([
+  ['summary', ({ safeFacts, ...identity }) =>
+    adaptSummaryOperationEvidence({ result: safeFacts, ...identity })],
+  ['lessons', ({ safeFacts, ...identity }) =>
+    adaptLessonOperationEvidence({ result: safeFacts, ...identity })],
+  ['memory_consolidate', ({ safeFacts, ...identity }) =>
+    adaptMemoryConsolidateOperationEvidence({ safeFacts, ...identity })],
+  ['semantic_rollup', ({ safeFacts, ...identity }) =>
+    adaptSemanticRollupOperationEvidence({ result: safeFacts, ...identity })],
+  ['skill_extract', ({ safeFacts, ...identity }) =>
+    adaptSkillExtractOperationEvidence({ safeFacts, ...identity })],
+  ['crystal', ({ safeFacts, ...identity }) =>
+    adaptCrystalOperationEvidence({ result: safeFacts, ...identity })],
+  ['consolidation_procedural', ({ safeFacts, ...identity }) =>
+    adaptConsolidationProceduralOperationEvidence({
+      result: safeFacts,
+      ...identity,
+    })],
+  ['reflect_insight', ({ safeFacts, ...identity }) =>
+    adaptReflectInsightOperationEvidence({ result: safeFacts, ...identity })],
+]);
 
 function verifiedEvidenceRecord(unit, evidenceRecord, stage) {
   const journalOutcome = unit.recovery.outcomes.at(-1);
@@ -50,11 +89,7 @@ function verifiedEvidenceRecord(unit, evidenceRecord, stage) {
   if (typeof attemptId !== 'string' || !attemptId) {
     throw new Error(`recovery_migration_adapter_attempt_missing:${unit.unit_id}`);
   }
-  const adapter = stage === 'lessons'
-    ? adaptLessonOperationEvidence
-    : stage === 'summary'
-      ? adaptSummaryOperationEvidence
-      : null;
+  const adapter = LEGACY_STAGE_EVIDENCE_ADAPTERS.get(stage);
   if (!adapter) throw new Error(`recovery_migration_stage_adapter_unsupported:${stage}`);
   if (
     (stage === 'lessons' && 'lessonEvidence' in evidenceRecord.safe_facts)
@@ -65,13 +100,16 @@ function verifiedEvidenceRecord(unit, evidenceRecord, stage) {
     );
   }
   const adapted = adapter({
-    result: evidenceRecord.safe_facts,
+    safeFacts: evidenceRecord.safe_facts,
     unit,
     attemptId,
     operationId,
     budget: evidenceRecord.budget,
   });
-  const evidence = adapted.evidence;
+  const evidence = normalizeOperationEvidence(
+    adapted.candidateEvidence,
+    adapted.snapshot,
+  );
   const safeLegacyEvidence = (
     evidence.kind === 'unknown'
     || evidence.kind === 'system_fault'
@@ -86,7 +124,7 @@ function verifiedEvidenceRecord(unit, evidenceRecord, stage) {
   }
   return {
     evidence,
-    budget: adapted.budget,
+    budget: evidenceRecord.budget,
     effect_verification: adapted.effectVerification,
     attempt_id: attemptId,
     operation_id: operationId,
@@ -121,7 +159,7 @@ function migrationEntry(unit, evidenceRecord, stage) {
     unit_id: unit.unit_id,
     attempt_id: attemptId,
     current_attempt_number: currentAttemptNumber,
-    start_attempt: !unit.attempt_id,
+    start_attempt: unit.recovery.attempts.length === 0,
     operation_id: unit.active_operation?.operation_id
       || unit.completed_operations.at(-1)?.operation_id
       || verified.operation_id
@@ -571,7 +609,7 @@ export async function appendRecoveryContractFence({
       events: current,
       verifyEvidenceProvenance,
     });
-    return journal.appendStageExpectedSeq(
+    return await journal.appendStageExpectedSeq(
       stage,
       manifest.journal_seq,
       'stage_recovery_contract_fenced',

@@ -1,12 +1,10 @@
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { registerWorker } from 'iii-sdk';
 import YAML from 'yaml';
 import {
   assertPinnedIiiVersionOutput,
@@ -18,67 +16,20 @@ import {
   createLegacyLessonEvidenceProvenanceVerifier,
 } from './legacy-lesson-safe-facts-collector-v1.mjs';
 import {
-  createOfflineStateKvSnapshot,
   verifyOfflineStateKvSnapshot,
 } from './offline-statekv-snapshot-v1.mjs';
-import { hashRecoveryValue } from './recovery-migration-contract-v1.mjs';
+import {
+  createRealLegacyLessonSnapshotFixture,
+  readFileTreeBytes,
+  REAL_LEGACY_LESSON_BODY_SENTINELS as BODY_SENTINELS,
+  REAL_LEGACY_LESSON_UNIT_ID as UNIT_ID,
+} from './iii-state-read-only-test-fixture-v1.mjs';
 
 const OFFICIAL_ENGINE_PATH = process.env.AGENTMEMORY_TEST_III_BIN;
 const realTest = OFFICIAL_ENGINE_PATH ? test : test.skip;
-const UNIT_ID = 'session-1';
-const ATTEMPT_ID = 'attempt-1';
-const RUNNER_INPUT_HASH = 'a'.repeat(64);
-const RUN_INPUT_HASH = 'b'.repeat(64);
-const CONFIG_HASH = 'c'.repeat(64);
-const RECEIPT_INPUT_HASH = hashRecoveryValue({
-  configHash: CONFIG_HASH,
-  runnerInputHash: RUNNER_INPUT_HASH,
-  serviceInputHash: RUN_INPUT_HASH,
-});
-const RECEIPT_KEY = `xop_${createHash('sha256')
-  .update(JSON.stringify([ATTEMPT_ID, 'lessons', UNIT_ID]))
-  .digest('hex')
-  .slice(0, 32)}`;
-const BODY_SENTINELS = [
-  'receipt body sentinel',
-  'run body sentinel',
-  'chunk body sentinel',
-  'lesson body sentinel',
-  'lesson context sentinel',
-  'lesson tag sentinel',
-];
-
-function safeChildEnvironment() {
-  return {
-    ...Object.fromEntries(
-      ['SystemRoot', 'WINDIR', 'TEMP', 'TMP']
-        .flatMap((name) => (
-          typeof process.env[name] === 'string'
-            ? [[name, process.env[name]]]
-            : []
-        )),
-    ),
-    III_TELEMETRY_ENABLED: 'false',
-    OTEL_ENABLED: 'false',
-  };
-}
 
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-async function freePort() {
-  const server = net.createServer();
-  await new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', resolve);
-  });
-  const address = server.address();
-  assert.ok(address && typeof address !== 'string');
-  await new Promise((resolve, reject) => {
-    server.close((error) => (error ? reject(error) : resolve()));
-  });
-  return address.port;
 }
 
 async function assertPortReleased(port) {
@@ -110,241 +61,15 @@ async function waitForProcessExit(pid) {
   throw new Error(`test_engine_process_did_not_exit:${pid}`);
 }
 
-async function waitForState(sdk, child) {
-  let lastError;
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    if (child.exitCode !== null || child.signalCode !== null) {
-      throw new Error('test_seed_engine_exited_early');
-    }
-    try {
-      await sdk.trigger({
-        function_id: 'state::get',
-        payload: { scope: 'test:readiness', key: 'missing' },
-      });
-      return;
-    } catch (error) {
-      lastError = error;
-      await delay(50);
-    }
-  }
-  throw new Error('test_seed_engine_not_ready', { cause: lastError });
-}
-
-async function waitForStateFiles(stateDir, expectedCount) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const entries = await fs.readdir(stateDir);
-    if (entries.length >= expectedCount) return entries;
-    await delay(50);
-  }
-  throw new Error('test_seed_state_files_missing');
-}
-
-async function waitForChildExit(child) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  await new Promise((resolve) => child.once('exit', resolve));
-}
-
-function seedConfig({ port, stateDir }) {
-  return [
-    'workers:',
-    '  - name: iii-worker-manager',
-    '    config:',
-    '      host: 127.0.0.1',
-    `      port: ${port}`,
-    '  - name: iii-state',
-    '    config:',
-    '      adapter:',
-    '        name: kv',
-    '        config:',
-    '          store_method: file_based',
-    `          file_path: ${JSON.stringify(stateDir.replaceAll('\\', '/'))}`,
-    '',
-  ].join('\n');
-}
-
-async function seedSyntheticState(root) {
-  const stateDir = path.join(root, 'state-source');
-  const configPath = path.join(root, 'seed-config.yaml');
-  await fs.mkdir(stateDir);
-  const port = await freePort();
-  await fs.writeFile(configPath, seedConfig({ port, stateDir }));
-  const child = spawn(OFFICIAL_ENGINE_PATH, [
-    '--no-update-check',
-    '--config',
-    configPath,
-  ], {
-    cwd: root,
-    env: safeChildEnvironment(),
-    windowsHide: true,
-    stdio: 'ignore',
-  });
-  const sdk = registerWorker(`ws://127.0.0.1:${port}`, {
-    workerName: `iii-state-read-only-seed-${process.pid}-${port}`,
-    enableMetricsReporting: false,
-    invocationTimeoutMs: 3_000,
-    reconnectionConfig: {
-      maxRetries: 3,
-      initialDelay: 50,
-      maxDelay: 250,
-    },
-    otel: { enabled: false },
-  });
-  try {
-    await waitForState(sdk, child);
-    const values = [
-      [
-        `mem:extraction-operation-receipt:${RECEIPT_KEY}`,
-        RECEIPT_KEY,
-        {
-          key: RECEIPT_KEY,
-          runId: ATTEMPT_ID,
-          unitId: UNIT_ID,
-          stage: 'lessons',
-          inputHash: RECEIPT_INPUT_HASH,
-          status: 'failed',
-          startedAt: '2026-07-30T00:00:00.000Z',
-          completedAt: '2026-07-30T00:00:01.000Z',
-          failure: { class: 'unit', cause: 'lesson_no_blocks' },
-          response: { content: BODY_SENTINELS[0] },
-        },
-      ],
-      [
-        'mem:lesson-extraction:runs',
-        'lex-run-1',
-        {
-          id: 'lex-run-1',
-          sessionId: UNIT_ID,
-          status: 'failed',
-          inputHash: RUN_INPUT_HASH,
-          configHash: CONFIG_HASH,
-          extractionGeneration: 2,
-          createdLessonIds: [],
-          replacedLessonIds: [],
-          finishedAt: '2026-07-30T00:00:01.000Z',
-          lastError: BODY_SENTINELS[1],
-        },
-      ],
-      [
-        'mem:lesson-extraction:chunks:lex-run-1',
-        'chunk-1',
-        {
-          id: 'chunk-1',
-          runId: 'lex-run-1',
-          sessionId: UNIT_ID,
-          chunkIndex: 0,
-          status: 'failed',
-          lessonIds: [],
-          lastError: BODY_SENTINELS[2],
-        },
-      ],
-      [
-        'mem:lessons',
-        'existing-lesson',
-        {
-          id: 'existing-lesson',
-          content: BODY_SENTINELS[3],
-          context: BODY_SENTINELS[4],
-          tags: [BODY_SENTINELS[5]],
-          deleted: true,
-          sourceRunId: 'old-run',
-          sourceWatermarks: {
-            'other-session': {
-              generation: 1,
-              mutationId: 'old-mutation',
-            },
-          },
-        },
-      ],
-    ];
-    for (const [scope, key, value] of values) {
-      await sdk.trigger({
-        function_id: 'state::set',
-        payload: { scope, key, value },
-      });
-    }
-    await waitForStateFiles(stateDir, values.length);
-  } finally {
-    await sdk.shutdown().catch(() => {});
-    child.kill();
-    await waitForChildExit(child);
-  }
-  await assertPortReleased(port);
-  return stateDir;
-}
-
-function journalEvents() {
-  return [
-    {
-      seq: 0,
-      type: 'unit_planned',
-      payload: { unit_id: UNIT_ID, input_hash: RUNNER_INPUT_HASH },
-    },
-    {
-      seq: 1,
-      type: 'stage_plan_completed',
-      payload: { unit_count: 1 },
-    },
-    {
-      seq: 2,
-      type: 'unit_started',
-      payload: { unit_id: UNIT_ID, attempt_id: ATTEMPT_ID },
-    },
-    {
-      seq: 3,
-      type: 'unit_terminal',
-      payload: {
-        unit_id: UNIT_ID,
-        attempt_id: ATTEMPT_ID,
-        status: 'failed',
-        error: 'lesson_no_blocks',
-      },
-    },
-  ];
-}
-
-function durableJournalEvents() {
-  return journalEvents().map((event) => {
-    const core = {
-      seq: event.seq,
-      at: `2026-07-30T00:00:0${event.seq}.000Z`,
-      type: event.type,
-      payload: event.payload,
-    };
-    return {
-      ...core,
-      checksum: createHash('sha256')
-        .update(JSON.stringify(core))
-        .digest('hex'),
-    };
-  });
-}
-
 async function createRealSnapshotFixture(
   root,
   snapshotEnginePath = OFFICIAL_ENGINE_PATH,
 ) {
-  const stateDir = await seedSyntheticState(root);
-  const journalPath = path.join(root, 'lessons.jsonl');
-  const snapshotDir = path.join(root, 'snapshot');
-  const events = durableJournalEvents();
-  await fs.writeFile(
-    journalPath,
-    `${events.map((event) => JSON.stringify(event)).join('\n')}\n`,
-  );
-  const manifest = await createOfflineStateKvSnapshot({
-    stateDir,
-    journalPath,
-    enginePath: snapshotEnginePath,
-    destinationDir: snapshotDir,
-    capturedAt: '2026-07-30T00:00:04.000Z',
-    expectedJournal: {
-      run_id: 'migration-run',
-      stage: 'lessons',
-      journal_seq: events.at(-1).seq,
-      input_summary_hash: hashRecoveryValue(events),
-    },
+  return createRealLegacyLessonSnapshotFixture({
+    root,
+    enginePath: OFFICIAL_ENGINE_PATH,
+    snapshotEnginePath,
   });
-  return { events, manifest, snapshotDir };
 }
 
 async function adapterRuntimeDirectories(root) {
@@ -357,14 +82,7 @@ async function adapterRuntimeDirectories(root) {
 }
 
 async function stateBytes(snapshotDir) {
-  const stateDir = path.join(snapshotDir, 'state');
-  const entries = (await fs.readdir(stateDir)).sort();
-  return Object.fromEntries(await Promise.all(entries.map(async (name) => [
-    name,
-    createHash('sha256')
-      .update(await fs.readFile(path.join(stateDir, name)))
-      .digest('hex'),
-  ])));
+  return readFileTreeBytes(path.join(snapshotDir, 'state'));
 }
 
 async function directAdapterInput(
@@ -436,13 +154,7 @@ realTest('real 0.11.2 state-only engine reads a verified working snapshot withou
       };
     },
   });
-  const result = await verifier({
-    run_id: 'migration-run',
-    stage: 'lessons',
-    journal_seq: fixture.events.at(-1).seq,
-    input_summary_hash: hashRecoveryValue(fixture.events),
-    units: [UNIT_ID],
-  });
+  const result = await verifier(fixture.request);
   assert.deepEqual(
     runtimeConfig.workers.map((worker) => worker.name),
     ['iii-worker-manager', 'iii-state'],
@@ -725,13 +437,7 @@ realTest('verifier rejects injected working-copy state mutation after adapter cl
     },
   });
   await assert.rejects(
-    () => verifier({
-      run_id: 'migration-run',
-      stage: 'lessons',
-      journal_seq: fixture.events.at(-1).seq,
-      input_summary_hash: hashRecoveryValue(fixture.events),
-      units: [UNIT_ID],
-    }),
+    () => verifier(fixture.request),
     /offline_snapshot_content_drifted/,
   );
   assert.equal(processExists(runtime.pid), false);
