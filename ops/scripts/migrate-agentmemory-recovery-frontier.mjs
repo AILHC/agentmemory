@@ -158,15 +158,6 @@ async function verifyPreviewEvidence({
   verifyEvidenceProvenance,
 }) {
   const units = externalUnits(manifest);
-  if (units.length === 0) {
-    return {
-      schema: 'recovery-migration-preview-evidence-verification/v1',
-      state: 'not_required',
-      verified_unit_count: 0,
-      verified_units_hash: hashRecoveryValue([]),
-      manifest_hash: manifest.manifest_hash,
-    };
-  }
   const request = {
     run_id: manifest.run_id,
     stage: manifest.stage,

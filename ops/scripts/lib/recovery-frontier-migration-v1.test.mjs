@@ -472,6 +472,39 @@ test('snapshot preview independently verifies exact collector facts with a bound
   );
 });
 
+test('snapshot preview verifies the exact Journal binding even when the frontier is empty', async (context) => {
+  const { rootDir } = await fixture(
+    'agentmemory-migration-cli-preview-empty-verified',
+    [],
+  );
+  context.after(() => fs.rm(rootDir, { recursive: true, force: true }));
+  const inputPath = path.join(rootDir, 'caller-evidence.json');
+  const snapshotPath = path.join(rootDir, 'evidence-snapshot');
+  await fs.writeFile(inputPath, JSON.stringify({ safeEvidenceByUnit: {} }));
+  let verifierRequest;
+  let output = '';
+  await runMigrationCli(migrationCliArgs({
+    command: 'preview',
+    rootDir,
+    inputPath,
+    snapshotPath,
+  }), {
+    createEvidenceVerifier: injectedEvidenceVerifier({}, {
+      onRequest: (value) => {
+        verifierRequest = value;
+      },
+    }),
+    writeOutput: (value) => {
+      output += value;
+    },
+  });
+  const parsed = JSON.parse(output);
+  assert.deepEqual(verifierRequest.units, []);
+  assert.equal(parsed.frontier_count, 0);
+  assert.equal(parsed.evidence_verification.state, 'independently_verified');
+  assert.equal(parsed.evidence_verification.verified_unit_count, 0);
+});
+
 test('snapshot preview rejects collector mismatch and verifier failure without appending', async (context) => {
   const { rootDir, journal } = await fixture('agentmemory-migration-cli-preview-mismatch');
   context.after(() => fs.rm(rootDir, { recursive: true, force: true }));
