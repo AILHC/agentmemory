@@ -130,6 +130,31 @@ try {
   await assert.rejects(fs.access(lockPath));
 });
 
+test('KeepStopped 参数必须与自动化暂停确认成对出现', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-deploy-mode-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const lockPath = path.join(root, 'tmp', 'deploy-current.lock.json');
+
+  const result = runPowerShell(`
+$RuntimeRoot = ${quotePowerShell(root)}
+foreach ($arguments in @(
+  @{ KeepStopped = $true; ConfirmAutomationPaused = $false },
+  @{ KeepStopped = $false; ConfirmAutomationPaused = $true }
+)) {
+  $caught = $false
+  try {
+    Invoke-AmDeployment -KeepStopped:$arguments.KeepStopped -ConfirmAutomationPaused:$arguments.ConfirmAutomationPaused
+  } catch {
+    $caught = $true
+  }
+  if (-not $caught) { throw 'invalid deployment mode arguments were accepted' }
+}
+`);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  await assert.rejects(fs.access(lockPath));
+});
+
 test('任何全量提炼 lock 都阻止部署', async (context) => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-deploy-run-lock-'));
   context.after(() => fs.rm(root, { recursive: true, force: true }));
@@ -143,6 +168,70 @@ try {
   $caught = $true
 }
 if (-not $caught) { throw 'runner lock unexpectedly accepted' }
+`);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
+test('嵌套 v2 writer lock 和 drain 请求都阻止离线部署且不会被删除', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-deploy-v2-lock-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const runRoot = path.join(root, 'formal.v2');
+  const lockPath = path.join(runRoot, 'writer.lock.json');
+  const drainPath = path.join(root, 'formal.json.drain-request.json');
+  await fs.mkdir(runRoot, { recursive: true });
+  await fs.writeFile(lockPath, '{}');
+
+  let result = runPowerShell(`
+$caught = $false
+try {
+  Assert-AmNoExtractionLocks -ExtractionRunsPath ${quotePowerShell(root)}
+} catch {
+  $caught = $true
+}
+if (-not $caught) { throw 'nested v2 writer lock unexpectedly accepted' }
+`);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal((await fs.stat(lockPath)).isFile(), true);
+
+  await fs.rm(lockPath);
+  await fs.writeFile(drainPath, '{}');
+  result = runPowerShell(`
+$caught = $false
+try {
+  Assert-AmNoExtractionControlRequests -ExtractionRunsPath ${quotePowerShell(root)}
+} catch {
+  $caught = $true
+}
+if (-not $caught) { throw 'drain request unexpectedly accepted' }
+`);
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal((await fs.stat(drainPath)).isFile(), true);
+});
+
+test('KeepStopped 前置条件拒绝未停止、未禁用或未确认自动化暂停', () => {
+  const result = runPowerShell(`
+foreach ($case in @(
+  @{ Service = [pscustomobject]@{ Status = 'Running'; StartType = 'Disabled' }; Pattern = 'Stopped' },
+  @{ Service = [pscustomobject]@{ Status = 'Stopped'; StartType = 'Automatic' }; Pattern = 'Disabled' }
+)) {
+  $caught = $false
+  try {
+    Assert-AmKeepStoppedServiceState -Service $case.Service
+  } catch {
+    if (-not $_.Exception.Message.Contains($case.Pattern)) { throw }
+    $caught = $true
+  }
+  if (-not $caught) { throw 'unsafe service state unexpectedly accepted' }
+}
+$caught = $false
+try {
+  Assert-AmKeepStoppedPreconditions -CurrentPath 'C:/missing-current' -ExtractionRunsPath 'C:/missing-runs'
+} catch {
+  if (-not $_.Exception.Message.Contains('paused automation confirmation')) { throw }
+  $caught = $true
+}
+if (-not $caught) { throw 'missing automation confirmation unexpectedly accepted' }
 `);
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -480,4 +569,364 @@ if (Test-AmPreparedCurrent -CurrentPath ${quotePowerShell(root)} -SourceCommit $
 `);
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
+});
+
+test('KeepStopped 成功切换全程不启动或停止 runtime', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-keep-stopped-success-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const current = path.join(root, 'app', 'current');
+  const next = path.join(root, 'app', 'current.new');
+  const lockPath = path.join(root, 'tmp', 'deploy-current.lock.json');
+  await fs.mkdir(current, { recursive: true });
+  await fs.mkdir(next, { recursive: true });
+  await fs.mkdir(path.join(root, 'extraction-runs'), { recursive: true });
+  await fs.writeFile(path.join(current, 'marker.txt'), 'old');
+  await fs.writeFile(path.join(next, 'marker.txt'), 'new');
+  await fs.writeFile(
+    path.join(next, 'DEPLOYMENT.json'),
+    `${JSON.stringify({ sourceCommit: '2'.repeat(40) })}\n`,
+  );
+
+  const result = runPowerShell(`
+$RuntimeRoot = ${quotePowerShell(root)}
+$RepositoryRoot = ${quotePowerShell(path.resolve('.'))}
+$script:startCalls = 0
+$script:stopCalls = 0
+$script:doctorCalls = 0
+$script:manifestChecks = 0
+function Get-AmDeploymentService { return [pscustomobject]@{ Status = 'Stopped'; StartType = 'Disabled' } }
+function Resolve-AmGitCommit { return (('2' * 40) -join '') }
+function Invoke-AmStoppedDeploymentDoctor { param($CurrentPath); $script:doctorCalls += 1 }
+function Invoke-AmCurrentManifestVerification { param($CurrentPath); $script:manifestChecks += 1 }
+function Update-AmServiceConfigForCurrent { param($ServiceConfigPath, $CurrentPath); return $null }
+function Move-AmLegacyScriptsToArchive { param($Runtime); return $null }
+function Start-AmDeploymentRuntime { $script:startCalls += 1; throw 'runtime start is forbidden' }
+function Stop-AmDeploymentRuntime { $script:stopCalls += 1; throw 'runtime stop is forbidden' }
+Invoke-AmDeployment -KeepStopped -ConfirmAutomationPaused
+if ($script:startCalls -ne 0 -or $script:stopCalls -ne 0) { throw 'runtime lifecycle function was called' }
+if ($script:doctorCalls -ne 3) { throw "unexpected stopped doctor calls: $script:doctorCalls" }
+if ($script:manifestChecks -ne 2) { throw "unexpected manifest checks: $script:manifestChecks" }
+`);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /deployment\.keepStopped=true/);
+  assert.equal(await fs.readFile(path.join(current, 'marker.txt'), 'utf8'), 'new');
+  await assert.rejects(fs.access(path.join(root, 'app', 'current.previous')));
+  await assert.rejects(fs.access(lockPath));
+});
+
+test('KeepStopped 在 build 期间状态漂移时拒绝切换且不启动', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-keep-stopped-drift-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const current = path.join(root, 'app', 'current');
+  const next = path.join(root, 'app', 'current.new');
+  const lockPath = path.join(root, 'tmp', 'deploy-current.lock.json');
+  await fs.mkdir(current, { recursive: true });
+  await fs.mkdir(next, { recursive: true });
+  await fs.mkdir(path.join(root, 'extraction-runs'), { recursive: true });
+  await fs.writeFile(path.join(current, 'marker.txt'), 'old');
+  await fs.writeFile(
+    path.join(next, 'DEPLOYMENT.json'),
+    `${JSON.stringify({ sourceCommit: '3'.repeat(40) })}\n`,
+  );
+
+  const result = runPowerShell(`
+$RuntimeRoot = ${quotePowerShell(root)}
+$RepositoryRoot = ${quotePowerShell(path.resolve('.'))}
+$script:serviceCalls = 0
+$script:startCalls = 0
+$script:stopCalls = 0
+function Get-AmDeploymentService {
+  $script:serviceCalls += 1
+  if ($script:serviceCalls -ge 3) {
+    return [pscustomobject]@{ Status = 'Running'; StartType = 'Disabled' }
+  }
+  return [pscustomobject]@{ Status = 'Stopped'; StartType = 'Disabled' }
+}
+function Resolve-AmGitCommit { return (('3' * 40) -join '') }
+function Invoke-AmStoppedDeploymentDoctor { param($CurrentPath) }
+function Invoke-AmCurrentManifestVerification { param($CurrentPath) }
+function Start-AmDeploymentRuntime { $script:startCalls += 1; throw 'runtime start is forbidden' }
+function Stop-AmDeploymentRuntime { $script:stopCalls += 1; throw 'runtime stop is forbidden' }
+$caught = $false
+try {
+  Invoke-AmDeployment -KeepStopped -ConfirmAutomationPaused
+} catch {
+  if (-not $_.Exception.Message.Contains('requires service Stopped')) { throw }
+  $caught = $true
+}
+if (-not $caught) { throw 'service drift unexpectedly accepted' }
+if ($script:startCalls -ne 0 -or $script:stopCalls -ne 0) { throw 'runtime lifecycle function was called' }
+`);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(await fs.readFile(path.join(current, 'marker.txt'), 'utf8'), 'old');
+  await assert.rejects(fs.access(path.join(root, 'app', 'current.previous')));
+  await assert.rejects(fs.access(lockPath));
+});
+
+test('KeepStopped 切换后验证失败会回滚且不会重启旧 runtime', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-keep-stopped-rollback-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const current = path.join(root, 'app', 'current');
+  const next = path.join(root, 'app', 'current.new');
+  const lockPath = path.join(root, 'tmp', 'deploy-current.lock.json');
+  await fs.mkdir(current, { recursive: true });
+  await fs.mkdir(next, { recursive: true });
+  await fs.mkdir(path.join(root, 'extraction-runs'), { recursive: true });
+  await fs.writeFile(path.join(current, 'marker.txt'), 'old');
+  await fs.writeFile(path.join(next, 'marker.txt'), 'new');
+  await fs.writeFile(
+    path.join(next, 'DEPLOYMENT.json'),
+    `${JSON.stringify({ sourceCommit: '4'.repeat(40) })}\n`,
+  );
+
+  const result = runPowerShell(`
+$RuntimeRoot = ${quotePowerShell(root)}
+$RepositoryRoot = ${quotePowerShell(path.resolve('.'))}
+$script:startCalls = 0
+$script:stopCalls = 0
+$script:manifestChecks = 0
+function Get-AmDeploymentService { return [pscustomobject]@{ Status = 'Stopped'; StartType = 'Disabled' } }
+function Resolve-AmGitCommit { return (('4' * 40) -join '') }
+function Invoke-AmStoppedDeploymentDoctor { param($CurrentPath) }
+function Invoke-AmCurrentManifestVerification {
+  param($CurrentPath)
+  $script:manifestChecks += 1
+  if ($script:manifestChecks -ge 2) { throw 'injected post-switch manifest failure' }
+}
+function Update-AmServiceConfigForCurrent { param($ServiceConfigPath, $CurrentPath); return $null }
+function Move-AmLegacyScriptsToArchive { param($Runtime); return $null }
+function Start-AmDeploymentRuntime { $script:startCalls += 1; throw 'runtime start is forbidden' }
+function Stop-AmDeploymentRuntime { $script:stopCalls += 1; throw 'runtime stop is forbidden' }
+$caught = $false
+try {
+  Invoke-AmDeployment -KeepStopped -ConfirmAutomationPaused
+} catch {
+  if (-not $_.Exception.Message.Contains('injected post-switch manifest failure')) { throw }
+  $caught = $true
+}
+if (-not $caught) { throw 'post-switch failure unexpectedly accepted' }
+if ($script:startCalls -ne 0 -or $script:stopCalls -ne 0) { throw 'runtime lifecycle function was called' }
+`);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(await fs.readFile(path.join(current, 'marker.txt'), 'utf8'), 'old');
+  const failed = (await fs.readdir(path.join(root, 'app')))
+    .filter((name) => name.startsWith('current.failed-'));
+  assert.equal(failed.length, 1);
+  await assert.rejects(fs.access(path.join(root, 'app', 'current.previous')));
+  await assert.rejects(fs.access(lockPath));
+});
+
+test('KeepStopped 回滚约束失败时同时保留部署错误和回滚错误', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-keep-stopped-dual-error-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const current = path.join(root, 'app', 'current');
+  const next = path.join(root, 'app', 'current.new');
+  const lockPath = path.join(root, 'tmp', 'deploy-current.lock.json');
+  await fs.mkdir(current, { recursive: true });
+  await fs.mkdir(next, { recursive: true });
+  await fs.mkdir(path.join(root, 'extraction-runs'), { recursive: true });
+  await fs.writeFile(path.join(current, 'marker.txt'), 'old');
+  await fs.writeFile(path.join(next, 'marker.txt'), 'new');
+  await fs.writeFile(
+    path.join(next, 'DEPLOYMENT.json'),
+    `${JSON.stringify({ sourceCommit: '5'.repeat(40) })}\n`,
+  );
+
+  const result = runPowerShell(`
+$RuntimeRoot = ${quotePowerShell(root)}
+$RepositoryRoot = ${quotePowerShell(path.resolve('.'))}
+$script:doctorCalls = 0
+$script:startCalls = 0
+$script:stopCalls = 0
+function Get-AmDeploymentService { return [pscustomobject]@{ Status = 'Stopped'; StartType = 'Disabled' } }
+function Resolve-AmGitCommit { return (('5' * 40) -join '') }
+function Invoke-AmStoppedDeploymentDoctor {
+  param($CurrentPath)
+  $script:doctorCalls += 1
+  if ($script:doctorCalls -eq 3) { throw 'injected post-switch doctor failure' }
+  if ($script:doctorCalls -eq 4) { throw 'injected rollback invariant failure' }
+}
+function Invoke-AmCurrentManifestVerification { param($CurrentPath) }
+function Update-AmServiceConfigForCurrent { param($ServiceConfigPath, $CurrentPath); return $null }
+function Move-AmLegacyScriptsToArchive { param($Runtime); return $null }
+function Start-AmDeploymentRuntime { $script:startCalls += 1; throw 'runtime start is forbidden' }
+function Stop-AmDeploymentRuntime { $script:stopCalls += 1; throw 'runtime stop is forbidden' }
+$caught = $false
+try {
+  Invoke-AmDeployment -KeepStopped -ConfirmAutomationPaused
+} catch {
+  if (-not $_.Exception.Message.Contains('injected post-switch doctor failure')) { throw }
+  if (-not $_.Exception.Message.Contains('injected rollback invariant failure')) { throw }
+  $caught = $true
+}
+if (-not $caught) { throw 'dual failure unexpectedly accepted' }
+if ($script:doctorCalls -ne 4) { throw "unexpected stopped doctor calls: $script:doctorCalls" }
+if ($script:startCalls -ne 0 -or $script:stopCalls -ne 0) { throw 'runtime lifecycle function was called' }
+`);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(await fs.readFile(path.join(current, 'marker.txt'), 'utf8'), 'old');
+  const failed = (await fs.readdir(path.join(root, 'app')))
+    .filter((name) => name.startsWith('current.failed-'));
+  assert.equal(failed.length, 1);
+  await assert.rejects(fs.access(path.join(root, 'app', 'current.previous')));
+  await assert.rejects(fs.access(lockPath));
+});
+
+test('普通部署模式仍执行停止、启动和 Running Doctor', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-normal-deployment-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const current = path.join(root, 'app', 'current');
+  const next = path.join(root, 'app', 'current.new');
+  const lockPath = path.join(root, 'tmp', 'deploy-current.lock.json');
+  await fs.mkdir(current, { recursive: true });
+  await fs.mkdir(next, { recursive: true });
+  await fs.mkdir(path.join(root, 'extraction-runs'), { recursive: true });
+  await fs.writeFile(path.join(current, 'marker.txt'), 'old');
+  await fs.writeFile(path.join(next, 'marker.txt'), 'new');
+  await fs.writeFile(
+    path.join(next, 'DEPLOYMENT.json'),
+    `${JSON.stringify({ sourceCommit: '6'.repeat(40) })}\n`,
+  );
+
+  const result = runPowerShell(`
+$RuntimeRoot = ${quotePowerShell(root)}
+$RepositoryRoot = ${quotePowerShell(path.resolve('.'))}
+$script:startCalls = 0
+$script:stopCalls = 0
+$script:doctorCalls = 0
+function Get-AmDeploymentService { return [pscustomobject]@{ Status = 'Stopped'; StartType = 'Automatic' } }
+function Resolve-AmGitCommit { return (('6' * 40) -join '') }
+function Stop-AmDeploymentRuntime { param($SelectedOwner, $CurrentPath, $RepoScripts, $Runtime); $script:stopCalls += 1 }
+function Start-AmDeploymentRuntime { param($SelectedOwner, $CurrentPath, $Runtime); $script:startCalls += 1; return $null }
+function Invoke-AmDeploymentDoctor { param($SelectedOwner, $CurrentPath); $script:doctorCalls += 1 }
+function Invoke-AmCurrentManifestVerification { param($CurrentPath) }
+function Update-AmServiceConfigForCurrent { param($ServiceConfigPath, $CurrentPath); return $null }
+function Move-AmLegacyScriptsToArchive { param($Runtime); return $null }
+Invoke-AmDeployment
+if ($script:stopCalls -ne 1) { throw "unexpected stop calls: $script:stopCalls" }
+if ($script:startCalls -ne 1) { throw "unexpected start calls: $script:startCalls" }
+if ($script:doctorCalls -ne 1) { throw "unexpected doctor calls: $script:doctorCalls" }
+`);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /deployment\.keepStopped=false/);
+  assert.equal(await fs.readFile(path.join(current, 'marker.txt'), 'utf8'), 'new');
+  await assert.rejects(fs.access(path.join(root, 'app', 'current.previous')));
+  await assert.rejects(fs.access(lockPath));
+});
+
+test('普通部署切换后失败会停止候选、恢复旧 current 并重启旧 runtime', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-normal-rollback-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const current = path.join(root, 'app', 'current');
+  const next = path.join(root, 'app', 'current.new');
+  const lockPath = path.join(root, 'tmp', 'deploy-current.lock.json');
+  await fs.mkdir(current, { recursive: true });
+  await fs.mkdir(next, { recursive: true });
+  await fs.mkdir(path.join(root, 'extraction-runs'), { recursive: true });
+  await fs.writeFile(path.join(current, 'marker.txt'), 'old');
+  await fs.writeFile(path.join(next, 'marker.txt'), 'new');
+  await fs.writeFile(
+    path.join(next, 'DEPLOYMENT.json'),
+    `${JSON.stringify({ sourceCommit: '7'.repeat(40) })}\n`,
+  );
+
+  const result = runPowerShell(`
+$RuntimeRoot = ${quotePowerShell(root)}
+$RepositoryRoot = ${quotePowerShell(path.resolve('.'))}
+$script:startCalls = 0
+$script:stopCalls = 0
+$script:doctorCalls = 0
+function Get-AmDeploymentService { return [pscustomobject]@{ Status = 'Stopped'; StartType = 'Automatic' } }
+function Resolve-AmGitCommit { return (('7' * 40) -join '') }
+function Stop-AmDeploymentRuntime { param($SelectedOwner, $CurrentPath, $RepoScripts, $Runtime); $script:stopCalls += 1 }
+function Start-AmDeploymentRuntime { param($SelectedOwner, $CurrentPath, $Runtime); $script:startCalls += 1; return $null }
+function Invoke-AmDeploymentDoctor {
+  param($SelectedOwner, $CurrentPath)
+  $script:doctorCalls += 1
+  throw 'injected normal doctor failure'
+}
+function Invoke-AmCurrentManifestVerification { param($CurrentPath) }
+function Update-AmServiceConfigForCurrent { param($ServiceConfigPath, $CurrentPath); return $null }
+function Move-AmLegacyScriptsToArchive { param($Runtime); return $null }
+$caught = $false
+try {
+  Invoke-AmDeployment
+} catch {
+  if (-not $_.Exception.Message.Contains('injected normal doctor failure')) { throw }
+  $caught = $true
+}
+if (-not $caught) { throw 'normal post-switch failure unexpectedly accepted' }
+if ($script:stopCalls -ne 2) { throw "unexpected stop calls: $script:stopCalls" }
+if ($script:startCalls -ne 2) { throw "unexpected start calls: $script:startCalls" }
+if ($script:doctorCalls -ne 1) { throw "unexpected doctor calls: $script:doctorCalls" }
+`);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(await fs.readFile(path.join(current, 'marker.txt'), 'utf8'), 'old');
+  const failed = (await fs.readdir(path.join(root, 'app')))
+    .filter((name) => name.startsWith('current.failed-'));
+  assert.equal(failed.length, 1);
+  await assert.rejects(fs.access(path.join(root, 'app', 'current.previous')));
+  await assert.rejects(fs.access(lockPath));
+});
+
+test('KeepStopped 在切换后源提交漂移时恢复旧 current 且不启动', async (context) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-keep-stopped-source-drift-'));
+  context.after(() => fs.rm(root, { recursive: true, force: true }));
+  const current = path.join(root, 'app', 'current');
+  const next = path.join(root, 'app', 'current.new');
+  const lockPath = path.join(root, 'tmp', 'deploy-current.lock.json');
+  await fs.mkdir(current, { recursive: true });
+  await fs.mkdir(next, { recursive: true });
+  await fs.mkdir(path.join(root, 'extraction-runs'), { recursive: true });
+  await fs.writeFile(path.join(current, 'marker.txt'), 'old');
+  await fs.writeFile(path.join(next, 'marker.txt'), 'new');
+  await fs.writeFile(
+    path.join(next, 'DEPLOYMENT.json'),
+    `${JSON.stringify({ sourceCommit: '8'.repeat(40) })}\n`,
+  );
+
+  const result = runPowerShell(`
+$RuntimeRoot = ${quotePowerShell(root)}
+$RepositoryRoot = ${quotePowerShell(path.resolve('.'))}
+$script:startCalls = 0
+$script:stopCalls = 0
+$script:doctorCalls = 0
+function Get-AmDeploymentService { return [pscustomobject]@{ Status = 'Stopped'; StartType = 'Disabled' } }
+function Resolve-AmGitCommit { return (('8' * 40) -join '') }
+function Invoke-AmStoppedDeploymentDoctor { param($CurrentPath); $script:doctorCalls += 1 }
+function Invoke-AmCurrentManifestVerification {
+  param($CurrentPath)
+  @{ sourceCommit = (('9' * 40) -join '') } |
+    ConvertTo-Json |
+    Set-Content -LiteralPath (Join-Path $CurrentPath 'DEPLOYMENT.json') -Encoding utf8
+}
+function Update-AmServiceConfigForCurrent { param($ServiceConfigPath, $CurrentPath); return $null }
+function Move-AmLegacyScriptsToArchive { param($Runtime); return $null }
+function Start-AmDeploymentRuntime { $script:startCalls += 1; throw 'runtime start is forbidden' }
+function Stop-AmDeploymentRuntime { $script:stopCalls += 1; throw 'runtime stop is forbidden' }
+$caught = $false
+try {
+  Invoke-AmDeployment -KeepStopped -ConfirmAutomationPaused
+} catch {
+  if (-not $_.Exception.Message.Contains('deployed source commit does not match')) { throw }
+  $caught = $true
+}
+if (-not $caught) { throw 'source commit drift unexpectedly accepted' }
+if ($script:doctorCalls -ne 4) { throw "unexpected stopped doctor calls: $script:doctorCalls" }
+if ($script:startCalls -ne 0 -or $script:stopCalls -ne 0) { throw 'runtime lifecycle function was called' }
+`);
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(await fs.readFile(path.join(current, 'marker.txt'), 'utf8'), 'old');
+  const failed = (await fs.readdir(path.join(root, 'app')))
+    .filter((name) => name.startsWith('current.failed-'));
+  assert.equal(failed.length, 1);
+  await assert.rejects(fs.access(path.join(root, 'app', 'current.previous')));
+  await assert.rejects(fs.access(lockPath));
 });

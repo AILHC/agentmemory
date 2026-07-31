@@ -1,6 +1,8 @@
 param(
   [string]$RepositoryRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\..')),
-  [string]$RuntimeRoot = ''
+  [string]$RuntimeRoot = '',
+  [switch]$KeepStopped,
+  [switch]$ConfirmAutomationPaused
 )
 
 $ErrorActionPreference = 'Stop'
@@ -119,9 +121,101 @@ function Exit-AmDeploymentLock {
 function Assert-AmNoExtractionLocks {
   param([Parameter(Mandatory = $true)][string]$ExtractionRunsPath)
   if (-not (Test-Path -LiteralPath $ExtractionRunsPath -PathType Container)) { return }
-  $locks = @(Get-ChildItem -LiteralPath $ExtractionRunsPath -File -Filter '*.lock' -ErrorAction Stop)
+  $locks = @(Get-ChildItem `
+    -LiteralPath $ExtractionRunsPath -Recurse -Force -File -ErrorAction Stop |
+      Where-Object {
+        $_.Name -like '*.lock' -or $_.Name -like '*.lock.json'
+      })
   if ($locks.Count -gt 0) {
-    throw "full extraction lock exists: $($locks[0].Name)"
+    throw "full extraction lock exists: $($locks[0].FullName)"
+  }
+}
+
+function Assert-AmNoExtractionControlRequests {
+  param([Parameter(Mandatory = $true)][string]$ExtractionRunsPath)
+  if (-not (Test-Path -LiteralPath $ExtractionRunsPath -PathType Container)) { return }
+  $requests = @(Get-ChildItem `
+    -LiteralPath $ExtractionRunsPath -Recurse -Force -File -ErrorAction Stop |
+      Where-Object { $_.Name -like '*.drain-request.json' })
+  if ($requests.Count -gt 0) {
+    throw "full extraction control request exists: $($requests[0].FullName)"
+  }
+}
+
+function Assert-AmDeploymentModeArguments {
+  param(
+    [switch]$KeepStopped,
+    [switch]$ConfirmAutomationPaused
+  )
+  if ($KeepStopped -and -not $ConfirmAutomationPaused) {
+    throw '-KeepStopped requires -ConfirmAutomationPaused.'
+  }
+  if (-not $KeepStopped -and $ConfirmAutomationPaused) {
+    throw '-ConfirmAutomationPaused is valid only with -KeepStopped.'
+  }
+}
+
+function Get-AmDeploymentService {
+  return Get-Service -Name 'agentmemory' -ErrorAction Stop
+}
+
+function Assert-AmKeepStoppedServiceState {
+  param([Parameter(Mandatory = $true)]$Service)
+  $stateProperty = $Service.PSObject.Properties['Status']
+  if (-not $stateProperty) {
+    $stateProperty = $Service.PSObject.Properties['State']
+  }
+  $startTypeProperty = $Service.PSObject.Properties['StartType']
+  if (-not $stateProperty -or -not $startTypeProperty) {
+    throw 'keep-stopped service state is unavailable.'
+  }
+  if ([string]$stateProperty.Value -ne 'Stopped') {
+    throw "keep-stopped deployment requires service Stopped, got '$($stateProperty.Value)'."
+  }
+  if ([string]$startTypeProperty.Value -ne 'Disabled') {
+    throw "keep-stopped deployment requires service Disabled, got '$($startTypeProperty.Value)'."
+  }
+}
+
+function Invoke-AmStoppedDeploymentDoctor {
+  param([Parameter(Mandatory = $true)][string]$CurrentPath)
+  $doctor = Join-Path $CurrentPath 'scripts\doctor-agentmemory-console.ps1'
+  if (-not (Test-Path -LiteralPath $doctor -PathType Leaf)) {
+    throw "stopped deployment doctor is missing: $doctor"
+  }
+  Invoke-AmDeploymentCommand -FilePath 'pwsh.exe' -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $doctor,
+    '-ExpectedState', 'Stopped'
+  )
+}
+
+function Assert-AmKeepStoppedPreconditions {
+  param(
+    [Parameter(Mandatory = $true)][string]$CurrentPath,
+    [Parameter(Mandatory = $true)][string]$ExtractionRunsPath,
+    [switch]$ConfirmAutomationPaused
+  )
+  if (-not $ConfirmAutomationPaused) {
+    throw 'keep-stopped deployment requires a paused automation confirmation.'
+  }
+  Assert-AmKeepStoppedServiceState -Service (Get-AmDeploymentService)
+  Assert-AmNoExtractionLocks -ExtractionRunsPath $ExtractionRunsPath
+  Assert-AmNoExtractionControlRequests -ExtractionRunsPath $ExtractionRunsPath
+  Invoke-AmStoppedDeploymentDoctor -CurrentPath $CurrentPath
+}
+
+function Assert-AmCurrentSourceCommit {
+  param(
+    [Parameter(Mandatory = $true)][string]$CurrentPath,
+    [Parameter(Mandatory = $true)][string]$SourceCommit
+  )
+  $manifestPath = Join-Path $CurrentPath 'DEPLOYMENT.json'
+  if (-not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+    throw "deployment manifest is missing: $manifestPath"
+  }
+  $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+  if ([string]$manifest.sourceCommit -cne $SourceCommit) {
+    throw 'deployed source commit does not match the prepared source commit.'
   }
 }
 
@@ -557,12 +651,20 @@ function Resolve-AmDeploymentOwner {
 }
 
 function Invoke-AmDeployment {
+  param(
+    [switch]$KeepStopped,
+    [switch]$ConfirmAutomationPaused
+  )
+  Assert-AmDeploymentModeArguments `
+    -KeepStopped:$KeepStopped `
+    -ConfirmAutomationPaused:$ConfirmAutomationPaused
   $appRoot = Join-Path $RuntimeRoot 'app'
   $current = Join-Path $appRoot 'current'
   $currentNew = Join-Path $appRoot 'current.new'
   $currentPrevious = Join-Path $appRoot 'current.previous'
   $lockPath = Join-Path $RuntimeRoot 'tmp\deploy-current.lock.json'
   $repoScripts = Join-Path $RepositoryRoot 'ops\scripts'
+  $extractionRuns = Join-Path $RuntimeRoot 'extraction-runs'
   foreach ($item in @(
     @{ Path = $current; Name = 'current' },
     @{ Path = $currentNew; Name = 'current.new' },
@@ -573,25 +675,39 @@ function Invoke-AmDeployment {
 
   $deploymentLock = Enter-AmDeploymentLock -LockPath $lockPath
   $switched = $false
+  $restored = $false
   $serviceConfigBackup = $null
   $legacyScriptsArchive = $null
   try {
     $sourceCommit = Resolve-AmGitCommit -Repo $RepositoryRoot -Commit 'HEAD'
     $owner = Resolve-AmDeploymentOwner -Service (
-      Get-Service -Name 'agentmemory' -ErrorAction Stop
+      Get-AmDeploymentService
     )
     Write-Output "deployment.sourceCommit=$sourceCommit"
     Write-Output "deployment.owner=$owner"
-    Assert-AmNoExtractionLocks -ExtractionRunsPath (Join-Path $RuntimeRoot 'extraction-runs')
+    Write-Output "deployment.keepStopped=$(([bool]$KeepStopped).ToString().ToLowerInvariant())"
+    if ($KeepStopped) {
+      Assert-AmKeepStoppedPreconditions `
+        -CurrentPath $current -ExtractionRunsPath $extractionRuns `
+        -ConfirmAutomationPaused:$ConfirmAutomationPaused
+    } else {
+      Assert-AmNoExtractionLocks -ExtractionRunsPath $extractionRuns
+    }
     if (Test-AmPreparedCurrent -CurrentPath $currentNew -SourceCommit $sourceCommit) {
       Write-Output "deployment.prepared=reused"
     } else {
       Prepare-AmCurrent -Repo $RepositoryRoot -Runtime $RuntimeRoot -Commit $sourceCommit
       Invoke-AmCurrentManifestVerification -CurrentPath $currentNew
     }
-    Stop-AmDeploymentRuntime `
-      -SelectedOwner $owner -CurrentPath $current -RepoScripts $repoScripts -Runtime $RuntimeRoot
-    Assert-AmNoExtractionLocks -ExtractionRunsPath (Join-Path $RuntimeRoot 'extraction-runs')
+    if ($KeepStopped) {
+      Assert-AmKeepStoppedPreconditions `
+        -CurrentPath $current -ExtractionRunsPath $extractionRuns `
+        -ConfirmAutomationPaused:$ConfirmAutomationPaused
+    } else {
+      Stop-AmDeploymentRuntime `
+        -SelectedOwner $owner -CurrentPath $current -RepoScripts $repoScripts -Runtime $RuntimeRoot
+      Assert-AmNoExtractionLocks -ExtractionRunsPath $extractionRuns
+    }
     if (Test-Path -LiteralPath $currentPrevious) {
       throw "previous deployment directory already exists: $currentPrevious"
     }
@@ -601,14 +717,22 @@ function Invoke-AmDeployment {
     $serviceConfigBackup = Update-AmServiceConfigForCurrent `
       -ServiceConfigPath (Join-Path $RuntimeRoot 'service\agentmemory.xml') `
       -CurrentPath $current
-    [void](Start-AmDeploymentRuntime -SelectedOwner $owner -CurrentPath $current -Runtime $RuntimeRoot)
-    Invoke-AmDeploymentDoctor -SelectedOwner $owner -CurrentPath $current
+    if ($KeepStopped) {
+      Assert-AmKeepStoppedPreconditions `
+        -CurrentPath $current -ExtractionRunsPath $extractionRuns `
+        -ConfirmAutomationPaused:$ConfirmAutomationPaused
+    } else {
+      [void](Start-AmDeploymentRuntime -SelectedOwner $owner -CurrentPath $current -Runtime $RuntimeRoot)
+      Invoke-AmDeploymentDoctor -SelectedOwner $owner -CurrentPath $current
+    }
     Invoke-AmCurrentManifestVerification -CurrentPath $current
+    Assert-AmCurrentSourceCommit -CurrentPath $current -SourceCommit $sourceCommit
     $legacyScriptsArchive = Move-AmLegacyScriptsToArchive -Runtime $RuntimeRoot
     Remove-Item -LiteralPath $currentPrevious -Recurse -Force
     $switched = $false
     Write-Output 'deployment.result=success'
   } catch {
+    $deploymentError = $_
     if ($legacyScriptsArchive) {
       Restore-AmLegacyScriptsArchive -Runtime $RuntimeRoot -ArchivePath $legacyScriptsArchive
     }
@@ -619,14 +743,28 @@ function Invoke-AmDeployment {
         -Force
     }
     if ($switched -and (Test-Path -LiteralPath $currentPrevious -PathType Container)) {
-      try {
-        Stop-AmDeploymentRuntime `
-          -SelectedOwner $owner -CurrentPath $current -RepoScripts $repoScripts -Runtime $RuntimeRoot
-      } catch {}
+      if (-not $KeepStopped) {
+        try {
+          Stop-AmDeploymentRuntime `
+            -SelectedOwner $owner -CurrentPath $current -RepoScripts $repoScripts -Runtime $RuntimeRoot
+        } catch {}
+      }
       [void](Restore-AmPreviousCurrent -CurrentPath $current -PreviousPath $currentPrevious)
+      $restored = $true
+      if (-not $KeepStopped) {
+        try {
+          [void](Start-AmDeploymentRuntime -SelectedOwner $owner -CurrentPath $current -Runtime $RuntimeRoot)
+        } catch {}
+      }
+    }
+    if ($KeepStopped -and $restored) {
       try {
-        [void](Start-AmDeploymentRuntime -SelectedOwner $owner -CurrentPath $current -Runtime $RuntimeRoot)
-      } catch {}
+        Assert-AmKeepStoppedPreconditions `
+          -CurrentPath $current -ExtractionRunsPath $extractionRuns `
+          -ConfirmAutomationPaused:$ConfirmAutomationPaused
+      } catch {
+        throw "deployment failed: $($deploymentError.Exception.Message); keep-stopped rollback invariant failed: $($_.Exception.Message)"
+      }
     }
     throw
   } finally {
@@ -635,5 +773,7 @@ function Invoke-AmDeployment {
 }
 
 if ($MyInvocation.InvocationName -ne '.') {
-  Invoke-AmDeployment
+  Invoke-AmDeployment `
+    -KeepStopped:$KeepStopped `
+    -ConfirmAutomationPaused:$ConfirmAutomationPaused
 }
