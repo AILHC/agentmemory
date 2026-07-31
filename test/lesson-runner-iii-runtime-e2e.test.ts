@@ -19,12 +19,22 @@ import { StateKV } from "../src/state/kv.js";
 import { KV } from "../src/state/schema.js";
 
 type Boundary =
+  | "extraction run pending"
   | "generation registry"
   | "generation run binding"
+  | "extraction run running"
+  | "extraction operation receipt running"
   | "candidate staging"
   | "candidate run binding"
+  | "commit plan"
+  | "initial committing receipt"
+  | "first formal lesson watermark"
+  | "first progress receipt"
+  | "second formal lesson watermark"
+  | "second progress receipt"
   | "formal lesson watermark"
-  | "committed receipt";
+  | "committed receipt"
+  | "extraction operation receipt succeeded";
 
 interface FaultCase {
   name: Boundary;
@@ -34,7 +44,7 @@ interface FaultCase {
 }
 
 interface AcknowledgedBoundary {
-  boundary: Boundary;
+  boundary: string;
   scope: string;
   key: string;
   value: unknown;
@@ -50,9 +60,20 @@ interface ChildRuntime {
   baseUrl: string;
   port: number;
   acknowledgedBoundaries: AcknowledgedBoundary[];
+  acknowledgedBoundary: Promise<AcknowledgedBoundary>;
+  faultReady: Promise<AcknowledgedBoundary>;
+  continueFault: () => Promise<void>;
   providerCalls: () => number;
   apiResponses: () => any[];
+  stateWrites: () => ObservedStateWrite[];
   exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
+}
+
+interface ObservedStateWrite {
+  index: number;
+  scope: string;
+  key: string;
+  boundaries: Boundary[];
 }
 
 interface EngineRuntime {
@@ -60,6 +81,7 @@ interface EngineRuntime {
   port: number;
   url: string;
   stateDir: string;
+  saveIntervalMs: number;
   exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 }
 
@@ -98,7 +120,7 @@ async function freePort() {
   return address.port;
 }
 
-function engineConfig(port: number, stateDir: string) {
+function engineConfig(port: number, stateDir: string, saveIntervalMs: number) {
   return [
     "workers:",
     "  - name: iii-worker-manager",
@@ -112,18 +134,22 @@ function engineConfig(port: number, stateDir: string) {
     "        config:",
     "          store_method: file_based",
     `          file_path: ${JSON.stringify(stateDir.replaceAll("\\", "/"))}`,
-    "          save_interval_ms: 10",
+    `          save_interval_ms: ${saveIntervalMs}`,
     "",
   ].join("\n");
 }
 
-async function startEngine(root: string, requestedPort?: number): Promise<EngineRuntime> {
+async function startEngine(
+  root: string,
+  requestedPort?: number,
+  saveIntervalMs = 10,
+): Promise<EngineRuntime> {
   if (!enginePath) throw new Error("test_iii_engine_path_missing");
   const port = requestedPort ?? await freePort();
   const stateDir = join(root, "iii-state");
   const configPath = join(root, "iii-config.yaml");
   await mkdir(stateDir, { recursive: true });
-  await writeFile(configPath, engineConfig(port, stateDir), "utf8");
+  await writeFile(configPath, engineConfig(port, stateDir, saveIntervalMs), "utf8");
   const child = spawn(enginePath, ["--no-update-check", "--config", configPath], {
     cwd: root,
     env: safeEngineEnvironment(),
@@ -133,7 +159,14 @@ async function startEngine(root: string, requestedPort?: number): Promise<Engine
   const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
     child.once("exit", (code, signal) => resolve({ code, signal }));
   });
-  return { child, port, url: `ws://127.0.0.1:${port}`, stateDir, exit };
+  return {
+    child,
+    port,
+    url: `ws://127.0.0.1:${port}`,
+    stateDir,
+    saveIntervalMs,
+    exit,
+  };
 }
 
 async function seedEngine(engine: EngineRuntime) {
@@ -210,18 +243,38 @@ async function stopEngine(engine: EngineRuntime) {
   ]);
 }
 
+async function forceStopEngine(engine: EngineRuntime) {
+  if (engine.child.exitCode === null && engine.child.signalCode === null) {
+    engine.child.kill("SIGKILL");
+  }
+  await within("engine-forced-shutdown", engine.exit, 10_000);
+}
+
 async function startRuntime({
   engine,
   fault,
+  faultIndex,
   port,
+  pauseBeforeFault = false,
 }: {
   engine: EngineRuntime;
   fault?: Boundary;
+  faultIndex?: number;
   port?: number;
+  pauseBeforeFault?: boolean;
 }): Promise<ChildRuntime> {
   const acknowledgedBoundaries: AcknowledgedBoundary[] = [];
+  let resolveAcknowledgedBoundary!: (boundary: AcknowledgedBoundary) => void;
+  let resolveFaultReady!: (boundary: AcknowledgedBoundary) => void;
+  const acknowledgedBoundary = new Promise<AcknowledgedBoundary>((resolve) => {
+    resolveAcknowledgedBoundary = resolve;
+  });
+  const faultReady = new Promise<AcknowledgedBoundary>((resolve) => {
+    resolveFaultReady = resolve;
+  });
   let providerCallCount = 0;
   const apiResponses: any[] = [];
+  const stateWrites: ObservedStateWrite[] = [];
   const child = fork(fixturePath, [], {
     execArgv: ["--import", "tsx"],
     silent: true,
@@ -231,6 +284,12 @@ async function startRuntime({
       AGENTMEMORY_TEST_RUNTIME_SECRET: "temporary-test-secret",
       ...(port ? { AGENTMEMORY_TEST_RUNTIME_PORT: String(port) } : {}),
       ...(fault ? { AGENTMEMORY_TEST_RUNTIME_FAULT: fault } : {}),
+      ...(faultIndex === undefined
+        ? {}
+        : { AGENTMEMORY_TEST_RUNTIME_FAULT_INDEX: String(faultIndex) }),
+      ...(pauseBeforeFault
+        ? { AGENTMEMORY_TEST_RUNTIME_PAUSE_BEFORE_FAULT: "1" }
+        : {}),
     },
   });
   const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
@@ -248,7 +307,17 @@ async function startRuntime({
       child.stderr?.on("data", (chunk) => stderr.push(chunk.toString()));
       child.on("message", (message: any) => {
         if (message?.type === "fault-acknowledged") {
-          acknowledgedBoundaries.push({
+          const boundary = {
+            boundary: message.boundary,
+            scope: message.scope,
+            key: message.key,
+            value: message.value,
+          };
+          acknowledgedBoundaries.push(boundary);
+          resolveAcknowledgedBoundary(boundary);
+        }
+        if (message?.type === "fault-ready") {
+          resolveFaultReady({
             boundary: message.boundary,
             scope: message.scope,
             key: message.key,
@@ -256,6 +325,14 @@ async function startRuntime({
           });
         }
         if (message?.type === "provider-call") providerCallCount += 1;
+        if (message?.type === "state-set-observed") {
+          stateWrites.push({
+            index: message.index,
+            scope: message.scope,
+            key: message.key,
+            boundaries: message.boundaries,
+          });
+        }
         if (message?.type === "api-response" || message?.type === "api-error") {
           apiResponses.push(message);
         }
@@ -278,8 +355,19 @@ async function startRuntime({
     baseUrl,
     port: Number(new URL(baseUrl).port),
     acknowledgedBoundaries,
+    acknowledgedBoundary,
+    faultReady,
+    continueFault: async () => {
+      await new Promise<void>((resolve, reject) => {
+        child.send(
+          { type: "continue-fault" },
+          (error) => error ? reject(error) : resolve(),
+        );
+      });
+    },
     providerCalls: () => providerCallCount,
     apiResponses: () => [...apiResponses],
+    stateWrites: () => structuredClone(stateWrites),
     exit,
   };
 }
@@ -294,6 +382,13 @@ async function stopRuntime(runtime: ChildRuntime) {
     await within("runtime-forced-shutdown", runtime.exit, 5_000).catch(() => {});
     throw error;
   }
+}
+
+async function forceStopRuntime(runtime: ChildRuntime) {
+  if (runtime.child.exitCode === null && runtime.child.signalCode === null) {
+    runtime.child.kill("SIGKILL");
+  }
+  await within("runtime-forced-shutdown", runtime.exit, 10_000);
 }
 
 async function within<T>(phase: string, promise: Promise<T>, milliseconds: number): Promise<T> {
@@ -326,6 +421,14 @@ async function readRuntimeValue(runtime: ChildRuntime, scope: string, key: strin
   const response = await fetch(url);
   if (!response.ok) throw new Error(`test_iii_runtime_value_http_${response.status}`);
   return (await response.json() as { value: unknown }).value;
+}
+
+async function deleteRuntimeValue(runtime: ChildRuntime, scope: string, key: string) {
+  const url = new URL("/__test/value", runtime.baseUrl);
+  url.searchParams.set("scope", scope);
+  url.searchParams.set("key", key);
+  const response = await fetch(url, { method: "DELETE" });
+  if (!response.ok) throw new Error(`test_iii_runtime_delete_http_${response.status}`);
 }
 
 function values<T = any>(snapshot: RuntimeSnapshot, scope: string) {
@@ -424,7 +527,7 @@ function summaryResponse({ attemptId, inputHash }: { attemptId: string; inputHas
         kind: "committed",
         receiptKey: `xop_${stableHash({ attemptId, inputHash }).slice(0, 32)}`,
         receiptVersion: 1,
-        resultRef: `summary-resumable-runs:${resumableRunId}`,
+        resultRef: `mem:summary-resumable:runs:${resumableRunId}`,
         effectHash: stableHash({ title, narrative: "", keyDecisions: [], filesModified: [], concepts: [] }),
       },
     },
@@ -436,6 +539,255 @@ function testDependencies() {
     v2RemainingStages: false,
     v2SummaryRemote: { advance: summaryResponse, record: async () => {} },
   };
+}
+
+const DURABILITY_SAVE_INTERVAL_MS = 2_000;
+const CRITICAL_STATEKV_BOUNDARIES = [
+  "extraction run pending",
+  "generation registry",
+  "generation run binding",
+  "extraction run running",
+  "extraction operation receipt running",
+  "candidate staging",
+  "candidate run binding",
+  "commit plan",
+  "initial committing receipt",
+  "first formal lesson watermark",
+  "first progress receipt",
+  "second formal lesson watermark",
+  "second progress receipt",
+  "committed receipt",
+  "extraction operation receipt succeeded",
+] as const satisfies readonly Boundary[];
+
+interface DurabilityScenarioResult {
+  boundary: string;
+  acknowledged: AcknowledgedBoundary;
+  persistedAfterCrash: unknown;
+  providerCalls: number;
+  exitCode: number;
+  snapshot: RuntimeSnapshot;
+  journal: any[];
+  control: any[];
+  acknowledgedWrites: ObservedStateWrite[];
+  safeStatus: ReturnType<typeof projectSafeRecoveryStatus>;
+}
+
+async function assertRealIiiBinary() {
+  if (!enginePath) throw new Error("test_iii_engine_path_missing");
+  assertPinnedIiiVersionOutput(
+    (await execFileAsync(enginePath, ["--version"], { windowsHide: true })).stdout,
+  );
+  expect(createHash("sha256").update(await readFile(enginePath)).digest("hex"))
+    .toBe(PINNED_III_ENGINE_SHA256);
+}
+
+async function runDurabilityScenario(
+  target: Boundary | { index: number },
+  { recover = true }: { recover?: boolean } = {},
+): Promise<DurabilityScenarioResult> {
+  const boundary = typeof target === "string"
+    ? target
+    : `state set #${target.index}`;
+  await assertRealIiiBinary();
+  process.env.AGENTMEMORY_SECRET = "temporary-test-secret";
+  process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
+  const root = await mkdtemp(join(tmpdir(), "agentmemory-lessons-real-iii-durability-"));
+  const runnerStateDir = join(root, "runner-state");
+  const runId = `real-iii-durability-${boundary.replaceAll(" ", "-")}`;
+  const sessionId = "temporary-real-iii-runtime-session";
+  const argv = [
+    "--base-url",
+    "placeholder",
+    "--state-dir",
+    runnerStateDir,
+    "--run-id",
+    runId,
+    "--mark",
+    runId,
+    "--run-state-format",
+    "v2",
+  ];
+  let engine: EngineRuntime | null = null;
+  let runtime: ChildRuntime | null = null;
+  let providerCalls = 0;
+  try {
+    engine = await startEngine(root);
+    await seedEngine(engine);
+    const enginePort = engine.port;
+    await stopEngine(engine);
+    engine = await startEngine(root, enginePort, DURABILITY_SAVE_INTERVAL_MS);
+    runtime = await startRuntime({
+      engine,
+      ...(typeof target === "string"
+        ? { fault: target }
+        : { faultIndex: target.index }),
+      pauseBeforeFault: true,
+    });
+    const runtimePort = runtime.port;
+    argv[1] = runtime.baseUrl;
+    const faultRun = within(
+      `durability-fault-run:${boundary}`,
+      mainForTest(argv, testDependencies()),
+      30_000,
+    ).then(
+      (exitCode) => ({ exitCode, error: undefined }),
+      (error) => ({ exitCode: undefined, error }),
+    );
+    const ready = await within(
+      `durability-fault-ready:${boundary}`,
+      runtime.faultReady,
+      30_000,
+    );
+    expect(ready.boundary).toBe(boundary);
+    await new Promise((resolve) =>
+      setTimeout(resolve, DURABILITY_SAVE_INTERVAL_MS + 500));
+    await waitForStateDirectoryStable(engine);
+    await runtime.continueFault();
+    const acknowledged = await within(
+      `durability-fault-acknowledged:${boundary}`,
+      runtime.acknowledgedBoundary,
+      10_000,
+    );
+    expect(acknowledged.boundary).toBe(boundary);
+    const acknowledgedWrites = runtime.stateWrites();
+    providerCalls += runtime.providerCalls();
+    await Promise.all([
+      forceStopRuntime(runtime),
+      forceStopEngine(engine),
+    ]);
+    await faultRun;
+
+    engine = await startEngine(root, enginePort);
+    runtime = await startRuntime({ engine, port: runtimePort });
+    argv[1] = runtime.baseUrl;
+    const persistedAfterCrash = await readRuntimeValue(
+      runtime,
+      acknowledged.scope,
+      acknowledged.key,
+    );
+    let exitCode = 75;
+    if (recover) {
+      for (let attempt = 0; attempt < 8 && exitCode === 75; attempt += 1) {
+        exitCode = await within(
+          `durability-resume:${boundary}:${attempt}`,
+          mainForTest([...argv, "--resume"], testDependencies()),
+          30_000,
+        );
+        if (exitCode === 75 && attempt < 7) {
+          providerCalls += runtime.providerCalls();
+          await stopRuntime(runtime);
+          runtime = await startRuntime({ engine, port: runtimePort });
+          argv[1] = runtime.baseUrl;
+        }
+      }
+    }
+    providerCalls += runtime.providerCalls();
+    const snapshot = await readRuntimeSnapshot(runtime);
+    const journal = (await readFile(
+      join(runnerStateDir, `${runId}.v2`, "lessons.jsonl"),
+      "utf8",
+    )).trim().split("\n").filter(Boolean).map(JSON.parse);
+    const control = (await readFile(
+      join(runnerStateDir, `${runId}.v2`, "control.jsonl"),
+      "utf8",
+    )).trim().split("\n").filter(Boolean).map(JSON.parse);
+    return {
+      boundary,
+      acknowledged,
+      persistedAfterCrash,
+      providerCalls,
+      exitCode,
+      snapshot,
+      journal,
+      control,
+      acknowledgedWrites,
+      safeStatus: projectSafeRecoveryStatus({
+        runId,
+        controlEvents: control,
+        stageEvents: { lessons: journal },
+        requiredStages: ["lessons"],
+      }),
+    };
+  } finally {
+    try {
+      if (runtime) await stopRuntime(runtime).catch(() => {});
+    } finally {
+      try {
+        if (engine) await stopEngine(engine).catch(() => {});
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  }
+}
+
+async function observeSuccessfulStateWrites(): Promise<ObservedStateWrite[]> {
+  await assertRealIiiBinary();
+  process.env.AGENTMEMORY_SECRET = "temporary-test-secret";
+  process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
+  const root = await mkdtemp(join(
+    tmpdir(),
+    "agentmemory-lessons-real-iii-write-inventory-",
+  ));
+  const runnerStateDir = join(root, "runner-state");
+  const runId = "real-iii-state-write-inventory";
+  const argv = [
+    "--base-url",
+    "placeholder",
+    "--state-dir",
+    runnerStateDir,
+    "--run-id",
+    runId,
+    "--mark",
+    runId,
+    "--run-state-format",
+    "v2",
+  ];
+  let engine: EngineRuntime | null = null;
+  let runtime: ChildRuntime | null = null;
+  try {
+    engine = await startEngine(root);
+    await seedEngine(engine);
+    const enginePort = engine.port;
+    await stopEngine(engine);
+    engine = await startEngine(root, enginePort);
+    runtime = await startRuntime({ engine });
+    argv[1] = runtime.baseUrl;
+    expect(await within(
+      "state-write-inventory-run",
+      mainForTest(argv, testDependencies()),
+      30_000,
+    )).toBe(0);
+    return runtime.stateWrites();
+  } finally {
+    try {
+      if (runtime) await stopRuntime(runtime).catch(() => {});
+    } finally {
+      try {
+        if (engine) await stopEngine(engine).catch(() => {});
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  }
+}
+
+function observedStateWriteKind(write: Pick<ObservedStateWrite, "scope">) {
+  for (const prefix of [
+    "mem:extraction-operation-receipt:",
+    "mem:lesson-extraction:generation:",
+    "mem:lesson-extraction:candidates:",
+    "mem:lesson-commit:plans:",
+    "mem:lesson-commit:receipts:",
+    "mem:extraction-run-metadata:",
+    "mem:extraction-run-manifest:",
+    "mem:extraction-run-record:",
+    "mem:extraction-run-audit-event:",
+  ]) {
+    if (write.scope.startsWith(prefix)) return prefix;
+  }
+  return write.scope;
 }
 
 realDescribe("Lessons real iii file_based recovery seam", () => {
@@ -688,5 +1040,246 @@ realDescribe("Lessons real iii file_based recovery seam", () => {
       }
     }
   }, 180_000);
+
+  it("proves a StateKV acknowledgement is not durability proof", async () => {
+    const result = await runDurabilityScenario("generation registry", {
+      recover: false,
+    });
+    expect(result.acknowledged.value).toBeDefined();
+    expect(result.persistedAfterCrash).not.toEqual(result.acknowledged.value);
+    expect(result.providerCalls).toBe(0);
+  }, 180_000);
+
+  it("recovers or requests exact reconciliation at every observed StateKV write acknowledgement boundary", async () => {
+    const inventory = await observeSuccessfulStateWrites();
+    expect(inventory.map((write) => write.index))
+      .toEqual(inventory.map((_, index) => index));
+    expect(inventory.length).toBeGreaterThan(CRITICAL_STATEKV_BOUNDARIES.length);
+    for (const expectedWrite of inventory) {
+      const label = `${expectedWrite.index}:${expectedWrite.scope}:${expectedWrite.boundaries.join(",") || "unclassified"}`;
+      const result = await runDurabilityScenario({
+        index: expectedWrite.index,
+      });
+      expect(result.acknowledged, label).toMatchObject({
+        boundary: `state set #${expectedWrite.index}`,
+      });
+      expect(observedStateWriteKind(result.acknowledged), label)
+        .toBe(observedStateWriteKind(expectedWrite));
+      expect(result.providerCalls, label).toBeLessThanOrEqual(1);
+      const lessons = values<any>(result.snapshot, KV.lessons);
+      const receiptScope = Object.keys(result.snapshot.scopes)
+        .find((scope) => scope.startsWith("mem:lesson-commit:receipts:"));
+      const receipts = receiptScope
+        ? values<any>(result.snapshot, receiptScope)
+        : [];
+      expect(receipts.length, label).toBeLessThanOrEqual(1);
+      const terminalEvent = result.journal.at(-1);
+      expect({
+        index: result.acknowledgedWrites.at(-1)?.index,
+        kind: observedStateWriteKind(result.acknowledgedWrites.at(-1)!),
+        boundaries: result.acknowledgedWrites.at(-1)?.boundaries,
+      }, label).toEqual({
+        index: expectedWrite.index,
+        kind: observedStateWriteKind(expectedWrite),
+        boundaries: expectedWrite.boundaries,
+      });
+      expect(
+        result.journal.some((event) => (
+          event.type === "unit_terminal"
+          && event.payload?.status === "failed"
+        )),
+        label,
+      ).toBe(false);
+      if (result.exitCode === 75) {
+        expect(result.safeStatus.run_status, label).toBe("waiting");
+        expect(terminalEvent?.type, label)
+          .toBe("unit_reconciliation_requested");
+        expect(terminalEvent?.payload?.decision?.action, label)
+          .toBe("reconcile");
+        expect(terminalEvent?.payload, label).toMatchObject({
+          receipt_key: expect.any(String),
+          receipt_input_hash: expect.stringMatching(/^[0-9a-f]{64}$/),
+          receipt_started_at: expect.any(String),
+        });
+        continue;
+      }
+      expect(result.exitCode, label).toBe(0);
+      expect(lessons, label).toHaveLength(2);
+      expect(receipts, label).toHaveLength(1);
+      expect(receipts[0], label).toMatchObject({
+        status: "committed",
+        appliedLessonIds: expect.arrayContaining(
+          lessons.map((lesson) => lesson.id),
+        ),
+      });
+      for (const lesson of lessons) {
+        expect(lesson.reinforcements, label).toBe(0);
+        expect(
+          lesson.sourceWatermarks?.["temporary-real-iii-runtime-session"],
+          label,
+        ).toBeDefined();
+      }
+      expect(result.safeStatus, label).toMatchObject({
+        run_status: "completed",
+        counts: { succeeded: 1 },
+      });
+    }
+  }, 900_000);
+
+  it("resumes a committed receipt with a missing formal watermark without repeating provider or effects", async () => {
+    await assertRealIiiBinary();
+    process.env.AGENTMEMORY_SECRET = "temporary-test-secret";
+    process.env.SUMMARIZE_CHUNK_CONCURRENCY = "1";
+    const root = await mkdtemp(join(
+      tmpdir(),
+      "agentmemory-lessons-real-iii-missing-watermark-",
+    ));
+    const runnerStateDir = join(root, "runner-state");
+    const runId = "real-iii-committed-receipt-missing-watermark";
+    const argv = [
+      "--base-url",
+      "placeholder",
+      "--state-dir",
+      runnerStateDir,
+      "--run-id",
+      runId,
+      "--mark",
+      runId,
+      "--run-state-format",
+      "v2",
+    ];
+    let engine: EngineRuntime | null = null;
+    let runtime: ChildRuntime | null = null;
+    let providerCalls = 0;
+    try {
+      engine = await startEngine(root);
+      await seedEngine(engine);
+      const enginePort = engine.port;
+      await stopEngine(engine);
+      engine = await startEngine(root, enginePort);
+      runtime = await startRuntime({
+        engine,
+        fault: "committed receipt",
+        pauseBeforeFault: true,
+      });
+      const runtimePort = runtime.port;
+      argv[1] = runtime.baseUrl;
+      const faultRun = within(
+        "missing-watermark-fault-run",
+        mainForTest(argv, testDependencies()),
+        30_000,
+      ).then(
+        (exitCode) => ({ exitCode, error: undefined }),
+        (error) => ({ exitCode: undefined, error }),
+      );
+      const ready = await within(
+        "missing-watermark-committed-ready",
+        runtime.faultReady,
+        30_000,
+      );
+      expect(ready.boundary).toBe("committed receipt");
+      providerCalls += runtime.providerCalls();
+      expect(providerCalls).toBe(1);
+      const baseline = await readRuntimeSnapshot(runtime);
+      const lessons = values<any>(baseline, KV.lessons);
+      expect(lessons).toHaveLength(2);
+      const removed = lessons[0];
+      await deleteRuntimeValue(runtime, KV.lessons, removed.id);
+      expect(await readRuntimeValue(runtime, KV.lessons, removed.id)).toBeUndefined();
+      await waitForScopePersistence(engine, KV.lessons);
+      await waitForStateDirectoryStable(engine);
+      await runtime.continueFault();
+      const acknowledged = await within(
+        "missing-watermark-committed-acknowledged",
+        runtime.acknowledgedBoundary,
+        10_000,
+      );
+      expect(acknowledged.boundary).toBe("committed receipt");
+      expect(await within("missing-watermark-runtime-exit", runtime.exit, 5_000))
+        .toEqual({ code: 86, signal: null });
+      await waitForScopePersistence(engine, acknowledged.scope);
+      await waitForStateDirectoryStable(engine);
+      await faultRun;
+      await stopEngine(engine);
+
+      engine = await startEngine(root, enginePort);
+      runtime = await startRuntime({ engine, port: runtimePort });
+      argv[1] = runtime.baseUrl;
+      expect(await readRuntimeValue(runtime, KV.lessons, removed.id)).toBeUndefined();
+      expect(await readRuntimeValue(
+        runtime,
+        acknowledged.scope,
+        acknowledged.key,
+      ))
+        .toMatchObject({ status: "committed" });
+      const recoveryProviderCallsBefore = providerCalls;
+      const recoveryWriteOffset = runtime.stateWrites().length;
+      let exitCode = 75;
+      for (let attempt = 0; attempt < 8 && exitCode === 75; attempt += 1) {
+        exitCode = await within(
+          `missing-watermark-resume:${attempt}`,
+          mainForTest([...argv, "--resume"], testDependencies()),
+          30_000,
+        );
+        if (exitCode === 75 && attempt < 7) {
+          providerCalls += runtime.providerCalls();
+          await stopRuntime(runtime);
+          runtime = await startRuntime({ engine, port: runtimePort });
+          argv[1] = runtime.baseUrl;
+        }
+      }
+      providerCalls += runtime.providerCalls();
+      expect(exitCode).toBe(0);
+      expect(providerCalls).toBe(recoveryProviderCallsBefore);
+      const recoveryWrites = runtime.stateWrites().slice(recoveryWriteOffset);
+      expect(recoveryWrites
+        .filter((write) => write.scope === KV.lessons)
+        .map(({ scope, key, boundaries }) => ({ scope, key, boundaries })))
+        .toEqual([{
+          scope: KV.lessons,
+          key: removed.id,
+          boundaries: ["first formal lesson watermark"],
+        }]);
+      const recoveryReceiptWrites = recoveryWrites.filter((write) =>
+        write.scope.startsWith("mem:lesson-commit:receipts:"));
+      expect(recoveryReceiptWrites.length).toBeGreaterThan(0);
+      expect(new Set(recoveryReceiptWrites.map((write) => write.key)).size)
+        .toBe(1);
+      expect(recoveryReceiptWrites.every((write) =>
+        write.key === acknowledged.key)).toBe(true);
+      const recovered = await readRuntimeSnapshot(runtime);
+      const recoveredLessons = values<any>(recovered, KV.lessons);
+      expect(recoveredLessons).toHaveLength(2);
+      expect(recoveredLessons.map((lesson) => lesson.id))
+        .toEqual(expect.arrayContaining(lessons.map((lesson) => lesson.id)));
+      expect(await readRuntimeValue(
+        runtime,
+        acknowledged.scope,
+        acknowledged.key,
+      ))
+        .toMatchObject({
+          status: "committed",
+          appliedLessonIds: expect.arrayContaining(
+            recoveredLessons.map((lesson) => lesson.id),
+          ),
+        });
+      for (const lesson of recoveredLessons) {
+        expect(lesson.reinforcements).toBe(0);
+        expect(
+          lesson.sourceWatermarks?.["temporary-real-iii-runtime-session"],
+        ).toBeDefined();
+      }
+    } finally {
+      try {
+        if (runtime) await stopRuntime(runtime).catch(() => {});
+      } finally {
+        try {
+          if (engine) await stopEngine(engine).catch(() => {});
+        } finally {
+          await rm(root, { recursive: true, force: true });
+        }
+      }
+    }
+  }, 300_000);
 
 });

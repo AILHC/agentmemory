@@ -9,19 +9,51 @@ import { KV } from "../../src/state/schema.js";
 import type { MemoryProvider } from "../../src/types.js";
 
 type Boundary =
+  | "extraction run pending"
   | "generation registry"
   | "generation run binding"
+  | "extraction run running"
+  | "extraction operation receipt running"
   | "candidate staging"
   | "candidate run binding"
+  | "commit plan"
+  | "initial committing receipt"
+  | "first formal lesson watermark"
+  | "first progress receipt"
+  | "second formal lesson watermark"
+  | "second progress receipt"
   | "formal lesson watermark"
-  | "committed receipt";
+  | "committed receipt"
+  | "extraction operation receipt succeeded";
 
 type Handler = (input: any) => Promise<any>;
+
+const observedBoundaryOrder: Boundary[] = [
+  "extraction run pending",
+  "generation registry",
+  "generation run binding",
+  "extraction run running",
+  "extraction operation receipt running",
+  "candidate staging",
+  "candidate run binding",
+  "commit plan",
+  "initial committing receipt",
+  "first formal lesson watermark",
+  "first progress receipt",
+  "second formal lesson watermark",
+  "second progress receipt",
+  "committed receipt",
+  "extraction operation receipt succeeded",
+];
 
 const engineUrl = process.env.AGENTMEMORY_TEST_III_ENGINE_URL;
 const secret = process.env.AGENTMEMORY_TEST_RUNTIME_SECRET;
 const requestedPort = Number(process.env.AGENTMEMORY_TEST_RUNTIME_PORT || "0");
 const faultBoundary = process.env.AGENTMEMORY_TEST_RUNTIME_FAULT as Boundary | undefined;
+const faultIndex = process.env.AGENTMEMORY_TEST_RUNTIME_FAULT_INDEX === undefined
+  ? undefined
+  : Number(process.env.AGENTMEMORY_TEST_RUNTIME_FAULT_INDEX);
+const pauseBeforeFault = process.env.AGENTMEMORY_TEST_RUNTIME_PAUSE_BEFORE_FAULT === "1";
 const metadataScope = "test:lesson-iii-runtime:metadata";
 
 if (!engineUrl || !secret) throw new Error("test_iii_runtime_configuration_missing");
@@ -55,36 +87,96 @@ async function waitForState() {
   throw new Error("test_iii_state_not_ready", { cause: lastError });
 }
 
-function matchesBoundary(boundary: Boundary, scope: string, value: any) {
+function matchesBoundary(
+  boundary: Boundary,
+  scope: string,
+  value: any,
+  formalLessonWriteCount: number,
+) {
   switch (boundary) {
+    case "extraction run pending":
+      return scope === KV.lessonExtractionRuns
+        && value?.status === "pending"
+        && value?.extractionGeneration === undefined;
     case "generation registry":
       return scope.startsWith("mem:lesson-extraction:generation:");
     case "generation run binding":
       return scope === KV.lessonExtractionRuns
         && Number.isSafeInteger(value?.extractionGeneration)
         && value.extractionGeneration > 0
+        && value?.status === "pending"
         && value.candidateStagingId === undefined;
+    case "extraction run running":
+      return scope === KV.lessonExtractionRuns
+        && value?.status === "running"
+        && Number.isSafeInteger(value?.extractionGeneration);
+    case "extraction operation receipt running":
+      return scope.startsWith("mem:extraction-operation-receipt:")
+        && value?.status === "running";
     case "candidate staging":
       return scope.startsWith("mem:lesson-extraction:candidates:");
     case "candidate run binding":
       return scope === KV.lessonExtractionRuns
         && value?.status === "succeeded"
         && typeof value?.candidateStagingId === "string";
+    case "commit plan":
+      return scope.startsWith("mem:lesson-commit:plans:");
+    case "initial committing receipt":
+      return scope.startsWith("mem:lesson-commit:receipts:")
+        && value?.status === "committing"
+        && value?.appliedLessonIds?.length === 0;
+    case "first formal lesson watermark":
+      return scope === KV.lessons && formalLessonWriteCount === 0;
+    case "first progress receipt":
+      return scope.startsWith("mem:lesson-commit:receipts:")
+        && value?.status === "committing"
+        && value?.appliedLessonIds?.length === 1;
+    case "second formal lesson watermark":
+      return scope === KV.lessons && formalLessonWriteCount === 1;
+    case "second progress receipt":
+      return scope.startsWith("mem:lesson-commit:receipts:")
+        && value?.status === "committing"
+        && value?.appliedLessonIds?.length === 2;
     case "formal lesson watermark":
       return scope === KV.lessons;
     case "committed receipt":
       return scope.startsWith("mem:lesson-commit:receipts:")
         && value?.status === "committed";
+    case "extraction operation receipt succeeded":
+      return scope.startsWith("mem:extraction-operation-receipt:")
+        && value?.status === "succeeded";
   }
 }
 
 let armed = false;
 let faultTriggered = false;
+let formalLessonWriteCount = 0;
+let stateSetCount = 0;
+let continueFault: (() => void) | null = null;
 const functions = new Map<string, Handler>();
 const rawTrigger = sdk.trigger.bind(sdk);
 
+async function waitUntilFaultMayContinue(
+  boundary: string,
+  scope: string,
+  key: string,
+  value: unknown,
+) {
+  if (!process.send) throw new Error("test_iii_runtime_ipc_missing");
+  await new Promise<void>((resolve, reject) => {
+    process.send?.(
+      { type: "fault-ready", boundary, scope, key, value },
+      (error) => error ? reject(error) : resolve(),
+    );
+  });
+  await new Promise<void>((resolve) => {
+    continueFault = resolve;
+  });
+  continueFault = null;
+}
+
 async function terminateAfterAcknowledgedBoundary(
-  boundary: Boundary,
+  boundary: string,
   scope: string,
   key: string,
   value: unknown,
@@ -98,6 +190,21 @@ async function terminateAfterAcknowledgedBoundary(
   });
   process.exit(86);
   return new Promise<never>(() => {});
+}
+
+async function reportStateSet(
+  index: number,
+  scope: string,
+  key: string,
+  boundaries: Boundary[],
+) {
+  if (!process.send) throw new Error("test_iii_runtime_ipc_missing");
+  await new Promise<void>((resolve, reject) => {
+    process.send?.(
+      { type: "state-set-observed", index, scope, key, boundaries },
+      (error) => error ? reject(error) : resolve(),
+    );
+  });
 }
 
 const faultingSdk = new Proxy(sdk as any, {
@@ -120,14 +227,63 @@ const faultingSdk = new Proxy(sdk as any, {
         if (!handler) throw new Error(`test_iii_runtime_missing_function:${functionId}`);
         return handler(data);
       }
+      const currentStateSetIndex = functionId === "state::set" && armed
+        ? stateSetCount++
+        : undefined;
+      const observedBoundaries = currentStateSetIndex !== undefined
+        ? observedBoundaryOrder.filter((boundary) => matchesBoundary(
+            boundary,
+            data?.scope,
+            data?.value,
+            formalLessonWriteCount,
+          ))
+        : [];
+      const shouldFault = Boolean(
+        armed
+        && !faultTriggered
+        && functionId === "state::set"
+        && (
+          currentStateSetIndex === faultIndex
+          || (
+            faultBoundary
+            && matchesBoundary(
+              faultBoundary,
+              data?.scope,
+              data?.value,
+              formalLessonWriteCount,
+            )
+          )
+        )
+      );
+      const faultLabel = faultBoundary
+        ?? `state set #${currentStateSetIndex}`;
+      if (shouldFault && pauseBeforeFault) {
+        faultTriggered = true;
+        await waitUntilFaultMayContinue(
+          faultLabel,
+          data.scope,
+          data.key,
+          data.value,
+        );
+      }
       const result = typeof input === "string"
         ? await rawTrigger(input, payload)
         : await rawTrigger(input);
-      if (armed && !faultTriggered && faultBoundary && functionId === "state::set"
-        && matchesBoundary(faultBoundary, data?.scope, data?.value)) {
+      if (functionId === "state::set" && armed) {
+        await reportStateSet(
+          currentStateSetIndex!,
+          data.scope,
+          data.key,
+          observedBoundaries,
+        );
+      }
+      if (functionId === "state::set" && data?.scope === KV.lessons) {
+        formalLessonWriteCount += 1;
+      }
+      if (shouldFault) {
         faultTriggered = true;
         return terminateAfterAcknowledgedBoundary(
-          faultBoundary,
+          faultLabel,
           data.scope,
           data.key,
           data.value,
@@ -228,6 +384,17 @@ const server = createServer(async (request, response) => {
       response.end(JSON.stringify({ value: await kv.get(scope, key) }));
       return;
     }
+    if (request.method === "DELETE" && url.pathname === "/__test/value") {
+      const scope = url.searchParams.get("scope");
+      const key = url.searchParams.get("key");
+      if (!scope || !key) {
+        response.writeHead(400).end();
+        return;
+      }
+      await kv.delete(scope, key);
+      response.writeHead(204).end();
+      return;
+    }
     if (request.method === "GET" && url.pathname === "/__test/state") {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(await stateSnapshot()));
@@ -274,6 +441,10 @@ server.listen(requestedPort, "127.0.0.1", () => {
 });
 
 process.on("message", (message: any) => {
+  if (message?.type === "continue-fault") {
+    continueFault?.();
+    return;
+  }
   if (message?.type !== "shutdown") return;
   server.close(async () => {
     await sdk.shutdown().catch(() => {});

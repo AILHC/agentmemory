@@ -23,6 +23,8 @@
     "migrate": "node dist/functions/migrate.js",
     "test": "vitest run --exclude test/integration.test.ts --exclude=ops/**",
     "test:ops": "node --test \"ops/**/*.test.mjs\"",
+    "test:recovery": "node ops/scripts/check-effect-state-recovery-v1.mjs",
+    "test:recovery-release": "node ops/scripts/check-effect-state-recovery-release-v2.mjs",
     "verify:v2-scale": "node ops/scripts/verify-run-state-journal-v2-scale.mjs",
     "verify:v2-statekv-scale": "node ops/scripts/verify-statekv-receipt-scale.mjs",
     "test:watch": "vitest --exclude test/integration.test.ts --exclude=ops/**",

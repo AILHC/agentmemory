@@ -71,7 +71,7 @@ function summaryResponse({ attemptId, inputHash }: { attemptId: string; inputHas
         kind: "committed",
         receiptKey: `xop_${stableHash({ attemptId, inputHash }).slice(0, 32)}`,
         receiptVersion: 1,
-        resultRef: `summary-resumable-runs:${resumableRunId}`,
+        resultRef: `mem:summary-resumable:runs:${resumableRunId}`,
         effectHash: stableHash({ title, narrative: "", keyDecisions: [], filesModified: [], concepts: [] }),
       },
     },

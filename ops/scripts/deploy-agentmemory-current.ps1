@@ -330,11 +330,15 @@ function Copy-AmReleaseScripts {
   $destinationLib = Join-Path $Destination 'lib'
   $requiredLib = @(
     'adaptive-provider-limiter.mjs',
+    'consolidation-procedural-recovery-adapter-v1.mjs',
+    'crystal-recovery-adapter-v1.mjs',
+    'effect-state-recovery-stage-catalog-v1.mjs',
     'full-extraction-stage-adapters-v2.mjs',
     'iii-state-read-only-adapter-v1.mjs',
     'legacy-lesson-safe-facts-collector-v1.mjs',
     'lesson-recovery-adapter-v1.mjs',
     'offline-statekv-snapshot-v1.mjs',
+    'reflect-insight-recovery-adapter-v1.mjs',
     'recoverable-stage-v2.mjs',
     'recovery-journal-reducer-v1.mjs',
     'recovery-frontier-migration-v1.mjs',
@@ -343,6 +347,8 @@ function Copy-AmReleaseScripts {
     'recovery-status-projection-v1.mjs',
     'run-state-journal-v2.mjs',
     'run-state-store.mjs',
+    'safe-stage-recovery-adapters-v1.mjs',
+    'semantic-rollup-recovery-adapter-v1.mjs',
     'stage-pipeline.mjs',
     'summary-recovery-adapter-v1.mjs',
     'v2-release-gate.mjs'

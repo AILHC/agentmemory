@@ -1,0 +1,1833 @@
+{
+  "schema_version": "effect-state-recovery-release-proof/v2",
+  "complete": true,
+  "requirements": {
+    "stages": [
+      "summary",
+      "lessons",
+      "memory_consolidate",
+      "semantic_rollup",
+      "skill_extract",
+      "crystal",
+      "consolidation_procedural",
+      "reflect_insight"
+    ],
+    "legacy_v1_risk_mapping_sha256": "64f09a6ddea4ad77660d1fa6ee72004a26fb5e5eeb5d4c49ba399c580712e51b",
+    "legacy_v1_risk_catalog_sha256": "30e8bf8053659b5754d8e26498b49cee306e36429d05ad7bff6e9bfc2076f4cc",
+    "obligations": [
+      {
+        "id": "protocol::not_dispatched_can_retry",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::unknown_response_requires_receipt_query",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::running_receipt_prevents_redispatch",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::succeeded_receipt_replays_without_effect",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::exact_absence_authorizes_one_fresh_retry",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::absence_retry_is_bounded",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::input_hash_drift_fails_before_effect",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::receipt_identity_tamper_fails_closed",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::duplicate_request_has_single_effect",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::duplicate_response_is_idempotent",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::out_of_order_response_is_rejected",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::late_original_and_fresh_retry_have_single_effect",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::receipt_ahead_of_journal_catches_up",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "protocol::unknown_error_fails_closed",
+        "layer": "shared_protocol",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "storage::append_failure_preserves_last_durable_state",
+        "layer": "shared_storage",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "storage::sync_uncertainty_fails_closed",
+        "layer": "shared_storage",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "storage::torn_tail_only_repair",
+        "layer": "shared_storage",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "storage::checksum_or_sequence_corruption_rejected",
+        "layer": "shared_storage",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "storage::writer_identity_conflict_rejected",
+        "layer": "shared_storage",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "state_machine::idempotent_recovery_action",
+        "layer": "state_machine",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "state_machine::committed_state_is_monotonic",
+        "layer": "state_machine",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "state_machine::unknown_never_becomes_retry_without_closed_proof",
+        "layer": "state_machine",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "state_machine::no_effect_requires_closed_proof",
+        "layer": "state_machine",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "state_machine::independent_units_continue_after_permanent_failure",
+        "layer": "state_machine",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "state_machine::dependent_units_block_after_upstream_isolation",
+        "layer": "state_machine",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "state_machine::reducer_and_safe_projection_are_deterministic",
+        "layer": "state_machine",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "state_machine::retry_budget_survives_restart",
+        "layer": "state_machine",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "state_machine::fixed_seed_crash_positions_match_baseline_or_block",
+        "layer": "state_machine",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "integration::summary_custom::receipt_protocol_conformance",
+        "layer": "integration_family",
+        "applies_to": [
+          "summary"
+        ]
+      },
+      {
+        "id": "integration::summary_custom::provider_boundaries_fail_closed",
+        "layer": "integration_family",
+        "applies_to": [
+          "summary"
+        ]
+      },
+      {
+        "id": "integration::summary_custom::persisted_progress_resumes_without_duplicate_effect",
+        "layer": "integration_family",
+        "applies_to": [
+          "summary"
+        ]
+      },
+      {
+        "id": "integration::lessons_custom::receipt_protocol_conformance",
+        "layer": "integration_family",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "integration::lessons_custom::provider_boundaries_fail_closed",
+        "layer": "integration_family",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "integration::lessons_custom::persisted_progress_resumes_without_duplicate_effect",
+        "layer": "integration_family",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "integration::two_phase_prepare_commit::receipt_protocol_conformance",
+        "layer": "integration_family",
+        "applies_to": [
+          "memory_consolidate",
+          "skill_extract"
+        ]
+      },
+      {
+        "id": "integration::two_phase_prepare_commit::provider_boundaries_fail_closed",
+        "layer": "integration_family",
+        "applies_to": [
+          "memory_consolidate",
+          "skill_extract"
+        ]
+      },
+      {
+        "id": "integration::two_phase_prepare_commit::persisted_progress_resumes_without_duplicate_effect",
+        "layer": "integration_family",
+        "applies_to": [
+          "memory_consolidate",
+          "skill_extract"
+        ]
+      },
+      {
+        "id": "integration::generic_single::receipt_protocol_conformance",
+        "layer": "integration_family",
+        "applies_to": [
+          "semantic_rollup",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "integration::generic_single::provider_boundaries_fail_closed",
+        "layer": "integration_family",
+        "applies_to": [
+          "semantic_rollup",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "integration::generic_single::persisted_progress_resumes_without_duplicate_effect",
+        "layer": "integration_family",
+        "applies_to": [
+          "semantic_rollup",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "stage::summary::complete_persisted_fact_rebuilds_receipt",
+        "layer": "stage_contract",
+        "applies_to": [
+          "summary"
+        ]
+      },
+      {
+        "id": "stage::summary::missing_conflicting_or_partial_fact_fails_closed",
+        "layer": "stage_contract",
+        "applies_to": [
+          "summary"
+        ]
+      },
+      {
+        "id": "stage::lessons::complete_persisted_fact_rebuilds_receipt",
+        "layer": "stage_contract",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "stage::lessons::missing_conflicting_or_partial_fact_fails_closed",
+        "layer": "stage_contract",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "stage::memory_consolidate::complete_persisted_fact_rebuilds_receipt",
+        "layer": "stage_contract",
+        "applies_to": [
+          "memory_consolidate"
+        ]
+      },
+      {
+        "id": "stage::memory_consolidate::missing_conflicting_or_partial_fact_fails_closed",
+        "layer": "stage_contract",
+        "applies_to": [
+          "memory_consolidate"
+        ]
+      },
+      {
+        "id": "stage::semantic_rollup::complete_persisted_fact_rebuilds_receipt",
+        "layer": "stage_contract",
+        "applies_to": [
+          "semantic_rollup"
+        ]
+      },
+      {
+        "id": "stage::semantic_rollup::missing_conflicting_or_partial_fact_fails_closed",
+        "layer": "stage_contract",
+        "applies_to": [
+          "semantic_rollup"
+        ]
+      },
+      {
+        "id": "stage::skill_extract::complete_persisted_fact_rebuilds_receipt",
+        "layer": "stage_contract",
+        "applies_to": [
+          "skill_extract"
+        ]
+      },
+      {
+        "id": "stage::skill_extract::missing_conflicting_or_partial_fact_fails_closed",
+        "layer": "stage_contract",
+        "applies_to": [
+          "skill_extract"
+        ]
+      },
+      {
+        "id": "stage::crystal::complete_persisted_fact_rebuilds_receipt",
+        "layer": "stage_contract",
+        "applies_to": [
+          "crystal"
+        ]
+      },
+      {
+        "id": "stage::crystal::missing_conflicting_or_partial_fact_fails_closed",
+        "layer": "stage_contract",
+        "applies_to": [
+          "crystal"
+        ]
+      },
+      {
+        "id": "stage::consolidation_procedural::complete_persisted_fact_rebuilds_receipt",
+        "layer": "stage_contract",
+        "applies_to": [
+          "consolidation_procedural"
+        ]
+      },
+      {
+        "id": "stage::consolidation_procedural::missing_conflicting_or_partial_fact_fails_closed",
+        "layer": "stage_contract",
+        "applies_to": [
+          "consolidation_procedural"
+        ]
+      },
+      {
+        "id": "stage::reflect_insight::complete_persisted_fact_rebuilds_receipt",
+        "layer": "stage_contract",
+        "applies_to": [
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "stage::reflect_insight::missing_conflicting_or_partial_fact_fails_closed",
+        "layer": "stage_contract",
+        "applies_to": [
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "runtime::summary::post_effect_response_loss_recovers",
+        "layer": "real_iii",
+        "applies_to": [
+          "summary"
+        ]
+      },
+      {
+        "id": "runtime::lessons::post_effect_response_loss_recovers",
+        "layer": "real_iii",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "runtime::memory_consolidate::post_effect_response_loss_recovers",
+        "layer": "real_iii",
+        "applies_to": [
+          "memory_consolidate"
+        ]
+      },
+      {
+        "id": "runtime::semantic_rollup::post_effect_response_loss_recovers",
+        "layer": "real_iii",
+        "applies_to": [
+          "semantic_rollup"
+        ]
+      },
+      {
+        "id": "runtime::skill_extract::post_effect_response_loss_recovers",
+        "layer": "real_iii",
+        "applies_to": [
+          "skill_extract"
+        ]
+      },
+      {
+        "id": "runtime::crystal::post_effect_response_loss_recovers",
+        "layer": "real_iii",
+        "applies_to": [
+          "crystal"
+        ]
+      },
+      {
+        "id": "runtime::consolidation_procedural::post_effect_response_loss_recovers",
+        "layer": "real_iii",
+        "applies_to": [
+          "consolidation_procedural"
+        ]
+      },
+      {
+        "id": "runtime::reflect_insight::post_effect_response_loss_recovers",
+        "layer": "real_iii",
+        "applies_to": [
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "migration::legacy_fence_makes_old_runner_refuse",
+        "layer": "migration",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "migration::new_runner_blocks_business_until_migration_complete",
+        "layer": "migration",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "migration::migration_reenters_after_each_append_boundary",
+        "layer": "migration",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "migration::migration_input_drift_rejects_append",
+        "layer": "migration",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "migration::only_unresolved_frontier_is_migrated",
+        "layer": "migration",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "migration::legacy_events_receipts_and_business_records_are_not_rewritten",
+        "layer": "migration",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "migration::per_stage_legacy_evidence_adapter_fails_closed",
+        "layer": "migration",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "migration::new_reducer_reads_migrated_history",
+        "layer": "migration",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "migration::preview_is_deterministic_for_same_input",
+        "layer": "migration",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "migration::lesson_no_blocks_requires_zero_effect_proof",
+        "layer": "migration",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "lessons_concurrency::manual_mutations_are_serialized_with_extraction",
+        "layer": "lessons_concurrency",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "lessons_concurrency::generation_registry_survives_interruption",
+        "layer": "lessons_concurrency",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "lessons_concurrency::run_binding_or_watermark_prevents_generation_reuse",
+        "layer": "lessons_concurrency",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "lessons_concurrency::candidate_upsert_and_source_removal_replay_as_one_mutation",
+        "layer": "lessons_concurrency",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "lessons_concurrency::mutation_or_registry_identity_conflict_fails_closed",
+        "layer": "lessons_concurrency",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "projection::safe_state_redacts_sensitive_payloads",
+        "layer": "safe_projection",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "projection::status_counts_equal_reducer_output",
+        "layer": "safe_projection",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "runtime_boundary::runner_restart_at_each_journal_boundary",
+        "layer": "subprocess_runtime",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "runtime_boundary::statekv_ack_is_not_durability_proof",
+        "layer": "real_iii",
+        "applies_to": [
+          "summary",
+          "lessons",
+          "memory_consolidate",
+          "semantic_rollup",
+          "skill_extract",
+          "crystal",
+          "consolidation_procedural",
+          "reflect_insight"
+        ]
+      },
+      {
+        "id": "runtime_boundary::runtime_exit_at_each_statekv_ack_boundary_recovers_or_requires_exact_reconciliation",
+        "layer": "real_iii",
+        "applies_to": [
+          "lessons"
+        ]
+      },
+      {
+        "id": "runtime_boundary::committed_receipt_missing_formal_watermark_resumes_or_conflicts",
+        "layer": "real_iii",
+        "applies_to": [
+          "lessons"
+        ]
+      }
+    ]
+  },
+  "coverage": {
+    "obligations": {
+      "required_catalog_sha256": "d360c6452df5aa5b9d728aa07b6129141a2dda62da158d65ea8f4df09051fb73",
+      "required_count": 85,
+      "covered_ids": [
+        "stage::summary::complete_persisted_fact_rebuilds_receipt",
+        "runtime::summary::post_effect_response_loss_recovers",
+        "stage::lessons::complete_persisted_fact_rebuilds_receipt",
+        "runtime::lessons::post_effect_response_loss_recovers",
+        "stage::memory_consolidate::complete_persisted_fact_rebuilds_receipt",
+        "runtime::memory_consolidate::post_effect_response_loss_recovers",
+        "stage::semantic_rollup::complete_persisted_fact_rebuilds_receipt",
+        "runtime::semantic_rollup::post_effect_response_loss_recovers",
+        "stage::skill_extract::complete_persisted_fact_rebuilds_receipt",
+        "runtime::skill_extract::post_effect_response_loss_recovers",
+        "stage::crystal::complete_persisted_fact_rebuilds_receipt",
+        "runtime::crystal::post_effect_response_loss_recovers",
+        "stage::consolidation_procedural::complete_persisted_fact_rebuilds_receipt",
+        "runtime::consolidation_procedural::post_effect_response_loss_recovers",
+        "stage::reflect_insight::complete_persisted_fact_rebuilds_receipt",
+        "runtime::reflect_insight::post_effect_response_loss_recovers",
+        "protocol::not_dispatched_can_retry",
+        "state_machine::idempotent_recovery_action",
+        "state_machine::independent_units_continue_after_permanent_failure",
+        "state_machine::dependent_units_block_after_upstream_isolation",
+        "state_machine::fixed_seed_crash_positions_match_baseline_or_block",
+        "integration::two_phase_prepare_commit::receipt_protocol_conformance",
+        "integration::generic_single::receipt_protocol_conformance",
+        "integration::two_phase_prepare_commit::provider_boundaries_fail_closed",
+        "integration::generic_single::provider_boundaries_fail_closed",
+        "integration::two_phase_prepare_commit::persisted_progress_resumes_without_duplicate_effect",
+        "integration::generic_single::persisted_progress_resumes_without_duplicate_effect",
+        "runtime_boundary::runner_restart_at_each_journal_boundary",
+        "protocol::unknown_response_requires_receipt_query",
+        "protocol::receipt_ahead_of_journal_catches_up",
+        "integration::summary_custom::receipt_protocol_conformance",
+        "integration::summary_custom::provider_boundaries_fail_closed",
+        "integration::summary_custom::persisted_progress_resumes_without_duplicate_effect",
+        "integration::lessons_custom::receipt_protocol_conformance",
+        "integration::lessons_custom::provider_boundaries_fail_closed",
+        "integration::lessons_custom::persisted_progress_resumes_without_duplicate_effect",
+        "migration::new_runner_blocks_business_until_migration_complete",
+        "protocol::running_receipt_prevents_redispatch",
+        "protocol::succeeded_receipt_replays_without_effect",
+        "protocol::exact_absence_authorizes_one_fresh_retry",
+        "protocol::absence_retry_is_bounded",
+        "protocol::input_hash_drift_fails_before_effect",
+        "protocol::duplicate_request_has_single_effect",
+        "protocol::duplicate_response_is_idempotent",
+        "protocol::late_original_and_fresh_retry_have_single_effect",
+        "state_machine::committed_state_is_monotonic",
+        "protocol::receipt_identity_tamper_fails_closed",
+        "protocol::out_of_order_response_is_rejected",
+        "protocol::unknown_error_fails_closed",
+        "state_machine::no_effect_requires_closed_proof",
+        "storage::append_failure_preserves_last_durable_state",
+        "storage::torn_tail_only_repair",
+        "storage::checksum_or_sequence_corruption_rejected",
+        "storage::writer_identity_conflict_rejected",
+        "storage::sync_uncertainty_fails_closed",
+        "state_machine::unknown_never_becomes_retry_without_closed_proof",
+        "state_machine::retry_budget_survives_restart",
+        "stage::summary::missing_conflicting_or_partial_fact_fails_closed",
+        "stage::lessons::missing_conflicting_or_partial_fact_fails_closed",
+        "stage::memory_consolidate::missing_conflicting_or_partial_fact_fails_closed",
+        "stage::semantic_rollup::missing_conflicting_or_partial_fact_fails_closed",
+        "stage::skill_extract::missing_conflicting_or_partial_fact_fails_closed",
+        "stage::crystal::missing_conflicting_or_partial_fact_fails_closed",
+        "stage::consolidation_procedural::missing_conflicting_or_partial_fact_fails_closed",
+        "stage::reflect_insight::missing_conflicting_or_partial_fact_fails_closed",
+        "migration::legacy_fence_makes_old_runner_refuse",
+        "migration::migration_input_drift_rejects_append",
+        "migration::only_unresolved_frontier_is_migrated",
+        "migration::new_reducer_reads_migrated_history",
+        "migration::preview_is_deterministic_for_same_input",
+        "migration::migration_reenters_after_each_append_boundary",
+        "migration::legacy_events_receipts_and_business_records_are_not_rewritten",
+        "migration::per_stage_legacy_evidence_adapter_fails_closed",
+        "migration::lesson_no_blocks_requires_zero_effect_proof",
+        "lessons_concurrency::generation_registry_survives_interruption",
+        "lessons_concurrency::mutation_or_registry_identity_conflict_fails_closed",
+        "lessons_concurrency::run_binding_or_watermark_prevents_generation_reuse",
+        "lessons_concurrency::manual_mutations_are_serialized_with_extraction",
+        "lessons_concurrency::candidate_upsert_and_source_removal_replay_as_one_mutation",
+        "runtime_boundary::statekv_ack_is_not_durability_proof",
+        "runtime_boundary::runtime_exit_at_each_statekv_ack_boundary_recovers_or_requires_exact_reconciliation",
+        "runtime_boundary::committed_receipt_missing_formal_watermark_resumes_or_conflicts",
+        "projection::safe_state_redacts_sensitive_payloads",
+        "projection::status_counts_equal_reducer_output",
+        "state_machine::reducer_and_safe_projection_are_deterministic"
+      ],
+      "missing_ids": []
+    }
+  },
+  "evidence": [
+    {
+      "id": "real-iii-eight-stage-after-effect-ack",
+      "test_path": "test/effect-state-recovery-iii-runtime-e2e.test.ts",
+      "runner": "vitest-real-iii",
+      "obligation_cases": [
+        {
+          "obligation_id": "stage::summary::complete_persisted_fact_rebuilds_receipt",
+          "expected_test_titles": [
+            "recovers after III acknowledged the summary formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "runtime::summary::post_effect_response_loss_recovers",
+          "expected_test_titles": [
+            "recovers after III acknowledged the summary formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "stage::lessons::complete_persisted_fact_rebuilds_receipt",
+          "expected_test_titles": [
+            "recovers after III acknowledged the lessons formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "runtime::lessons::post_effect_response_loss_recovers",
+          "expected_test_titles": [
+            "recovers after III acknowledged the lessons formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "stage::memory_consolidate::complete_persisted_fact_rebuilds_receipt",
+          "expected_test_titles": [
+            "recovers after III acknowledged the memory_consolidate formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "runtime::memory_consolidate::post_effect_response_loss_recovers",
+          "expected_test_titles": [
+            "recovers after III acknowledged the memory_consolidate formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "stage::semantic_rollup::complete_persisted_fact_rebuilds_receipt",
+          "expected_test_titles": [
+            "recovers after III acknowledged the semantic_rollup formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "runtime::semantic_rollup::post_effect_response_loss_recovers",
+          "expected_test_titles": [
+            "recovers after III acknowledged the semantic_rollup formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "stage::skill_extract::complete_persisted_fact_rebuilds_receipt",
+          "expected_test_titles": [
+            "recovers after III acknowledged the skill_extract formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "runtime::skill_extract::post_effect_response_loss_recovers",
+          "expected_test_titles": [
+            "recovers after III acknowledged the skill_extract formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "stage::crystal::complete_persisted_fact_rebuilds_receipt",
+          "expected_test_titles": [
+            "recovers after III acknowledged the crystal formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "runtime::crystal::post_effect_response_loss_recovers",
+          "expected_test_titles": [
+            "recovers after III acknowledged the crystal formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "stage::consolidation_procedural::complete_persisted_fact_rebuilds_receipt",
+          "expected_test_titles": [
+            "recovers after III acknowledged the consolidation_procedural formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "runtime::consolidation_procedural::post_effect_response_loss_recovers",
+          "expected_test_titles": [
+            "recovers after III acknowledged the consolidation_procedural formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "stage::reflect_insight::complete_persisted_fact_rebuilds_receipt",
+          "expected_test_titles": [
+            "recovers after III acknowledged the reflect_insight formal business effect"
+          ]
+        },
+        {
+          "obligation_id": "runtime::reflect_insight::post_effect_response_loss_recovers",
+          "expected_test_titles": [
+            "recovers after III acknowledged the reflect_insight formal business effect"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shared-recoverable-stage-kernel",
+      "test_path": "ops/scripts/lib/recoverable-stage-v2.test.mjs",
+      "runner": "node",
+      "obligation_cases": [
+        {
+          "obligation_id": "protocol::not_dispatched_can_retry",
+          "expected_test_titles": [
+            "unit_started without operation_started remains a fresh inner dispatch boundary"
+          ]
+        },
+        {
+          "obligation_id": "state_machine::idempotent_recovery_action",
+          "expected_test_titles": [
+            "single-phase recovery reuses one attempt and only repeats idempotent boundaries",
+            "two-phase recovery persists prepare and commit identities at every boundary"
+          ]
+        },
+        {
+          "obligation_id": "state_machine::independent_units_continue_after_permanent_failure",
+          "expected_test_titles": [
+            "single-phase drains independent work and blocks only actual dependents",
+            "two-phase prepare failure drains independent work and blocks only dependents",
+            "two-phase commit failure drains independent work and blocks only dependents"
+          ]
+        },
+        {
+          "obligation_id": "state_machine::dependent_units_block_after_upstream_isolation",
+          "expected_test_titles": [
+            "single-phase drains independent work and blocks only actual dependents",
+            "two-phase prepare failure drains independent work and blocks only dependents",
+            "two-phase commit failure drains independent work and blocks only dependents"
+          ]
+        },
+        {
+          "obligation_id": "state_machine::fixed_seed_crash_positions_match_baseline_or_block",
+          "expected_test_titles": [
+            "fixed-seed crash positions match the baseline or fail closed across both recovery modes"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "remaining-stage-recovery-kernel",
+      "test_path": "ops/scripts/lib/full-extraction-stage-adapters-v2.test.mjs",
+      "runner": "node",
+      "obligation_cases": [
+        {
+          "obligation_id": "integration::two_phase_prepare_commit::receipt_protocol_conformance",
+          "expected_test_titles": [
+            "integration::two_phase_prepare_commit::receipt_protocol_conformance"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::receipt_protocol_conformance",
+          "expected_test_titles": [
+            "integration::generic_single::receipt_protocol_conformance"
+          ]
+        },
+        {
+          "obligation_id": "integration::two_phase_prepare_commit::provider_boundaries_fail_closed",
+          "expected_test_titles": [
+            "integration::two_phase_prepare_commit::provider_boundaries_fail_closed"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::provider_boundaries_fail_closed",
+          "expected_test_titles": [
+            "integration::generic_single::provider_boundaries_fail_closed"
+          ]
+        },
+        {
+          "obligation_id": "integration::two_phase_prepare_commit::persisted_progress_resumes_without_duplicate_effect",
+          "expected_test_titles": [
+            "integration::two_phase_prepare_commit::persisted_progress_resumes_without_duplicate_effect"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::persisted_progress_resumes_without_duplicate_effect",
+          "expected_test_titles": [
+            "integration::generic_single::persisted_progress_resumes_without_duplicate_effect"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "subprocess-runner-journal-boundaries",
+      "test_path": "ops/scripts/lib/effect-state-recovery-subprocess-v1.test.mjs",
+      "runner": "node-subprocess",
+      "obligation_cases": [
+        {
+          "obligation_id": "runtime_boundary::runner_restart_at_each_journal_boundary",
+          "expected_test_titles": [
+            "runtime_boundary::runner_restart_at_each_journal_boundary"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shared-production-runner-recovery",
+      "test_path": "ops/scripts/run-agentmemory-full-extraction-v2.test.mjs",
+      "runner": "node",
+      "obligation_cases": [
+        {
+          "obligation_id": "protocol::unknown_response_requires_receipt_query",
+          "expected_test_titles": [
+            "v2 summary keeps an uncontracted 5xx pending and re-verifies the same receipt"
+          ]
+        },
+        {
+          "obligation_id": "protocol::receipt_ahead_of_journal_catches_up",
+          "expected_test_titles": [
+            "v2 Lessons resumes every committed recovery boundary without repeating Provider work"
+          ]
+        },
+        {
+          "obligation_id": "integration::summary_custom::receipt_protocol_conformance",
+          "expected_test_titles": [
+            "v2 summary recovery waits when no durable result is visible",
+            "v2 summary retries the same identity after exact missing-receipt proof",
+            "v2 summary keeps an uncontracted 5xx pending and re-verifies the same receipt",
+            "v2 summary waits on a persisted reconciliation failure without redispatching"
+          ]
+        },
+        {
+          "obligation_id": "integration::summary_custom::provider_boundaries_fail_closed",
+          "expected_test_titles": [
+            "v2 summary does not retry a provider failure without persisted no-effect evidence"
+          ]
+        },
+        {
+          "obligation_id": "integration::summary_custom::persisted_progress_resumes_without_duplicate_effect",
+          "expected_test_titles": [
+            "v2 summary recovery reconciles one durable chunk before advancing the next chunk",
+            "v2 resumes a partial summary plan without duplicating planned units"
+          ]
+        },
+        {
+          "obligation_id": "integration::lessons_custom::receipt_protocol_conformance",
+          "expected_test_titles": [
+            "v2 lessons recovers every durable boundary with one stable remote operation",
+            "v2 lessons waits on reconciliation-required receipts without sealing",
+            "v2 lessons retries the same identity after exact missing-receipt proof"
+          ]
+        },
+        {
+          "obligation_id": "integration::lessons_custom::provider_boundaries_fail_closed",
+          "expected_test_titles": [
+            "v2 lessons keeps safe transient failures pending but seals deterministic failures"
+          ]
+        },
+        {
+          "obligation_id": "integration::lessons_custom::persisted_progress_resumes_without_duplicate_effect",
+          "expected_test_titles": [
+            "v2 Lessons resumes every committed recovery boundary without repeating Provider work"
+          ]
+        },
+        {
+          "obligation_id": "migration::new_runner_blocks_business_until_migration_complete",
+          "expected_test_titles": [
+            "new runner refuses business APIs while a fenced migration is incomplete"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shared-operation-receipts",
+      "test_path": "test/extraction-operation-receipts.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "protocol::running_receipt_prevents_redispatch",
+          "expected_test_titles": [
+            "does not re-execute an operation left running across a server crash"
+          ]
+        },
+        {
+          "obligation_id": "protocol::succeeded_receipt_replays_without_effect",
+          "expected_test_titles": [
+            "returns the cached safe response when the original client lost the response"
+          ]
+        },
+        {
+          "obligation_id": "protocol::exact_absence_authorizes_one_fresh_retry",
+          "expected_test_titles": [
+            "serializes a delayed original request with an absence-authorized fresh retry"
+          ]
+        },
+        {
+          "obligation_id": "protocol::absence_retry_is_bounded",
+          "expected_test_titles": [
+            "serializes a delayed original request with an absence-authorized fresh retry"
+          ]
+        },
+        {
+          "obligation_id": "protocol::input_hash_drift_fails_before_effect",
+          "expected_test_titles": [
+            "rejects service input drift after receipt absence before any effect runs"
+          ]
+        },
+        {
+          "obligation_id": "protocol::duplicate_request_has_single_effect",
+          "expected_test_titles": [
+            "serializes concurrent calls and executes the same successful operation once"
+          ]
+        },
+        {
+          "obligation_id": "protocol::duplicate_response_is_idempotent",
+          "expected_test_titles": [
+            "materializes a succeeded receipt only from an explicitly verified missing result"
+          ]
+        },
+        {
+          "obligation_id": "protocol::late_original_and_fresh_retry_have_single_effect",
+          "expected_test_titles": [
+            "serializes a delayed original request with an absence-authorized fresh retry"
+          ]
+        },
+        {
+          "obligation_id": "state_machine::committed_state_is_monotonic",
+          "expected_test_titles": [
+            "does not downgrade an uncertain succeeded-receipt write into a retryable failure"
+          ]
+        },
+        {
+          "obligation_id": "protocol::receipt_identity_tamper_fails_closed",
+          "expected_test_titles": [
+            "fails closed when a persisted receipt identity is tampered"
+          ]
+        },
+        {
+          "obligation_id": "protocol::out_of_order_response_is_rejected",
+          "expected_test_titles": [
+            "rejects an out-of-order verified response after the receipt is terminal"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shared-recovery-policy",
+      "test_path": "ops/scripts/lib/recovery-policy-v1.test.mjs",
+      "runner": "node",
+      "obligation_cases": [
+        {
+          "obligation_id": "protocol::unknown_error_fails_closed",
+          "expected_test_titles": [
+            "unknown structures and policy versions fail closed"
+          ]
+        },
+        {
+          "obligation_id": "state_machine::no_effect_requires_closed_proof",
+          "expected_test_titles": [
+            "missing or contradictory no-effect proof always becomes unknown"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shared-journal-storage",
+      "test_path": "ops/scripts/lib/run-state-journal-v2.test.mjs",
+      "runner": "node",
+      "obligation_cases": [
+        {
+          "obligation_id": "storage::append_failure_preserves_last_durable_state",
+          "expected_test_titles": [
+            "v2 journal append failure preserves the exact prior durable prefix"
+          ]
+        },
+        {
+          "obligation_id": "storage::torn_tail_only_repair",
+          "expected_test_titles": [
+            "v2 journal uses independent zero-based sequences and only repairs a torn final line"
+          ]
+        },
+        {
+          "obligation_id": "storage::checksum_or_sequence_corruption_rejected",
+          "expected_test_titles": [
+            "v2 journal rejects complete checksum and sequence corruption"
+          ]
+        },
+        {
+          "obligation_id": "storage::writer_identity_conflict_rejected",
+          "expected_test_titles": [
+            "v2 journal rejects append after the persisted writer identity changes"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shared-real-journal-sync-failure",
+      "test_path": "test/lesson-runner-runtime-e2e.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "storage::sync_uncertainty_fails_closed",
+          "expected_test_titles": [
+            "keeps Journal V2 conservative after a real temporary-file sync failure"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shared-journal-reducer",
+      "test_path": "ops/scripts/lib/recovery-journal-reducer-v1.test.mjs",
+      "runner": "node",
+      "obligation_cases": [
+        {
+          "obligation_id": "state_machine::unknown_never_becomes_retry_without_closed_proof",
+          "expected_test_titles": [
+            "unknown outcome remains coordinating and cannot become retry"
+          ]
+        },
+        {
+          "obligation_id": "state_machine::retry_budget_survives_restart",
+          "expected_test_titles": [
+            "retry budget and deadline survive reduction until the next immutable attempt"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "summary-stage-fails-closed",
+      "test_path": "ops/scripts/lib/summary-recovery-adapter-v1.test.mjs",
+      "runner": "node",
+      "obligation_cases": [
+        {
+          "obligation_id": "stage::summary::missing_conflicting_or_partial_fact_fails_closed",
+          "expected_test_titles": [
+            "Summary adapter rejects the legacy result reference namespace",
+            "unproved skipped and infeasible results fail conservatively to coordination",
+            "arbitrary response proof fields are not accepted as persisted facts",
+            "a mismatched Summary operation identity becomes a run-blocking system fault"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lessons-stage-fails-closed",
+      "test_path": "test/lesson-commit-recovery.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "stage::lessons::missing_conflicting_or_partial_fact_fails_closed",
+          "expected_test_titles": [
+            "classifies receipt corruption, partial effects and formal facts strictly"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "memory-consolidate-production-endpoint-contracts",
+      "test_path": "test/full-extraction-api.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "integration::two_phase_prepare_commit::receipt_protocol_conformance",
+          "expected_test_titles": [
+            "replays a v2 memory prepare response with its proposal handle",
+            "hard-stops a recovered memory prepare when the receipt is missing",
+            "replays a v2 memory commit with an identity distinct from prepare"
+          ]
+        },
+        {
+          "obligation_id": "integration::two_phase_prepare_commit::provider_boundaries_fail_closed",
+          "expected_test_titles": [
+            "persists and replays a provider failure through the real memory prepare endpoint"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "memory-consolidate-stage-fails-closed",
+      "test_path": "test/consolidate.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "stage::memory_consolidate::missing_conflicting_or_partial_fact_fails_closed",
+          "expected_test_titles": [
+            "commits a prepared proposal idempotently with deterministic memory and audit ids"
+          ]
+        },
+        {
+          "obligation_id": "integration::two_phase_prepare_commit::persisted_progress_resumes_without_duplicate_effect",
+          "expected_test_titles": [
+            "re-enters after the intent commit write without duplicating effects",
+            "re-enters after the parent commit write without duplicating effects",
+            "re-enters after the memory commit write without duplicating effects",
+            "re-enters after the audit commit write without duplicating effects",
+            "re-enters after the proposal commit write without duplicating effects"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "semantic-rollup-stage-fails-closed",
+      "test_path": "test/semantic-rollup.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "stage::semantic_rollup::missing_conflicting_or_partial_fact_fails_closed",
+          "expected_test_titles": [
+            "returns closed structured hard failures for formal recovery identity faults",
+            "returns a structured hard failure when a committed semantic item conflicts",
+            "freezes the provider result in the outer receipt and re-verifies a committed plan item by item"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::receipt_protocol_conformance",
+          "expected_test_titles": [
+            "freezes the provider result in the outer receipt and re-verifies a committed plan item by item",
+            "returns closed structured hard failures for formal recovery identity faults"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::provider_boundaries_fail_closed",
+          "expected_test_titles": [
+            "leaves a provider-failed recovery receipt running without semantic effects"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::persisted_progress_resumes_without_duplicate_effect",
+          "expected_test_titles": [
+            "resumes a frozen semantic result collection after a partial write without another provider call"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "skill-extract-stage-fails-closed",
+      "test_path": "test/skill-extract.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "stage::skill_extract::missing_conflicting_or_partial_fact_fails_closed",
+          "expected_test_titles": [
+            "ordered prepare and commit reinforces a shared skill once per source session"
+          ]
+        },
+        {
+          "obligation_id": "integration::two_phase_prepare_commit::receipt_protocol_conformance",
+          "expected_test_titles": [
+            "ordered prepare and commit reinforces a shared skill once per source session",
+            "rejects a fresh prepare when source drift changes the absence-bound input hash"
+          ]
+        },
+        {
+          "obligation_id": "integration::two_phase_prepare_commit::provider_boundaries_fail_closed",
+          "expected_test_titles": [
+            "persists and replays a provider failure without creating skill effects"
+          ]
+        },
+        {
+          "obligation_id": "integration::two_phase_prepare_commit::persisted_progress_resumes_without_duplicate_effect",
+          "expected_test_titles": [
+            "re-enters after the commit intent write without another provider call or reinforcement",
+            "re-enters after the stable effect hash write without another provider call or reinforcement",
+            "re-enters after the procedural effect write without another provider call or reinforcement",
+            "re-enters after the audit effect write without another provider call or reinforcement",
+            "re-enters after the committed proposal write without another provider call or reinforcement"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "crystal-stage-fails-closed",
+      "test_path": "test/crystallize.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "stage::crystal::missing_conflicting_or_partial_fact_fails_closed",
+          "expected_test_titles": [
+            "replays one pinned full-stage operation without repeating provider work",
+            "fails closed when a committed crystal conflicts with the frozen plan",
+            "re-verifies a committed plan and fills missing crystal, lesson, and action effects"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::receipt_protocol_conformance",
+          "expected_test_titles": [
+            "replays one pinned full-stage operation without repeating provider work",
+            "fails closed when a committed crystal conflicts with the frozen plan"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::provider_boundaries_fail_closed",
+          "expected_test_titles": [
+            "leaves a provider-failed crystal receipt running without formal effects"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::persisted_progress_resumes_without_duplicate_effect",
+          "expected_test_titles": [
+            "resumes a frozen crystal after a lesson commit failure",
+            "persists the frozen recovery plan before effects and resumes without a second provider call"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "procedural-stage-fails-closed",
+      "test_path": "test/consolidation-pipeline.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "stage::consolidation_procedural::missing_conflicting_or_partial_fact_fails_closed",
+          "expected_test_titles": [
+            "recovers a frozen procedural commit without another model call or duplicate reinforcement",
+            "rejects a committed procedural receipt when a formal effect is missing"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::receipt_protocol_conformance",
+          "expected_test_titles": [
+            "recovers a frozen procedural commit without another model call or duplicate reinforcement",
+            "rejects a committed procedural receipt when a formal effect is missing"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::provider_boundaries_fail_closed",
+          "expected_test_titles": [
+            "leaves a provider-failed procedural receipt running without formal effects"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::persisted_progress_resumes_without_duplicate_effect",
+          "expected_test_titles": [
+            "recovers a frozen procedural commit without another model call or duplicate reinforcement"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "reflect-stage-fails-closed",
+      "test_path": "test/reflect.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "stage::reflect_insight::missing_conflicting_or_partial_fact_fails_closed",
+          "expected_test_titles": [
+            "recovers a full insight commit without re-calling the model or double-reinforcing",
+            "rejects a committed reflect receipt when a formal insight is missing"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::receipt_protocol_conformance",
+          "expected_test_titles": [
+            "recovers a full insight commit without re-calling the model or double-reinforcing",
+            "rejects a committed reflect receipt when a formal insight is missing"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::provider_boundaries_fail_closed",
+          "expected_test_titles": [
+            "leaves a provider-failed reflect receipt running without insight effects"
+          ]
+        },
+        {
+          "obligation_id": "integration::generic_single::persisted_progress_resumes_without_duplicate_effect",
+          "expected_test_titles": [
+            "recovers a full insight commit without re-calling the model or double-reinforcing"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "migration-frontier-contract",
+      "test_path": "ops/scripts/lib/recovery-frontier-migration-v1.test.mjs",
+      "runner": "node",
+      "obligation_cases": [
+        {
+          "obligation_id": "migration::legacy_fence_makes_old_runner_refuse",
+          "expected_test_titles": [
+            "legacy runner rejects the fence and migration resumes an interrupted manifest append"
+          ]
+        },
+        {
+          "obligation_id": "migration::migration_input_drift_rejects_append",
+          "expected_test_titles": [
+            "fence uses the formal writer lock and refuses stale preview input"
+          ]
+        },
+        {
+          "obligation_id": "migration::only_unresolved_frontier_is_migrated",
+          "expected_test_titles": [
+            "preview excludes never-started units, includes retry and committing facts, and derives retry attempt from the journal"
+          ]
+        },
+        {
+          "obligation_id": "migration::new_reducer_reads_migrated_history",
+          "expected_test_titles": [
+            "legacy runner rejects the fence and migration resumes an interrupted manifest append"
+          ]
+        },
+        {
+          "obligation_id": "migration::preview_is_deterministic_for_same_input",
+          "expected_test_titles": [
+            "preview is deterministic and orders the unresolved frontier by unit identity"
+          ]
+        },
+        {
+          "obligation_id": "migration::migration_reenters_after_each_append_boundary",
+          "expected_test_titles": [
+            "migration reenters after every manifest append boundary"
+          ]
+        },
+        {
+          "obligation_id": "migration::legacy_events_receipts_and_business_records_are_not_rewritten",
+          "expected_test_titles": [
+            "migration appends recovery events without rewriting legacy events receipts or business records"
+          ]
+        },
+        {
+          "obligation_id": "migration::per_stage_legacy_evidence_adapter_fails_closed",
+          "expected_test_titles": [
+            "all eight legacy stage evidence adapters fail closed on unproved effects"
+          ]
+        },
+        {
+          "obligation_id": "migration::lesson_no_blocks_requires_zero_effect_proof",
+          "expected_test_titles": [
+            "lesson_no_blocks migration requires and preserves a closed zero-effect proof"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lessons-generation-concurrency",
+      "test_path": "test/lesson-extraction-recovery.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "lessons_concurrency::generation_registry_survives_interruption",
+          "expected_test_titles": [
+            "keeps the allocated generation across registry and run-binding response losses"
+          ]
+        },
+        {
+          "obligation_id": "lessons_concurrency::mutation_or_registry_identity_conflict_fails_closed",
+          "expected_test_titles": [
+            "fails closed on mutation and registry identity conflicts"
+          ]
+        },
+        {
+          "obligation_id": "lessons_concurrency::run_binding_or_watermark_prevents_generation_reuse",
+          "expected_test_titles": [
+            "serializes run binding with watermark commits so a generation is never reused",
+            "rejects an old watermark commit after the generation was bound to another run"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "lessons-mutation-concurrency",
+      "test_path": "test/lesson-commit.test.ts",
+      "runner": "vitest",
+      "obligation_cases": [
+        {
+          "obligation_id": "lessons_concurrency::manual_mutations_are_serialized_with_extraction",
+          "expected_test_titles": [
+            "preserves the extraction watermark when manual, strengthen, decay and heuristic replacement share a lesson"
+          ]
+        },
+        {
+          "obligation_id": "lessons_concurrency::candidate_upsert_and_source_removal_replay_as_one_mutation",
+          "expected_test_titles": [
+            "upserts a same-lesson candidate before removing its heuristic source"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "real-iii-statekv-durability-boundaries",
+      "test_path": "test/lesson-runner-iii-runtime-e2e.test.ts",
+      "runner": "vitest-real-iii",
+      "obligation_cases": [
+        {
+          "obligation_id": "runtime_boundary::statekv_ack_is_not_durability_proof",
+          "expected_test_titles": [
+            "proves a StateKV acknowledgement is not durability proof"
+          ]
+        },
+        {
+          "obligation_id": "runtime_boundary::runtime_exit_at_each_statekv_ack_boundary_recovers_or_requires_exact_reconciliation",
+          "expected_test_titles": [
+            "recovers or requests exact reconciliation at every observed StateKV write acknowledgement boundary"
+          ]
+        },
+        {
+          "obligation_id": "runtime_boundary::committed_receipt_missing_formal_watermark_resumes_or_conflicts",
+          "expected_test_titles": [
+            "resumes a committed receipt with a missing formal watermark without repeating provider or effects"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "safe-recovery-status-projection",
+      "test_path": "ops/scripts/lib/recovery-status-projection-v1.test.mjs",
+      "runner": "node",
+      "obligation_cases": [
+        {
+          "obligation_id": "projection::safe_state_redacts_sensitive_payloads",
+          "expected_test_titles": [
+            "safe status and monitor never expose restricted payloads or raw provider errors"
+          ]
+        },
+        {
+          "obligation_id": "projection::status_counts_equal_reducer_output",
+          "expected_test_titles": [
+            "safe status counts are the exact projection from the unique reducer"
+          ]
+        },
+        {
+          "obligation_id": "state_machine::reducer_and_safe_projection_are_deterministic",
+          "expected_test_titles": [
+            "reducer and safe projection are deterministic for identical journal input"
+          ]
+        }
+      ]
+    }
+  ]
+}

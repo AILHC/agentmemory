@@ -17,7 +17,48 @@ permissions:
   contents: read
 
 jobs:
+  recovery-proof:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - run: npm install --package-lock-only --legacy-peer-deps --no-audit --no-fund
+      - run: npm ci --legacy-peer-deps --no-audit --no-fund
+
+      - name: Verify development recovery checks
+        run: npm run test:recovery
+
+      - name: Verify ops tests
+        run: npm run test:ops
+
+      - name: Download pinned III runtime
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "iii-v0.11.2.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "iii-v0.11.2"
+          Invoke-WebRequest `
+            -Uri "https://github.com/iii-hq/iii/releases/download/iii%2Fv0.11.2/iii-x86_64-pc-windows-msvc.zip" `
+            -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $destination
+          $engine = Get-ChildItem -LiteralPath $destination -Filter "iii.exe" -File -Recurse |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $engine) {
+            throw "Pinned III runtime archive did not contain iii.exe"
+          }
+          "AGENTMEMORY_TEST_III_BIN=$engine" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Verify complete effect-state recovery proof against pinned III
+        run: npm run test:recovery-release
+
   publish:
+    needs: recovery-proof
     runs-on: ubuntu-latest
     permissions:
       contents: read
