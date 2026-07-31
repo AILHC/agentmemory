@@ -1,5 +1,9 @@
 import { foldRecoveryStageEvents } from './run-state-journal-v2.mjs';
 import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
+import {
+  inspectRecoveryMigrationGate,
+  recoveryMigrationStepForEvent,
+} from './recovery-migration-contract-v1.mjs';
 import { resolveOperationRecovery } from './recovery-policy-v1.mjs';
 
 const ACCEPTED_TERMINALS = new Set(['succeeded', 'skipped']);
@@ -35,6 +39,7 @@ const SINGLE_EVENTS = new Set([
 ]);
 const TWO_PHASE_EVENTS = new Set([
   ...PLAN_EVENTS,
+  'unit_attempt_started',
   'unit_prepare_started',
   'unit_dependency_blocked',
   'unit_split',
@@ -54,6 +59,9 @@ const TWO_PHASE_EVENTS = new Set([
   'unit_recorded',
   'run_blocked',
   'run_attention_required',
+  'stage_recovery_contract_fenced',
+  'stage_recovery_migration_started',
+  'stage_recovery_migration_completed',
   'stage_completed',
 ]);
 const RECOVERY_BOUND_EVENTS = new Set([
@@ -99,26 +107,125 @@ function createUnit(unitId) {
   };
 }
 
+function applyAuthorizedMigrationProjection(event, unit, mode) {
+  const payload = event.payload;
+  if (event.type === 'unit_attempt_started') {
+    unit.started = true;
+    unit.attempt_id = payload.attempt_id;
+    unit.attempt_number = payload.attempt_number ?? 0;
+    unit.retry_attempts_used = payload.attempts_used;
+    unit.retry_max_attempts = payload.max_attempts;
+    unit.retry_scheduled = null;
+    unit.active_operation = null;
+    unit.blocked = false;
+    unit.blocked_payload = undefined;
+    unit.recovery_state = 'running';
+    if (mode === 'two_phase') {
+      if (unit.committing) unit.commit_attempt_id = payload.attempt_id;
+      else unit.prepare_attempt_id = payload.attempt_id;
+    }
+    return true;
+  }
+  if (event.type === 'unit_outcome_observed') {
+    unit.recovery_outcomes = [...(unit.recovery_outcomes || []), payload];
+    unit.migration_outcome = payload;
+    if (unit.terminal) {
+      unit.superseded_terminals.push({
+        seq: unit.terminal_seq,
+        payload: unit.terminal_payload,
+      });
+    }
+    unit.terminal = null;
+    unit.terminal_payload = undefined;
+    unit.terminal_seq = undefined;
+    unit.blocked = false;
+    unit.blocked_payload = undefined;
+    unit.recovery_state = 'running';
+    return true;
+  }
+  if (event.type === 'unit_retry_scheduled') {
+    unit.retry_scheduled = payload;
+    unit.recovery_state = 'retry_wait';
+    return true;
+  }
+  if (event.type === 'unit_reconciliation_requested') {
+    unit.blocked = true;
+    unit.blocked_payload = {
+      ...payload,
+      reconciliation_request_seq: event.seq,
+    };
+    unit.recovery_state = 'reconciling';
+    return true;
+  }
+  if (event.type === 'unit_commit_resumed') {
+    unit.recovery_state = 'committing';
+    return true;
+  }
+  if (event.type === 'unit_effect_committed') {
+    unit.effect_committed = payload;
+    unit.recovery_state = 'committed';
+    return true;
+  }
+  if (event.type === 'unit_resolution') {
+    unit.terminal = payload.status;
+    unit.terminal_payload = payload;
+    unit.terminal_seq = event.seq;
+    unit.migration_resolution = payload;
+    unit.recovery_state = payload.status;
+    return true;
+  }
+  if (event.type === 'unit_isolated') {
+    unit.blocked = false;
+    unit.blocked_payload = undefined;
+    unit.terminal = 'failed';
+    unit.terminal_payload = payload;
+    unit.terminal_seq = event.seq;
+    unit.recovery_state = 'isolated';
+    return true;
+  }
+  if (event.type === 'unit_recorded') {
+    unit.recorded = true;
+    unit.migration_recorded = payload;
+    return true;
+  }
+  return false;
+}
+
 function acceptedUnitCount(units) {
   return [...units.values()].filter((unit) => !unit.split).length;
 }
 
 function validateStageEvents(events, mode) {
+  const migrationGate = inspectRecoveryMigrationGate(events);
+  const hasMigrationPrivilege = events.some((event) => (
+    typeof event.payload?.migration_id === 'string'
+  ));
+  let recoveryProjection = null;
   if (
     mode === 'single'
     || events.some((event) => RECOVERY_BOUND_EVENTS.has(event.type))
+    || migrationGate.state !== 'open'
+    || hasMigrationPrivilege
   ) {
-    reduceRecoveryJournal(events);
+    recoveryProjection = reduceRecoveryJournal(events);
   }
   const allowed = mode === 'single' ? SINGLE_EVENTS : TWO_PHASE_EVENTS;
   const units = new Map();
   let planCompleted = false;
   let completed = false;
-  let runBlocked = null;
+  const migrationBlock = migrationGate.state === 'fenced'
+    ? recoveryProjection?.run?.block || {
+        code: 'recovery_migration_incomplete',
+        migration_id: migrationGate.manifest.migration_id,
+        manifest_hash: migrationGate.manifest.manifest_hash,
+      }
+    : null;
+  let runBlocked = migrationBlock;
   let runAttentionRequired = null;
   for (const event of events) {
     if (!allowed.has(event.type)) transitionError(mode, event, 'event_type');
     if (completed) transitionError(mode, event, 'after_stage_completed');
+    const migrationStep = recoveryMigrationStepForEvent(event, migrationGate);
     if (
       event.type === 'stage_recovery_contract_fenced'
       || event.type === 'stage_recovery_migration_started'
@@ -162,23 +269,40 @@ function validateStageEvents(events, mode) {
     const unitId = assertUnitId(event, mode);
     const unit = units.get(unitId);
     if (!unit) transitionError(mode, event, 'unit_not_planned');
+    if (migrationStep && applyAuthorizedMigrationProjection(event, unit, mode)) {
+      continue;
+    }
     if (event.type === 'unit_attempt_started') {
+      const authenticatedLegacyAttempt = (
+        migrationGate.manifest
+        && event.seq <= migrationGate.manifest.journal_seq
+        && !unit.started
+        && !unit.retry_scheduled
+      );
+      const retryAttempt = (
+        unit.retry_scheduled
+        && event.payload?.previous_attempt_id === unit.attempt_id
+        && event.payload?.attempt_id !== unit.attempt_id
+        && event.payload?.attempt_number === unit.retry_scheduled.attempt_number
+      );
       if (
         mode !== 'single'
-        || !unit.retry_scheduled
-        || event.payload?.previous_attempt_id !== unit.attempt_id
+        || (!authenticatedLegacyAttempt && !retryAttempt)
         || typeof event.payload?.attempt_id !== 'string'
         || !event.payload.attempt_id
-        || event.payload.attempt_id === unit.attempt_id
-        || event.payload?.attempt_number !== unit.retry_scheduled.attempt_number
+        || unit.recorded
+        || unit.terminal
+        || unit.blocked
       ) {
         transitionError(mode, event, 'retry_attempt');
       }
       unit.started = true;
       unit.attempt_id = event.payload.attempt_id;
-      unit.attempt_number = event.payload.attempt_number;
-      unit.retry_attempts_used = unit.retry_scheduled.attempts_used;
-      unit.retry_max_attempts = unit.retry_scheduled.max_attempts;
+      unit.attempt_number = event.payload.attempt_number ?? 0;
+      unit.retry_attempts_used = unit.retry_scheduled?.attempts_used
+        ?? event.payload.attempts_used;
+      unit.retry_max_attempts = unit.retry_scheduled?.max_attempts
+        ?? event.payload.max_attempts;
       unit.retry_scheduled = null;
       unit.active_operation = null;
       unit.blocked = false;
@@ -653,7 +777,7 @@ function validateStageEvents(events, mode) {
     units,
     planCompleted,
     completed,
-    runBlocked,
+    runBlocked: migrationBlock || runBlocked,
     runAttentionRequired,
   };
 }
@@ -834,6 +958,20 @@ function frozenPlanSkipVerified(unit, terminal) {
   );
 }
 
+function authenticatedMigrationTerminal(unit) {
+  return (
+    unit.recorded
+    && unit.migration_outcome
+    && unit.migration_resolution
+    && unit.migration_recorded
+    && unit.migration_outcome.migration_id === unit.migration_resolution.migration_id
+    && unit.migration_outcome.migration_id === unit.migration_recorded.migration_id
+    && unit.migration_outcome.attempt_id === unit.terminal_payload?.attempt_id
+    && unit.migration_resolution.status === unit.terminal
+    && ACCEPTED_TERMINALS.has(unit.terminal)
+  );
+}
+
 function acceptedVerificationAction(terminal, recovery) {
   return (
     terminal?.status === 'succeeded'
@@ -884,9 +1022,9 @@ export async function runSinglePhaseStage({
 }) {
   const events = [...initialEvents];
   let state = await ensurePlan({ events, plan, planMetadata, append, mode: 'single' });
+  if (state.runBlocked) return { status: 'blocked', detail: state.runBlocked };
   if (planOnly) return { status: 'planned', unitCount: plan.length };
   if (state.completed) return { status: 'completed', acceptedCount: acceptedUnitCount(state.units) };
-  if (state.runBlocked) return { status: 'blocked', detail: state.runBlocked };
   if (state.runAttentionRequired) {
     return { status: 'attention_required', detail: state.runAttentionRequired };
   }
@@ -1057,7 +1195,10 @@ export async function runSinglePhaseStage({
       recovered
       && ACCEPTED_TERMINALS.has(unit.terminal)
     ) {
-      if (!frozenPlanSkipVerified(plannedUnit, unit.terminal_payload)) {
+      if (
+        !frozenPlanSkipVerified(plannedUnit, unit.terminal_payload)
+        && !authenticatedMigrationTerminal(unit)
+      ) {
         const completedOperation = unit.completed_operations.at(-1);
         if (
           !completedOperation?.operation_id
@@ -1495,9 +1636,9 @@ export async function runTwoPhaseStage({
 }) {
   const events = [...initialEvents];
   let state = await ensurePlan({ events, plan, planMetadata, append, mode: 'two_phase' });
+  if (state.runBlocked) return { status: 'blocked', detail: state.runBlocked };
   if (planOnly) return { status: 'planned', unitCount: plan.length };
   if (state.completed) return { status: 'completed', acceptedCount: acceptedUnitCount(state.units) };
-  if (state.runBlocked) return { status: 'blocked', detail: state.runBlocked };
   if (state.runAttentionRequired) {
     return { status: 'attention_required', detail: state.runAttentionRequired };
   }
@@ -1981,6 +2122,7 @@ export async function runTwoPhaseStage({
     if (
       recoveredAcceptedTerminal
       && !frozenPlanSkipVerified(plannedUnit, unit.terminal_payload)
+      && !authenticatedMigrationTerminal(unit)
     ) {
       if (typeof verifyRecoveredTerminal !== 'function') {
         const detail = recoveredTerminalBlock(

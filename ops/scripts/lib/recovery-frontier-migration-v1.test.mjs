@@ -18,6 +18,10 @@ import {
 } from './recovery-migration-contract-v1.mjs';
 import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
 import {
+  validateSinglePhaseStage,
+  validateTwoPhaseStage,
+} from './recoverable-stage-v2.mjs';
+import {
   RECOVERY_POLICY_HASH,
   RECOVERY_POLICY_VERSION,
   decideRecovery,
@@ -1087,6 +1091,38 @@ test('legacy runner rejects the fence and migration resumes an interrupted manif
   assert.equal(reduced.run.acceptance_ready, false);
   assert.equal(reduced.completed, false);
   assert.equal(events.filter((event) => event.type === 'unit_resolution').length, 1);
+  validateSinglePhaseStage(events);
+
+  const forgedTail = [
+    ...structuredClone(events),
+    {
+      seq: events.length,
+      type: 'stage_completed',
+      payload: {
+        unit_count: 1,
+        accepted_count: 1,
+        migration_id: manifest.migration_id,
+      },
+    },
+  ];
+  assert.throws(
+    () => reduceRecoveryJournal(forgedTail),
+    /recovery_migration_privilege_outside_manifest/,
+  );
+
+  await journal.acquireLock();
+  try {
+    await journal.appendStage('lessons', 'stage_completed', {
+      unit_count: 1,
+      accepted_count: 1,
+    });
+  } finally {
+    await journal.releaseLock();
+  }
+  events = await journal.readStage('lessons');
+  assert.equal(inspectRecoveryMigrationGate(events).state, 'migrated');
+  assert.equal(reduceRecoveryJournal(events).completed, true);
+  validateSinglePhaseStage(events);
 });
 
 test('migration reenters after every manifest append boundary', async (context) => {
@@ -1691,6 +1727,16 @@ test('preview excludes never-started units, includes retry and committing facts,
   ));
   assert.equal(retryStep.payload.attempts_used, 2);
   assert.equal(retryStep.payload.attempt_number, 8);
+  assert.throws(
+    () => buildRecoveryMigrationManifest({
+      runId: 'migration-run',
+      stage: 'memory_consolidate',
+      events,
+      safeEvidenceByUnit: {},
+      ...MIGRATION_METADATA,
+    }),
+    /recovery_migration_two_phase_retry_unsupported:memory_consolidate/,
+  );
 });
 
 test('migration repairs a legacy prepare identity before appending recovery evidence', () => {
@@ -1743,6 +1789,7 @@ test('migration repairs a legacy prepare identity before appending recovery evid
     reduceRecoveryJournal(migrated).units.get('lesson-p').recovery.state,
     'reconciling',
   );
+  validateTwoPhaseStage(migrated);
 });
 
 test('preview rejects recovery contract versions and hashes unsupported by the runner', async (context) => {

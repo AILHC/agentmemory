@@ -193,12 +193,14 @@ export function inspectRecoveryMigrationGate(events) {
   if (fences.length !== 1) throw new Error('recovery_migration_duplicate_fence');
   const fence = fences[0];
   const manifest = validateRecoveryMigrationManifest(fence.payload, fence.seq);
-  const suffix = events.slice(fence.seq + 1);
-  if (suffix.length > manifest.steps.length) {
-    throw new Error('recovery_migration_suffix_overflow');
+  const legacyPrefix = events.slice(0, manifest.journal_seq + 1);
+  if (hashRecoveryValue(legacyPrefix) !== manifest.input_summary_hash) {
+    throw new Error('recovery_migration_input_summary_mismatch');
   }
-  for (let index = 0; index < suffix.length; index += 1) {
-    const actual = suffix[index];
+  const suffix = events.slice(fence.seq + 1);
+  const migrationPrefix = suffix.slice(0, manifest.steps.length);
+  for (let index = 0; index < migrationPrefix.length; index += 1) {
+    const actual = migrationPrefix[index];
     const expected = manifest.steps[index];
     if (
       actual.seq !== expected.expected_seq + 1
@@ -210,10 +212,29 @@ export function inspectRecoveryMigrationGate(events) {
     }
   }
   return {
-    state: suffix.length === manifest.steps.length ? 'migrated' : 'fenced',
+    state: migrationPrefix.length === manifest.steps.length ? 'migrated' : 'fenced',
     manifest,
-    completedSteps: suffix.length,
+    completedSteps: migrationPrefix.length,
   };
+}
+
+export function recoveryMigrationStepForEvent(event, gate) {
+  if (!gate?.manifest || !Number.isSafeInteger(event?.seq)) return null;
+  const fenceSeq = gate.manifest.journal_seq + 1;
+  const index = event.seq - fenceSeq - 1;
+  if (!Number.isSafeInteger(index) || index < 0 || index >= gate.manifest.steps.length) {
+    return null;
+  }
+  const expected = gate.manifest.steps[index];
+  if (
+    event.type !== expected.type
+    || event.seq !== expected.expected_seq + 1
+    || JSON.stringify(canonicalRecoveryValue(event.payload))
+      !== JSON.stringify(canonicalRecoveryValue(expected.payload))
+  ) {
+    return null;
+  }
+  return expected;
 }
 
 export function assertRecoveryMigrationPrivileges(events, gate) {
@@ -225,11 +246,20 @@ export function assertRecoveryMigrationPrivileges(events, gate) {
     return;
   }
   const fenceSeq = gate.manifest.journal_seq + 1;
-  if (tagged.some((event) => (
-    event.seq < fenceSeq
-    || (event.seq === fenceSeq && event.type !== 'stage_recovery_contract_fenced')
-  ))) {
-    throw new Error('recovery_migration_privilege_before_fence');
+  for (const event of tagged) {
+    if (event.seq < fenceSeq) {
+      throw new Error('recovery_migration_privilege_before_fence');
+    }
+    if (
+      event.seq === fenceSeq
+      && event.type === 'stage_recovery_contract_fenced'
+      && event.payload === gate.manifest
+    ) {
+      continue;
+    }
+    if (!recoveryMigrationStepForEvent(event, gate)) {
+      throw new Error('recovery_migration_privilege_outside_manifest');
+    }
   }
 }
 

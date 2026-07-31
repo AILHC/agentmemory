@@ -34,6 +34,13 @@ import {
 import {
   adaptReflectInsightOperationEvidence,
 } from './reflect-insight-recovery-adapter-v1.mjs';
+import {
+  validateSinglePhaseStage,
+  validateTwoPhaseStage,
+} from './recoverable-stage-v2.mjs';
+import {
+  EFFECT_STATE_RECOVERY_STAGE_MODES,
+} from './effect-state-recovery-stage-catalog-v1.mjs';
 
 const LEGACY_STAGE_EVIDENCE_ADAPTERS = new Map([
   ['summary', ({ safeFacts, ...identity }) =>
@@ -298,6 +305,36 @@ function withStepMetadata(steps, manifest) {
   });
 }
 
+function completeMigrationEvents(legacyEvents, manifest) {
+  return [
+    ...legacyEvents,
+    {
+      seq: manifest.fence_seq,
+      type: 'stage_recovery_contract_fenced',
+      payload: manifest,
+    },
+    ...manifest.steps.map((step) => ({
+      seq: step.expected_seq + 1,
+      type: step.type,
+      payload: step.payload,
+    })),
+  ];
+}
+
+function assertRecoveryMigrationRunnerCompatible(stage, events) {
+  const mode = EFFECT_STATE_RECOVERY_STAGE_MODES[stage];
+  if (!mode) throw new Error(`recovery_migration_stage_mode_unsupported:${stage}`);
+  try {
+    if (mode === 'single') validateSinglePhaseStage(events);
+    else validateTwoPhaseStage(events);
+  } catch (error) {
+    throw new Error(
+      `recovery_migration_runner_incompatible:${stage}:${error.message}`,
+      { cause: error },
+    );
+  }
+}
+
 export function buildRecoveryMigrationManifest({
   runId,
   stage,
@@ -348,6 +385,12 @@ export function buildRecoveryMigrationManifest({
       left.unit_id.localeCompare(right.unit_id, 'en')
       || left.entry_hash.localeCompare(right.entry_hash, 'en')
     ));
+  if (
+    EFFECT_STATE_RECOVERY_STAGE_MODES[stage] === 'two_phase'
+    && entries.some((entry) => entry.decision.action === 'retry')
+  ) {
+    throw new Error(`recovery_migration_two_phase_retry_unsupported:${stage}`);
+  }
   const journalSeq = events.at(-1)?.seq ?? -1;
   const inputSummaryHash = hashRecoveryValue(events);
   const frontierHash = hashRecoveryValue(entries);
@@ -619,6 +662,10 @@ export async function appendRecoveryContractFence({
       events: current,
       verifyEvidenceProvenance,
     });
+    assertRecoveryMigrationRunnerCompatible(
+      stage,
+      completeMigrationEvents(current, manifest),
+    );
     const appended = await journal.appendStageExpectedSeq(
       stage,
       manifest.journal_seq,
@@ -663,6 +710,12 @@ export async function resumeRecoveryMigration({ journal, stage }) {
     if (hashRecoveryValue(legacyPrefix) !== gate.manifest.input_summary_hash) {
       throw new Error('recovery_migration_input_summary_drifted');
     }
+    assertRecoveryMigrationRunnerCompatible(
+      stage,
+      gate.state === 'migrated'
+        ? events
+        : completeMigrationEvents(legacyPrefix, gate.manifest),
+    );
     for (let index = gate.completedSteps; index < gate.manifest.steps.length; index += 1) {
       const step = gate.manifest.steps[index];
       await journal.appendStageExpectedSeq(

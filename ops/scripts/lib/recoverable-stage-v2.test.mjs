@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import test from 'node:test';
 import {
   runSinglePhaseStage,
@@ -6,7 +7,9 @@ import {
   validateSinglePhaseStage,
   validateTwoPhaseStage,
 } from './recoverable-stage-v2.mjs';
+import { buildRecoveryMigrationManifest } from './recovery-frontier-migration-v1.mjs';
 import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
+import { RECOVERY_POLICY_VERSION } from './recovery-policy-v1.mjs';
 
 function makeHarness() {
   const events = [];
@@ -53,6 +56,82 @@ function makeExecutionBoundary(limit) {
 }
 
 const plan = [{ unit_id: 'unit-1', input_hash: 'input-1' }];
+
+function legacyLessonNoBlocksEvidence(unitId) {
+  const attemptId = `${unitId}-attempt`;
+  const receiptKey = `xop_${createHash('sha256')
+    .update(JSON.stringify([attemptId, 'lessons', unitId]))
+    .digest('hex')
+    .slice(0, 32)}`;
+  return {
+    adapter: 'lessons/legacy-safe-facts-v1',
+    attempt_id: attemptId,
+    operation_id: `${unitId}:legacy`,
+    safe_facts: {
+      failure: { cause: 'lesson_no_blocks' },
+      expectedLessonRunId: `${unitId}-run`,
+      expectedRunInputHash: 'a'.repeat(64),
+      expectedReceiptInputHash: 'c'.repeat(64),
+      expectedConfigHash: 'b'.repeat(64),
+      lessonRun: {
+        id: `${unitId}-run`,
+        sessionId: unitId,
+        status: 'failed',
+        inputHash: 'a'.repeat(64),
+        configHash: 'b'.repeat(64),
+        createdLessonIds: [],
+        replacedLessonIds: [],
+        finishedAt: '2026-07-30T00:00:00.000Z',
+      },
+      receipt: {
+        key: receiptKey,
+        runId: attemptId,
+        unitId,
+        stage: 'lessons',
+        inputHash: 'c'.repeat(64),
+        status: 'failed',
+        failure: { class: 'unit', cause: 'lesson_no_blocks' },
+      },
+      lessonChunks: [],
+      formalLessonWrites: [],
+      collection: {
+        schema: 'legacy-lesson-safe-facts-collection/v1',
+        snapshot_hash: 'd'.repeat(64),
+        state_tree_hash: 'f'.repeat(64),
+        engine_hash: 'e'.repeat(64),
+        journal_input_summary_hash: '1'.repeat(64),
+        scope_proofs: [
+          `mem:extraction-operation-receipt:${receiptKey}`,
+          'mem:extraction-operation-receipts',
+          'mem:lesson-extraction:runs',
+          `mem:lesson-extraction:chunks:${unitId}-run`,
+          'mem:lessons',
+          `mem:lesson-commit:receipts:${unitId}-run`,
+        ].map((scope) => ({
+          scope,
+          exact_count: 0,
+          safe_projection_hash: '2'.repeat(64),
+        })),
+      },
+    },
+  };
+}
+
+function completeMigrationEvents(events, manifest) {
+  return [
+    ...events,
+    {
+      seq: manifest.fence_seq,
+      type: 'stage_recovery_contract_fenced',
+      payload: manifest,
+    },
+    ...manifest.steps.map((step) => ({
+      seq: step.expected_seq + 1,
+      type: step.type,
+      payload: step.payload,
+    })),
+  ];
+}
 
 function reconciliationBinding({
   attemptId,
@@ -779,6 +858,226 @@ test('single-phase recovery is scheduling-equivalent after every new journal bou
   for (const boundary of boundaries) {
     assert.deepEqual(await runScenario(boundary), baseline, boundary);
   }
+});
+
+test('authenticated migration supersedes a legacy terminal and controlled resume claims only the next unit', async () => {
+  const stagePlan = [
+    { unit_id: 'lesson-a', input_hash: 'input-a' },
+    { unit_id: 'lesson-b', input_hash: 'input-b' },
+  ];
+  const legacyEvents = [
+    { seq: 0, type: 'unit_planned', payload: stagePlan[0] },
+    { seq: 1, type: 'unit_planned', payload: stagePlan[1] },
+    { seq: 2, type: 'stage_plan_completed', payload: { unit_count: 2 } },
+    {
+      seq: 3,
+      type: 'unit_started',
+      payload: { unit_id: 'lesson-a', attempt_id: 'lesson-a-attempt' },
+    },
+    {
+      seq: 4,
+      type: 'unit_terminal',
+      payload: {
+        unit_id: 'lesson-a',
+        attempt_id: 'lesson-a-attempt',
+        status: 'failed',
+        error: 'lesson_no_blocks',
+      },
+    },
+  ];
+  const manifest = buildRecoveryMigrationManifest({
+    runId: 'formal-shape',
+    stage: 'lessons',
+    events: legacyEvents,
+    safeEvidenceByUnit: {
+      'lesson-a': legacyLessonNoBlocksEvidence('lesson-a'),
+    },
+    originalContractVersion: 'run-state-journal-v2/legacy',
+    targetContractVersion: RECOVERY_POLICY_VERSION,
+    originalPolicyVersion: 'legacy-stage-recovery/v2',
+    targetPolicyVersion: RECOVERY_POLICY_VERSION,
+    upgradeAt: '2026-07-30T00:00:00.000Z',
+    authorizedAt: '2026-07-30T00:00:00.000Z',
+    authorizationSourceType: 'change_ticket',
+  });
+  const migratedEvents = completeMigrationEvents(legacyEvents, manifest);
+  const partialEvents = migratedEvents.slice(0, -1);
+  const partialResult = await runSinglePhaseStage({
+    events: partialEvents,
+    plan: stagePlan,
+    stage: 'lessons',
+    append: async () => assert.fail('partial migration must not append stage events'),
+    attemptIdForUnit: () => assert.fail('partial migration must not create attempts'),
+    execute: async () => assert.fail('partial migration must not execute business work'),
+    record: async () => assert.fail('partial migration must not record business work'),
+  });
+  assert.equal(partialResult.status, 'blocked');
+  assert.equal(partialResult.detail.code, 'recovery_migration_incomplete');
+  const partialPlanOnly = await runSinglePhaseStage({
+    events: partialEvents,
+    plan: stagePlan,
+    stage: 'lessons',
+    planOnly: true,
+    append: async () => assert.fail('partial migration plan-only must not append'),
+    attemptIdForUnit: () => assert.fail('partial migration plan-only must not create attempts'),
+    execute: async () => assert.fail('partial migration plan-only must not execute'),
+    record: async () => assert.fail('partial migration plan-only must not record'),
+  });
+  assert.equal(partialPlanOnly.status, 'blocked');
+  assert.equal(partialPlanOnly.detail.code, 'recovery_migration_incomplete');
+
+  const validated = validateSinglePhaseStage(migratedEvents);
+  assert.equal(validated.units.get('lesson-a').terminal, 'skipped');
+  assert.equal(validated.units.get('lesson-a').recorded, true);
+  const reduced = reduceRecoveryJournal(migratedEvents);
+  assert.equal(reduced.units.get('lesson-a').superseded_terminals.length, 1);
+
+  const tampered = structuredClone(migratedEvents);
+  const tamperedOutcomeIndex = tampered.findIndex((event) => (
+    event.type === 'unit_outcome_observed'
+    && event.payload?.migration_id === manifest.migration_id
+  ));
+  tampered[tamperedOutcomeIndex] = {
+    ...tampered[tamperedOutcomeIndex],
+    payload: {
+      ...tampered[tamperedOutcomeIndex].payload,
+      manifest_hash: '0'.repeat(64),
+    },
+  };
+  assert.throws(
+    () => validateSinglePhaseStage(tampered),
+    /recovery_migration_step_mismatch/,
+  );
+  const prefixTampered = structuredClone(migratedEvents);
+  prefixTampered[0] = {
+    ...prefixTampered[0],
+    payload: { ...prefixTampered[0].payload, input_hash: 'changed-input' },
+  };
+  assert.throws(
+    () => validateSinglePhaseStage(prefixTampered),
+    /recovery_migration_input_summary_mismatch/,
+  );
+
+  const events = structuredClone(migratedEvents);
+  const executed = [];
+  const recorded = [];
+  const result = await runSinglePhaseStage({
+    events,
+    plan: stagePlan,
+    stage: 'lessons',
+    append: async (type, payload) => {
+      const event = { seq: events.length, type, payload };
+      events.push(event);
+      return event;
+    },
+    attemptIdForUnit: (unit) => `${unit.unit_id}-attempt`,
+    execute: async ({ unit }) => {
+      executed.push(unit.unit_id);
+      return { status: 'succeeded', payload: { lesson_run_id: `${unit.unit_id}-run` } };
+    },
+    verifyRecoveredTerminal: async () => (
+      assert.fail('authenticated migration terminal must not be re-verified')
+    ),
+    record: async ({ unit }) => {
+      recorded.push(unit.unit_id);
+    },
+    executionBoundary: makeExecutionBoundary(1),
+  });
+
+  assert.deepEqual(result, {
+    status: 'paused',
+    unitId: 'lesson-b',
+    processedCount: 1,
+  });
+  assert.deepEqual(executed, ['lesson-b']);
+  assert.deepEqual(recorded, ['lesson-b']);
+  assert.equal(
+    events.filter((event) => (
+      event.type === 'unit_outcome_observed'
+      && event.payload?.unit_id === 'lesson-a'
+    )).length,
+    1,
+  );
+});
+
+test('unfenced initial unit_attempt_started remains invalid', () => {
+  assert.throws(
+    () => validateSinglePhaseStage([
+      { seq: 0, type: 'unit_planned', payload: { unit_id: 'unit-1' } },
+      { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
+      {
+        seq: 2,
+        type: 'unit_attempt_started',
+        payload: { unit_id: 'unit-1', attempt_id: 'attempt-1', attempt_number: 0 },
+      },
+    ]),
+    /retry_attempt/,
+  );
+});
+
+test('two-phase partial migration blocks before plan-only or business work', async () => {
+  const twoPhasePlan = [{ unit_id: 'memory-a', input_hash: 'memory-input' }];
+  const legacyEvents = [
+    { seq: 0, type: 'unit_planned', payload: twoPhasePlan[0] },
+    { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
+    {
+      seq: 2,
+      type: 'unit_prepare_started',
+      payload: { unit_id: 'memory-a', attempt_id: 'prepare-a' },
+    },
+    {
+      seq: 3,
+      type: 'unit_prepared',
+      payload: { unit_id: 'memory-a', attempt_id: 'prepare-a' },
+    },
+    {
+      seq: 4,
+      type: 'unit_committing',
+      payload: {
+        unit_id: 'memory-a',
+        attempt_id: 'commit-a',
+        prepared_attempt_id: 'prepare-a',
+      },
+    },
+    {
+      seq: 5,
+      type: 'unit_terminal',
+      payload: { unit_id: 'memory-a', attempt_id: 'commit-a', status: 'succeeded' },
+    },
+    {
+      seq: 6,
+      type: 'unit_recorded',
+      payload: { unit_id: 'memory-a', attempt_id: 'commit-a' },
+    },
+  ];
+  const manifest = buildRecoveryMigrationManifest({
+    runId: 'two-phase-partial',
+    stage: 'memory_consolidate',
+    events: legacyEvents,
+    safeEvidenceByUnit: {},
+    originalContractVersion: 'run-state-journal-v2/legacy',
+    targetContractVersion: RECOVERY_POLICY_VERSION,
+    originalPolicyVersion: 'legacy-stage-recovery/v2',
+    targetPolicyVersion: RECOVERY_POLICY_VERSION,
+    upgradeAt: '2026-07-30T00:00:00.000Z',
+    authorizedAt: '2026-07-30T00:00:00.000Z',
+    authorizationSourceType: 'change_ticket',
+  });
+  const partialEvents = completeMigrationEvents(legacyEvents, manifest).slice(0, -1);
+  const result = await runTwoPhaseStage({
+    events: partialEvents,
+    plan: twoPhasePlan,
+    stage: 'memory_consolidate',
+    planOnly: true,
+    append: async () => assert.fail('partial two-phase migration must not append'),
+    prepareAttemptIdForUnit: () => assert.fail('partial migration must not prepare'),
+    commitAttemptIdForUnit: () => assert.fail('partial migration must not commit'),
+    prepare: async () => assert.fail('partial migration must not prepare business work'),
+    commit: async () => assert.fail('partial migration must not commit business work'),
+    record: async () => assert.fail('partial migration must not record business work'),
+  });
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.detail.code, 'recovery_migration_incomplete');
 });
 
 test('fixed-seed crash positions match the baseline or fail closed across both recovery modes', async () => {
