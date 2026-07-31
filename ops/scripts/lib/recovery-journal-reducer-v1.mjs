@@ -1,6 +1,8 @@
 import {
+  RECOVERY_POLICY_HASH,
   RECOVERY_POLICY_VERSION,
   decideRecovery,
+  recoveryValueHash,
 } from './recovery-policy-v1.mjs';
 import {
   assertRecoveryMigrationPrivileges,
@@ -37,9 +39,11 @@ function validateRecoveryAction(event, unit, action) {
     || payload.attempt_id !== unit.attempt_id
     || payload.operation_id !== outcome.operation_id
     || payload.policy_version !== outcome.policy_version
+    || payload.policy_hash !== outcome.policy_hash
     || !same(payload.evidence, outcome.evidence)
     || !same(payload.decision, outcome.decision)
     || !same(payload.budget, outcome.budget)
+    || !same(payload.normalization, outcome.normalization)
     || payload.effect_verification !== outcome.effect_verification
     || payload.decision?.action !== action
   ) {
@@ -187,8 +191,11 @@ function applyGenericEvent(event, unit, run, units) {
     const migrationAttemptRepair = (
       typeof payload.migration_id === 'string'
       && unit.started
-      && !unit.attempt_id
       && unit.recovery.attempts.length === 0
+      && (
+        !unit.attempt_id
+        || payload.attempt_id === unit.attempt_id
+      )
     );
     const initialAttempt = (
       (!unit.started && !unit.recovery.retry)
@@ -233,6 +240,9 @@ function applyGenericEvent(event, unit, run, units) {
       && ACCEPTED_RESOLUTIONS.has(completedOperation?.terminal_result?.status)
     );
     const migrationStep = typeof payload.migration_id === 'string';
+    const normalizationBound = payload.normalization !== undefined
+      || payload.policy_hash !== undefined;
+    const normalization = payload.normalization;
     const decision = decideRecovery({
       policyVersion: payload.policy_version,
       evidence: payload.evidence,
@@ -241,6 +251,15 @@ function applyGenericEvent(event, unit, run, units) {
     });
     if (
       payload.policy_version !== RECOVERY_POLICY_VERSION
+      || (
+        normalizationBound
+        && (
+          payload.policy_hash !== RECOVERY_POLICY_HASH
+          || !/^[0-9a-f]{64}$/.test(String(normalization?.candidate_evidence_hash || ''))
+          || !/^[0-9a-f]{64}$/.test(String(normalization?.snapshot_hash || ''))
+          || normalization?.normalized_evidence_hash !== recoveryValueHash(payload.evidence)
+        )
+      )
       || JSON.stringify(decision) !== JSON.stringify(payload.decision)
       || !unit.planned
       || !unit.started
@@ -301,45 +320,82 @@ function applyGenericEvent(event, unit, run, units) {
     validateRecoveryAction(event, unit, 'reconcile');
     if (
       typeof payload.migration_id !== 'string'
-      && payload.operation_id !== unit.active_operation?.operation_id
+      && (
+        payload.operation_id !== unit.active_operation?.operation_id
+        || !['execute', 'prepare', 'commit'].includes(payload.phase)
+        || !/^xop_[0-9a-f]{32}$/.test(String(payload.receipt_key || ''))
+        || payload.receipt_run_id !== payload.attempt_id
+        || typeof payload.receipt_stage !== 'string'
+        || !payload.receipt_stage
+        || typeof payload.receipt_unit_id !== 'string'
+        || !payload.receipt_unit_id
+        || !/^[0-9a-f]{64}$/.test(String(payload.receipt_input_hash || ''))
+        || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(
+          String(payload.receipt_started_at || ''),
+        )
+      )
     ) {
       transitionError(event, 'reconciliation_operation');
     }
     unit.terminal = null;
     unit.terminal_payload = undefined;
     unit.blocked = true;
-    unit.blocked_payload = payload;
+    unit.blocked_payload = {
+      ...payload,
+      reconciliation_request_seq: event.seq,
+    };
     unit.recovery.state = 'reconciling';
     return true;
   }
   if (event.type === 'unit_reconciliation_resolved') {
-    const legacyResolution = (
-      unit?.planned
-      && unit.blocked
-      && !unit.active_operation
-      && payload.result_status === 'absent'
-    );
+    const request = unit?.blocked_payload;
+    const genericRequest = request?.decision?.action === 'reconcile';
+    const legacyRequest = request?.reason === 'extraction_operation_reconciliation_required';
+    const expectedPhase = request?.phase
+      || (unit?.committing ? 'commit' : 'execute');
+    const resolvedPhase = payload.phase || (legacyRequest ? expectedPhase : null);
     if (
-      !legacyResolution
-      && (
-        !unit?.planned
-        || !unit.blocked
-        || !unit.active_operation
-        || payload.attempt_id !== unit.attempt_id
-        || payload.operation_id !== unit.active_operation.operation_id
-        || !/^xrec_[0-9a-f]{32}$/.test(String(payload.reconciliation_id || ''))
-        || !/^[0-9a-f]{64}$/.test(String(payload.receipt_input_hash || ''))
-        || payload.receipt_status !== 'reconciled'
-        || payload.result_status !== 'absent'
-        || payload.cause !== 'orphaned_operation_result_absent'
+      !unit?.planned
+      || !unit.blocked
+      || !unit.active_operation
+      || (!genericRequest && !legacyRequest)
+      || !['execute', 'prepare', 'commit'].includes(expectedPhase)
+      || resolvedPhase !== expectedPhase
+      || payload.attempt_id !== unit.attempt_id
+      || payload.operation_id !== unit.active_operation.operation_id
+      || (
+        genericRequest
+        && payload.reconciliation_request_seq !== request.reconciliation_request_seq
       )
+      || (
+        genericRequest
+        && (
+          payload.receipt_key !== request.receipt_key
+          || payload.receipt_run_id !== request.receipt_run_id
+          || payload.receipt_stage !== request.receipt_stage
+          || payload.receipt_unit_id !== request.receipt_unit_id
+          || payload.receipt_input_hash !== request.receipt_input_hash
+          || payload.receipt_started_at !== request.receipt_started_at
+        )
+      )
+      || !/^xrec_[0-9a-f]{32}$/.test(String(payload.reconciliation_id || ''))
+      || (
+        genericRequest
+        && !/^xop_[0-9a-f]{32}$/.test(String(payload.receipt_key || ''))
+      )
+      || !/^[0-9a-f]{64}$/.test(String(payload.receipt_input_hash || ''))
+      || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(
+        String(payload.receipt_started_at || ''),
+      )
+      || payload.receipt_status !== 'reconciled'
+      || payload.result_status !== 'absent'
+      || payload.cause !== 'orphaned_operation_result_absent'
     ) {
       transitionError(event, 'reconciliation_resolution');
     }
     unit.blocked = false;
     unit.blocked_payload = undefined;
     unit.active_operation = null;
-    if (legacyResolution) unit.started = false;
     unit.recovery.reconciliation = payload;
     unit.recovery.state = 'running';
     return true;
@@ -490,7 +546,11 @@ export function reduceRecoveryJournal(events) {
         || completed
         || [...units.values()].some((unit) => (
           !unit.split
-          && (!ACCEPTED_RESOLUTIONS.has(unit.terminal) || !unit.recorded)
+          && (
+            unit.blocked
+            || !ACCEPTED_RESOLUTIONS.has(unit.terminal)
+            || !unit.recorded
+          )
         ))
       ) {
         transitionError(event, 'stage_completion');
@@ -551,6 +611,7 @@ export function reduceRecoveryJournal(events) {
     } else if (event.type === 'unit_prepare_started') {
       unit.started = true;
       unit.prepare_attempt_id = event.payload.attempt_id;
+      unit.attempt_id = event.payload.attempt_id;
     } else if (event.type === 'unit_operation_started') {
       ensureMutableUnit(event, unit);
       if (
@@ -584,6 +645,7 @@ export function reduceRecoveryJournal(events) {
     } else if (event.type === 'unit_committing') {
       unit.committing = true;
       unit.commit_attempt_id = event.payload.attempt_id;
+      unit.attempt_id = event.payload.attempt_id;
     } else if (event.type === 'unit_terminal') {
       ensureMutableUnit(event, unit);
       if (
@@ -714,9 +776,15 @@ export function reduceRecoveryJournal(events) {
     .filter(Boolean)
     .sort();
   const acceptanceReady = (
-    units.size > 0
+    completed
+    && run.status === 'completed'
+    && units.size > 0
     && [...units.values()].every((unit) => (
-      unit.split || (ACCEPTED_RESOLUTIONS.has(unit.terminal) && unit.recorded)
+      unit.split || (
+        !unit.blocked
+        && ACCEPTED_RESOLUTIONS.has(unit.terminal)
+        && unit.recorded
+      )
     ))
   );
   return {

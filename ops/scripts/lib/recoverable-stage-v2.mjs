@@ -1,5 +1,6 @@
 import { foldRecoveryStageEvents } from './run-state-journal-v2.mjs';
 import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
+import { resolveOperationRecovery } from './recovery-policy-v1.mjs';
 
 const ACCEPTED_TERMINALS = new Set(['succeeded', 'skipped']);
 const TERMINALS = new Set([...ACCEPTED_TERMINALS, 'failed']);
@@ -35,13 +36,37 @@ const SINGLE_EVENTS = new Set([
 const TWO_PHASE_EVENTS = new Set([
   ...PLAN_EVENTS,
   'unit_prepare_started',
+  'unit_dependency_blocked',
   'unit_split',
   'unit_prepared',
   'unit_committing',
+  'unit_operation_started',
+  'unit_operation_completed',
+  'unit_outcome_observed',
+  'unit_reconciliation_requested',
+  'unit_reconciliation_resolved',
+  'unit_commit_resumed',
+  'unit_effect_committed',
+  'unit_resolution',
+  'unit_isolated',
   'unit_terminal',
   'unit_blocked',
   'unit_recorded',
+  'run_blocked',
+  'run_attention_required',
   'stage_completed',
+]);
+const RECOVERY_BOUND_EVENTS = new Set([
+  'unit_operation_started',
+  'unit_operation_completed',
+  'unit_outcome_observed',
+  'unit_reconciliation_requested',
+  'unit_reconciliation_resolved',
+  'unit_commit_resumed',
+  'unit_effect_committed',
+  'unit_resolution',
+  'unit_isolated',
+  'run_blocked',
 ]);
 
 function transitionError(mode, event, reason) {
@@ -79,7 +104,12 @@ function acceptedUnitCount(units) {
 }
 
 function validateStageEvents(events, mode) {
-  if (mode === 'single') reduceRecoveryJournal(events);
+  if (
+    mode === 'single'
+    || events.some((event) => RECOVERY_BOUND_EVENTS.has(event.type))
+  ) {
+    reduceRecoveryJournal(events);
+  }
   const allowed = mode === 'single' ? SINGLE_EVENTS : TWO_PHASE_EVENTS;
   const units = new Map();
   let planCompleted = false;
@@ -111,7 +141,8 @@ function validateStageEvents(events, mode) {
     if (event.type === 'stage_completed') {
       if (!planCompleted) transitionError(mode, event, 'before_plan_completed');
       if ([...units.values()].some((unit) =>
-        !unit.split && (!ACCEPTED_TERMINALS.has(unit.terminal) || !unit.recorded))) {
+        !unit.split
+        && (unit.blocked || !ACCEPTED_TERMINALS.has(unit.terminal) || !unit.recorded))) {
         transitionError(mode, event, 'units_not_accepted');
       }
       completed = true;
@@ -156,18 +187,44 @@ function validateStageEvents(events, mode) {
       continue;
     }
     if (event.type === 'unit_reconciliation_resolved') {
-      if (mode !== 'single') transitionError(mode, event, 'reconciliation_mode');
       if (!unit.blocked) transitionError(mode, event, 'reconciliation_without_block');
       if (!unit.active_operation) transitionError(mode, event, 'reconciliation_without_active_operation');
+      const request = unit.blocked_payload;
+      const genericRequest = request?.decision?.action === 'reconcile';
+      const legacyRequest = request?.reason === 'extraction_operation_reconciliation_required';
+      const expectedPhase = request?.phase
+        || (mode === 'single' ? 'execute' : unit.committing ? 'commit' : 'prepare');
+      const resolvedPhase = event.payload?.phase || (legacyRequest ? expectedPhase : null);
       if (
         event.payload?.attempt_id !== unit.attempt_id
         || event.payload?.operation_id !== unit.active_operation.operation_id
+        || !['execute', 'prepare', 'commit'].includes(expectedPhase)
+        || resolvedPhase !== expectedPhase
+        || (
+          genericRequest
+          && event.payload?.reconciliation_request_seq !== request.reconciliation_request_seq
+        )
+        || (
+          genericRequest
+          && (
+            event.payload?.receipt_key !== request.receipt_key
+            || event.payload?.receipt_run_id !== request.receipt_run_id
+            || event.payload?.receipt_stage !== request.receipt_stage
+            || event.payload?.receipt_unit_id !== request.receipt_unit_id
+            || event.payload?.receipt_input_hash !== request.receipt_input_hash
+            || event.payload?.receipt_started_at !== request.receipt_started_at
+          )
+        )
       ) {
         transitionError(mode, event, 'reconciliation_operation_identity');
       }
       if (
-        unit.blocked_payload?.reason !== 'extraction_operation_reconciliation_required'
+        (!genericRequest && !legacyRequest)
         || !/^xrec_[0-9a-f]{32}$/.test(String(event.payload?.reconciliation_id || ''))
+        || (
+          genericRequest
+          && !/^xop_[0-9a-f]{32}$/.test(String(event.payload?.receipt_key || ''))
+        )
         || !/^[0-9a-f]{64}$/.test(String(event.payload?.receipt_input_hash || ''))
         || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(
           String(event.payload?.receipt_started_at || ''),
@@ -185,25 +242,45 @@ function validateStageEvents(events, mode) {
       }
       unit.active_operation = null;
       unit.reconciliations = [...(unit.reconciliations || []), event.payload];
+      unit.recovery_state = 'running';
       continue;
     }
     if (event.type === 'unit_reconciliation_requested') {
+      const genericRequest = event.payload?.decision?.action === 'reconcile';
+      const migrationRequest = typeof event.payload?.migration_id === 'string';
       if (
-        mode !== 'single'
-        || event.payload?.attempt_id !== unit.attempt_id
-        || event.payload?.decision?.action !== 'reconcile'
+        event.payload?.attempt_id !== unit.attempt_id
+        || !genericRequest
+        || (
+          !migrationRequest
+          && (
+            !['execute', 'prepare', 'commit'].includes(event.payload?.phase)
+            || !/^xop_[0-9a-f]{32}$/.test(String(event.payload?.receipt_key || ''))
+            || event.payload?.receipt_run_id !== event.payload?.attempt_id
+            || typeof event.payload?.receipt_stage !== 'string'
+            || !event.payload.receipt_stage
+            || typeof event.payload?.receipt_unit_id !== 'string'
+            || !event.payload.receipt_unit_id
+            || !/^[0-9a-f]{64}$/.test(String(event.payload?.receipt_input_hash || ''))
+            || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(
+              String(event.payload?.receipt_started_at || ''),
+            )
+          )
+        )
       ) {
         transitionError(mode, event, 'reconciliation_request');
       }
       unit.blocked = true;
-      unit.blocked_payload = event.payload;
+      unit.blocked_payload = {
+        ...event.payload,
+        reconciliation_request_seq: event.seq,
+      };
       unit.recovery_state = 'reconciling';
       continue;
     }
     if (event.type === 'unit_commit_resumed') {
       if (
-        mode !== 'single'
-        || event.payload?.attempt_id !== unit.attempt_id
+        event.payload?.attempt_id !== unit.attempt_id
         || !['resume_commit', 'reconcile_commit'].includes(event.payload?.decision?.action)
       ) {
         transitionError(mode, event, 'commit_resume');
@@ -211,7 +288,7 @@ function validateStageEvents(events, mode) {
       unit.recovery_state = 'committing';
       continue;
     }
-    if (mode === 'single' && event.type === 'unit_outcome_observed') {
+    if (event.type === 'unit_outcome_observed') {
       const activeOperationId = unit.active_operation?.operation_id;
       const completedOperation = unit.completed_operations.at(-1);
       const completedOperationId = completedOperation?.operation_id;
@@ -252,8 +329,7 @@ function validateStageEvents(events, mode) {
     }
     if (event.type === 'unit_effect_committed') {
       if (
-        mode !== 'single'
-        || event.payload?.attempt_id !== unit.attempt_id
+        event.payload?.attempt_id !== unit.attempt_id
         || event.payload?.decision?.action !== 'replay'
       ) {
         transitionError(mode, event, 'effect_commit');
@@ -263,8 +339,7 @@ function validateStageEvents(events, mode) {
     }
     if (event.type === 'unit_isolated') {
       if (
-        mode !== 'single'
-        || event.payload?.attempt_id !== unit.attempt_id
+        event.payload?.attempt_id !== unit.attempt_id
         || event.payload?.decision?.action !== 'isolate'
       ) {
         transitionError(mode, event, 'isolation');
@@ -284,8 +359,7 @@ function validateStageEvents(events, mode) {
           : declared.stage === dependency.stage && declared.unit_id === dependency.unit_id
       ));
       if (
-        mode !== 'single'
-        || unit.started
+        unit.started
         || !Array.isArray(dependencyIds)
         || dependencyIds.length === 0
         || !Array.isArray(dependencies)
@@ -448,10 +522,11 @@ function validateStageEvents(events, mode) {
       }
       unit.started = true;
       unit.prepare_attempt_id = event.payload.attempt_id;
+      unit.attempt_id = event.payload.attempt_id;
       continue;
     }
     if (!unit.started) transitionError(mode, event, 'before_started');
-    if (mode === 'single' && event.type === 'unit_operation_started') {
+    if (event.type === 'unit_operation_started') {
       if (unit.active_operation) transitionError(mode, event, 'operation_already_started');
       if (event.payload?.attempt_id !== unit.attempt_id) {
         transitionError(mode, event, 'operation_attempt_identity');
@@ -466,7 +541,7 @@ function validateStageEvents(events, mode) {
       unit.active_operation = event.payload;
       continue;
     }
-    if (mode === 'single' && event.type === 'unit_operation_completed') {
+    if (event.type === 'unit_operation_completed') {
       if (!unit.active_operation) transitionError(mode, event, 'operation_not_started');
       if (
         event.payload?.attempt_id !== unit.attempt_id
@@ -526,6 +601,7 @@ function validateStageEvents(events, mode) {
       }
       unit.committing = true;
       unit.commit_attempt_id = event.payload.attempt_id;
+      unit.attempt_id = event.payload.attempt_id;
       continue;
     }
     if (event.type === 'unit_blocked') {
@@ -747,6 +823,48 @@ function blockedPayload(unit, attemptId, result) {
   };
 }
 
+function frozenPlanSkipVerified(unit, terminal) {
+  return (
+    typeof unit.skip_reason === 'string'
+    && unit.skip_reason.length > 0
+    && terminal?.status === 'skipped'
+    && terminal?.reason === unit.skip_reason
+    && Array.isArray(terminal?.result_ids)
+    && terminal.result_ids.length === 0
+  );
+}
+
+function acceptedVerificationAction(terminal, recovery) {
+  return (
+    terminal?.status === 'succeeded'
+    && recovery?.decision?.action === 'replay'
+  ) || (
+    terminal?.status === 'skipped'
+    && recovery?.decision?.action === 'skipped'
+  );
+}
+
+function recoveredTerminalBlock(stage, unit, reason) {
+  return {
+    code: 'receipt_integrity_error',
+    stage,
+    blocked_unit_id: unit.unit_id,
+    reason,
+  };
+}
+
+function reconciliationEvidenceMissingBlock(stage, unit, actionPayload) {
+  return {
+    code: 'receipt_integrity_error',
+    stage,
+    blocked_unit_id: unit.unit_id,
+    attempt_id: actionPayload.attempt_id,
+    operation_id: actionPayload.operation_id,
+    phase: actionPayload.phase,
+    reason: 'reconciliation_evidence_missing',
+  };
+}
+
 export async function runSinglePhaseStage({
   events: initialEvents,
   plan,
@@ -859,74 +977,181 @@ export async function runSinglePhaseStage({
       unit = { ...unit, started: true, attempt_id: attemptId };
       state.units.set(unit.unit_id, unit);
     }
+    const recoveryBudget = {
+      attemptsUsed: unit.retry_attempts_used || 0,
+      maxAttempts: unit.retry_max_attempts ?? maxRetryAttempts,
+    };
+    const resolveOutcome = async ({
+      operationId,
+      candidateEvidence,
+      snapshot = {},
+      effectVerification,
+      verification = false,
+    }) => {
+      const verifiesCompletedOperation = verification === true
+        && operationId === unit.completed_operations.at(-1)?.operation_id
+        && ACCEPTED_TERMINALS.has(
+          unit.completed_operations.at(-1)?.terminal_result?.status,
+        );
+      if (!unit.active_operation && !verifiesCompletedOperation) {
+        throw new Error('v2_single_operation_not_started');
+      }
+      if (
+        !verifiesCompletedOperation
+        && operationId !== unit.active_operation?.operation_id
+      ) {
+        throw new Error('v2_single_operation_identity_mismatch');
+      }
+      const recovery = resolveOperationRecovery({
+        candidateEvidence,
+        snapshot,
+        budget: recoveryBudget,
+        effectVerification,
+      });
+      const eventPayload = {
+        unit_id: unit.unit_id,
+        attempt_id: attemptId,
+        operation_id: operationId,
+        ...(verification ? { verification: true } : {}),
+        policy_version: recovery.policyVersion,
+        policy_hash: recovery.policyHash,
+        evidence: recovery.evidence,
+        decision: recovery.decision,
+        budget: recovery.budget,
+        normalization: recovery.normalization,
+        ...(recovery.effectVerification
+          ? { effect_verification: recovery.effectVerification }
+          : {}),
+      };
+      const outcomeAlreadyObserved = (unit.recovery_outcomes || []).some((outcome) => (
+        outcome.operation_id === eventPayload.operation_id
+        && outcome.policy_version === eventPayload.policy_version
+        && outcome.policy_hash === eventPayload.policy_hash
+        && JSON.stringify(outcome.evidence) === JSON.stringify(eventPayload.evidence)
+        && JSON.stringify(outcome.decision) === JSON.stringify(eventPayload.decision)
+        && JSON.stringify(outcome.budget) === JSON.stringify(eventPayload.budget)
+        && JSON.stringify(outcome.normalization) === JSON.stringify(eventPayload.normalization)
+      ));
+      if (!outcomeAlreadyObserved) {
+        await appendAndTrack(events, append, 'unit_outcome_observed', eventPayload);
+        unit = {
+          ...unit,
+          recovery_outcomes: [...(unit.recovery_outcomes || []), eventPayload],
+        };
+        state.units.set(unit.unit_id, unit);
+      }
+      return recovery;
+    };
     if (
       recovered
       && ACCEPTED_TERMINALS.has(unit.terminal)
-      && !unit.recorded
-      && typeof verifyRecoveredTerminal === 'function'
     ) {
-      const completedOperation = unit.completed_operations.at(-1);
-      if (completedOperation?.operation_id) {
+      if (!frozenPlanSkipVerified(plannedUnit, unit.terminal_payload)) {
+        const completedOperation = unit.completed_operations.at(-1);
+        if (
+          !completedOperation?.operation_id
+          || typeof verifyRecoveredTerminal !== 'function'
+        ) {
+          const detail = recoveredTerminalBlock(
+            stage,
+            unit,
+            'recovered_terminal_verifier_required',
+          );
+          await appendAndTrack(events, append, 'run_blocked', detail);
+          return { status: 'blocked', unitId: unit.unit_id, detail };
+        }
         const verification = await verifyRecoveredTerminal({
-        unit: plannedUnit,
-        attemptId,
-        terminal: unit.terminal_payload,
-        completedOperations: [...unit.completed_operations],
-        recoveryBudget: {
-          attemptsUsed: unit.retry_attempts_used || 0,
-          maxAttempts: unit.retry_max_attempts ?? maxRetryAttempts,
-        },
+          unit: plannedUnit,
+          attemptId,
+          terminal: unit.terminal_payload,
+          completedOperations: [...unit.completed_operations],
+          recoveryBudget,
         });
-        const recovery = verification?.recovery;
+        const recovery = verification?.recoveryCandidate
+          ? unit.recorded
+            ? resolveOperationRecovery({
+                ...verification.recoveryCandidate,
+                budget: recoveryBudget,
+              })
+            : await resolveOutcome({
+                operationId: completedOperation.operation_id,
+                verification: true,
+                ...verification.recoveryCandidate,
+              })
+          : verification?.recovery;
         if (!recovery?.decision || !recovery?.evidence) {
-          throw new Error('v2_recovered_terminal_verification_invalid');
+          const detail = recoveredTerminalBlock(
+            stage,
+            unit,
+            'recovered_terminal_verification_invalid',
+          );
+          await appendAndTrack(events, append, 'run_blocked', detail);
+          return { status: 'blocked', unitId: unit.unit_id, detail };
         }
         const actionPayload = {
           unit_id: unit.unit_id,
           attempt_id: attemptId,
           operation_id: completedOperation.operation_id,
+          phase: 'execute',
           policy_version: recovery.policyVersion,
+          policy_hash: recovery.policyHash,
           evidence: recovery.evidence,
           decision: recovery.decision,
           budget: recovery.budget,
+          normalization: recovery.normalization,
+          ...(verification?.reconciliationBinding || {}),
           ...(recovery.effectVerification
             ? { effect_verification: recovery.effectVerification }
             : {}),
         };
-        const outcomeAlreadyObserved = (unit.recovery_outcomes || []).some((outcome) => (
-          outcome.operation_id === actionPayload.operation_id
-          && outcome.policy_version === actionPayload.policy_version
-          && JSON.stringify(outcome.evidence) === JSON.stringify(actionPayload.evidence)
-          && JSON.stringify(outcome.decision) === JSON.stringify(actionPayload.decision)
-        ));
-        if (!outcomeAlreadyObserved) {
+        if (!unit.recorded && !verification?.recoveryCandidate) {
+          const outcomeAlreadyObserved = (unit.recovery_outcomes || []).some((outcome) => (
+            outcome.operation_id === actionPayload.operation_id
+            && outcome.policy_version === actionPayload.policy_version
+            && JSON.stringify(outcome.evidence) === JSON.stringify(actionPayload.evidence)
+            && JSON.stringify(outcome.decision) === JSON.stringify(actionPayload.decision)
+          ));
+          if (!outcomeAlreadyObserved) {
           await appendAndTrack(events, append, 'unit_outcome_observed', {
             ...actionPayload,
             verification: true,
           });
-        }
-        if (recovery.decision.action === 'replay') {
-          const effectAlreadyCommitted = unit.effect_committed?.operation_id
-            === actionPayload.operation_id
-            && JSON.stringify(unit.effect_committed.evidence)
-              === JSON.stringify(actionPayload.evidence);
-          if (!effectAlreadyCommitted) {
-            await appendAndTrack(events, append, 'unit_effect_committed', actionPayload);
           }
-        } else if (recovery.decision.action === 'reconcile') {
-          await appendAndTrack(events, append, 'unit_reconciliation_requested', actionPayload);
-          unit = {
-            ...unit,
-            blocked: true,
-            blocked_payload: actionPayload,
-            recovery_state: 'reconciling',
-          };
-          state.units.set(unit.unit_id, unit);
-          continue;
-        } else if (recovery.decision.action === 'block_run') {
-          await appendAndTrack(events, append, 'run_blocked', actionPayload);
-          return { status: 'blocked', unitId: unit.unit_id, detail: actionPayload };
-        } else {
+        }
+        if (!acceptedVerificationAction(unit.terminal_payload, recovery)) {
+          if (unit.recorded) {
+            const detail = recoveredTerminalBlock(
+              stage,
+              unit,
+              'recovered_terminal_verification_rejected',
+            );
+            await appendAndTrack(events, append, 'run_blocked', detail);
+            return { status: 'blocked', unitId: unit.unit_id, detail };
+          }
+          if (recovery.decision.action === 'reconcile') {
+            if (!verification?.reconciliationBinding) {
+              const detail = reconciliationEvidenceMissingBlock(
+                stage,
+                unit,
+                actionPayload,
+              );
+              await appendAndTrack(events, append, 'run_blocked', detail);
+              return { status: 'blocked', unitId: unit.unit_id, detail };
+            }
+            await appendAndTrack(events, append, 'unit_reconciliation_requested', actionPayload);
+            unit = {
+              ...unit,
+              blocked: true,
+              blocked_payload: actionPayload,
+              recovery_state: 'reconciling',
+            };
+            state.units.set(unit.unit_id, unit);
+            continue;
+          }
+          if (recovery.decision.action === 'block_run') {
+            await appendAndTrack(events, append, 'run_blocked', actionPayload);
+            return { status: 'blocked', unitId: unit.unit_id, detail: actionPayload };
+          }
           throw new Error(`v2_recovered_terminal_verification_rejected:${recovery.decision.action}`);
         }
       }
@@ -1005,13 +1230,11 @@ export async function runSinglePhaseStage({
         completedOperations: [...unit.completed_operations],
         observedOutcomes: [...(unit.recovery_outcomes || [])],
         retryAuthorization: unit.retry_authorization || null,
-        recoveryBudget: {
-          attemptsUsed: unit.retry_attempts_used || 0,
-          maxAttempts: unit.retry_max_attempts ?? maxRetryAttempts,
-        },
+        recoveryBudget,
         startOperation,
         completeOperation,
         observeOutcome,
+        resolveOutcome,
       }));
       const recovery = result.recovery;
       if (recovery) {
@@ -1020,10 +1243,14 @@ export async function runSinglePhaseStage({
           attempt_id: attemptId,
           operation_id: unit.active_operation?.operation_id
             || unit.completed_operations.at(-1)?.operation_id,
+          phase: 'execute',
           policy_version: recovery.policyVersion,
+          policy_hash: recovery.policyHash,
           evidence: recovery.evidence,
           decision: recovery.decision,
           budget: recovery.budget,
+          normalization: recovery.normalization,
+          ...(result.reconciliationBinding || {}),
           ...(recovery.effectVerification
             ? { effect_verification: recovery.effectVerification }
             : {}),
@@ -1045,6 +1272,15 @@ export async function runSinglePhaseStage({
           state.units.set(unit.unit_id, unit);
         }
         if (recovery.decision.action === 'reconcile') {
+          if (!result.reconciliationBinding) {
+            const detail = reconciliationEvidenceMissingBlock(
+              stage,
+              unit,
+              actionPayload,
+            );
+            await appendAndTrack(events, append, 'run_blocked', detail);
+            return { status: 'blocked', unitId: unit.unit_id, detail };
+          }
           await appendAndTrack(
             events,
             append,
@@ -1175,7 +1411,7 @@ export async function runSinglePhaseStage({
   state = validateStageEvents(events, 'single');
   const requiredUnits = [...state.units.values()].filter((unit) => !unit.split);
   const acceptanceReady = requiredUnits.every((unit) => (
-    ACCEPTED_TERMINALS.has(unit.terminal) && unit.recorded
+    !unit.blocked && ACCEPTED_TERMINALS.has(unit.terminal) && unit.recorded
   ));
   if (!acceptanceReady) {
     const attentionUnits = requiredUnits.filter((unit) => (
@@ -1230,25 +1466,62 @@ export async function runTwoPhaseStage({
   commitAttemptIdForUnit,
   prepare,
   commit,
+  verifyRecoveredTerminal,
   record,
   planOnly = false,
+  stage = 'stage',
+  dependencyStates = new Map(),
+  recoverPrepare = false,
+  recoverCommit = false,
 }) {
   const events = [...initialEvents];
   let state = await ensurePlan({ events, plan, planMetadata, append, mode: 'two_phase' });
   if (planOnly) return { status: 'planned', unitCount: plan.length };
   if (state.completed) return { status: 'completed', acceptedCount: acceptedUnitCount(state.units) };
+  if (state.runBlocked) return { status: 'blocked', detail: state.runBlocked };
+  if (state.runAttentionRequired) {
+    return { status: 'attention_required', detail: state.runAttentionRequired };
+  }
 
-  const work = [...state.units.values()];
+  const work = orderUnitsByDependencies([...state.units.values()]);
   for (let cursor = 0; cursor < work.length; cursor += 1) {
     const plannedUnit = work[cursor];
     let unit = state.units.get(plannedUnit.unit_id);
+    const recoveredAcceptedTerminal = ACCEPTED_TERMINALS.has(unit.terminal);
     if (unit.split) continue;
-    if (unit.blocked) {
-      return { status: 'blocked', unitId: unit.unit_id, detail: unit.blocked_payload };
+    if (unit.blocked || unit.terminal === 'failed') continue;
+    const dependencies = (unit.depends_on || []).map((dependency) => (
+      dependencySnapshot({
+        dependency,
+        stage,
+        state,
+        dependencyStates,
+      })
+    ));
+    const failedDependencies = dependencies.filter(dependencyFailed);
+    if (failedDependencies.length > 0) {
+      const dependencyPayload = {
+        unit_id: unit.unit_id,
+        dependencies: failedDependencies,
+        dependency_unit_ids: failedDependencies.map((dependency) => dependency.unit_id),
+        reason: 'dependency_not_accepted',
+      };
+      await appendAndTrack(
+        events,
+        append,
+        'unit_dependency_blocked',
+        dependencyPayload,
+      );
+      unit = {
+        ...unit,
+        blocked: true,
+        blocked_payload: dependencyPayload,
+        recovery_state: 'dependency_blocked',
+      };
+      state.units.set(unit.unit_id, unit);
+      continue;
     }
-    if (unit.terminal === 'failed') {
-      return { status: 'failed', unitId: unit.unit_id, detail: unit.terminal_payload };
-    }
+    if (!dependencies.every(dependencyAccepted)) continue;
     const prepareAttemptId = unit.prepare_attempt_id || prepareAttemptIdForUnit(plannedUnit);
     const prepareRecovered = unit.started;
     if (!unit.started) {
@@ -1261,20 +1534,125 @@ export async function runTwoPhaseStage({
       state.units.set(unit.unit_id, unit);
     }
     if (!unit.prepared && !unit.terminal) {
+      const prepareOperationId = `${unit.unit_id}:prepare`;
+      const completedPrepareOperation = [...unit.completed_operations]
+        .reverse()
+        .find((operation) => (
+          operation.phase === 'prepare'
+          && operation.operation_id === prepareOperationId
+          && operation.attempt_id === prepareAttemptId
+        ));
+      if (
+        recoverPrepare
+        && !unit.active_operation
+        && !completedPrepareOperation
+      ) {
+        const operationPayload = {
+          unit_id: unit.unit_id,
+          attempt_id: prepareAttemptId,
+          operation_id: prepareOperationId,
+          phase: 'prepare',
+        };
+        await appendAndTrack(events, append, 'unit_operation_started', operationPayload);
+        unit = { ...unit, active_operation: operationPayload };
+        state.units.set(unit.unit_id, unit);
+      }
       const result = normalizePrepareResult(await prepare({
         unit: plannedUnit,
         attemptId: prepareAttemptId,
         recovered: prepareRecovered,
       }));
+      if (result.recoveryCandidate) {
+        const recovery = resolveOperationRecovery({
+          ...result.recoveryCandidate,
+          budget: { attemptsUsed: 0, maxAttempts: 0 },
+        });
+        const actionPayload = {
+          unit_id: unit.unit_id,
+          attempt_id: prepareAttemptId,
+          operation_id: unit.active_operation?.operation_id || prepareOperationId,
+          phase: 'prepare',
+          policy_version: recovery.policyVersion,
+          policy_hash: recovery.policyHash,
+          evidence: recovery.evidence,
+          decision: recovery.decision,
+          budget: recovery.budget,
+          normalization: recovery.normalization,
+          ...(result.reconciliationBinding || {}),
+          ...(recovery.effectVerification
+            ? { effect_verification: recovery.effectVerification }
+            : {}),
+        };
+        await appendAndTrack(events, append, 'unit_outcome_observed', actionPayload);
+        unit = {
+          ...unit,
+          recovery_outcomes: [...(unit.recovery_outcomes || []), actionPayload],
+        };
+        state.units.set(unit.unit_id, unit);
+        if (recovery.decision.action === 'reconcile') {
+          if (!result.reconciliationBinding) {
+            const detail = reconciliationEvidenceMissingBlock(
+              stage,
+              unit,
+              actionPayload,
+            );
+            await appendAndTrack(events, append, 'run_blocked', detail);
+            return { status: 'blocked', unitId: unit.unit_id, detail };
+          }
+          await appendAndTrack(
+            events,
+            append,
+            'unit_reconciliation_requested',
+            actionPayload,
+          );
+          unit = {
+            ...unit,
+            blocked: true,
+            blocked_payload: actionPayload,
+            recovery_state: 'reconciling',
+          };
+          state.units.set(unit.unit_id, unit);
+          continue;
+        }
+        if (recovery.decision.action === 'block_run') {
+          await appendAndTrack(events, append, 'run_blocked', actionPayload);
+          return { status: 'blocked', unitId: unit.unit_id, detail: actionPayload };
+        }
+        throw new Error(`v2_prepare_recovery_action_invalid:${recovery.decision.action}`);
+      }
       if (result.status === 'pending') {
-        return { status: 'pending', unitId: unit.unit_id };
+        continue;
       }
       if (result.status === 'blocked') {
         const payload = blockedPayload(unit, prepareAttemptId, result);
         await appendAndTrack(events, append, 'unit_blocked', payload);
-        return { status: 'blocked', unitId: unit.unit_id, detail: payload };
+        unit = {
+          ...unit,
+          blocked: true,
+          blocked_payload: payload,
+          recovery_state: 'reconciling',
+        };
+        state.units.set(unit.unit_id, unit);
+        continue;
       }
       if (result.status === 'split') {
+        if (recoverPrepare && unit.active_operation) {
+          const operationPayload = {
+            unit_id: unit.unit_id,
+            attempt_id: prepareAttemptId,
+            operation_id: unit.active_operation.operation_id,
+            phase: 'prepare',
+            status: 'split',
+            child_unit_ids: result.children.map((child) => child.unit_id),
+          };
+          await appendAndTrack(events, append, 'unit_operation_completed', operationPayload);
+          unit = {
+            ...unit,
+            active_operation: null,
+            completed_operations: [...unit.completed_operations, operationPayload],
+          };
+          state.units.set(unit.unit_id, unit);
+        }
         await appendAndTrack(events, append, 'unit_split', {
           unit_id: unit.unit_id,
           attempt_id: prepareAttemptId,
@@ -1295,6 +1673,22 @@ export async function runTwoPhaseStage({
         continue;
       }
       if (result.status === 'prepared') {
+        if (recoverPrepare && unit.active_operation) {
+          const operationPayload = {
+            unit_id: unit.unit_id,
+            attempt_id: prepareAttemptId,
+            operation_id: unit.active_operation.operation_id,
+            phase: 'prepare',
+            status: 'prepared',
+          };
+          await appendAndTrack(events, append, 'unit_operation_completed', operationPayload);
+          unit = {
+            ...unit,
+            active_operation: null,
+            completed_operations: [...unit.completed_operations, operationPayload],
+          };
+          state.units.set(unit.unit_id, unit);
+        }
         const payload = {
           ...result.prepared,
           unit_id: unit.unit_id,
@@ -1305,12 +1699,30 @@ export async function runTwoPhaseStage({
         state.units.set(unit.unit_id, unit);
       } else {
         const payload = terminalPayload(unit, prepareAttemptId, result);
+        if (recoverPrepare && unit.active_operation) {
+          const operationPayload = {
+            unit_id: unit.unit_id,
+            attempt_id: prepareAttemptId,
+            operation_id: unit.active_operation.operation_id,
+            phase: 'prepare',
+            status: result.status,
+            terminal_result: {
+              status: result.status,
+              payload: result.payload || {},
+            },
+          };
+          await appendAndTrack(events, append, 'unit_operation_completed', operationPayload);
+          unit = {
+            ...unit,
+            active_operation: null,
+            completed_operations: [...unit.completed_operations, operationPayload],
+          };
+          state.units.set(unit.unit_id, unit);
+        }
         await appendAndTrack(events, append, 'unit_terminal', payload);
         unit = { ...unit, terminal: result.status, terminal_payload: payload };
         state.units.set(unit.unit_id, unit);
-        if (result.status === 'failed') {
-          return { status: 'failed', unitId: unit.unit_id, detail: payload };
-        }
+        if (result.status === 'failed') continue;
       }
     }
     if (unit.prepared && !unit.terminal) {
@@ -1318,34 +1730,267 @@ export async function runTwoPhaseStage({
         unit: plannedUnit,
         prepared: unit.prepared_payload,
       });
+      const commitRecovered = unit.committing;
       if (!unit.committing) {
         await appendAndTrack(events, append, 'unit_committing', {
           unit_id: unit.unit_id,
           attempt_id: commitAttemptId,
           prepared_attempt_id: prepareAttemptId,
         });
-        unit = { ...unit, committing: true, commit_attempt_id: commitAttemptId };
+        unit = {
+          ...unit,
+          committing: true,
+          commit_attempt_id: commitAttemptId,
+          attempt_id: commitAttemptId,
+        };
         state.units.set(unit.unit_id, unit);
+      }
+      const operationId = `${unit.unit_id}:commit`;
+      const startOperation = async ({ operationId: nextOperationId, ...payload }) => {
+        if (unit.active_operation) throw new Error('v2_two_phase_operation_already_started');
+        if (typeof nextOperationId !== 'string' || !nextOperationId) {
+          throw new Error('v2_two_phase_operation_id_invalid');
+        }
+        const eventPayload = {
+          ...payload,
+          unit_id: unit.unit_id,
+          attempt_id: commitAttemptId,
+          operation_id: nextOperationId,
+        };
+        await appendAndTrack(events, append, 'unit_operation_started', eventPayload);
+        unit = { ...unit, active_operation: eventPayload };
+        state.units.set(unit.unit_id, unit);
+        return eventPayload;
+      };
+      const completeOperation = async ({ operationId: completedOperationId, ...payload }) => {
+        if (!unit.active_operation) throw new Error('v2_two_phase_operation_not_started');
+        if (completedOperationId !== unit.active_operation.operation_id) {
+          throw new Error('v2_two_phase_operation_identity_mismatch');
+        }
+        const eventPayload = {
+          ...payload,
+          unit_id: unit.unit_id,
+          attempt_id: commitAttemptId,
+          operation_id: completedOperationId,
+        };
+        await appendAndTrack(events, append, 'unit_operation_completed', eventPayload);
+        unit = {
+          ...unit,
+          active_operation: null,
+          completed_operations: [...unit.completed_operations, eventPayload],
+        };
+        state.units.set(unit.unit_id, unit);
+        return eventPayload;
+      };
+      const resolveOutcome = async ({
+        operationId: resolvedOperationId,
+        candidateEvidence,
+        snapshot = {},
+        effectVerification,
+        verification = false,
+      }) => {
+        const completedOperation = unit.completed_operations.at(-1);
+        const verifiesCompletedOperation = verification === true
+          && resolvedOperationId === completedOperation?.operation_id
+          && ACCEPTED_TERMINALS.has(completedOperation?.terminal_result?.status);
+        if (!unit.active_operation && !verifiesCompletedOperation) {
+          throw new Error('v2_two_phase_operation_not_started');
+        }
+        if (
+          !verifiesCompletedOperation
+          && resolvedOperationId !== unit.active_operation?.operation_id
+        ) {
+          throw new Error('v2_two_phase_operation_identity_mismatch');
+        }
+        const recovery = resolveOperationRecovery({
+          candidateEvidence,
+          snapshot,
+          budget: { attemptsUsed: 0, maxAttempts: 0 },
+          effectVerification,
+        });
+        const eventPayload = {
+          unit_id: unit.unit_id,
+          attempt_id: commitAttemptId,
+          operation_id: resolvedOperationId,
+          ...(verification ? { verification: true } : {}),
+          policy_version: recovery.policyVersion,
+          policy_hash: recovery.policyHash,
+          evidence: recovery.evidence,
+          decision: recovery.decision,
+          budget: recovery.budget,
+          normalization: recovery.normalization,
+          ...(recovery.effectVerification
+            ? { effect_verification: recovery.effectVerification }
+            : {}),
+        };
+        const duplicate = (unit.recovery_outcomes || []).some((outcome) => (
+          outcome.operation_id === eventPayload.operation_id
+          && outcome.policy_version === eventPayload.policy_version
+          && outcome.policy_hash === eventPayload.policy_hash
+          && JSON.stringify(outcome.evidence) === JSON.stringify(eventPayload.evidence)
+          && JSON.stringify(outcome.decision) === JSON.stringify(eventPayload.decision)
+          && JSON.stringify(outcome.normalization) === JSON.stringify(eventPayload.normalization)
+        ));
+        if (!duplicate) {
+          await appendAndTrack(events, append, 'unit_outcome_observed', eventPayload);
+          unit = {
+            ...unit,
+            recovery_outcomes: [...(unit.recovery_outcomes || []), eventPayload],
+          };
+          state.units.set(unit.unit_id, unit);
+        }
+        return recovery;
+      };
+      if (recoverCommit && !unit.active_operation && !unit.completed_operations.at(-1)?.terminal_result) {
+        await startOperation({ operationId });
       }
       const result = normalizeAdapterResult(await commit({
         unit: plannedUnit,
         attemptId: commitAttemptId,
         prepared: unit.prepared_payload,
+        recovered: commitRecovered,
+        activeOperation: unit.active_operation,
+        completedOperations: [...unit.completed_operations],
+        ...(recoverCommit
+          ? { startOperation, completeOperation, resolveOutcome }
+          : {}),
       }));
+      const recovery = result.recovery;
+      if (recovery) {
+        const actionPayload = {
+          unit_id: unit.unit_id,
+          attempt_id: commitAttemptId,
+          operation_id: unit.active_operation?.operation_id
+            || unit.completed_operations.at(-1)?.operation_id,
+          phase: 'commit',
+          policy_version: recovery.policyVersion,
+          policy_hash: recovery.policyHash,
+          evidence: recovery.evidence,
+          decision: recovery.decision,
+          budget: recovery.budget,
+          normalization: recovery.normalization,
+          ...(result.reconciliationBinding || {}),
+          ...(recovery.effectVerification
+            ? { effect_verification: recovery.effectVerification }
+            : {}),
+        };
+        if (recovery.decision.action === 'reconcile') {
+          if (!result.reconciliationBinding) {
+            const detail = reconciliationEvidenceMissingBlock(
+              stage,
+              unit,
+              actionPayload,
+            );
+            await appendAndTrack(events, append, 'run_blocked', detail);
+            return { status: 'blocked', unitId: unit.unit_id, detail };
+          }
+          await appendAndTrack(events, append, 'unit_reconciliation_requested', actionPayload);
+          unit = {
+            ...unit,
+            blocked: true,
+            blocked_payload: actionPayload,
+            recovery_state: 'reconciling',
+          };
+          state.units.set(unit.unit_id, unit);
+          continue;
+        }
+        if (['resume_commit', 'reconcile_commit'].includes(recovery.decision.action)) {
+          await appendAndTrack(events, append, 'unit_commit_resumed', actionPayload);
+          unit = { ...unit, recovery_state: 'committing' };
+          state.units.set(unit.unit_id, unit);
+        } else if (recovery.decision.action === 'block_run') {
+          await appendAndTrack(events, append, 'run_blocked', actionPayload);
+          return { status: 'blocked', unitId: unit.unit_id, detail: actionPayload };
+        } else if (recovery.decision.action === 'isolate') {
+          await appendAndTrack(events, append, 'unit_isolated', actionPayload);
+          unit = {
+            ...unit,
+            terminal: 'failed',
+            terminal_payload: actionPayload,
+            recovery_state: 'isolated',
+          };
+          state.units.set(unit.unit_id, unit);
+          continue;
+        } else if (recovery.decision.action === 'replay') {
+          const effectAlreadyCommitted = unit.effect_committed?.operation_id
+            === actionPayload.operation_id
+            && unit.effect_committed?.policy_version === actionPayload.policy_version
+            && JSON.stringify(unit.effect_committed.evidence)
+              === JSON.stringify(actionPayload.evidence)
+            && unit.effect_committed?.effect_verification
+              === actionPayload.effect_verification;
+          if (!effectAlreadyCommitted) {
+            await appendAndTrack(events, append, 'unit_effect_committed', actionPayload);
+            unit = { ...unit, effect_committed: actionPayload };
+            state.units.set(unit.unit_id, unit);
+          }
+        }
+      }
       if (result.status === 'pending') {
-        return { status: 'pending', unitId: unit.unit_id };
+        continue;
       }
       if (result.status === 'blocked') {
         const payload = blockedPayload(unit, commitAttemptId, result);
         await appendAndTrack(events, append, 'unit_blocked', payload);
-        return { status: 'blocked', unitId: unit.unit_id, detail: payload };
+        unit = {
+          ...unit,
+          blocked: true,
+          blocked_payload: payload,
+          recovery_state: 'reconciling',
+        };
+        state.units.set(unit.unit_id, unit);
+        continue;
       }
       const payload = terminalPayload(unit, commitAttemptId, result);
-      await appendAndTrack(events, append, 'unit_terminal', payload);
+      await appendAndTrack(
+        events,
+        append,
+        result.recovery ? 'unit_resolution' : 'unit_terminal',
+        payload,
+      );
       unit = { ...unit, terminal: result.status, terminal_payload: payload };
       state.units.set(unit.unit_id, unit);
-      if (result.status === 'failed') {
-        return { status: 'failed', unitId: unit.unit_id, detail: payload };
+      if (result.status === 'failed') continue;
+    }
+    if (
+      recoveredAcceptedTerminal
+      && !frozenPlanSkipVerified(plannedUnit, unit.terminal_payload)
+    ) {
+      if (typeof verifyRecoveredTerminal !== 'function') {
+        const detail = recoveredTerminalBlock(
+          stage,
+          unit,
+          'recovered_terminal_verifier_required',
+        );
+        await appendAndTrack(events, append, 'run_blocked', detail);
+        return { status: 'blocked', unitId: unit.unit_id, detail };
+      }
+      const verification = await verifyRecoveredTerminal({
+        unit: plannedUnit,
+        prepareAttemptId,
+        commitAttemptId: unit.commit_attempt_id || null,
+        prepared: unit.prepared_payload || null,
+        terminal: unit.terminal_payload,
+        completedOperations: [...unit.completed_operations],
+      });
+      const recovery = verification?.recoveryCandidate
+        ? resolveOperationRecovery({
+            ...verification.recoveryCandidate,
+            budget: { attemptsUsed: 0, maxAttempts: 0 },
+          })
+        : verification?.recovery;
+      if (
+        !recovery?.decision
+        || !recovery?.evidence
+        || !acceptedVerificationAction(unit.terminal_payload, recovery)
+      ) {
+        const detail = recoveredTerminalBlock(
+          stage,
+          unit,
+          'recovered_terminal_verification_rejected',
+        );
+        await appendAndTrack(events, append, 'run_blocked', detail);
+        return { status: 'blocked', unitId: unit.unit_id, detail };
       }
     }
     if (!unit.recorded) {
@@ -1363,6 +2008,37 @@ export async function runTwoPhaseStage({
       unit = { ...unit, recorded: true };
       state.units.set(unit.unit_id, unit);
     }
+  }
+
+  state = validateStageEvents(events, 'two_phase');
+  const requiredUnits = [...state.units.values()].filter((unit) => !unit.split);
+  const acceptanceReady = requiredUnits.every((unit) => (
+    !unit.blocked && ACCEPTED_TERMINALS.has(unit.terminal) && unit.recorded
+  ));
+  if (!acceptanceReady) {
+    const attentionUnits = requiredUnits.filter((unit) => (
+      unit.terminal === 'failed'
+      || ['isolated', 'dependency_blocked'].includes(unit.recovery_state)
+    ));
+    if (attentionUnits.length > 0) {
+      const detail = {
+        unit_ids: attentionUnits.map((unit) => unit.unit_id),
+        failed_count: attentionUnits.filter((unit) => unit.terminal === 'failed').length,
+        isolated_count: attentionUnits.filter((unit) => (
+          unit.recovery_state === 'isolated'
+        )).length,
+        dependency_blocked_count: attentionUnits.filter((unit) => (
+          unit.recovery_state === 'dependency_blocked'
+        )).length,
+      };
+      await appendAndTrack(events, append, 'run_attention_required', detail);
+      return { status: 'attention_required', detail };
+    }
+    const waitingUnit = requiredUnits.find((unit) => !unit.terminal);
+    return {
+      status: 'pending',
+      ...(waitingUnit ? { unitId: waitingUnit.unit_id } : {}),
+    };
   }
 
   await appendAndTrack(events, append, 'stage_completed', {

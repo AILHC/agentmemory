@@ -49,7 +49,7 @@ function successfulSummaryResponse({ attemptId, inputHash }, title = 'summary') 
         kind: 'committed',
         receiptKey: `xop_${stableHash({ attemptId, inputHash }).slice(0, 32)}`,
         receiptVersion: 1,
-        resultRef: `summary-resumable-runs:${resumableRunId}`,
+        resultRef: `mem:summary-resumable:runs:${resumableRunId}`,
         effectHash: stableHash({
           title,
           narrative: '',
@@ -57,6 +57,53 @@ function successfulSummaryResponse({ attemptId, inputHash }, title = 'summary') 
           filesModified: [],
           concepts: [],
         }),
+      },
+    },
+  };
+}
+
+function runningSummaryOperationReceipt({
+  attemptId,
+  runnerInputHash,
+  operationUnitId,
+}) {
+  return {
+    key: `xop_${stableHash([attemptId, 'summary', operationUnitId]).slice(0, 32)}`,
+    version: 1,
+    status: 'running',
+    runId: attemptId,
+    stage: 'summary',
+    unitId: operationUnitId,
+    inputHash: stableHash({ attemptId, runnerInputHash, operationUnitId }),
+    runnerInputHash,
+    startedAt: '2026-07-30T00:00:00.000Z',
+  };
+}
+
+function missingOperationReceiptResponse({
+  attemptId,
+  stage,
+  unitId,
+  runnerInputHash,
+}) {
+  return {
+    ok: false,
+    status_code: 503,
+    data: {
+      success: false,
+      failure: {
+        class: 'transient_runtime',
+        cause: 'extraction_operation_reconciliation_required',
+      },
+      operationReceiptAbsence: {
+        schema: 'extraction-operation-receipt-absence/v1',
+        key: `xop_${stableHash([attemptId, stage, unitId]).slice(0, 32)}`,
+        runId: attemptId,
+        stage,
+        unitId,
+        inputHash: stableHash({ attemptId, stage, unitId, runnerInputHash }),
+        runnerInputHash,
+        observedAt: '2026-07-30T00:00:00.000Z',
       },
     },
   };
@@ -443,11 +490,12 @@ test('v2 summary treats unit_started without an inner operation as not yet dispa
         },
         v2LessonsRemote: lessonsRemote,
       });
-      assert.equal(code, 75);
+      assert.equal(code, 1);
       const root = path.join(stateDir, 'summary-recovery.v2');
       const stage = (await fs.readFile(path.join(root, 'summary.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
-      assert.equal(stage.at(-1).type, 'unit_reconciliation_requested');
-      assert.equal(stage.at(-1).payload.decision.action, 'reconcile');
+      assert.equal(stage.at(-1).type, 'run_blocked');
+      assert.equal(stage.at(-1).payload.reason, 'reconciliation_evidence_missing');
+      assert.equal(stage.some((event) => event.type === 'unit_reconciliation_requested'), false);
       assert.equal(stage.some((event) => event.type === 'unit_terminal'), false);
     });
     assert.equal(attempts.length, 1);
@@ -519,15 +567,181 @@ test('v2 summary recovery waits when no durable result is visible', async () => 
           record: async () => {},
         },
       });
-      assert.equal(code, 75);
+      assert.equal(code, 1);
     });
     const events = (await fs.readFile(
       path.join(stateDir, 'summary-missing.v2', 'summary.jsonl'),
       'utf8',
     )).trim().split('\n').map(JSON.parse);
-    assert.equal(events.at(-1).type, 'unit_reconciliation_requested');
-    assert.equal(events.at(-1).payload.decision.action, 'reconcile');
+    assert.equal(events.at(-1).type, 'run_blocked');
+    assert.equal(events.at(-1).payload.reason, 'reconciliation_evidence_missing');
+    assert.equal(events.some((event) => event.type === 'unit_reconciliation_requested'), false);
   } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 summary retries the same identity after exact missing-receipt proof', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-absence-'));
+  const requests = [];
+  try {
+    await withServer((_request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+      }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'summary-absence',
+        '--run-state-format', 'v2',
+      ];
+      await assert.rejects(() => mainForEarlyStages(argv, {
+        v2SummaryRemote: {
+          advance: async () => assert.fail('must not dispatch before operation journal durability'),
+          record: async () => {},
+        },
+        v2LessonsRemote: {
+          start: async () => assert.fail('lessons must not start before Summary recovery'),
+          record: async () => {},
+        },
+        onV2DurableEvent: async ({ scope, type }) => {
+          if (scope === 'summary' && type === 'unit_operation_started') {
+            throw new Error('injected_crash');
+          }
+        },
+      }), /injected_crash/);
+
+      const code = await mainForEarlyStages([...argv, '--resume'], {
+        v2SummaryRemote: {
+          advance: async (request) => {
+            requests.push(request);
+            return request.requireExistingReceipt
+              ? missingOperationReceiptResponse({
+                  attemptId: request.attemptId,
+                  stage: 'summary',
+                  unitId: request.operationUnitId,
+                  runnerInputHash: request.inputHash,
+                })
+              : successfulSummaryResponse(request, 'absence recovery');
+          },
+          record: async () => {},
+        },
+        v2LessonsRemote: {
+          start: async () => committedLessonResponse('lesson-after-summary-absence'),
+          record: async () => {},
+        },
+      });
+
+      assert.equal(code, 0);
+    });
+    assert.deepEqual(
+      requests.map((request) => request.requireExistingReceipt),
+      [true, false],
+    );
+    assert.equal(
+      requests[1].expectedReceiptInputHash,
+      stableHash({
+        attemptId: requests[0].attemptId,
+        stage: 'summary',
+        unitId: requests[0].operationUnitId,
+        runnerInputHash: requests[0].inputHash,
+      }),
+    );
+    const events = (await fs.readFile(
+      path.join(stateDir, 'summary-absence.v2', 'summary.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(events.at(-1).type, 'stage_completed');
+    assert.equal(events.some((event) => event.type === 'run_blocked'), false);
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 summary keeps an uncontracted 5xx pending and re-verifies the same receipt', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-5xx-'));
+  const calls = [];
+  const lessonsRemote = {
+    start: async ({ attemptId }) => ({
+      ok: true,
+      data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+    }),
+    record: async () => {},
+  };
+  try {
+    await withServer((request, response) => {
+      assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+      }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'summary-uncontracted-5xx',
+        '--run-state-format', 'v2',
+      ];
+      const firstCode = await mainForEarlyStages(argv, {
+        v2SummaryRemote: {
+          advance: async (request) => {
+            calls.push(request);
+            return {
+              ok: false,
+              status_code: 500,
+              data: { error: 'generic runtime failure' },
+            };
+          },
+          record: async () => assert.fail('unverified result must not be recorded'),
+        },
+        v2LessonsRemote: lessonsRemote,
+      });
+      assert.equal(firstCode, 75);
+
+      const resumedCode = await mainForEarlyStages([...argv, '--resume'], {
+        v2SummaryRemote: {
+          advance: async (request) => {
+            calls.push(request);
+            assert.equal(request.requireExistingReceipt, true);
+            return {
+              ...successfulSummaryResponse(request, 'recovered summary'),
+              data: {
+                ...successfulSummaryResponse(request, 'recovered summary').data,
+                operationUnitId: request.operationUnitId,
+              },
+            };
+          },
+          record: async () => {},
+        },
+        v2LessonsRemote: lessonsRemote,
+      });
+      assert.equal(resumedCode, 0);
+    });
+    assert.deepEqual(calls.map((call) => call.requireExistingReceipt), [false, true]);
+    const events = (await fs.readFile(
+      path.join(stateDir, 'summary-uncontracted-5xx.v2', 'summary.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(events.some((event) => event.type === 'unit_reconciliation_requested'), false);
+    assert.ok(
+      events.some((event) => event.type === 'unit_resolution'),
+      JSON.stringify(events.map((event) => ({
+        type: event.type,
+        action: event.payload?.decision?.action,
+      }))),
+    );
+  } finally {
+    await fs.rm(stateDir, { recursive: true, force: true });
     if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
     else process.env.AGENTMEMORY_SECRET = previousSecret;
   }
@@ -555,7 +769,7 @@ test('v2 Summary routes structured domain and unknown outcomes through recovery 
       {
         name: 'unknown',
         status: 'future_summary_state',
-        expectedCode: 75,
+        expectedCode: 1,
         expectedObservation: null,
         expectedAction: 'reconcile',
       },
@@ -803,6 +1017,103 @@ test('v2 Summary isolates one permanent failure without stopping an independent 
   }
 });
 
+test('v2 Summary attention still drains an independent remaining stage', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-cross-stage-drain-'));
+  const executed = [];
+  const recorded = [];
+  try {
+    await withServer((request, response) => {
+      assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [{ id: 'failed-summary', startedAt: '2026-07-22T00:00:00.000Z' }],
+      }));
+    }, async (baseUrl) => {
+      const code = await mainForTest([
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'cross-stage-drain',
+        '--run-state-format', 'v2',
+      ], {
+        v2RuntimeCheck: async () => ({ summarizeChunkConcurrency: 1 }),
+        v2SummaryRemote: {
+          advance: async (request) => ({
+            ok: true,
+            data: {
+              status: 'infeasible',
+              error: 'infeasible',
+              operationUnitId: request.operationUnitId,
+              recoveryEvidence: {
+                kind: 'no_effect',
+                observation: 'business_rejected',
+                reasonCode: 'infeasible',
+                proof: {
+                  kind: 'receipt_before_formal_effect',
+                  receiptKey: 'receipt-failed-summary',
+                  receiptVersion: 1,
+                  phase: 'preflight',
+                  commitPlanAbsent: true,
+                },
+              },
+            },
+          }),
+          record: async () => assert.fail('isolated Summary must not record'),
+        },
+        v2LessonsRemote: {
+          start: async () => assert.fail('Summary-dependent Lesson must not dispatch'),
+          record: async () => assert.fail('Summary-dependent Lesson must not record'),
+        },
+        v2RemainingStages: async ({ eligibleStages, runSingleStage }) => {
+          assert.deepEqual(eligibleStages, {
+            semantic_rollup: false,
+            skill_extract: false,
+            reflect_insight: false,
+          });
+          return runSingleStage({
+            stage: 'memory_consolidate',
+            plan: [{
+              unit_id: 'independent-memory-unit',
+              source_ids: ['memory-1'],
+              input_hash: 'independent-memory-input',
+            }],
+            adapter: {
+              attemptIdForUnit: () => 'independent-memory-attempt',
+              execute: async ({ unit }) => {
+                executed.push(unit.unit_id);
+                return { status: 'succeeded', payload: { memory_ids: ['memory-1'] } };
+              },
+              record: async ({ unit }) => recorded.push(unit.unit_id),
+            },
+          });
+        },
+      });
+      assert.equal(code, 1);
+    });
+
+    assert.deepEqual(executed, ['independent-memory-unit']);
+    assert.deepEqual(recorded, ['independent-memory-unit']);
+    const events = (await fs.readFile(
+      path.join(stateDir, 'cross-stage-drain.v2', 'memory_consolidate.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(
+      events.some((event) => (
+        event.type === 'unit_terminal'
+        && event.payload.unit_id === 'independent-memory-unit'
+        && event.payload.status === 'succeeded'
+      )),
+      true,
+    );
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
 test('v2 summary recovery reconciles one durable chunk before advancing the next chunk', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
@@ -952,6 +1263,11 @@ test('v2 summary does not retry a provider failure without persisted no-effect e
                   cause: 'network_error',
                   phase: 'provider_call',
                 },
+                operationReceipt: runningSummaryOperationReceipt({
+                  attemptId,
+                  runnerInputHash: inputHash,
+                  operationUnitId,
+                }),
               },
             };
           }
@@ -1640,6 +1956,16 @@ test('v2 default production adapters send stable summary and lesson identities',
       for await (const chunk of request) body += chunk;
       const payload = body ? JSON.parse(body) : null;
       requests.push({ url: request.url, payload });
+      const operationReceipt = (stage, serviceInputHash = payload?.inputHash) => ({
+        key: `xop_${stableHash([payload.runId, stage, payload.unitId]).slice(0, 32)}`,
+        version: 1,
+        status: 'succeeded',
+        runId: payload.runId,
+        stage,
+        unitId: payload.unitId,
+        inputHash: serviceInputHash,
+        runnerInputHash: payload.inputHash,
+      });
       response.setHeader('content-type', 'application/json');
       if (request.url === '/agentmemory/runtime-config') {
         response.end(JSON.stringify({
@@ -1699,9 +2025,50 @@ test('v2 default production adapters send stable summary and lesson identities',
           inputHash: 'memory-verified-input-1',
         }));
       } else if (request.url === '/agentmemory/full/memory-consolidate-window/commit') {
-        response.end(JSON.stringify({ success: true, status: 'succeeded', memoryIds: ['mem-1'] }));
+        response.end(JSON.stringify({
+          success: true,
+          status: 'succeeded',
+          memoryIds: ['mem-1'],
+          domainEffectEvidence: {
+            schema: 'memory-consolidate-domain-effect/v1',
+            proposalHash: 'memory-proposal-1',
+            resultId: 'mem-1',
+            auditId: 'memory-audit-1',
+            effectHash: '5'.repeat(64),
+          },
+          operationReceipt: operationReceipt('memory_consolidate'),
+        }));
       } else if (request.url === '/agentmemory/semantic-rollup') {
-        response.end(JSON.stringify({ success: true, status: 'succeeded', semanticMemoryIds: ['sem-1'] }));
+        const receipt = operationReceipt('semantic_rollup', 'a'.repeat(64));
+        response.end(JSON.stringify({
+          success: true,
+          status: 'succeeded',
+          runId: payload.runId,
+          windowId: payload.windowId,
+          inputHash: 'b'.repeat(64),
+          configHash: 'c'.repeat(64),
+          semanticMemoryIds: ['sem-1'],
+          semanticRecoveryEvidence: {
+            schema: 'semantic-rollup-recovery/v1',
+            phase: 'committed',
+            receiptKey: receipt.key,
+            receiptVersion: 1,
+            resultRef: 'mem:audit:audit-semantic-1',
+            effectHash: 'd'.repeat(64),
+            identity: {
+              runId: payload.runId,
+              unitId: payload.unitId,
+              receiptInputHash: receipt.inputHash,
+              runnerInputHash: payload.inputHash,
+              extractionRunId: payload.runId,
+              extractionWindowId: payload.windowId,
+              inputHash: 'b'.repeat(64),
+              configHash: 'c'.repeat(64),
+            },
+            sourceSummaryHashes: payload.sourceSummaryHashes,
+          },
+          operationReceipt: receipt,
+        }));
       } else if (request.url === '/agentmemory/full/skill-extract/prepare') {
         response.end(JSON.stringify({
           success: true,
@@ -1715,6 +2082,14 @@ test('v2 default production adapters send stable summary and lesson identities',
           success: true,
           status: 'succeeded',
           proceduralMemoryIds: ['skill-1'],
+          domainEffectEvidence: {
+            schema: 'skill-extract-domain-effect/v1',
+            proposalHash: 'skill-proposal-1',
+            resultId: 'skill-1',
+            auditId: 'skill-audit-1',
+            effectHash: '6'.repeat(64),
+          },
+          operationReceipt: operationReceipt('skill_extract'),
         }));
       } else if (request.url === '/agentmemory/full/crystals/auto' && payload.dryRun === true) {
         response.end(JSON.stringify({
@@ -1726,9 +2101,30 @@ test('v2 default production adapters send stable summary and lesson identities',
           }],
         }));
       } else if (request.url === '/agentmemory/full/crystals/auto') {
+        const receipt = operationReceipt('crystal', 'e'.repeat(64));
         response.end(JSON.stringify({
           success: true,
+          crystalIds: ['crystal-1'],
           groups: [{ groupId: 'cg-1', status: 'succeeded', crystalIds: ['crystal-1'] }],
+          crystalRecoveryEvidence: {
+            schema: 'crystal-recovery/v1',
+            phase: 'committed',
+            receiptKey: receipt.key,
+            receiptVersion: receipt.version,
+            resultRef: 'crystal:crystal-1',
+            effectHash: 'f'.repeat(64),
+            identity: {
+              runId: payload.runId,
+              unitId: payload.unitId,
+              inputHash: receipt.inputHash,
+            },
+            group: {
+              groupId: payload.groupId,
+              actionIds: payload.actionIds,
+              actionUpdatedAts: payload.actionUpdatedAts,
+            },
+          },
+          operationReceipt: receipt,
         }));
       } else if (request.url === '/agentmemory/full/consolidation-procedural-windows/plan') {
         response.end(JSON.stringify({
@@ -1736,10 +2132,26 @@ test('v2 default production adapters send stable summary and lesson identities',
           windows: [{ windowId: 'cpw-1', memoryIds: ['pattern-1'], inputHash: 'proc-input-1' }],
         }));
       } else if (request.url === '/agentmemory/full/consolidation-procedural-window') {
+        const receipt = operationReceipt('consolidation_procedural', '1'.repeat(64));
         response.end(JSON.stringify({
           success: true,
           status: 'succeeded',
+          inputHash: receipt.inputHash,
           proceduralMemoryIds: ['proc-1'],
+          proceduralRecoveryEvidence: {
+            schema: 'consolidation-procedural-commit/v1',
+            kind: 'committed',
+            receiptKey: receipt.key,
+            receiptVersion: 1,
+            resultRef: `procedural-recoveries:${receipt.key}`,
+            effectHash: '2'.repeat(64),
+            identity: {
+              runId: payload.runId,
+              unitId: payload.unitId,
+              inputHash: receipt.inputHash,
+            },
+          },
+          operationReceipt: receipt,
         }));
       } else if (request.url === '/agentmemory/full/reflect-insight-windows/plan') {
         response.end(JSON.stringify({
@@ -1753,7 +2165,21 @@ test('v2 default production adapters send stable summary and lesson identities',
           }],
         }));
       } else if (request.url === '/agentmemory/full/reflect-insight-window') {
-        response.end(JSON.stringify({ success: true, status: 'succeeded', insightIds: ['insight-1'] }));
+        const receipt = operationReceipt('reflect_insight', '3'.repeat(64));
+        response.end(JSON.stringify({
+          success: true,
+          status: 'succeeded',
+          insightIds: ['insight-1'],
+          reflectRecoveryEvidence: {
+            schema: 'reflect-insight-commit/v1',
+            kind: 'committed',
+            receiptKey: receipt.key,
+            receiptVersion: 1,
+            resultRef: `reflect-insight-recoveries:${receipt.key}`,
+            effectHash: '4'.repeat(64),
+          },
+          operationReceipt: receipt,
+        }));
       } else if (request.url === '/agentmemory/extraction-runs/record') {
         response.end(JSON.stringify({ success: true }));
       } else {
@@ -1767,7 +2193,12 @@ test('v2 default production adapters send stable summary and lesson identities',
         '--run-id', 'contract',
         '--run-state-format', 'v2',
       ];
-      assert.equal(await mainForTest(argv), 0);
+      const initialExitCode = await mainForTest(argv);
+      const initialStatus = await fs.readFile(
+        path.join(stateDir, 'contract.v2', 'status.json'),
+        'utf8',
+      );
+      assert.equal(initialExitCode, 0, initialStatus);
 
       const runRoot = path.join(stateDir, 'contract.v2');
       const readRunFiles = async () => Object.fromEntries(await Promise.all(
@@ -2178,7 +2609,22 @@ test('v2 lessons recovers every durable boundary with one stable remote operatio
         throw new Error('lesson_response_lost');
       }
       const operation = operations.get(attemptId);
-      return { ok: true, data: { runs: [{ id: operation.id, status: 'succeeded' }] } };
+      return {
+        ok: true,
+        data: {
+          runs: [{ id: operation.id, status: 'succeeded' }],
+          lessonEvidence: {
+            kind: 'committed',
+            runId: operation.id,
+            stagingId: 'staging-1',
+            planId: 'plan-1',
+            receiptKey: `lcr_${'1'.repeat(32)}`,
+            receiptVersion: 1,
+            resultRef: 'lesson-commit-plans:plan-1',
+            effectHash: 'd'.repeat(64),
+          },
+        },
+      };
     },
     record: async ({ runId, attemptId }) => {
       records.push({ runId, attemptId });
@@ -2199,7 +2645,7 @@ test('v2 lessons recovers every durable boundary with one stable remote operatio
         v2SummaryRemote: summaryRemote,
         v2LessonsRemote: lessonsRemote,
         onV2DurableEvent: async ({ scope, type }) => {
-          if (scope === 'lessons' && type === 'unit_terminal' && crashTerminal) {
+          if (scope === 'lessons' && type === 'unit_resolution' && crashTerminal) {
             crashTerminal = false;
             throw new Error('crash_before_terminal_return');
           }
@@ -2216,14 +2662,26 @@ test('v2 lessons recovers every durable boundary with one stable remote operatio
     });
     assert.equal(operations.size, 1);
     assert.equal(new Set(calls.map((call) => call.attemptId)).size, 1);
-    assert.equal(calls.length, 2);
-    assert.deepEqual(calls.map((call) => call.requireExistingReceipt), [false, true]);
+    assert.equal(calls.length, 4);
+    assert.deepEqual(
+      calls.map((call) => call.requireExistingReceipt),
+      [false, true, true, true],
+    );
     assert.equal(new Set(records.map((record) => record.attemptId)).size, 1);
     assert.equal(records.length, 2);
     const root = path.join(stateDir, 'lessons-boundaries.v2');
     const lessons = (await fs.readFile(path.join(root, 'lessons.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
     assert.deepEqual(lessons.map((event) => event.type), [
-      'unit_planned', 'stage_plan_completed', 'unit_started', 'unit_terminal', 'unit_recorded', 'stage_completed',
+      'unit_planned',
+      'stage_plan_completed',
+      'unit_started',
+      'unit_operation_started',
+      'unit_outcome_observed',
+      'unit_operation_completed',
+      'unit_effect_committed',
+      'unit_resolution',
+      'unit_recorded',
+      'stage_completed',
     ]);
     const control = (await fs.readFile(path.join(root, 'control.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
     assert.equal(control.some((event) => event.type === 'stage_sealed'), false);
@@ -2248,10 +2706,27 @@ test('v2 lessons waits on reconciliation-required receipts without sealing', asy
           record: async () => {},
         },
         v2LessonsRemote: {
-          start: async () => ({
+          start: async (request) => ({
             ok: false,
             error: 'extraction_operation_reconciliation_required',
-            data: { failure: { cause: 'extraction_operation_reconciliation_required' } },
+            data: {
+              failure: { cause: 'extraction_operation_reconciliation_required' },
+              operationReceipt: {
+                key: `xop_${stableHash([
+                  request.attemptId,
+                  'lessons',
+                  request.sessionId,
+                ]).slice(0, 32)}`,
+                version: 1,
+                status: 'running',
+                runId: request.attemptId,
+                stage: 'lessons',
+                unitId: request.sessionId,
+                inputHash: '2'.repeat(64),
+                runnerInputHash: request.inputHash,
+                startedAt: '2026-07-30T00:00:00.000Z',
+              },
+            },
           }),
           record: async () => assert.fail('must not record a reconciled failure'),
         },
@@ -2266,9 +2741,103 @@ test('v2 lessons waits on reconciliation-required receipts without sealing', asy
       lessons.at(-1).payload.evidence.reasonCode,
       'legacy_lessons_effect_unknown',
     );
+    assert.equal(
+      lessons.at(-1).payload.receipt_key,
+      `xop_${stableHash([
+        lessons.at(-1).payload.attempt_id,
+        'lessons',
+        lessons.at(-1).payload.unit_id,
+      ]).slice(0, 32)}`,
+    );
+    assert.equal(lessons.at(-1).payload.receipt_stage, 'lessons');
+    assert.equal(lessons.at(-1).payload.receipt_input_hash, '2'.repeat(64));
+    assert.equal(lessons.at(-1).payload.receipt_started_at, '2026-07-30T00:00:00.000Z');
     assert.equal(lessons.some((event) => event.type === 'unit_terminal'), false);
     const control = (await fs.readFile(path.join(root, 'control.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
     assert.equal(control.some((event) => event.type === 'stage_sealed' && event.payload.stage === 'lessons'), false);
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
+test('v2 lessons retries the same identity after exact missing-receipt proof', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-lessons-absence-'));
+  const requests = [];
+  try {
+    await withServer((_request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [{ id: 's1', startedAt: '2026-07-24T00:00:00.000Z' }],
+      }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'lessons-absence',
+        '--run-state-format', 'v2',
+      ];
+      await assert.rejects(() => mainForEarlyStages(argv, {
+        v2SummaryRemote: {
+          advance: async (request) => successfulSummaryResponse(request),
+          record: async () => {},
+        },
+        v2LessonsRemote: {
+          start: async () => assert.fail('must not dispatch before operation journal durability'),
+          record: async () => {},
+        },
+        onV2DurableEvent: async ({ scope, type }) => {
+          if (scope === 'lessons' && type === 'unit_operation_started') {
+            throw new Error('injected_crash');
+          }
+        },
+      }), /injected_crash/);
+
+      const code = await mainForEarlyStages([...argv, '--resume'], {
+        v2SummaryRemote: {
+          advance: async (request) => successfulSummaryResponse(request),
+          record: async () => {},
+        },
+        v2LessonsRemote: {
+          start: async (request) => {
+            requests.push(request);
+            return request.requireExistingReceipt
+              ? missingOperationReceiptResponse({
+                  attemptId: request.attemptId,
+                  stage: 'lessons',
+                  unitId: request.sessionId,
+                  runnerInputHash: request.inputHash,
+                })
+              : committedLessonResponse('lesson-after-absence');
+          },
+          record: async () => {},
+        },
+      });
+
+      assert.equal(code, 0);
+    });
+    assert.deepEqual(
+      requests.map((request) => request.requireExistingReceipt),
+      [true, false],
+    );
+    assert.equal(
+      requests[1].expectedReceiptInputHash,
+      stableHash({
+        attemptId: requests[0].attemptId,
+        stage: 'lessons',
+        unitId: requests[0].sessionId,
+        runnerInputHash: requests[0].inputHash,
+      }),
+    );
+    const events = (await fs.readFile(
+      path.join(stateDir, 'lessons-absence.v2', 'lessons.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(events.at(-1).type, 'stage_completed');
+    assert.equal(events.some((event) => event.type === 'run_blocked'), false);
   } finally {
     if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
     else process.env.AGENTMEMORY_SECRET = previousSecret;
@@ -2659,10 +3228,18 @@ test('v2 summary waits on a persisted reconciliation failure without redispatchi
       const argv = ['--base-url', baseUrl, '--state-dir', stateDir, '--run-id', 'summary-reconcile', '--run-state-format', 'v2'];
       const code = await mainForEarlyStages(argv, {
         v2SummaryRemote: {
-          advance: async () => ({
+          advance: async ({ attemptId, inputHash, operationUnitId }) => ({
             ok: false,
             error: 'extraction_operation_reconciliation_required',
-            data: { status: 'failed', failure: { cause: 'extraction_operation_reconciliation_required' } },
+            data: {
+              status: 'failed',
+              failure: { cause: 'extraction_operation_reconciliation_required' },
+              operationReceipt: runningSummaryOperationReceipt({
+                attemptId,
+                runnerInputHash: inputHash,
+                operationUnitId,
+              }),
+            },
           }),
           record: async () => assert.fail('must not record a reconciled summary failure'),
         },

@@ -7,6 +7,8 @@ import {
   decideRecovery,
   normalizeOperationEvidence,
   recoveryPolicyHash,
+  recoveryValueHash,
+  resolveOperationRecovery,
 } from './recovery-policy-v1.mjs';
 
 const HASH = 'a'.repeat(64);
@@ -121,6 +123,33 @@ test('missing or contradictory no-effect proof always becomes unknown', () => {
     receipt: { formalEffect: true },
   });
   assert.equal(contradicted.kind, 'unknown');
+});
+
+test('the recovery entry point always normalizes before deciding and binds the observation', () => {
+  const proof = proofCases[0];
+  const candidateEvidence = noEffect(proof.proof);
+  const valid = resolveOperationRecovery({
+    candidateEvidence,
+    snapshot: proof.snapshot,
+    budget: { attemptsUsed: 0, maxAttempts: 1 },
+  });
+  assert.equal(valid.evidence.kind, 'no_effect');
+  assert.equal(valid.decision.action, 'retry');
+  assert.equal(valid.policyHash, RECOVERY_POLICY_HASH);
+  assert.equal(valid.normalization.candidate_evidence_hash, recoveryValueHash(candidateEvidence));
+  assert.equal(valid.normalization.snapshot_hash, recoveryValueHash(proof.snapshot));
+  assert.equal(valid.normalization.normalized_evidence_hash, recoveryValueHash(valid.evidence));
+
+  const stale = resolveOperationRecovery({
+    candidateEvidence,
+    snapshot: {
+      ...proof.snapshot,
+      receipt: { formalEffect: true },
+    },
+    budget: { attemptsUsed: 0, maxAttempts: 1 },
+  });
+  assert.equal(stale.evidence.kind, 'unknown');
+  assert.equal(stale.decision.action, 'reconcile');
 });
 
 test('recovery decision table covers every evidence kind', () => {

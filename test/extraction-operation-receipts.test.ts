@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   buildExtractionOperationKey,
+  completeModelOperationFromVerifiedResult,
   ExtractionOperationResultUncertainError,
   registerExtractionOperationReceiptFunctions,
   withExtractionOperationReceipt,
+  withIdempotentCommitReceipt,
 } from "../src/functions/extraction-operation-receipts.js";
 import { KV } from "../src/state/schema.js";
 
@@ -86,6 +88,7 @@ async function seedOrphanedSummaryOperation(kv: ReturnType<typeof mockKV>) {
     attemptId: orphanIdentity.runId,
     attemptInputHash: orphanReconciliationInput.result.runnerInputHash,
     generationConfigHash: orphanReconciliationInput.result.generationConfigHash,
+    totalChunks: 2,
     status: "in_progress",
     createdAt: "2026-07-26T17:39:42.912Z",
     updatedAt: "2026-07-26T17:44:06.658Z",
@@ -116,6 +119,93 @@ describe("extraction operation receipts", () => {
     expect(first.response).toEqual({ success: true, memoryIds: ["mem-1"] });
     expect(second.response).toEqual(first.response);
     expect([first.replayed, second.replayed].sort()).toEqual([false, true]);
+  });
+
+  it("serializes a delayed original request with an absence-authorized fresh retry", async () => {
+    const kv = mockKV();
+    const operationIdentity = {
+      runId: "absence-race-run",
+      stage: "memory_consolidate" as const,
+      unitId: "absence-race-unit",
+      inputHash: "a".repeat(64),
+    };
+    const probe = await withExtractionOperationReceipt(
+      kv as never,
+      operationIdentity,
+      vi.fn(),
+      { requireExisting: true },
+    );
+    expect(probe.receiptAbsence?.inputHash).toBe(operationIdentity.inputHash);
+
+    let releaseOldRequest!: () => void;
+    const oldRequestGate = new Promise<void>((resolve) => {
+      releaseOldRequest = resolve;
+    });
+    let effectStarted!: () => void;
+    const effectStartedGate = new Promise<void>((resolve) => {
+      effectStarted = resolve;
+    });
+    let releaseEffect!: () => void;
+    const effectGate = new Promise<void>((resolve) => {
+      releaseEffect = resolve;
+    });
+    const execute = vi.fn(async () => {
+      effectStarted();
+      await effectGate;
+      return { success: true, memoryIds: ["mem-race"] };
+    });
+
+    const delayedOldRequest = oldRequestGate.then(() =>
+      withExtractionOperationReceipt(kv as never, operationIdentity, execute));
+    const freshRetry = withExtractionOperationReceipt(
+      kv as never,
+      operationIdentity,
+      execute,
+      { expectedInputHash: probe.receiptAbsence!.inputHash },
+    );
+    await effectStartedGate;
+    releaseOldRequest();
+    releaseEffect();
+
+    const [fresh, delayed] = await Promise.all([freshRetry, delayedOldRequest]);
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(fresh.response).toEqual({ success: true, memoryIds: ["mem-race"] });
+    expect(delayed.response).toEqual(fresh.response);
+  });
+
+  it("rejects service input drift after receipt absence before any effect runs", async () => {
+    const kv = mockKV();
+    const execute = vi.fn(async () => ({ success: true }));
+    const driftedIdentity = {
+      runId: "absence-drift-run",
+      stage: "skill_extract" as const,
+      unitId: "absence-drift-unit",
+      inputHash: "b".repeat(64),
+    };
+
+    const modelResult = await withExtractionOperationReceipt(
+      kv as never,
+      driftedIdentity,
+      execute,
+      { expectedInputHash: "a".repeat(64) },
+    );
+    const commitResult = await withIdempotentCommitReceipt(
+      kv as never,
+      { ...driftedIdentity, stage: "memory_consolidate" as const },
+      execute,
+      { expectedInputHash: "a".repeat(64) },
+    );
+
+    expect(modelResult.failure).toEqual({
+      class: "hard",
+      cause: "extraction_operation_input_hash_drifted_after_absence",
+    });
+    expect(commitResult.failure).toEqual(modelResult.failure);
+    expect(execute).not.toHaveBeenCalled();
+    expect(await kv.get(
+      KV.extractionOperationReceipt(buildExtractionOperationKey(driftedIdentity)),
+      buildExtractionOperationKey(driftedIdentity),
+    )).toBeNull();
   });
 
   it("returns the cached safe response when the original client lost the response", async () => {
@@ -162,6 +252,61 @@ describe("extraction operation receipts", () => {
     });
   });
 
+  it("fails closed when a persisted receipt identity is tampered", async () => {
+    const kv = mockKV();
+    const key = buildExtractionOperationKey(identity);
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...identity,
+      inputHash: "tampered-input-hash",
+      key,
+      version: 1,
+      status: "succeeded",
+      startedAt: "2026-07-14T00:00:00.000Z",
+      completedAt: "2026-07-14T00:00:01.000Z",
+      response: { success: true, memoryIds: ["tampered-result"] },
+    });
+    const execute = vi.fn(async () => ({ success: true, memoryIds: ["new-result"] }));
+
+    const result = await withExtractionOperationReceipt(kv as never, identity, execute);
+
+    expect(result).toMatchObject({
+      replayed: true,
+      failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
+      receipt: { inputHash: "tampered-input-hash" },
+    });
+    expect(execute).not.toHaveBeenCalled();
+  });
+
+  it("rejects an out-of-order verified response after the receipt is terminal", async () => {
+    const kv = mockKV();
+    const first = { success: true, memoryIds: ["canonical-result"] };
+    const late = { success: true, memoryIds: ["late-result"] };
+
+    await completeModelOperationFromVerifiedResult(
+      kv as never,
+      identity,
+      first,
+      { allowMissing: true },
+    );
+    const rejected = await completeModelOperationFromVerifiedResult(
+      kv as never,
+      identity,
+      late,
+      { allowMissing: true },
+    );
+    const key = buildExtractionOperationKey(identity);
+
+    expect(rejected).toMatchObject({
+      replayed: true,
+      response: first,
+      receipt: { status: "succeeded", response: first },
+    });
+    await expect(kv.get(
+      KV.extractionOperationReceipt(key),
+      key,
+    )).resolves.toMatchObject({ status: "succeeded", response: first });
+  });
+
   it("does not re-execute an operation left running across a server crash", async () => {
     const kv = mockKV();
     const key = buildExtractionOperationKey(identity);
@@ -200,10 +345,51 @@ describe("extraction operation receipts", () => {
         class: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
       },
+      receiptAbsence: {
+        schema: "extraction-operation-receipt-absence/v1",
+        ...identity,
+        key: buildExtractionOperationKey(identity),
+        observedAt: expect.stringMatching(
+          /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/,
+        ),
+      },
     });
     expect(result.receipt).toBeUndefined();
     const key = buildExtractionOperationKey(identity);
     await expect(kv.get(KV.extractionOperationReceipt(key), key)).resolves.toBeNull();
+  });
+
+  it("materializes a succeeded receipt only from an explicitly verified missing result", async () => {
+    const kv = mockKV();
+    const verified = { success: true, status: "succeeded", memoryIds: ["mem-1"] };
+
+    const repaired = await completeModelOperationFromVerifiedResult(
+      kv as never,
+      identity,
+      verified,
+      { allowMissing: true },
+    );
+    const replayed = await completeModelOperationFromVerifiedResult(
+      kv as never,
+      identity,
+      { success: true, status: "succeeded", memoryIds: ["different"] },
+      { allowMissing: true },
+    );
+
+    expect(repaired).toMatchObject({
+      replayed: true,
+      response: verified,
+      receipt: {
+        status: "succeeded",
+        key: buildExtractionOperationKey(identity),
+        response: verified,
+      },
+    });
+    expect(replayed).toMatchObject({
+      replayed: true,
+      response: verified,
+      receipt: { status: "succeeded", response: verified },
+    });
   });
 
   it("stores only a structured failure and immutably replays it for the same attempt", async () => {
@@ -430,9 +616,14 @@ describe("extraction operation receipts", () => {
 
   it("replays a succeeded receipt before checking stale retry authorization", async () => {
     const kv = mockKV();
+    const summaryIdentity = {
+      ...identity,
+      stage: "summary" as const,
+      unitId: "summary-unit",
+    };
     const first = await withExtractionOperationReceipt(
       kv as never,
-      identity,
+      summaryIdentity,
       async () => ({
         success: false,
         retryableReceiptFailure: true,
@@ -446,7 +637,7 @@ describe("extraction operation receipts", () => {
     const authorization = failedRetryAuthorization(first.receipt);
     const succeeded = await withExtractionOperationReceipt(
       kv as never,
-      identity,
+      summaryIdentity,
       async () => ({ success: true, summary: { title: "persisted" } }),
       {
         retryFailed: true,
@@ -458,7 +649,7 @@ describe("extraction operation receipts", () => {
 
     const replayed = await withExtractionOperationReceipt(
       kv as never,
-      identity,
+      summaryIdentity,
       execute,
       {
         retryFailed: true,
@@ -727,6 +918,26 @@ describe("extraction operation receipts", () => {
       semanticMemoryIds: ["sem-1"],
       semanticMemoryCharSizes: { "sem-1": 42 },
       inputHash: "semantic-source-hash",
+      configHash: "a".repeat(64),
+      semanticRecoveryEvidence: {
+        schema: "semantic-rollup-recovery/v1",
+        phase: "committed",
+        receiptKey: buildExtractionOperationKey(semanticIdentity),
+        receiptVersion: 1,
+        resultRef: "mem:audit:audit-semantic-1",
+        effectHash: "b".repeat(64),
+        identity: {
+          runId: semanticIdentity.runId,
+          unitId: semanticIdentity.unitId,
+          receiptInputHash: semanticIdentity.inputHash,
+          runnerInputHash: "c".repeat(64),
+          extractionRunId: semanticIdentity.runId,
+          extractionWindowId: semanticIdentity.unitId,
+          inputHash: semanticIdentity.inputHash,
+          configHash: "a".repeat(64),
+        },
+        sourceSummaryHashes: { "session-1": "d".repeat(64) },
+      },
       provider: "pi-agent-sdk",
       model: "gpt-test",
       promptChars: 123,
@@ -747,12 +958,79 @@ describe("extraction operation receipts", () => {
       semanticMemoryIds: ["sem-1"],
       semanticMemoryCharSizes: { "sem-1": 42 },
       inputHash: "semantic-source-hash",
+      configHash: "a".repeat(64),
+      semanticRecoveryEvidence: {
+        schema: "semantic-rollup-recovery/v1",
+        phase: "committed",
+        receiptKey: buildExtractionOperationKey(semanticIdentity),
+        receiptVersion: 1,
+        resultRef: "mem:audit:audit-semantic-1",
+        effectHash: "b".repeat(64),
+        identity: {
+          runId: semanticIdentity.runId,
+          unitId: semanticIdentity.unitId,
+          receiptInputHash: semanticIdentity.inputHash,
+          runnerInputHash: "c".repeat(64),
+          extractionRunId: semanticIdentity.runId,
+          extractionWindowId: semanticIdentity.unitId,
+          inputHash: semanticIdentity.inputHash,
+          configHash: "a".repeat(64),
+        },
+        sourceSummaryHashes: { "session-1": "d".repeat(64) },
+      },
       provider: "pi-agent-sdk",
       model: "gpt-test",
       promptChars: 123,
     });
     expect(replay.response).toEqual(first.response);
     expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("retains only the strict crystal recovery evidence needed for replay", async () => {
+    const kv = mockKV();
+    const crystalIdentity = {
+      ...identity,
+      stage: "crystal" as const,
+      unitId: "crystal-group-1",
+      inputHash: "c".repeat(64),
+    };
+    const recoveryEvidence = {
+      schema: "crystal-recovery/v1",
+      phase: "committed",
+      receiptKey: buildExtractionOperationKey(crystalIdentity),
+      receiptVersion: 1,
+      resultRef: "crystal:crys-1",
+      effectHash: "d".repeat(64),
+      identity: {
+        runId: crystalIdentity.runId,
+        unitId: crystalIdentity.unitId,
+        inputHash: crystalIdentity.inputHash,
+      },
+      group: {
+        groupId: crystalIdentity.unitId,
+        actionIds: ["act-1"],
+        actionUpdatedAts: ["2026-07-14T00:00:00.000Z"],
+      },
+    };
+
+    const result = await withExtractionOperationReceipt(
+      kv as never,
+      crystalIdentity,
+      async () => ({
+        success: true,
+        crystalIds: ["crys-1"],
+        crystalRecoveryEvidence: {
+          ...recoveryEvidence,
+          arbitraryModelText: "must not survive",
+        },
+      }),
+    );
+
+    expect(result.response).toEqual({
+      success: true,
+      crystalIds: ["crys-1"],
+      crystalRecoveryEvidence: recoveryEvidence,
+    });
   });
 
   it("projects each write stage without retaining arbitrary model prose", async () => {
@@ -830,6 +1108,53 @@ describe("extraction operation receipts", () => {
         promptChars: 99,
       });
     }
+  });
+
+  it("projects only receipt-bound procedural business-empty recovery evidence", async () => {
+    const kv = mockKV();
+    const proceduralIdentity = {
+      runId: "procedural-run",
+      stage: "consolidation_procedural" as const,
+      unitId: "cpw-1",
+      inputHash: "a".repeat(64),
+    };
+    const receiptKey = buildExtractionOperationKey(proceduralIdentity);
+    const result = await withExtractionOperationReceipt(kv as never, proceduralIdentity, async () => ({
+      success: true,
+      status: "skipped",
+      inputHash: proceduralIdentity.inputHash,
+      proceduralRecoveryEvidence: {
+        kind: "no_effect",
+        observation: "business_empty",
+        reasonCode: "fewer_than_2_recurring_patterns",
+        identity: {
+          runId: proceduralIdentity.runId,
+          unitId: proceduralIdentity.unitId,
+          inputHash: proceduralIdentity.inputHash,
+        },
+        proof: {
+          kind: "receipt_before_formal_effect",
+          receiptKey,
+          receiptVersion: 1,
+          phase: "candidate_staging",
+          commitPlanAbsent: true,
+        },
+        rawModelText: "must not persist",
+      },
+    }));
+
+    expect(result.response).toMatchObject({
+      proceduralRecoveryEvidence: {
+        kind: "no_effect",
+        identity: {
+          runId: proceduralIdentity.runId,
+          unitId: proceduralIdentity.unitId,
+          inputHash: proceduralIdentity.inputHash,
+        },
+        proof: { receiptKey, commitPlanAbsent: true },
+      },
+    });
+    expect(JSON.stringify(result.response)).not.toContain("rawModelText");
   });
 
   it("keeps total receipt bytes linear while every StateKV scope stays bounded", async () => {
@@ -1139,6 +1464,351 @@ describe("extraction operation receipts", () => {
     expect(execute).toHaveBeenCalledTimes(1);
   });
 
+  it("reconciles an exact orphaned summary map receipt only when its partial is absent", async () => {
+    const kv = mockKV();
+    await seedOrphanedSummaryOperation(kv);
+    const mapIdentity = {
+      ...orphanIdentity,
+      unitId: `${orphanReconciliationInput.result.sessionId}:map:1`,
+    };
+    const mapKey = buildExtractionOperationKey(mapIdentity);
+    await kv.set(KV.extractionOperationReceipt(mapKey), mapKey, {
+      ...mapIdentity,
+      key: mapKey,
+      status: "running",
+      startedAt: orphanReconciliationInput.operation.expectedStartedAt,
+    });
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never);
+    const reconcile = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
+    const mapInput = {
+      ...orphanReconciliationInput,
+      operation: {
+        ...orphanReconciliationInput.operation,
+        unitId: mapIdentity.unitId,
+      },
+    };
+
+    await expect(reconcile(mapInput)).resolves.toMatchObject({
+      success: true,
+      replayed: false,
+      operation: mapIdentity,
+      receipt: {
+        status: "reconciled",
+        failure: { cause: "orphaned_operation_result_absent" },
+      },
+    });
+  });
+
+  it("refuses summary map orphan reconciliation when the exact partial exists", async () => {
+    const kv = mockKV();
+    await seedOrphanedSummaryOperation(kv);
+    const mapIdentity = {
+      ...orphanIdentity,
+      unitId: `${orphanReconciliationInput.result.sessionId}:map:1`,
+    };
+    const mapKey = buildExtractionOperationKey(mapIdentity);
+    await kv.set(KV.extractionOperationReceipt(mapKey), mapKey, {
+      ...mapIdentity,
+      key: mapKey,
+      status: "running",
+      startedAt: orphanReconciliationInput.operation.expectedStartedAt,
+    });
+    await kv.set(
+      KV.summaryResumablePartials(orphanReconciliationInput.result.resumableRunId),
+      "1",
+      {
+        runId: orphanReconciliationInput.result.resumableRunId,
+        chunkIndex: 1,
+        status: "completed",
+        summary: { title: "persisted map result" },
+        createdAt: "2026-07-26T17:44:07.700Z",
+      },
+    );
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never);
+    const reconcile = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
+
+    await expect(reconcile({
+      ...orphanReconciliationInput,
+      operation: {
+        ...orphanReconciliationInput.operation,
+        unitId: mapIdentity.unitId,
+      },
+    })).resolves.toEqual({
+      success: false,
+      failure: {
+        class: "hard",
+        cause: "orphan_reconciliation_result_present",
+      },
+    });
+  });
+
+  it("treats a malformed summary map partial as binding drift, not as absence", async () => {
+    const kv = mockKV();
+    await seedOrphanedSummaryOperation(kv);
+    const mapIdentity = {
+      ...orphanIdentity,
+      unitId: `${orphanReconciliationInput.result.sessionId}:map:1`,
+    };
+    const mapKey = buildExtractionOperationKey(mapIdentity);
+    await kv.set(KV.extractionOperationReceipt(mapKey), mapKey, {
+      ...mapIdentity,
+      key: mapKey,
+      status: "running",
+      startedAt: orphanReconciliationInput.operation.expectedStartedAt,
+    });
+    await kv.set(
+      KV.summaryResumablePartials(orphanReconciliationInput.result.resumableRunId),
+      "1",
+      {
+        runId: orphanReconciliationInput.result.resumableRunId,
+        chunkIndex: 1,
+        status: "skipped",
+        createdAt: "2026-07-26T17:44:07.700Z",
+      },
+    );
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never);
+    const reconcile = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
+
+    await expect(reconcile({
+      ...orphanReconciliationInput,
+      operation: {
+        ...orphanReconciliationInput.operation,
+        unitId: mapIdentity.unitId,
+      },
+    })).resolves.toEqual({
+      success: false,
+      failure: {
+        class: "hard",
+        cause: "orphan_reconciliation_result_binding_drifted",
+      },
+    });
+  });
+
+  it("reconciles generic protocol-state orphans but rejects persisted stage recovery", async () => {
+    const kv = mockKV();
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never);
+    const reconcile = functions.get("mem::extraction-operation-receipt-reconcile-orphan")!;
+    const operation = {
+      runId: "7".repeat(64),
+      stage: "semantic_rollup" as const,
+      unitId: "semantic-unit",
+      inputHash: "8".repeat(64),
+    };
+    const key = buildExtractionOperationKey(operation);
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...operation,
+      key,
+      version: 1,
+      status: "running",
+      startedAt: "2026-07-30T00:00:00.000Z",
+    });
+    const input = {
+      operation: {
+        ...operation,
+        expectedStatus: "running",
+        expectedStartedAt: "2026-07-30T00:00:00.000Z",
+      },
+      result: {
+        kind: "protocol_state",
+        phase: "execute",
+        runnerInputHash: "9".repeat(64),
+      },
+    };
+
+    await expect(reconcile(input)).resolves.toMatchObject({
+      success: true,
+      replayed: false,
+      operation,
+      receipt: {
+        status: "reconciled",
+        failure: { cause: "orphaned_operation_result_absent" },
+      },
+      reconciliation: { resultStatus: "absent" },
+    });
+
+    const stagedOperation = {
+      ...operation,
+      runId: "a".repeat(64),
+    };
+    const stagedKey = buildExtractionOperationKey(stagedOperation);
+    await kv.set(KV.extractionOperationReceipt(stagedKey), stagedKey, {
+      ...stagedOperation,
+      key: stagedKey,
+      version: 1,
+      status: "running",
+      startedAt: "2026-07-30T00:02:00.000Z",
+      semanticRecovery: {
+        schema: "semantic-rollup-recovery/v1",
+        phase: "staged",
+        identity: {
+          runId: stagedOperation.runId,
+          unitId: stagedOperation.unitId,
+          receiptInputHash: stagedOperation.inputHash,
+        },
+      },
+    });
+    await expect(reconcile({
+      ...input,
+      operation: {
+        ...stagedOperation,
+        expectedStatus: "running",
+        expectedStartedAt: "2026-07-30T00:02:00.000Z",
+      },
+    })).resolves.toEqual({
+      success: false,
+      failure: {
+        class: "hard",
+        cause: "orphan_reconciliation_result_present",
+      },
+    });
+  });
+
+  it("requires a server-side proposal absence check for prepare reconciliation", async () => {
+    const kv = mockKV();
+    const operation = {
+      runId: "b".repeat(64),
+      stage: "memory_consolidate" as const,
+      unitId: "memory-unit",
+      inputHash: "c".repeat(64),
+    };
+    const key = buildExtractionOperationKey(operation);
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...operation,
+      key,
+      version: 1,
+      status: "running",
+      startedAt: "2026-07-30T00:03:00.000Z",
+    });
+    const input = {
+      operation: {
+        ...operation,
+        expectedStatus: "running",
+        expectedStartedAt: "2026-07-30T00:03:00.000Z",
+      },
+      result: {
+        kind: "protocol_state",
+        phase: "prepare",
+        runnerInputHash: "d".repeat(64),
+      },
+    };
+
+    const withoutVerifier = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => withoutVerifier.set(id, handler),
+    } as never, kv as never);
+    await expect(withoutVerifier.get(
+      "mem::extraction-operation-receipt-reconcile-orphan",
+    )!(input)).resolves.toEqual({
+      success: false,
+      failure: {
+        class: "hard",
+        cause: "orphan_reconciliation_result_binding_drifted",
+      },
+    });
+
+    const findMemoryProposal = vi.fn(async () => null);
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never, { findMemoryProposal });
+    await expect(functions.get(
+      "mem::extraction-operation-receipt-reconcile-orphan",
+    )!(input)).resolves.toMatchObject({
+      success: true,
+      receipt: { status: "reconciled" },
+    });
+    expect(findMemoryProposal).toHaveBeenCalledWith(kv, {
+      runId: operation.runId,
+      stage: operation.stage,
+      unitId: operation.unitId,
+      inputHash: input.result.runnerInputHash,
+    });
+  });
+
+  it("requires a server-side lesson result absence proof before reconciling", async () => {
+    const kv = mockKV();
+    const operation = {
+      runId: "e".repeat(64),
+      stage: "lessons" as const,
+      unitId: "lesson-unit",
+      inputHash: "f".repeat(64),
+    };
+    const key = buildExtractionOperationKey(operation);
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...operation,
+      key,
+      version: 1,
+      status: "running",
+      startedAt: "2026-07-30T00:05:00.000Z",
+    });
+    const input = {
+      operation: {
+        ...operation,
+        expectedStatus: "running",
+        expectedStartedAt: "2026-07-30T00:05:00.000Z",
+      },
+      result: {
+        kind: "protocol_state",
+        phase: "execute",
+        runnerInputHash: "a".repeat(64),
+      },
+    };
+
+    const absent = vi.fn(async () => "absent" as const);
+    const functions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => functions.set(id, handler),
+    } as never, kv as never, { verifyLessonResult: absent });
+    await expect(functions.get(
+      "mem::extraction-operation-receipt-reconcile-orphan",
+    )!(input)).resolves.toMatchObject({
+      success: true,
+      receipt: { status: "reconciled" },
+      reconciliation: { resultStatus: "absent" },
+    });
+    expect(absent).toHaveBeenCalledWith(
+      kv,
+      operation,
+      input.result.runnerInputHash,
+    );
+
+    const presentKv = mockKV();
+    await presentKv.set(KV.extractionOperationReceipt(key), key, {
+      ...operation,
+      key,
+      version: 1,
+      status: "running",
+      startedAt: "2026-07-30T00:05:00.000Z",
+    });
+    const presentFunctions = new Map<string, Function>();
+    registerExtractionOperationReceiptFunctions({
+      registerFunction: (id: string, handler: Function) => presentFunctions.set(id, handler),
+    } as never, presentKv as never, {
+      verifyLessonResult: async () => "present",
+    });
+    await expect(presentFunctions.get(
+      "mem::extraction-operation-receipt-reconcile-orphan",
+    )!(input)).resolves.toEqual({
+      success: false,
+      failure: {
+        class: "hard",
+        cause: "orphan_reconciliation_result_present",
+      },
+    });
+  });
+
   it("persists a fresh running boundary before re-executing a reconciled receipt", async () => {
     const kv = mockKV();
     await seedOrphanedSummaryOperation(kv);
@@ -1346,4 +2016,474 @@ describe("extraction operation receipts", () => {
       },
     });
   });
+
+  it("re-enters a staged reflect receipt under the same identity", async () => {
+    const kv = mockKV();
+    const reflectIdentity = {
+      runId: "reflect-run",
+      stage: "reflect_insight" as const,
+      unitId: "reflect-unit",
+      inputHash: "reflect-input",
+    };
+    const key = buildExtractionOperationKey(reflectIdentity);
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...reflectIdentity,
+      key,
+      version: 1,
+      status: "running",
+      startedAt: "2026-07-30T00:00:00.000Z",
+      reflectRecovery: {
+        schema: "reflect-insight-recovery/v1",
+        phase: "staged",
+        identity: {
+          runId: reflectIdentity.runId,
+          unitId: reflectIdentity.unitId,
+          inputHash: reflectIdentity.inputHash,
+        },
+      },
+    });
+    const execute = vi.fn(async () => ({ success: true, status: "succeeded" }));
+
+    const result = await withExtractionOperationReceipt(
+      kv as never,
+      reflectIdentity,
+      execute,
+      { requireExisting: true },
+    );
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(result.response).toMatchObject({ success: true, status: "succeeded" });
+    await expect(kv.get<Record<string, unknown>>(KV.extractionOperationReceipt(key), key))
+      .resolves.toMatchObject({ status: "succeeded" });
+  });
+
+  it("re-enters a staged procedural receipt under the same identity", async () => {
+    const kv = mockKV();
+    const proceduralIdentity = {
+      runId: "procedural-run",
+      stage: "consolidation_procedural" as const,
+      unitId: "procedural-unit",
+      inputHash: "procedural-input",
+    };
+    const key = buildExtractionOperationKey(proceduralIdentity);
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...proceduralIdentity,
+      key,
+      version: 1,
+      status: "running",
+      startedAt: "2026-07-30T00:00:00.000Z",
+      proceduralRecovery: {
+        schema: "consolidation-procedural-recovery/v1",
+        phase: "staged",
+        identity: {
+          runId: proceduralIdentity.runId,
+          unitId: proceduralIdentity.unitId,
+          inputHash: proceduralIdentity.inputHash,
+        },
+      },
+    });
+    const execute = vi.fn(async () => ({ success: true, status: "succeeded" }));
+
+    const result = await withExtractionOperationReceipt(
+      kv as never,
+      proceduralIdentity,
+      execute,
+      { requireExisting: true },
+    );
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(result.response).toMatchObject({ success: true, status: "succeeded" });
+    await expect(kv.get<Record<string, unknown>>(KV.extractionOperationReceipt(key), key))
+      .resolves.toMatchObject({ status: "succeeded" });
+  });
+
+  it.each([
+    ["semantic_rollup", "semantic"],
+    ["crystal", "crystal"],
+  ] as const)(
+    "does not re-enter a running %s receipt without a frozen stage plan",
+    async (stage, prefix) => {
+      const kv = mockKV();
+      const stageIdentity = {
+        runId: `${prefix}-run`,
+        stage,
+        unitId: `${prefix}-unit`,
+        inputHash: `${prefix}-input`,
+      };
+      const key = buildExtractionOperationKey(stageIdentity);
+      await kv.set(KV.extractionOperationReceipt(key), key, {
+        ...stageIdentity,
+        key,
+        version: 1,
+        status: "running",
+        startedAt: "2026-07-30T00:00:00.000Z",
+      });
+      const execute = vi.fn(async () => ({ success: true, status: "succeeded" }));
+
+      const result = await withExtractionOperationReceipt(
+        kv as never,
+        stageIdentity,
+        execute,
+        { requireExisting: true },
+      );
+
+      expect(execute).not.toHaveBeenCalled();
+      expect(result).toMatchObject({
+        failure: {
+          class: "transient_runtime",
+          cause: "extraction_operation_reconciliation_required",
+        },
+      });
+      await expect(kv.get<Record<string, unknown>>(KV.extractionOperationReceipt(key), key))
+        .resolves.toMatchObject({ status: "running" });
+    },
+  );
+
+  it.each([
+    ["semantic_rollup", "semantic", "semanticRecovery", "semantic-rollup-recovery/v1"],
+    ["crystal", "crystal", "crystalRecovery", "crystal-recovery/v1"],
+  ] as const)(
+    "re-enters a running %s receipt only with a matching frozen stage plan",
+    async (stage, prefix, recoveryField, schema) => {
+      const kv = mockKV();
+      const stageIdentity = {
+        runId: `${prefix}-run`,
+        stage,
+        unitId: `${prefix}-unit`,
+        inputHash: `${prefix}-input`,
+      };
+      const key = buildExtractionOperationKey(stageIdentity);
+      const recoveryIdentity = stage === "semantic_rollup"
+        ? {
+          runId: stageIdentity.runId,
+          unitId: stageIdentity.unitId,
+          receiptInputHash: stageIdentity.inputHash,
+        }
+        : {
+          runId: stageIdentity.runId,
+          unitId: stageIdentity.unitId,
+          inputHash: stageIdentity.inputHash,
+        };
+      await kv.set(KV.extractionOperationReceipt(key), key, {
+        ...stageIdentity,
+        key,
+        version: 1,
+        status: "running",
+        startedAt: "2026-07-30T00:00:00.000Z",
+        [recoveryField]: {
+          schema,
+          phase: "staged",
+          identity: recoveryIdentity,
+        },
+      });
+      const execute = vi.fn(async () => ({ success: true, status: "succeeded" }));
+
+      const result = await withExtractionOperationReceipt(
+        kv as never,
+        stageIdentity,
+        execute,
+        { requireExisting: true },
+      );
+
+      expect(execute).toHaveBeenCalledTimes(1);
+      expect(result.response).toMatchObject({ success: true, status: "succeeded" });
+      await expect(kv.get<Record<string, unknown>>(KV.extractionOperationReceipt(key), key))
+        .resolves.toMatchObject({
+          status: "succeeded",
+          [recoveryField]: { schema, phase: "staged" },
+        });
+    },
+  );
+
+  it("re-verifies a succeeded semantic receipt and preserves its committed recovery plan", async () => {
+    const kv = mockKV();
+    const semanticIdentity = {
+      runId: "semantic-verify-run",
+      stage: "semantic_rollup" as const,
+      unitId: "semantic-verify-unit",
+      inputHash: "e".repeat(64),
+    };
+    const key = buildExtractionOperationKey(semanticIdentity);
+    const semanticRecovery = {
+      schema: "semantic-rollup-recovery/v1",
+      phase: "committed",
+      identity: {
+        runId: semanticIdentity.runId,
+        unitId: semanticIdentity.unitId,
+        receiptInputHash: semanticIdentity.inputHash,
+      },
+      expectedFacts: [{ id: "sem-1" }],
+    };
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...semanticIdentity,
+      key,
+      version: 1,
+      status: "succeeded",
+      startedAt: "2026-07-30T00:00:00.000Z",
+      completedAt: "2026-07-30T00:01:00.000Z",
+      response: { success: true, status: "succeeded", semanticMemoryIds: ["sem-1"] },
+      semanticRecovery,
+    });
+    const execute = vi.fn(async () => ({
+      success: true,
+      status: "succeeded",
+      semanticMemoryIds: ["sem-1", "sem-2"],
+    }));
+
+    const result = await withExtractionOperationReceipt(
+      kv as never,
+      semanticIdentity,
+      execute,
+      { requireExisting: true },
+    );
+
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(result).toMatchObject({
+      replayed: true,
+      response: { semanticMemoryIds: ["sem-1", "sem-2"] },
+      receipt: {
+        status: "succeeded",
+        semanticRecovery,
+      },
+    });
+  });
+
+  it("keeps a staged semantic receipt running when the domain reports a non-hard failure", async () => {
+    const kv = mockKV();
+    const semanticIdentity = {
+      runId: "semantic-failure-run",
+      stage: "semantic_rollup" as const,
+      unitId: "semantic-failure-unit",
+      inputHash: "a".repeat(64),
+    };
+    const key = buildExtractionOperationKey(semanticIdentity);
+    const semanticRecovery = {
+      schema: "semantic-rollup-recovery/v1",
+      phase: "staged",
+      identity: {
+        runId: semanticIdentity.runId,
+        unitId: semanticIdentity.unitId,
+        receiptInputHash: semanticIdentity.inputHash,
+      },
+    };
+
+    const result = await withExtractionOperationReceipt(
+      kv as never,
+      semanticIdentity,
+      async () => {
+        const running = await kv.get<Record<string, unknown>>(
+          KV.extractionOperationReceipt(key),
+          key,
+        );
+        await kv.set(KV.extractionOperationReceipt(key), key, {
+          ...running,
+          semanticRecovery,
+        });
+        return {
+          success: false,
+          failure: { class: "transient_runtime", cause: "semantic_commit_uncertain" },
+        };
+      },
+    );
+
+    expect(result).toMatchObject({
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+      receipt: { status: "running", semanticRecovery },
+    });
+    await expect(kv.get<Record<string, unknown>>(KV.extractionOperationReceipt(key), key))
+      .resolves.toMatchObject({ status: "running", semanticRecovery });
+  });
+
+  it("preserves staged semantic recovery evidence on a hard failed receipt", async () => {
+    const kv = mockKV();
+    const semanticIdentity = {
+      runId: "semantic-hard-run",
+      stage: "semantic_rollup" as const,
+      unitId: "semantic-hard-unit",
+      inputHash: "b".repeat(64),
+    };
+    const key = buildExtractionOperationKey(semanticIdentity);
+    const semanticRecovery = {
+      schema: "semantic-rollup-recovery/v1",
+      phase: "staged",
+      identity: {
+        runId: semanticIdentity.runId,
+        unitId: semanticIdentity.unitId,
+        receiptInputHash: semanticIdentity.inputHash,
+      },
+    };
+
+    const result = await withExtractionOperationReceipt(
+      kv as never,
+      semanticIdentity,
+      async () => {
+        const running = await kv.get<Record<string, unknown>>(
+          KV.extractionOperationReceipt(key),
+          key,
+        );
+        await kv.set(KV.extractionOperationReceipt(key), key, {
+          ...running,
+          semanticRecovery,
+        });
+        return {
+          success: false,
+          failure: { class: "hard", cause: "semantic_rollup_commit_conflict" },
+        };
+      },
+    );
+
+    expect(result).toMatchObject({
+      failure: { class: "hard", cause: "semantic_rollup_commit_conflict" },
+      receipt: { status: "failed", semanticRecovery },
+    });
+    await expect(kv.get<Record<string, unknown>>(KV.extractionOperationReceipt(key), key))
+      .resolves.toMatchObject({ status: "failed", semanticRecovery });
+  });
+
+  it("keeps a staged crystal receipt running when commit verification is uncertain", async () => {
+    const kv = mockKV();
+    const crystalIdentity = {
+      runId: "crystal-failure-run",
+      stage: "crystal" as const,
+      unitId: "crystal-failure-unit",
+      inputHash: "c".repeat(64),
+    };
+    const key = buildExtractionOperationKey(crystalIdentity);
+    const crystalRecovery = {
+      schema: "crystal-recovery/v1",
+      phase: "staged",
+      identity: {
+        runId: crystalIdentity.runId,
+        unitId: crystalIdentity.unitId,
+        inputHash: crystalIdentity.inputHash,
+      },
+    };
+
+    const result = await withIdempotentCommitReceipt(
+      kv as never,
+      crystalIdentity,
+      async () => {
+        const running = await kv.get<Record<string, unknown>>(
+          KV.extractionOperationReceipt(key),
+          key,
+        );
+        await kv.set(KV.extractionOperationReceipt(key), key, {
+          ...running,
+          crystalRecovery,
+        });
+        return {
+          success: false,
+          failure: { class: "transient_runtime", cause: "crystal_commit_uncertain" },
+        };
+      },
+    );
+
+    expect(result).toMatchObject({
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+      receipt: { status: "running", crystalRecovery },
+    });
+    await expect(kv.get<Record<string, unknown>>(KV.extractionOperationReceipt(key), key))
+      .resolves.toMatchObject({ status: "running", crystalRecovery });
+  });
+
+  it("returns exact absence evidence instead of executing a missing recovered commit", async () => {
+    const kv = mockKV();
+    const commit = vi.fn(async () => ({ success: true, status: "succeeded" }));
+    const commitIdentity = {
+      runId: "missing-commit-run",
+      stage: "memory_consolidate" as const,
+      unitId: "missing-commit-unit",
+      inputHash: "a".repeat(64),
+    };
+
+    const result = await withIdempotentCommitReceipt(
+      kv as never,
+      commitIdentity,
+      commit,
+      { requireExisting: true },
+    );
+
+    expect(commit).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+      receiptAbsence: {
+        schema: "extraction-operation-receipt-absence/v1",
+        ...commitIdentity,
+        key: buildExtractionOperationKey(commitIdentity),
+      },
+    });
+  });
+
+  it.each(["memory_consolidate", "skill_extract"] as const)(
+    "re-verifies a succeeded %s commit receipt through its domain callback",
+    async (stage) => {
+      const kv = mockKV();
+      const commitIdentity = {
+        runId: `${stage}-run`,
+        stage,
+        unitId: `${stage}-unit`,
+        inputHash: `${stage}-input`,
+      };
+      const key = buildExtractionOperationKey(commitIdentity);
+      await kv.set(KV.extractionOperationReceipt(key), key, {
+        ...commitIdentity,
+        key,
+        version: 1,
+        status: "succeeded",
+        startedAt: "2026-07-30T00:00:00.000Z",
+        completedAt: "2026-07-30T00:00:01.000Z",
+        response: { success: true, status: "succeeded" },
+      });
+      const domainEffectEvidence = {
+        schema: stage === "memory_consolidate"
+          ? "memory-consolidate-domain-effect/v1"
+          : "skill-extract-domain-effect/v1",
+        proposalHash: `${stage}-proposal`,
+        resultId: `${stage}-result`,
+        auditId: `${stage}-audit`,
+        effectHash: "a".repeat(64),
+      };
+      const verify = vi.fn(async () => ({
+        success: true,
+        status: "succeeded",
+        ...(stage === "memory_consolidate"
+          ? { memoryIds: [domainEffectEvidence.resultId] }
+          : {
+              proceduralMemoryIds: [domainEffectEvidence.resultId],
+              skill: {
+                id: domainEffectEvidence.resultId,
+                name: "must not enter recovery state",
+                triggerCondition: "sensitive trigger",
+                steps: ["sensitive step"],
+              },
+            }),
+        domainEffectEvidence,
+      }));
+
+      const result = await withIdempotentCommitReceipt(
+        kv as never,
+        commitIdentity,
+        verify,
+        { requireExisting: true },
+      );
+
+      expect(verify).toHaveBeenCalledTimes(1);
+      expect(result).toMatchObject({
+        replayed: true,
+        response: { success: true, status: "succeeded", domainEffectEvidence },
+        receipt: { status: "succeeded", response: { domainEffectEvidence } },
+      });
+      expect(result.response).not.toHaveProperty("skill");
+      expect(result.receipt.response).not.toHaveProperty("skill");
+    },
+  );
 });

@@ -188,7 +188,7 @@ test('v2 journal 单独报告 blocked 且不把它计入 running', async (contex
   );
 });
 
-test('v2 journal 在受控协调后把原 blocked 单元恢复为 pending', async (context) => {
+test('v2 journal 在受控协调后把原 blocked 单元恢复为 running', async (context) => {
   const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-reconciled-'));
   context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
   const runId = 'v2-reconciled';
@@ -198,17 +198,32 @@ test('v2 journal 在受控协调后把原 blocked 单元恢复为 pending', asyn
     event(1, 'stage_opened', { stage: 'summary' }),
   ]);
   await writeJournal(path.join(runRoot, 'summary.jsonl'), [
-    event(0, 'unit_planned', { unit_id: 'session-a' }),
+    event(0, 'unit_planned', { unit_id: 'session-a', input_hash: 'b'.repeat(64) }),
     event(1, 'stage_plan_completed', {}),
-    event(2, 'unit_started', { unit_id: 'session-a' }),
-    event(3, 'unit_blocked', {
+    event(2, 'unit_started', {
       unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+    }),
+    event(3, 'unit_operation_started', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+    }),
+    event(4, 'unit_blocked', {
+      unit_id: 'session-a',
+      attempt_id: 'a'.repeat(64),
       reason: 'extraction_operation_reconciliation_required',
     }),
-    event(4, 'unit_reconciliation_resolved', {
+    event(5, 'unit_reconciliation_resolved', {
       unit_id: 'session-a',
-      reconciliation_id: 'xrec_1234',
+      attempt_id: 'a'.repeat(64),
+      operation_id: 'session-a:reduce',
+      reconciliation_id: `xrec_${'1'.repeat(32)}`,
+      receipt_input_hash: 'c'.repeat(64),
+      receipt_started_at: '2026-07-30T00:00:00.000Z',
+      receipt_status: 'reconciled',
       result_status: 'absent',
+      cause: 'orphaned_operation_result_absent',
     }),
   ]);
 
@@ -218,7 +233,7 @@ test('v2 journal 在受控协调后把原 blocked 单元恢复为 pending', asyn
   assert.match(result.stdout, /acceptance_ready=false/);
   assert.match(
     result.stdout,
-    /stage\.summary=succeeded:0,skipped:0,failed:0,pending:1,running:0,blocked:0/,
+    /stage\.summary=succeeded:0,skipped:0,failed:0,pending:0,running:1,blocked:0/,
   );
 });
 

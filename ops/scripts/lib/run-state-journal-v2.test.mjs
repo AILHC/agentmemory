@@ -63,6 +63,76 @@ test('v2 journal retries transient sharing violations when opening an append han
   }
 });
 
+test('v2 journal append failure preserves the exact prior durable prefix', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-append-prefix-'));
+  let injectPartialWrite = false;
+  const fsApi = {
+    ...fs,
+    open: async (filePath, flags, ...args) => {
+      const handle = await fs.open(filePath, flags, ...args);
+      if (!String(filePath).endsWith('summary.jsonl') || flags !== 'a') return handle;
+      return new Proxy(handle, {
+        get(target, property, receiver) {
+          if (property === 'writeFile') {
+            return async (value, ...writeArgs) => {
+              if (injectPartialWrite) {
+                injectPartialWrite = false;
+                const text = String(value);
+                await target.writeFile(text.slice(0, Math.max(1, Math.floor(text.length / 2))), ...writeArgs);
+                const error = new Error('injected_append_enospc');
+                error.code = 'ENOSPC';
+                throw error;
+              }
+              return target.writeFile(value, ...writeArgs);
+            };
+          }
+          const value = Reflect.get(target, property, receiver);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    },
+  };
+  let journal = new RunStateJournalV2({ rootDir, runId: 'v2-prefix', fsApi });
+  try {
+    await journal.acquireLock();
+    await journal.open();
+    await journal.appendStage('summary', 'unit_planned', { unit_id: 's1' });
+    const durablePrefix = await fs.readFile(journal.stagePath('summary'), 'utf8');
+
+    injectPartialWrite = true;
+    await assert.rejects(
+      () => journal.appendStage('summary', 'stage_plan_completed', { unit_count: 1 }),
+      /injected_append_enospc/,
+    );
+    assert.deepEqual(
+      (await journal.readStage('summary')).map((event) => event.type),
+      ['unit_planned'],
+    );
+    assert.equal(await fs.readFile(journal.stagePath('summary'), 'utf8'), durablePrefix);
+
+    await assert.rejects(
+      () => journal.appendStage('summary', 'stage_plan_completed', { unit_count: 1 }),
+      /v2_journal_writer_poisoned/,
+    );
+    await journal.releaseLock();
+    journal = new RunStateJournalV2({ rootDir, runId: 'v2-prefix', fsApi });
+    await journal.acquireLock();
+    await journal.open();
+    assert.deepEqual(
+      (await journal.readStage('summary')).map((event) => event.type),
+      ['unit_planned'],
+    );
+    await journal.appendStage('summary', 'stage_plan_completed', { unit_count: 1 });
+    assert.deepEqual(
+      (await journal.readStage('summary')).map((event) => event.type),
+      ['unit_planned', 'stage_plan_completed'],
+    );
+  } finally {
+    await journal.releaseLock();
+    await fs.rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 test('v2 journal rejects complete checksum and sequence corruption', async () => {
   const { journal } = await makeJournal('agentmemory-v2-integrity');
   try {
@@ -337,6 +407,81 @@ test('v2 journal CAS append requires the writer lock and the exact durable stage
     assert.deepEqual((await journal.readStage('summary')).map((event) => event.type), [
       'unit_planned',
     ]);
+  } finally {
+    await journal.releaseLock();
+    await fs.rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('v2 journal CAS serializes same-owner concurrent appends with the same expected sequence', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-cas-concurrent-'));
+  const journal = new RunStateJournalV2({ rootDir, runId: 'v2-cas-concurrent' });
+  try {
+    await journal.acquireLock();
+    await journal.open();
+    const outcomes = await Promise.allSettled([
+      journal.appendStageExpectedSeq(
+        'summary',
+        -1,
+        'unit_planned',
+        { unit_id: 's1', input_hash: 'input-s1' },
+      ),
+      journal.appendStageExpectedSeq(
+        'summary',
+        -1,
+        'unit_planned',
+        { unit_id: 's2', input_hash: 'input-s2' },
+      ),
+    ]);
+
+    const fulfilled = outcomes.filter((outcome) => outcome.status === 'fulfilled');
+    const rejected = outcomes.filter((outcome) => outcome.status === 'rejected');
+    assert.equal(fulfilled.length, 1);
+    assert.equal(fulfilled[0].value.seq, 0);
+    assert.equal(rejected.length, 1);
+    assert.match(rejected[0].reason.message, /v2_stage_journal_seq_drifted/);
+    assert.equal((await journal.readStage('summary')).length, 1);
+  } finally {
+    await journal.releaseLock();
+    await fs.rm(rootDir, { recursive: true, force: true });
+  }
+});
+
+test('v2 journal rejects append after the persisted writer identity changes', async () => {
+  const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-writer-drift-'));
+  const journal = new RunStateJournalV2({ rootDir, runId: 'v2-writer-drift' });
+  try {
+    await journal.acquireLock();
+    await journal.open();
+    await journal.appendStageExpectedSeq(
+      'summary',
+      -1,
+      'unit_planned',
+      { unit_id: 's1' },
+    );
+    const owner = JSON.parse(await fs.readFile(journal.lockPath, 'utf8'));
+    await fs.writeFile(journal.lockPath, JSON.stringify({
+      ...owner,
+      owner_id: 'different-writer',
+    }));
+
+    await assert.rejects(
+      () => journal.appendStage(
+        'summary',
+        'stage_plan_completed',
+        { unit_count: 1 },
+      ),
+      /v2_writer_lock_changed/,
+    );
+    await assert.rejects(
+      () => journal.appendControl('run_completed', { stage_count: 1 }),
+      /v2_writer_lock_changed/,
+    );
+    assert.deepEqual(
+      (await journal.readStage('summary')).map((event) => event.type),
+      ['unit_planned'],
+    );
+    assert.deepEqual(await journal.readControl(), []);
   } finally {
     await journal.releaseLock();
     await fs.rm(rootDir, { recursive: true, force: true });

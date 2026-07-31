@@ -85,19 +85,27 @@ class JournalFile {
     this.fs = fsApi;
     this.seq = -1;
     this.tail = Promise.resolve();
+    this.poisoned = false;
   }
 
-  async append(type, payload) {
-    const operation = async () => {
-      const event = {
-        seq: this.seq + 1,
-        at: new Date().toISOString(),
-        type,
-        payload: sanitize(payload),
-      };
-      event.checksum = sha256(canonicalEvent(event));
-      const line = `${JSON.stringify(event)}\n`;
-      if (Buffer.byteLength(line) > lineLimit(type)) throw new Error(`v2_journal_line_too_large:${type}`);
+  enqueue(operation) {
+    const current = this.tail.then(operation);
+    this.tail = current.catch(() => {});
+    return current;
+  }
+
+  async appendUnqueued(type, payload) {
+    if (this.poisoned) throw new Error('v2_journal_writer_poisoned');
+    const event = {
+      seq: this.seq + 1,
+      at: new Date().toISOString(),
+      type,
+      payload: sanitize(payload),
+    };
+    event.checksum = sha256(canonicalEvent(event));
+    const line = `${JSON.stringify(event)}\n`;
+    if (Buffer.byteLength(line) > lineLimit(type)) throw new Error(`v2_journal_line_too_large:${type}`);
+    try {
       await this.fs.mkdir(path.dirname(this.filePath), { recursive: true });
       const handle = await openForAppend(this.filePath, this.fs);
       try {
@@ -106,12 +114,27 @@ class JournalFile {
       } finally {
         await handle.close();
       }
-      this.seq = event.seq;
-      return event;
-    };
-    const current = this.tail.then(operation);
-    this.tail = current.catch(() => {});
-    return current;
+    } catch (error) {
+      this.poisoned = true;
+      throw error;
+    }
+    this.seq = event.seq;
+    return event;
+  }
+
+  append(type, payload) {
+    return this.enqueue(() => this.appendUnqueued(type, payload));
+  }
+
+  appendExpectedSeq({ expectedSeq, type, payload, verifyWriter }) {
+    return this.enqueue(async () => {
+      const events = await readJournal(this.filePath, this.fs);
+      const currentSeq = events.at(-1)?.seq ?? -1;
+      this.seq = currentSeq;
+      if (currentSeq !== expectedSeq) throw new Error('v2_stage_journal_seq_drifted');
+      await verifyWriter();
+      return this.appendUnqueued(type, payload);
+    });
   }
 }
 
@@ -273,6 +296,29 @@ export class RunStateJournalV2 {
     return true;
   }
 
+  async assertWriterLockOwned() {
+    if (!this.lock) throw new Error('v2_writer_lock_required');
+    const raw = await this.fs.readFile(this.lockPath, 'utf8').catch((error) => {
+      if (error?.code === 'ENOENT') throw new Error('v2_writer_lock_changed');
+      throw error;
+    });
+    let current;
+    try {
+      current = JSON.parse(raw);
+    } catch {
+      throw new Error('v2_writer_lock_changed');
+    }
+    if (
+      !current
+      || current.run_id !== this.lock.run_id
+      || current.pid !== this.lock.pid
+      || current.created_at !== this.lock.created_at
+      || current.owner_id !== this.lock.owner_id
+    ) {
+      throw new Error('v2_writer_lock_changed');
+    }
+  }
+
   async open() {
     const controlEvents = await readJournal(this.controlPath, this.fs);
     this.control.seq = controlEvents.at(-1)?.seq ?? -1;
@@ -280,22 +326,26 @@ export class RunStateJournalV2 {
   }
 
   async appendControl(type, payload = {}) {
+    if (this.lock) await this.assertWriterLockOwned();
     return this.control.append(type, payload);
   }
 
   async appendStage(stage, type, payload = {}) {
+    if (this.lock) await this.assertWriterLockOwned();
     return this.stageWriter(stage).append(type, payload);
   }
 
   async appendStageExpectedSeq(stage, expectedSeq, type, payload = {}) {
-    if (!this.lock) throw new Error('v2_writer_lock_required');
+    await this.assertWriterLockOwned();
     if (!Number.isSafeInteger(expectedSeq) || expectedSeq < -1) {
       throw new Error('v2_expected_stage_seq_invalid');
     }
-    const events = await this.readStage(stage);
-    const currentSeq = events.at(-1)?.seq ?? -1;
-    if (currentSeq !== expectedSeq) throw new Error('v2_stage_journal_seq_drifted');
-    return this.appendStage(stage, type, payload);
+    return this.stageWriter(stage).appendExpectedSeq({
+      expectedSeq,
+      type,
+      payload,
+      verifyWriter: () => this.assertWriterLockOwned(),
+    });
   }
 
   async readControl() { return readJournal(this.controlPath, this.fs); }
@@ -386,7 +436,10 @@ function foldStageEventsUnchecked(events) {
     }
     if (event.type === 'unit_reconciliation_requested') {
       unit.blocked = true;
-      unit.blocked_payload = event.payload;
+      unit.blocked_payload = {
+        ...event.payload,
+        reconciliation_request_seq: event.seq,
+      };
       unit.recovery_state = 'reconciling';
     }
     if (event.type === 'unit_effect_committed') {
@@ -430,6 +483,7 @@ function foldStageEventsUnchecked(events) {
       }
       unit.active_operation = null;
       unit.reconciliations = [...(unit.reconciliations || []), event.payload];
+      unit.recovery_state = 'running';
     }
     if (event.type === 'unit_summary_failed_terminal_retry_authorized') {
       const supersededOperation = unit.completed_operations.pop();

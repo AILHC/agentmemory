@@ -46,12 +46,19 @@ export function projectSafeRecoveryStatus({
   stageEvents = {},
   requiredStages = [],
 }) {
+  const normalizedRequiredStages = [...new Set(
+    requiredStages.filter((stage) => typeof stage === 'string' && stage),
+  )];
   const stages = Object.keys(stageEvents)
     .sort((left, right) => left.localeCompare(right, 'en'))
     .map((stage) => projectStage(stage, stageEvents[stage]));
-  const selectedStages = requiredStages.length > 0
-    ? stages.filter((entry) => requiredStages.includes(entry.stage))
+  const selectedStages = normalizedRequiredStages.length > 0
+    ? stages.filter((entry) => normalizedRequiredStages.includes(entry.stage))
     : stages;
+  const presentStageNames = new Set(stages.map((entry) => entry.stage));
+  const missingRequiredStages = normalizedRequiredStages.filter(
+    (stage) => !presentStageNames.has(stage),
+  );
   const counts = {
     total: 0,
     succeeded: 0,
@@ -71,8 +78,13 @@ export function projectSafeRecoveryStatus({
   const runCompleted = controlEvents.some((event) => event.type === 'run_completed');
   const acceptanceReady = (
     selectedStages.length > 0
+    && missingRequiredStages.length === 0
+    && (
+      normalizedRequiredStages.length === 0
+      || selectedStages.length === normalizedRequiredStages.length
+    )
     && selectedStages.every((stage) => stage.acceptance_ready)
-    && (requiredStages.length > 0 || runCompleted)
+    && (normalizedRequiredStages.length > 0 || runCompleted)
   );
   const lastProgressAt = latestTimestamp([
     ...controlEvents,
@@ -115,6 +127,7 @@ export function projectSafeRecoveryStatus({
       .sort()
       .at(0) || null,
     acceptance_ready: acceptanceReady,
+    missing_required_stages: missingRequiredStages,
     system_block_reason_codes: [...new Set(systemCodes)].sort(),
     stages,
   };

@@ -4227,12 +4227,29 @@ test('main applies session concurrency only to summary and lessons session work'
   const active = { summary: 0, lessons: 0, skill_extract: 0 };
   const peak = { summary: 0, lessons: 0, skill_extract: 0 };
   const started = { summary: [], lessons: [], skill_extract: [] };
+  const stageBarriers = { summary: [], lessons: [] };
   const wait = async (stage, sessionId) => {
     started[stage].push(sessionId);
     active[stage] += 1;
     peak[stage] = Math.max(peak[stage], active[stage]);
-    await new Promise((resolve) => setTimeout(resolve, 25));
-    active[stage] -= 1;
+    try {
+      if (!stageBarriers[stage]) return;
+      await new Promise((resolve, reject) => {
+        const timeout = setTimeout(
+          () => reject(new Error(`${stage} did not start all three session workers concurrently`)),
+          5000,
+        );
+        stageBarriers[stage].push(() => {
+          clearTimeout(timeout);
+          resolve();
+        });
+        if (stageBarriers[stage].length === 3) {
+          for (const release of stageBarriers[stage].splice(0)) release();
+        }
+      });
+    } finally {
+      active[stage] -= 1;
+    }
   };
 
   await withMockAgentMemory(async (method, url, body) => {

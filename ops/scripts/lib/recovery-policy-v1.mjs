@@ -98,6 +98,24 @@ const RECEIPT_PROOF_PHASES = new Set([
 const SAFE_CODE = /^[a-z0-9][a-z0-9_.:-]{0,127}$/i;
 const EFFECT_HASH = /^[0-9a-f]{64}$/;
 
+function canonicalRecoveryValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalRecoveryValue);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort((left, right) => left.localeCompare(right, 'en'))
+        .map((key) => [key, canonicalRecoveryValue(value[key])]),
+    );
+  }
+  return value;
+}
+
+export function recoveryValueHash(value) {
+  return createHash('sha256')
+    .update(JSON.stringify(canonicalRecoveryValue(value)))
+    .digest('hex');
+}
+
 function isObject(value) {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
 }
@@ -440,4 +458,33 @@ export function decideRecovery({
     };
   }
   return { policyVersion, action: 'isolate', reasonCode: evidence.reasonCode };
+}
+
+export function resolveOperationRecovery({
+  policyVersion = RECOVERY_POLICY_VERSION,
+  candidateEvidence,
+  snapshot = {},
+  budget,
+  effectVerification,
+} = {}) {
+  const evidence = normalizeOperationEvidence(candidateEvidence, snapshot);
+  const decision = decideRecovery({
+    policyVersion,
+    evidence,
+    budget,
+    effectVerification,
+  });
+  return {
+    policyVersion,
+    policyHash: RECOVERY_POLICY_HASH,
+    evidence,
+    decision,
+    budget,
+    normalization: {
+      candidate_evidence_hash: recoveryValueHash(candidateEvidence ?? null),
+      snapshot_hash: recoveryValueHash(snapshot),
+      normalized_evidence_hash: recoveryValueHash(evidence),
+    },
+    ...(effectVerification ? { effectVerification } : {}),
+  };
 }

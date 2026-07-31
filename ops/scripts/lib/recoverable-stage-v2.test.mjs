@@ -10,17 +10,23 @@ import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
 
 function makeHarness() {
   const events = [];
-  let failAfterType = null;
+  const occurrences = new Map();
+  let failAfterBoundary = null;
   return {
     events,
-    failAfter(type) {
-      failAfterType = type;
+    failAfter(boundary) {
+      failAfterBoundary = boundary;
     },
     async append(type, payload) {
       const event = { seq: events.length, type, payload };
       events.push(event);
-      if (failAfterType === type) {
-        failAfterType = null;
+      const occurrence = (occurrences.get(type) ?? 0) + 1;
+      occurrences.set(type, occurrence);
+      if (
+        failAfterBoundary === type
+        || failAfterBoundary === `${type}#${occurrence}`
+      ) {
+        failAfterBoundary = null;
         throw new Error(`crash_after_${type}`);
       }
       return event;
@@ -29,6 +35,23 @@ function makeHarness() {
 }
 
 const plan = [{ unit_id: 'unit-1', input_hash: 'input-1' }];
+
+function reconciliationBinding({
+  attemptId,
+  stage = 'summary',
+  unitId = 'unit-1',
+  inputHash = 'd'.repeat(64),
+  marker = '1',
+}) {
+  return {
+    receipt_key: `xop_${marker.repeat(32)}`,
+    receipt_run_id: attemptId,
+    receipt_stage: stage,
+    receipt_unit_id: unitId,
+    receipt_input_hash: inputHash,
+    receipt_started_at: '2026-07-30T00:00:00.000Z',
+  };
+}
 
 function noEffectRecovery({
   attemptsUsed,
@@ -56,6 +79,33 @@ function noEffectRecovery({
       ...(retryAvailable && notBefore ? { notBefore } : {}),
     },
     budget: { attemptsUsed, maxAttempts },
+  };
+}
+
+function committedVerificationCandidate(label = 'verified') {
+  const receiptKey = `receipt-${label}`;
+  const resultRef = `results:${label}`;
+  const effectHash = 'e'.repeat(64);
+  return {
+    recoveryCandidate: {
+      candidateEvidence: {
+        kind: 'committed',
+        receiptKey,
+        receiptVersion: 1,
+        resultRef,
+        effectHash,
+      },
+      snapshot: {
+        receipt: {
+          key: receiptKey,
+          version: 1,
+          resultRef,
+          effectHash,
+          status: 'succeeded',
+        },
+      },
+      effectVerification: 'all_applied',
+    },
   };
 }
 
@@ -163,14 +213,32 @@ test('single-phase recovery reuses one attempt and only repeats idempotent bound
     plan,
     append: harness.append,
     attemptIdForUnit: () => 'attempt-1',
-    execute: async ({ attemptId, recovered }) => {
+    verifyRecoveredTerminal: async () => committedVerificationCandidate('single-reuse'),
+    execute: async ({
+      attemptId,
+      recovered,
+      activeOperation,
+      startOperation,
+      completeOperation,
+    }) => {
       executeAttempts.push(attemptId);
       executeRecovery.push(recovered);
+      const operation = activeOperation
+        || await startOperation({ operationId: 'unit-1:execute' });
       if (loseExecuteResponse) {
         loseExecuteResponse = false;
         throw new Error('execute_response_lost');
       }
-      return { status: 'succeeded', payload: { result_id: 'result-1' } };
+      const terminalResult = {
+        status: 'succeeded',
+        payload: { result_id: 'result-1' },
+      };
+      await completeOperation({
+        operationId: operation.operation_id,
+        status: 'succeeded',
+        terminal_result: terminalResult,
+      });
+      return terminalResult;
     },
     record: async ({ attemptId }) => {
       recordAttempts.push(attemptId);
@@ -193,7 +261,10 @@ test('single-phase recovery reuses one attempt and only repeats idempotent bound
     'unit_planned',
     'stage_plan_completed',
     'unit_started',
+    'unit_operation_started',
+    'unit_operation_completed',
     'unit_terminal',
+    'unit_outcome_observed',
     'unit_recorded',
     'stage_completed',
   ]);
@@ -253,6 +324,84 @@ test('single-phase generic run blocks are durable and never redispatch', async (
   assert.equal(harness.events.at(-1).type, 'run_blocked');
 });
 
+test('single-phase kernel normalizes adapter facts before journaling a decision', async () => {
+  const harness = makeHarness();
+  const result = await runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'attempt-kernel-resolution',
+    execute: async ({ startOperation, resolveOutcome }) => {
+      await startOperation({ operationId: 'unit-1:summary' });
+      const recovery = await resolveOutcome({
+        operationId: 'unit-1:summary',
+        candidateEvidence: {
+          kind: 'no_effect',
+          observation: 'execution_error',
+          reasonCode: 'provider_unavailable',
+          proof: {
+            kind: 'request_not_dispatched',
+            attemptId: 'attempt-kernel-resolution',
+            journalSeq: 3,
+          },
+        },
+        snapshot: {
+          requestDispatch: {
+            state: 'dispatched',
+            persisted: true,
+            attemptId: 'attempt-kernel-resolution',
+            journalSeq: 3,
+          },
+        },
+      });
+      return {
+        status: 'pending',
+        recovery,
+        reconciliationBinding: reconciliationBinding({
+          attemptId: 'attempt-kernel-resolution',
+        }),
+      };
+    },
+    record: async () => assert.fail('reconciling unit must not be recorded'),
+  });
+
+  assert.equal(result.status, 'pending');
+  const outcome = harness.events.find((event) => event.type === 'unit_outcome_observed');
+  assert.equal(outcome.payload.evidence.kind, 'unknown');
+  assert.equal(outcome.payload.decision.action, 'reconcile');
+  assert.match(outcome.payload.policy_hash, /^[0-9a-f]{64}$/);
+  assert.match(outcome.payload.normalization.candidate_evidence_hash, /^[0-9a-f]{64}$/);
+  assert.match(outcome.payload.normalization.snapshot_hash, /^[0-9a-f]{64}$/);
+  assert.match(outcome.payload.normalization.normalized_evidence_hash, /^[0-9a-f]{64}$/);
+});
+
+test('single-phase reconciliation without exact binding blocks the run once', async () => {
+  const harness = makeHarness();
+  const result = await runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'attempt-missing-binding',
+    execute: async ({ startOperation, resolveOutcome }) => {
+      await startOperation({ operationId: 'unit-1:execute' });
+      const recovery = await resolveOutcome({
+        operationId: 'unit-1:execute',
+        candidateEvidence: {
+          kind: 'unknown',
+          receiptKey: 'receipt-without-binding',
+          reasonCode: 'response_lost',
+        },
+      });
+      return { status: 'pending', recovery };
+    },
+    record: async () => assert.fail('missing reconciliation binding must not record'),
+  });
+
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.detail.reason, 'reconciliation_evidence_missing');
+  assert.equal(harness.events.at(-1).type, 'run_blocked');
+});
+
 for (const [kind, action, reference] of [
   ['staged', 'resume_commit', { resultRef: 'staging:unit-1' }],
   ['committing', 'reconcile_commit', { commitPlanRef: 'commit-plan:unit-1' }],
@@ -280,7 +429,10 @@ for (const [kind, action, reference] of [
       attemptIdForUnit: () => 'attempt-commit-resume',
       execute: async ({ startOperation }) => {
         await startOperation({ operationId: 'unit-1:lessons' });
-        return { status: 'pending', recovery };
+        return {
+          status: 'pending',
+          recovery,
+        };
       },
       record: async () => assert.fail('commit-resume unit must not be recorded'),
     });
@@ -367,9 +519,27 @@ test('single-phase persists retry budget and Retry-After only extends backoff', 
     now: () => new Date(clock),
     retryBackoffMs: 5_000,
     maxRetryAttempts: configuredMaxRetryAttempts,
-    execute: async ({ unit, attemptId, recoveryBudget, startOperation }) => {
+    verifyRecoveredTerminal: async () => committedVerificationCandidate('retry-independent'),
+    execute: async ({
+      unit,
+      attemptId,
+      recoveryBudget,
+      activeOperation,
+      startOperation,
+      completeOperation,
+    }) => {
       calls.push({ unitId: unit.unit_id, attemptId, recoveryBudget });
-      if (unit.unit_id === 'independent') return { status: 'succeeded' };
+      if (unit.unit_id === 'independent') {
+        const operation = activeOperation
+          || await startOperation({ operationId: 'independent:dispatch' });
+        const terminalResult = { status: 'succeeded', payload: { result_ids: ['independent'] } };
+        await completeOperation({
+          operationId: operation.operation_id,
+          status: 'succeeded',
+          terminal_result: terminalResult,
+        });
+        return terminalResult;
+      }
       await startOperation({ operationId: 'retrying:dispatch' });
       return {
         status: recoveryBudget.attemptsUsed === 0 ? 'pending' : 'failed',
@@ -437,8 +607,28 @@ test('single-phase recovery is scheduling-equivalent after every new journal bou
       now: () => new Date(clock),
       retryBackoffMs: 1_000,
       maxRetryAttempts: 1,
-      execute: async ({ unit, recoveryBudget, startOperation }) => {
-        if (unit.unit_id === 'independent') return { status: 'succeeded' };
+      verifyRecoveredTerminal: async () => committedVerificationCandidate('schedule-independent'),
+      execute: async ({
+        unit,
+        recoveryBudget,
+        activeOperation,
+        startOperation,
+        completeOperation,
+      }) => {
+        if (unit.unit_id === 'independent') {
+          const operation = activeOperation
+            || await startOperation({ operationId: 'independent:dispatch' });
+          const terminalResult = {
+            status: 'succeeded',
+            payload: { result_ids: ['independent'] },
+          };
+          await completeOperation({
+            operationId: operation.operation_id,
+            status: 'succeeded',
+            terminal_result: terminalResult,
+          });
+          return terminalResult;
+        }
         assert.equal(unit.unit_id, 'upstream');
         await startOperation({ operationId: 'upstream:dispatch' });
         return {
@@ -487,6 +677,386 @@ test('single-phase recovery is scheduling-equivalent after every new journal bou
   for (const boundary of boundaries) {
     assert.deepEqual(await runScenario(boundary), baseline, boundary);
   }
+});
+
+test('fixed-seed crash positions match the baseline or fail closed across both recovery modes', async () => {
+  const positionsFor = (boundaries) => {
+    let state = 0x5eed1234;
+    const remaining = [...boundaries];
+    const positions = [];
+    while (remaining.length > 0) {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      positions.push(remaining.splice(state % remaining.length, 1)[0]);
+    }
+    return positions;
+  };
+
+  const typeCounts = (events) => Object.fromEntries(
+    [...new Set(events.map((event) => event.type))]
+      .sort()
+      .map((type) => [
+        type,
+        events.filter((event) => event.type === type).length,
+      ]),
+  );
+
+  const eventBoundaries = (events) => {
+    const occurrences = new Map();
+    return events.map((event) => {
+      const occurrence = (occurrences.get(event.type) ?? 0) + 1;
+      occurrences.set(event.type, occurrence);
+      return `${event.type}#${occurrence}`;
+    });
+  };
+
+  const invokeAfterInjectedCrash = async (invoke, crashState) => {
+    try {
+      return await invoke();
+    } catch (error) {
+      assert.match(error.message, /^crash_after_/);
+      crashState.observed = true;
+      return null;
+    }
+  };
+
+  const runCommittedSingle = async (crashBoundary = null) => {
+    const harness = makeHarness();
+    let effectCount = 0;
+    let recordCount = 0;
+    let effectApplied = false;
+    let recorded = false;
+    const recoveryCandidate = committedVerificationCandidate(
+      'fixed-seed-single',
+    ).recoveryCandidate;
+    const invoke = () => runSinglePhaseStage({
+      events: harness.events,
+      plan,
+      append: harness.append,
+      attemptIdForUnit: () => 'attempt-fixed-seed',
+      verifyRecoveredTerminal: async () => committedVerificationCandidate('fixed-seed-single'),
+      execute: async ({
+        activeOperation,
+        completedOperations,
+        startOperation,
+        completeOperation,
+        resolveOutcome,
+      }) => {
+        const completed = completedOperations.at(-1);
+        let operationId = completed?.operation_id;
+        let terminalResult = completed?.terminal_result;
+        if (!terminalResult) {
+          const operation = activeOperation
+            || await startOperation({ operationId: 'unit-1:execute' });
+          operationId = operation.operation_id;
+          if (!effectApplied) {
+            effectApplied = true;
+            effectCount += 1;
+          }
+          terminalResult = {
+            status: 'succeeded',
+            payload: { result_ids: ['single-result'] },
+          };
+          const recovery = await resolveOutcome({
+            operationId,
+            ...recoveryCandidate,
+          });
+          await completeOperation({
+            operationId,
+            status: 'succeeded',
+            terminal_result: terminalResult,
+          });
+          return { ...terminalResult, recovery };
+        }
+        const recovery = await resolveOutcome({
+          operationId,
+          verification: true,
+          ...recoveryCandidate,
+        });
+        return { ...terminalResult, recovery };
+      },
+      record: async () => {
+        if (!recorded) {
+          recorded = true;
+          recordCount += 1;
+        }
+      },
+    });
+    if (crashBoundary) harness.failAfter(crashBoundary);
+    const crashState = { observed: false };
+    const interrupted = await invokeAfterInjectedCrash(invoke, crashState);
+    const result = interrupted?.status === 'completed'
+      ? interrupted
+      : await invoke();
+    if (crashBoundary) assert.equal(crashState.observed, true, crashBoundary);
+    const state = validateSinglePhaseStage(harness.events);
+    return {
+      status: result.status,
+      effectCount,
+      recordCount,
+      terminal: state.units.get('unit-1').terminal,
+      eventTypeCounts: typeCounts(harness.events),
+      eventBoundaries: eventBoundaries(harness.events),
+      events: structuredClone(harness.events),
+    };
+  };
+
+  const runCommittedTwoPhase = async (crashBoundary = null) => {
+    const harness = makeHarness();
+    let prepareEffectCount = 0;
+    let commitEffectCount = 0;
+    let recordCount = 0;
+    let prepareApplied = false;
+    let commitApplied = false;
+    let recorded = false;
+    const recoveryCandidate = committedVerificationCandidate(
+      'fixed-seed-two-phase',
+    ).recoveryCandidate;
+    const invoke = () => runTwoPhaseStage({
+      events: harness.events,
+      plan,
+      append: harness.append,
+      recoverCommit: true,
+      prepareAttemptIdForUnit: () => 'prepare-fixed-seed',
+      commitAttemptIdForUnit: () => 'commit-fixed-seed',
+      verifyRecoveredTerminal: async () => committedVerificationCandidate('fixed-seed-two-phase'),
+      prepare: async () => {
+        if (!prepareApplied) {
+          prepareApplied = true;
+          prepareEffectCount += 1;
+        }
+        return {
+          status: 'prepared',
+          prepared: {
+            prepared_handle: 'fixed-handle',
+            proposal_hash: 'fixed-proposal',
+          },
+        };
+      },
+      commit: async ({
+        activeOperation,
+        completedOperations,
+        completeOperation,
+        resolveOutcome,
+      }) => {
+        const completed = completedOperations.at(-1);
+        let operationId = completed?.operation_id;
+        let terminalResult = completed?.terminal_result;
+        if (!terminalResult) {
+          operationId = activeOperation.operation_id;
+          if (!commitApplied) {
+            commitApplied = true;
+            commitEffectCount += 1;
+          }
+          terminalResult = {
+            status: 'succeeded',
+            payload: { result_ids: ['two-phase-result'] },
+          };
+          const recovery = await resolveOutcome({
+            operationId,
+            ...recoveryCandidate,
+          });
+          await completeOperation({
+            operationId,
+            status: 'succeeded',
+            terminal_result: terminalResult,
+          });
+          return { ...terminalResult, recovery };
+        }
+        const recovery = await resolveOutcome({
+          operationId,
+          verification: true,
+          ...recoveryCandidate,
+        });
+        return { ...terminalResult, recovery };
+      },
+      record: async () => {
+        if (!recorded) {
+          recorded = true;
+          recordCount += 1;
+        }
+      },
+    });
+    if (crashBoundary) harness.failAfter(crashBoundary);
+    const crashState = { observed: false };
+    const interrupted = await invokeAfterInjectedCrash(invoke, crashState);
+    const result = interrupted?.status === 'completed'
+      ? interrupted
+      : await invoke();
+    if (crashBoundary) assert.equal(crashState.observed, true, crashBoundary);
+    const state = validateTwoPhaseStage(harness.events);
+    return {
+      status: result.status,
+      prepareEffectCount,
+      commitEffectCount,
+      recordCount,
+      terminal: state.units.get('unit-1').terminal,
+      eventTypeCounts: typeCounts(harness.events),
+      eventBoundaries: eventBoundaries(harness.events),
+      events: structuredClone(harness.events),
+    };
+  };
+
+  const runSingleRetryIsolation = async (crashBoundary = null) => {
+    const harness = makeHarness();
+    const invoke = () => runSinglePhaseStage({
+      events: harness.events,
+      plan,
+      append: harness.append,
+      attemptIdForUnit: (unit, attemptNumber = 0) => (
+        `fixed-seed-policy-${unit.unit_id}-${attemptNumber}`
+      ),
+      now: () => new Date('2026-07-30T00:00:00.000Z'),
+      retryBackoffMs: 0,
+      maxRetryAttempts: 1,
+      execute: async ({
+        attemptId,
+        recoveryBudget,
+        activeOperation,
+        startOperation,
+        resolveOutcome,
+      }) => {
+        const operation = activeOperation || await startOperation({
+          operationId: `unit-1:no-effect:${attemptId}`,
+        });
+        const operationStart = [...harness.events].reverse().find((event) => (
+          event.type === 'unit_operation_started'
+          && event.payload.operation_id === operation.operation_id
+        ));
+        const requestDispatch = {
+          state: 'not_dispatched',
+          persisted: true,
+          attemptId,
+          journalSeq: operationStart.seq,
+        };
+        const recovery = await resolveOutcome({
+          operationId: operation.operation_id,
+          candidateEvidence: {
+            kind: 'no_effect',
+            observation: 'execution_error',
+            reasonCode: 'provider_unavailable',
+            proof: {
+              kind: 'request_not_dispatched',
+              attemptId,
+              journalSeq: operationStart.seq,
+            },
+          },
+          snapshot: { requestDispatch },
+        });
+        return {
+          status: recovery.decision.action === 'retry' ? 'pending' : 'failed',
+          recovery,
+        };
+      },
+      record: async () => assert.fail('isolated unit must not be recorded'),
+    });
+    if (crashBoundary) harness.failAfter(crashBoundary);
+    const crashState = { observed: false };
+    let result = await invokeAfterInjectedCrash(invoke, crashState);
+    for (let attempt = 0; attempt < 5 && result?.status !== 'attention_required'; attempt += 1) {
+      result = await invokeAfterInjectedCrash(invoke, crashState);
+    }
+    if (crashBoundary) assert.equal(crashState.observed, true, crashBoundary);
+    assert.equal(result?.status, 'attention_required');
+    const state = validateSinglePhaseStage(harness.events);
+    return {
+      status: result.status,
+      terminal: state.units.get('unit-1').terminal,
+      decisions: harness.events
+        .filter((event) => event.type === 'unit_outcome_observed')
+        .map((event) => event.payload.decision.action),
+      eventTypeCounts: typeCounts(harness.events),
+      eventBoundaries: eventBoundaries(harness.events),
+      events: structuredClone(harness.events),
+    };
+  };
+
+  const runTwoPhaseReconcileBlock = async (crashBoundary = null) => {
+    const harness = makeHarness();
+    const invoke = () => runTwoPhaseStage({
+      events: harness.events,
+      plan,
+      append: harness.append,
+      recoverCommit: true,
+      prepareAttemptIdForUnit: () => 'prepare-fixed-seed-block',
+      commitAttemptIdForUnit: () => 'commit-fixed-seed-block',
+      prepare: async () => ({
+        status: 'prepared',
+        prepared: {
+          prepared_handle: 'fixed-block-handle',
+          proposal_hash: 'fixed-block-proposal',
+        },
+      }),
+      commit: async ({ activeOperation, resolveOutcome }) => {
+        const recovery = await resolveOutcome({
+          operationId: activeOperation.operation_id,
+          candidateEvidence: {
+            kind: 'unknown',
+            receiptKey: 'fixed-seed-missing-reconciliation-binding',
+            reasonCode: 'response_lost',
+          },
+        });
+        return { status: 'pending', recovery };
+      },
+      record: async () => assert.fail('blocked run must not be recorded'),
+    });
+    if (crashBoundary) harness.failAfter(crashBoundary);
+    const crashState = { observed: false };
+    const interrupted = await invokeAfterInjectedCrash(invoke, crashState);
+    const result = interrupted?.status === 'blocked'
+      ? interrupted
+      : await invoke();
+    if (crashBoundary) assert.equal(crashState.observed, true, crashBoundary);
+    return {
+      status: result.status,
+      reason: result.detail.reason,
+      decisions: harness.events
+        .filter((event) => event.type === 'unit_outcome_observed')
+        .map((event) => event.payload.decision.action),
+      eventTypeCounts: typeCounts(harness.events),
+      eventBoundaries: eventBoundaries(harness.events),
+      events: structuredClone(harness.events),
+    };
+  };
+
+  const scenarios = [
+    {
+      name: 'single_committed',
+      run: runCommittedSingle,
+    },
+    {
+      name: 'two_phase_committed',
+      run: runCommittedTwoPhase,
+    },
+    {
+      name: 'single_retry_isolate',
+      run: runSingleRetryIsolation,
+    },
+    {
+      name: 'two_phase_reconcile_block',
+      run: runTwoPhaseReconcileBlock,
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    const baseline = await scenario.run();
+    for (const boundary of positionsFor(baseline.eventBoundaries)) {
+      assert.deepEqual(
+        await scenario.run(boundary),
+        baseline,
+        `${scenario.name}:${boundary}`,
+      );
+    }
+  }
+
+  const singlePolicy = await runSingleRetryIsolation();
+  assert.deepEqual(singlePolicy.decisions, ['retry', 'isolate']);
+  assert.equal(singlePolicy.eventTypeCounts.unit_retry_scheduled, 1);
+  assert.equal(singlePolicy.eventTypeCounts.unit_isolated, 1);
+
+  const twoPhaseBlocked = await runTwoPhaseReconcileBlock();
+  assert.deepEqual(twoPhaseBlocked.decisions, ['reconcile']);
+  assert.equal(twoPhaseBlocked.status, 'blocked');
+  assert.equal(twoPhaseBlocked.eventTypeCounts.run_blocked, 1);
 });
 
 test('single-phase orphan reconciliation clears only the matching blocked active operation', async () => {
@@ -580,6 +1150,203 @@ test('single-phase orphan reconciliation consumes only the matching retry author
     () => validateSinglePhaseStage(authorizedBlockedEvents('unit-1:map:0')),
     /reconciliation_(?:operation_identity|resolution)/,
   );
+});
+
+test('single-phase generic reconciliation resolves the exact request without a legacy reason', async () => {
+  const harness = makeHarness();
+  let calls = 0;
+  const invoke = () => runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'attempt-generic-reconcile',
+    execute: async ({
+      activeOperation,
+      startOperation,
+      completeOperation,
+      resolveOutcome,
+    }) => {
+      calls += 1;
+      const operation = activeOperation
+        || await startOperation({ operationId: 'unit-1:generic' });
+      if (calls === 1) {
+        const recovery = await resolveOutcome({
+          operationId: operation.operation_id,
+          candidateEvidence: {
+            kind: 'unknown',
+            receiptKey: 'receipt-generic',
+            reasonCode: 'response_lost',
+          },
+        });
+        return {
+          status: 'pending',
+          recovery,
+          reconciliationBinding: reconciliationBinding({
+            attemptId: 'attempt-generic-reconcile',
+            marker: '2',
+          }),
+        };
+      }
+      await completeOperation({
+        operationId: operation.operation_id,
+        status: 'succeeded',
+      });
+      return { status: 'succeeded' };
+    },
+    record: async () => {},
+  });
+
+  assert.equal((await invoke()).status, 'pending');
+  const requested = harness.events.at(-1);
+  assert.equal(requested.type, 'unit_reconciliation_requested');
+  assert.equal(requested.payload.phase, 'execute');
+  assert.equal(requested.payload.reason, undefined);
+
+  await harness.append('unit_reconciliation_resolved', {
+    unit_id: 'unit-1',
+    attempt_id: 'attempt-generic-reconcile',
+    operation_id: 'unit-1:generic',
+    phase: 'execute',
+    reconciliation_request_seq: requested.seq,
+    ...reconciliationBinding({
+      attemptId: 'attempt-generic-reconcile',
+      marker: '2',
+    }),
+    reconciliation_id: 'xrec_0123456789abcdef0123456789abcdef',
+    receipt_status: 'reconciled',
+    result_status: 'absent',
+    cause: 'orphaned_operation_result_absent',
+  });
+
+  assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 1 });
+  assert.equal(calls, 2);
+});
+
+test('single-phase re-verifies a recorded terminal before completing the stage', async () => {
+  const harness = makeHarness();
+  harness.events.push(
+    { seq: 0, type: 'unit_planned', payload: plan[0] },
+    { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
+    {
+      seq: 2,
+      type: 'unit_started',
+      payload: { unit_id: 'unit-1', attempt_id: 'attempt-recorded' },
+    },
+    {
+      seq: 3,
+      type: 'unit_operation_started',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'attempt-recorded',
+        operation_id: 'unit-1:execute',
+      },
+    },
+    {
+      seq: 4,
+      type: 'unit_operation_completed',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'attempt-recorded',
+        operation_id: 'unit-1:execute',
+        status: 'succeeded',
+        terminal_result: {
+          status: 'succeeded',
+          payload: { result_ids: ['result-1'] },
+        },
+      },
+    },
+    {
+      seq: 5,
+      type: 'unit_terminal',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'attempt-recorded',
+        status: 'succeeded',
+        result_ids: ['result-1'],
+      },
+    },
+    {
+      seq: 6,
+      type: 'unit_recorded',
+      payload: { unit_id: 'unit-1', attempt_id: 'attempt-recorded' },
+    },
+  );
+  let verificationCalls = 0;
+
+  assert.deepEqual(await runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'must-not-run',
+    verifyRecoveredTerminal: async () => {
+      verificationCalls += 1;
+      return committedVerificationCandidate('recorded-single');
+    },
+    execute: async () => assert.fail('recorded terminal must not execute'),
+    record: async () => assert.fail('recorded terminal must not record twice'),
+  }), { status: 'completed', acceptedCount: 1 });
+  assert.equal(verificationCalls, 1);
+  assert.equal(harness.events.at(-1).type, 'stage_completed');
+});
+
+test('single-phase blocks completion when a recorded terminal cannot be re-verified', async () => {
+  const harness = makeHarness();
+  harness.events.push(
+    { seq: 0, type: 'unit_planned', payload: plan[0] },
+    { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
+    {
+      seq: 2,
+      type: 'unit_started',
+      payload: { unit_id: 'unit-1', attempt_id: 'attempt-unverified' },
+    },
+    {
+      seq: 3,
+      type: 'unit_operation_started',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'attempt-unverified',
+        operation_id: 'unit-1:execute',
+      },
+    },
+    {
+      seq: 4,
+      type: 'unit_operation_completed',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'attempt-unverified',
+        operation_id: 'unit-1:execute',
+        status: 'succeeded',
+        terminal_result: { status: 'succeeded', payload: { result_ids: [] } },
+      },
+    },
+    {
+      seq: 5,
+      type: 'unit_terminal',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'attempt-unverified',
+        status: 'succeeded',
+        result_ids: [],
+      },
+    },
+    {
+      seq: 6,
+      type: 'unit_recorded',
+      payload: { unit_id: 'unit-1', attempt_id: 'attempt-unverified' },
+    },
+  );
+
+  const result = await runSinglePhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    attemptIdForUnit: () => 'must-not-run',
+    execute: async () => assert.fail('recorded terminal must not execute'),
+    record: async () => assert.fail('recorded terminal must not record twice'),
+  });
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.detail.reason, 'recovered_terminal_verifier_required');
+  assert.equal(harness.events.at(-1).type, 'run_blocked');
 });
 
 test('single-phase adapters can journal an exact inner operation before dispatch', async () => {
@@ -947,6 +1714,7 @@ test('two-phase recovery persists prepare and commit identities at every boundar
     append: harness.append,
     prepareAttemptIdForUnit: () => 'prepare-1',
     commitAttemptIdForUnit: ({ prepared }) => `commit-${prepared.proposal_hash}`,
+    verifyRecoveredTerminal: async () => committedVerificationCandidate('two-phase-reuse'),
     prepare: async ({ attemptId, recovered }) => {
       prepareAttempts.push(attemptId);
       prepareRecovery.push(recovered);
@@ -1003,6 +1771,346 @@ test('two-phase recovery persists prepare and commit identities at every boundar
   ]);
 });
 
+test('two-phase recovery resumes after prepare operation completion without starting a duplicate operation', async () => {
+  const harness = makeHarness();
+  const invoke = () => runTwoPhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    recoverPrepare: true,
+    recoverCommit: true,
+    prepareAttemptIdForUnit: () => 'prepare-response-loss',
+    commitAttemptIdForUnit: () => 'commit-response-loss',
+    prepare: async () => ({
+      status: 'prepared',
+      prepared: {
+        prepared_handle: 'prepared-handle',
+        proposal_hash: 'prepared-proposal',
+      },
+    }),
+    commit: async ({
+      activeOperation,
+      completeOperation,
+      resolveOutcome,
+    }) => {
+      const terminalResult = {
+        status: 'succeeded',
+        payload: { result_ids: ['prepared-result'] },
+      };
+      const recoveryCandidate = committedVerificationCandidate(
+        'prepare-response-loss',
+      ).recoveryCandidate;
+      const recovery = await resolveOutcome({
+        operationId: activeOperation.operation_id,
+        ...recoveryCandidate,
+      });
+      await completeOperation({
+        operationId: activeOperation.operation_id,
+        status: 'succeeded',
+        terminal_result: terminalResult,
+      });
+      return { ...terminalResult, recovery };
+    },
+    verifyRecoveredTerminal: async () => committedVerificationCandidate(
+      'prepare-response-loss',
+    ),
+    record: async () => {},
+  });
+
+  harness.failAfter('unit_operation_completed#1');
+  await assert.rejects(invoke, /crash_after_unit_operation_completed/);
+  assert.deepEqual(
+    harness.events.map((event) => event.type),
+    [
+      'unit_planned',
+      'stage_plan_completed',
+      'unit_prepare_started',
+      'unit_operation_started',
+      'unit_operation_completed',
+    ],
+  );
+  assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 1 });
+  assert.equal(
+    harness.events.filter((event) => (
+      event.type === 'unit_operation_started'
+      && event.payload.phase === 'prepare'
+    )).length,
+    1,
+  );
+  assert.equal(
+    harness.events.filter((event) => event.type === 'unit_prepared').length,
+    1,
+  );
+});
+
+test('two-phase commit uses the shared outcome resolver before recording acceptance', async () => {
+  const harness = makeHarness();
+  const effectHash = 'e'.repeat(64);
+  const result = await runTwoPhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    recoverCommit: true,
+    prepareAttemptIdForUnit: () => 'prepare-shared',
+    commitAttemptIdForUnit: () => 'commit-shared',
+    prepare: async () => ({
+      status: 'prepared',
+      prepared: {
+        prepared_handle: 'handle-shared',
+        proposal_hash: 'proposal-shared',
+        prepare_input_hash: 'prepare-input-shared',
+      },
+    }),
+    commit: async ({
+      activeOperation,
+      completeOperation,
+      resolveOutcome,
+    }) => {
+      const operationId = activeOperation.operation_id;
+      const recovery = await resolveOutcome({
+        operationId,
+        candidateEvidence: {
+          kind: 'committed',
+          receiptKey: 'xop_shared',
+          receiptVersion: 1,
+          resultRef: 'memories:shared',
+          effectHash,
+        },
+        snapshot: {
+          receipt: {
+            key: 'xop_shared',
+            version: 1,
+            resultRef: 'memories:shared',
+            effectHash,
+            status: 'succeeded',
+          },
+        },
+        effectVerification: 'all_applied',
+      });
+      assert.equal(recovery.decision.action, 'replay');
+      const terminalResult = {
+        status: 'succeeded',
+        payload: { result_ids: ['memory-shared'] },
+      };
+      await completeOperation({
+        operationId,
+        status: 'succeeded',
+        terminal_result: terminalResult,
+      });
+      return { ...terminalResult, recovery };
+    },
+    record: async () => {},
+  });
+
+  assert.deepEqual(result, { status: 'completed', acceptedCount: 1 });
+  assert.deepEqual(harness.events.map((event) => event.type), [
+    'unit_planned',
+    'stage_plan_completed',
+    'unit_prepare_started',
+    'unit_prepared',
+    'unit_committing',
+    'unit_operation_started',
+    'unit_outcome_observed',
+    'unit_operation_completed',
+    'unit_effect_committed',
+    'unit_resolution',
+    'unit_recorded',
+    'stage_completed',
+  ]);
+});
+
+test('two-phase commit reconciliation resolves the exact generic request', async () => {
+  const harness = makeHarness();
+  const result = await runTwoPhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    recoverCommit: true,
+    prepareAttemptIdForUnit: () => 'prepare-generic',
+    commitAttemptIdForUnit: () => 'commit-generic',
+    prepare: async () => ({
+      status: 'prepared',
+      prepared: {
+        prepared_handle: 'handle-generic',
+        proposal_hash: 'proposal-generic',
+        prepare_input_hash: 'prepare-input-generic',
+      },
+    }),
+    commit: async ({ activeOperation, resolveOutcome }) => {
+      const recovery = await resolveOutcome({
+        operationId: activeOperation.operation_id,
+        candidateEvidence: {
+          kind: 'unknown',
+          receiptKey: 'receipt-generic-commit',
+          reasonCode: 'response_lost',
+        },
+      });
+      return {
+        status: 'pending',
+        recovery,
+        reconciliationBinding: reconciliationBinding({
+          attemptId: 'commit-generic',
+          stage: 'memory_consolidate',
+          marker: '3',
+        }),
+      };
+    },
+    record: async () => assert.fail('reconciling commit must not record'),
+  });
+
+  assert.equal(result.status, 'pending');
+  const requested = harness.events.at(-1);
+  assert.equal(requested.type, 'unit_reconciliation_requested');
+  assert.equal(requested.payload.phase, 'commit');
+
+  await harness.append('unit_reconciliation_resolved', {
+    unit_id: 'unit-1',
+    attempt_id: 'commit-generic',
+    operation_id: 'unit-1:commit',
+    phase: 'commit',
+    reconciliation_request_seq: requested.seq,
+    ...reconciliationBinding({
+      attemptId: 'commit-generic',
+      stage: 'memory_consolidate',
+      marker: '3',
+    }),
+    reconciliation_id: 'xrec_0123456789abcdef0123456789abcdef',
+    receipt_status: 'reconciled',
+    result_status: 'absent',
+    cause: 'orphaned_operation_result_absent',
+  });
+
+  const state = validateTwoPhaseStage(harness.events);
+  assert.equal(state.units.get('unit-1').blocked, false);
+  assert.equal(state.units.get('unit-1').active_operation, null);
+  assert.equal(state.units.get('unit-1').recovery_state, 'running');
+});
+
+test('two-phase commit reconciliation without exact binding blocks the run', async () => {
+  const harness = makeHarness();
+  const result = await runTwoPhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    recoverCommit: true,
+    prepareAttemptIdForUnit: () => 'prepare-missing-commit-binding',
+    commitAttemptIdForUnit: () => 'commit-missing-binding',
+    prepare: async () => ({
+      status: 'prepared',
+      prepared: {
+        prepared_handle: 'handle-missing-binding',
+        proposal_hash: 'proposal-missing-binding',
+        prepare_input_hash: 'prepare-input-missing-binding',
+      },
+    }),
+    commit: async ({ activeOperation, resolveOutcome }) => {
+      const recovery = await resolveOutcome({
+        operationId: activeOperation.operation_id,
+        candidateEvidence: {
+          kind: 'unknown',
+          receiptKey: 'commit-receipt-without-binding',
+          reasonCode: 'response_lost',
+        },
+      });
+      return { status: 'pending', recovery };
+    },
+    record: async () => assert.fail('missing commit binding must not record'),
+  });
+
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.detail.reason, 'reconciliation_evidence_missing');
+  assert.equal(harness.events.at(-1).type, 'run_blocked');
+});
+
+test('two-phase re-verifies a recorded commit terminal before completing the stage', async () => {
+  const harness = makeHarness();
+  harness.events.push(
+    { seq: 0, type: 'unit_planned', payload: plan[0] },
+    { seq: 1, type: 'stage_plan_completed', payload: { unit_count: 1 } },
+    {
+      seq: 2,
+      type: 'unit_prepare_started',
+      payload: { unit_id: 'unit-1', attempt_id: 'prepare-recorded' },
+    },
+    {
+      seq: 3,
+      type: 'unit_prepared',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'prepare-recorded',
+        prepared_handle: 'handle-recorded',
+        proposal_hash: 'proposal-recorded',
+        prepare_input_hash: 'prepare-input-recorded',
+      },
+    },
+    {
+      seq: 4,
+      type: 'unit_committing',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'commit-recorded',
+        prepared_attempt_id: 'prepare-recorded',
+      },
+    },
+    {
+      seq: 5,
+      type: 'unit_operation_started',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'commit-recorded',
+        operation_id: 'unit-1:commit',
+      },
+    },
+    {
+      seq: 6,
+      type: 'unit_operation_completed',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'commit-recorded',
+        operation_id: 'unit-1:commit',
+        status: 'succeeded',
+        terminal_result: {
+          status: 'succeeded',
+          payload: { result_ids: ['memory-recorded'] },
+        },
+      },
+    },
+    {
+      seq: 7,
+      type: 'unit_terminal',
+      payload: {
+        unit_id: 'unit-1',
+        attempt_id: 'commit-recorded',
+        status: 'succeeded',
+        result_ids: ['memory-recorded'],
+      },
+    },
+    {
+      seq: 8,
+      type: 'unit_recorded',
+      payload: { unit_id: 'unit-1', attempt_id: 'commit-recorded' },
+    },
+  );
+  let verificationCalls = 0;
+
+  assert.deepEqual(await runTwoPhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    prepareAttemptIdForUnit: () => 'must-not-prepare',
+    commitAttemptIdForUnit: () => 'must-not-commit',
+    prepare: async () => assert.fail('recorded terminal must not prepare'),
+    commit: async () => assert.fail('recorded terminal must not commit'),
+    verifyRecoveredTerminal: async () => {
+      verificationCalls += 1;
+      return committedVerificationCandidate('recorded-two-phase');
+    },
+    record: async () => assert.fail('recorded terminal must not record twice'),
+  }), { status: 'completed', acceptedCount: 1 });
+  assert.equal(verificationCalls, 1);
+  assert.equal(harness.events.at(-1).type, 'stage_completed');
+});
+
 test('two-phase prepare can finish directly without entering commit', async () => {
   const harness = makeHarness();
   let commitCalls = 0;
@@ -1036,7 +2144,7 @@ test('two-phase prepare can finish directly without entering commit', async () =
   ]);
 });
 
-test('two-phase prepare blocking is durable and never enters commit', async () => {
+test('two-phase prepare reconciliation stays pending and never becomes attention', async () => {
   const harness = makeHarness();
   let prepareCalls = 0;
   const invoke = (prepare) => runTwoPhaseStage({
@@ -1053,12 +2161,186 @@ test('two-phase prepare blocking is durable and never enters commit', async () =
   assert.equal((await invoke(async () => {
     prepareCalls += 1;
     return { status: 'blocked', reason: 'extraction_operation_reconciliation_required' };
-  })).status, 'blocked');
-  assert.equal((await invoke(async () => assert.fail('blocked prepare must not redispatch'))).status, 'blocked');
+  })).status, 'pending');
+  assert.equal(
+    (await invoke(async () => assert.fail('blocked prepare must not redispatch'))).status,
+    'pending',
+  );
   assert.equal(prepareCalls, 1);
   assert.equal(harness.events.at(-1).type, 'unit_blocked');
+  assert.equal(
+    reduceRecoveryJournal(harness.events).units.get('unit-1').recovery.state,
+    'reconciling',
+  );
   assert.equal(harness.events.some((event) => event.type === 'unit_terminal'), false);
+  assert.equal(harness.events.some((event) => event.type === 'run_attention_required'), false);
 });
+
+test('two-phase prepare reconciliation without exact binding blocks the run', async () => {
+  const harness = makeHarness();
+  const result = await runTwoPhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    recoverPrepare: true,
+    prepareAttemptIdForUnit: () => 'prepare-missing-binding',
+    commitAttemptIdForUnit: () => 'commit-must-not-exist',
+    prepare: async () => ({
+      status: 'blocked',
+      recoveryCandidate: {
+        candidateEvidence: {
+          kind: 'unknown',
+          receiptKey: 'prepare-receipt-without-binding',
+          reasonCode: 'response_lost',
+        },
+      },
+    }),
+    commit: async () => assert.fail('missing prepare binding must not commit'),
+    record: async () => assert.fail('missing prepare binding must not record'),
+  });
+
+  assert.equal(result.status, 'blocked');
+  assert.equal(result.detail.reason, 'reconciliation_evidence_missing');
+  assert.equal(harness.events.at(-1).type, 'run_blocked');
+});
+
+test('two-phase prepare reconciliation resolves the exact receipt and resumes safely', async () => {
+  const harness = makeHarness();
+  let prepareCalls = 0;
+  const binding = reconciliationBinding({
+    attemptId: 'prepare-reconciled',
+    stage: 'memory_consolidate',
+    marker: '4',
+  });
+  const invoke = () => runTwoPhaseStage({
+    events: harness.events,
+    plan,
+    append: harness.append,
+    recoverPrepare: true,
+    prepareAttemptIdForUnit: () => 'prepare-reconciled',
+    commitAttemptIdForUnit: () => 'commit-after-prepare-reconcile',
+    prepare: async () => {
+      prepareCalls += 1;
+      if (prepareCalls === 1) {
+        return {
+          status: 'blocked',
+          recoveryCandidate: {
+            candidateEvidence: {
+              kind: 'unknown',
+              receiptKey: binding.receipt_key,
+              reasonCode: 'response_lost',
+            },
+          },
+          reconciliationBinding: binding,
+        };
+      }
+      return {
+        status: 'prepared',
+        prepared: {
+          prepared_handle: 'handle-after-reconcile',
+          proposal_hash: 'proposal-after-reconcile',
+          prepare_input_hash: 'prepare-input-after-reconcile',
+        },
+      };
+    },
+    commit: async () => ({ status: 'succeeded', payload: { result_ids: ['result-1'] } }),
+    record: async () => {},
+  });
+
+  assert.equal((await invoke()).status, 'pending');
+  const request = harness.events.at(-1);
+  assert.equal(request.type, 'unit_reconciliation_requested');
+  assert.equal(request.payload.phase, 'prepare');
+  assert.equal(request.payload.operation_id, 'unit-1:prepare');
+
+  await harness.append('unit_reconciliation_resolved', {
+    unit_id: 'unit-1',
+    attempt_id: 'prepare-reconciled',
+    operation_id: 'unit-1:prepare',
+    phase: 'prepare',
+    reconciliation_request_seq: request.seq,
+    ...binding,
+    reconciliation_id: 'xrec_0123456789abcdef0123456789abcdef',
+    receipt_status: 'reconciled',
+    result_status: 'absent',
+    cause: 'orphaned_operation_result_absent',
+  });
+
+  assert.deepEqual(await invoke(), { status: 'completed', acceptedCount: 1 });
+  assert.equal(prepareCalls, 2);
+  assert.equal(
+    harness.events.filter((event) => (
+      event.type === 'unit_operation_started'
+      && event.payload.phase === 'prepare'
+    )).length,
+    2,
+  );
+});
+
+for (const failurePhase of ['prepare', 'commit']) {
+  test(`two-phase ${failurePhase} failure drains independent work and blocks only dependents`, async () => {
+    const harness = makeHarness();
+    const multiPlan = [
+      { unit_id: 'upstream', input_hash: 'input-upstream' },
+      {
+        unit_id: 'dependent',
+        input_hash: 'input-dependent',
+        depends_on: ['upstream'],
+      },
+      { unit_id: 'independent', input_hash: 'input-independent' },
+    ];
+    const prepared = [];
+    const committed = [];
+    const recorded = [];
+
+    const result = await runTwoPhaseStage({
+      events: harness.events,
+      plan: multiPlan,
+      stage: 'memory_consolidate',
+      append: harness.append,
+      prepareAttemptIdForUnit: (unit) => `prepare-${unit.unit_id}`,
+      commitAttemptIdForUnit: ({ unit }) => `commit-${unit.unit_id}`,
+      prepare: async ({ unit }) => {
+        prepared.push(unit.unit_id);
+        if (unit.unit_id === 'upstream' && failurePhase === 'prepare') {
+          return { status: 'failed', payload: { error: 'prepare_failed' } };
+        }
+        return {
+          status: 'prepared',
+          prepared: {
+            prepared_handle: `proposal-${unit.unit_id}`,
+            proposal_hash: `hash-${unit.unit_id}`,
+            prepare_input_hash: `input-${unit.unit_id}`,
+          },
+        };
+      },
+      commit: async ({ unit }) => {
+        committed.push(unit.unit_id);
+        if (unit.unit_id === 'upstream' && failurePhase === 'commit') {
+          return { status: 'failed', payload: { error: 'commit_failed' } };
+        }
+        return { status: 'succeeded', payload: { result_ids: [`result-${unit.unit_id}`] } };
+      },
+      record: async ({ unit }) => recorded.push(unit.unit_id),
+    });
+
+    assert.equal(result.status, 'attention_required');
+    assert.deepEqual(prepared, ['upstream', 'independent']);
+    assert.deepEqual(
+      committed,
+      failurePhase === 'prepare' ? ['independent'] : ['upstream', 'independent'],
+    );
+    assert.deepEqual(recorded, ['independent']);
+    assert.equal(
+      harness.events.some((event) => (
+        event.type === 'unit_dependency_blocked'
+        && event.payload.unit_id === 'dependent'
+      )),
+      true,
+    );
+    assert.equal(harness.events.at(-1).type, 'run_attention_required');
+  });
+}
 
 test('single-phase split becomes durable plan facts and resumes from child units', async () => {
   const harness = makeHarness();

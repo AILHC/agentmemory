@@ -3,6 +3,7 @@ import test from 'node:test';
 import {
   RECOVERY_POLICY_VERSION,
   decideRecovery,
+  resolveOperationRecovery,
 } from './recovery-policy-v1.mjs';
 import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
 
@@ -123,7 +124,16 @@ test('unknown outcome remains coordinating and cannot become retry', () => {
   const observed = outcome(4, evidence);
   events.push(
     observed,
-    event(5, 'unit_reconciliation_requested', observed.payload),
+    event(5, 'unit_reconciliation_requested', {
+      ...observed.payload,
+      phase: 'execute',
+      receipt_key: `xop_${'1'.repeat(32)}`,
+      receipt_run_id: 'attempt-1',
+      receipt_stage: 'summary',
+      receipt_unit_id: 'summary-1:reduce',
+      receipt_input_hash: 'a'.repeat(64),
+      receipt_started_at: '2026-07-30T00:00:00.000Z',
+    }),
   );
   const reduced = reduceRecoveryJournal(events);
   assert.equal(reduced.units.get('summary-1').recovery.state, 'reconciling');
@@ -220,6 +230,27 @@ test('reducer rejects altered decisions and unknown event structures', () => {
     () => reduceRecoveryJournal([...prefix, event(4, 'unit_future_state', { unit_id: 'summary-1' })]),
     /recovery_journal_event_unsupported/,
   );
+
+  const recovery = resolveOperationRecovery({
+    candidateEvidence: evidence,
+    snapshot: {},
+  });
+  const bound = event(4, 'unit_outcome_observed', {
+    unit_id: 'summary-1',
+    attempt_id: 'attempt-1',
+    operation_id: 'summary-1:reduce',
+    policy_version: recovery.policyVersion,
+    policy_hash: recovery.policyHash,
+    evidence: recovery.evidence,
+    decision: recovery.decision,
+    normalization: recovery.normalization,
+  });
+  assert.doesNotThrow(() => reduceRecoveryJournal([...prefix, bound]));
+  bound.payload.normalization.normalized_evidence_hash = 'f'.repeat(64);
+  assert.throws(
+    () => reduceRecoveryJournal([...prefix, bound]),
+    /recovery_journal_decision_invalid/,
+  );
 });
 
 test('legacy terminal events remain readable without generating legacy authorization', () => {
@@ -237,6 +268,26 @@ test('legacy terminal events remain readable without generating legacy authoriza
   ]);
   assert.equal(reduced.units.get('summary-1').terminal, 'skipped');
   assert.equal(reduced.run.acceptance_ready, true);
+});
+
+test('accepted and recorded units are not acceptance-ready before stage completion', () => {
+  const events = [
+    event(0, 'unit_planned', { unit_id: 'unit-1', input_hash: 'input-1' }),
+    event(1, 'stage_plan_completed', { unit_count: 1 }),
+    event(2, 'unit_started', { unit_id: 'unit-1', attempt_id: 'attempt-1' }),
+    event(3, 'unit_terminal', {
+      unit_id: 'unit-1',
+      attempt_id: 'attempt-1',
+      status: 'skipped',
+      reason: 'no input',
+      result_ids: [],
+    }),
+    event(4, 'unit_recorded', { unit_id: 'unit-1', attempt_id: 'attempt-1' }),
+  ];
+
+  assert.equal(reduceRecoveryJournal(events).run.acceptance_ready, false);
+  events.push(event(5, 'stage_completed', { unit_count: 1, accepted_count: 1 }));
+  assert.equal(reduceRecoveryJournal(events).run.acceptance_ready, true);
 });
 
 test('migration privilege cannot be forged without a validated fence manifest', () => {

@@ -4,6 +4,7 @@ import {
   RECOVERY_POLICY_VERSION,
   decideRecovery,
 } from './recovery-policy-v1.mjs';
+import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
 import {
   monitorSafeRecoveryStatus,
   projectSafeRecoveryStatus,
@@ -14,9 +15,13 @@ function event(seq, type, payload, at = '2026-07-30T00:00:00.000Z') {
 }
 
 function coordinatingStage(secretSentinel) {
+  const attemptId = 'a'.repeat(64);
+  const runnerInputHash = 'b'.repeat(64);
+  const receiptInputHash = 'c'.repeat(64);
+  const receiptKey = `xop_${'d'.repeat(32)}`;
   const evidence = {
     kind: 'unknown',
-    receiptKey: 'safe-receipt-key',
+    receiptKey,
     reasonCode: 'response_lost',
   };
   const decision = decideRecovery({
@@ -24,20 +29,20 @@ function coordinatingStage(secretSentinel) {
     evidence,
   });
   return [
-    event(0, 'unit_planned', { unit_id: 'summary-a', input_hash: 'safe-hash' }),
+    event(0, 'unit_planned', { unit_id: 'summary-a', input_hash: runnerInputHash }),
     event(1, 'stage_plan_completed', { unit_count: 1 }),
     event(2, 'unit_attempt_started', {
       unit_id: 'summary-a',
-      attempt_id: 'attempt-a',
+      attempt_id: attemptId,
     }),
     event(3, 'unit_operation_started', {
       unit_id: 'summary-a',
-      attempt_id: 'attempt-a',
+      attempt_id: attemptId,
       operation_id: 'summary-a:reduce',
     }),
     event(4, 'unit_outcome_observed', {
       unit_id: 'summary-a',
-      attempt_id: 'attempt-a',
+      attempt_id: attemptId,
       operation_id: 'summary-a:reduce',
       policy_version: RECOVERY_POLICY_VERSION,
       evidence,
@@ -46,13 +51,38 @@ function coordinatingStage(secretSentinel) {
     }),
     event(5, 'unit_reconciliation_requested', {
       unit_id: 'summary-a',
-      attempt_id: 'attempt-a',
+      attempt_id: attemptId,
       operation_id: 'summary-a:reduce',
+      phase: 'execute',
+      reconciliation_request_seq: 5,
       policy_version: RECOVERY_POLICY_VERSION,
       evidence,
       decision,
+      receipt_key: receiptKey,
+      receipt_run_id: attemptId,
+      receipt_stage: 'summary',
+      receipt_unit_id: 'summary-a:reduce',
+      receipt_input_hash: receiptInputHash,
+      receipt_started_at: '2026-07-30T00:00:00.000Z',
       error: secretSentinel,
     }),
+  ];
+}
+
+function completedStage(unitId) {
+  return [
+    event(0, 'unit_planned', { unit_id: unitId, input_hash: `${unitId}-input` }),
+    event(1, 'stage_plan_completed', { unit_count: 1 }),
+    event(2, 'unit_started', { unit_id: unitId, attempt_id: `${unitId}-attempt` }),
+    event(3, 'unit_terminal', {
+      unit_id: unitId,
+      attempt_id: `${unitId}-attempt`,
+      status: 'skipped',
+      reason: 'no input',
+      result_ids: [],
+    }),
+    event(4, 'unit_recorded', { unit_id: unitId, attempt_id: `${unitId}-attempt` }),
+    event(5, 'stage_completed', { unit_count: 1, accepted_count: 1 }),
   ];
 }
 
@@ -95,6 +125,29 @@ test('safe status counts are the exact projection from the unique reducer', () =
   });
   assert.equal(status.run_status, 'attention_required');
   assert.equal(status.acceptance_ready, false);
+});
+
+test('reducer and safe projection are deterministic for identical journal input', () => {
+  const stageEvents = completedStage('deterministic-unit');
+  const input = {
+    runId: 'deterministic-run',
+    controlEvents: [event(0, 'run_started', {
+      run_id: 'deterministic-run',
+      recovery_policy_version: RECOVERY_POLICY_VERSION,
+    })],
+    stageEvents: { summary: stageEvents },
+    requiredStages: ['summary'],
+  };
+
+  const firstReduced = reduceRecoveryJournal(stageEvents);
+  const secondReduced = reduceRecoveryJournal(structuredClone(stageEvents));
+  assert.deepEqual(firstReduced, secondReduced);
+
+  const firstProjection = projectSafeRecoveryStatus(input);
+  const secondProjection = projectSafeRecoveryStatus(structuredClone(input));
+  assert.deepEqual(firstProjection, secondProjection);
+  assert.deepEqual(firstProjection.counts, firstReduced.run.projection);
+  assert.equal(firstProjection.acceptance_ready, firstReduced.run.acceptance_ready);
 });
 
 test('safe status and monitor never expose restricted payloads or raw provider errors', () => {
@@ -148,4 +201,19 @@ test('monitor only reports health, stalling, attention, blocking, and acceptance
   });
   assert.equal('retry' in monitor, false);
   assert.equal('repair' in monitor, false);
+});
+
+test('safe status cannot accept a run while any required stage is absent', () => {
+  const status = projectSafeRecoveryStatus({
+    runId: 'missing-stage-run',
+    stageEvents: {
+      summary: completedStage('summary-a'),
+    },
+    requiredStages: ['summary', 'lessons', 'summary'],
+  });
+
+  assert.equal(status.acceptance_ready, false);
+  assert.equal(status.run_status, 'running');
+  assert.deepEqual(status.missing_required_stages, ['lessons']);
+  assert.equal(status.stages[0].acceptance_ready, true);
 });

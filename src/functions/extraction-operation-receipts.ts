@@ -4,6 +4,7 @@ import type {
   ExtractionOperationIdentity,
   ExtractionOperationReceipt,
   ResumableSummaryActiveRun,
+  ResumableSummaryPartial,
   ResumableSummaryRun,
   StageFailure,
 } from "../types.js";
@@ -18,7 +19,17 @@ export interface ExtractionOperationResult<T> {
   response?: T;
   failure?: StageFailure;
   receipt?: ExtractionOperationReceipt<T>;
+  receiptAbsence?: ExtractionOperationReceiptAbsence;
 }
+
+export interface ExtractionOperationReceiptAbsence extends ExtractionOperationIdentity {
+  schema: "extraction-operation-receipt-absence/v1";
+  key: string;
+  observedAt: string;
+}
+
+export type ExtractionOperationReceiptAbsenceProjection =
+  ExtractionOperationReceiptAbsence & { runnerInputHash: string };
 
 export interface FailedExtractionOperationRetryAuthorization {
   receiptInputHash: string;
@@ -36,6 +47,8 @@ export interface FailedExtractionOperationRetryAuthorization {
 
 export interface ExtractionOperationReceiptOptions {
   requireExisting?: boolean;
+  /** 缺失 receipt 探测返回的服务端 input hash；漂移时不得创建或执行新 operation。 */
+  expectedInputHash?: string;
   /** 仅在调用方已确认未持久化结果时启用，允许失败重开同一 receipt。 */
   retryFailed?: boolean;
   failedRetryAuthorization?: FailedExtractionOperationRetryAuthorization;
@@ -130,27 +143,32 @@ const STAGE_RECEIPT_RESPONSE_KEYS: Record<ExtractionOperationIdentity["stage"], 
   semantic_rollup: new Set([
     "semanticMemoryIds", "semantic_memory_ids",
     "semanticMemoryCharSizes", "semantic_memory_char_sizes",
+    "configHash", "config_hash", "semanticRecoveryEvidence", "semantic_recovery_evidence",
   ]),
   skill_extract: new Set([
     "skillIds", "skill_ids", "proceduralMemoryIds", "procedural_memory_ids",
     "memoryIds", "memory_ids", "extracted", "reinforced",
     "preparedHandle", "prepared_handle", "proposalHash", "proposal_hash",
+    "domainEffectEvidence", "domain_effect_evidence",
   ]),
   memory_consolidate: new Set([
     "memoryIds", "memory_ids", "consolidated", "totalObservations", "total_observations",
     "preparedHandle", "prepared_handle", "proposalHash", "proposal_hash",
+    "domainEffectEvidence", "domain_effect_evidence",
   ]),
   consolidation_procedural: new Set([
     "proceduralMemoryIds", "procedural_memory_ids", "memoryIds", "memory_ids",
     "patternsAnalyzed", "patterns_analyzed",
+    "newProcedures", "new_procedures", "proceduralRecoveryEvidence", "procedural_recovery_evidence",
   ]),
   reflect_insight: new Set([
     "insightIds", "insight_ids", "memoryIds", "memory_ids", "newInsights", "new_insights",
     "reinforced", "totalInsights", "total_insights", "totalItems", "total_items",
-    "usedFallback", "used_fallback",
+    "usedFallback", "used_fallback", "reflectRecoveryEvidence", "reflect_recovery_evidence",
   ]),
   crystal: new Set([
     "crystalIds", "crystal_ids", "groupCount", "group_count", "groups", "items",
+    "crystalRecoveryEvidence", "crystal_recovery_evidence",
   ]),
 };
 
@@ -198,6 +216,20 @@ function safeCharSizes(value: unknown): Record<string, number> | undefined {
   ) as Record<string, number>;
 }
 
+function safeHashRecord(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (
+    entries.length === 0
+    || entries.some(([key, hash]) => !key || typeof hash !== "string" || !/^[0-9a-f]{64}$/.test(hash))
+  ) return undefined;
+  return Object.fromEntries(
+    entries
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, hash]) => [key, hash as string]),
+  );
+}
+
 function safeResultRef(value: unknown): Record<string, string | number> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
@@ -211,6 +243,212 @@ function safeResultRef(value: unknown): Record<string, string | number> | undefi
   return projected;
 }
 
+function safeSemanticRecoveryEvidence(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const identity = record.identity;
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)) return undefined;
+  const rawIdentity = identity as Record<string, unknown>;
+  const projectedIdentity = Object.fromEntries(
+    [
+      "runId",
+      "unitId",
+      "receiptInputHash",
+      "runnerInputHash",
+      "extractionRunId",
+      "extractionWindowId",
+      "inputHash",
+      "configHash",
+    ]
+      .filter((key) => typeof rawIdentity[key] === "string" && rawIdentity[key])
+      .map((key) => [key, rawIdentity[key]]),
+  );
+  const sourceSummaryHashes = safeHashRecord(record.sourceSummaryHashes);
+  if (
+    record.schema !== "semantic-rollup-recovery/v1"
+    || record.phase !== "committed"
+    || Object.keys(projectedIdentity).length !== 8
+    || !sourceSummaryHashes
+    || typeof record.receiptKey !== "string"
+    || !record.receiptKey
+    || record.receiptVersion !== 1
+    || typeof record.resultRef !== "string"
+    || !record.resultRef
+    || typeof record.effectHash !== "string"
+    || !/^[0-9a-f]{64}$/.test(record.effectHash)
+  ) return undefined;
+  return {
+    schema: record.schema,
+    phase: record.phase,
+    receiptKey: record.receiptKey,
+    receiptVersion: record.receiptVersion,
+    resultRef: record.resultRef,
+    effectHash: record.effectHash,
+    identity: projectedIdentity,
+    sourceSummaryHashes,
+  };
+}
+
+function safeReflectRecoveryEvidence(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.kind === "committed"
+    && record.schema === "reflect-insight-commit/v1"
+    && typeof record.receiptKey === "string" && record.receiptKey
+    && record.receiptVersion === 1
+    && typeof record.resultRef === "string" && record.resultRef
+    && typeof record.effectHash === "string" && /^[0-9a-f]{64}$/.test(record.effectHash)
+  ) {
+    return {
+      schema: record.schema,
+      kind: record.kind,
+      receiptKey: record.receiptKey,
+      receiptVersion: record.receiptVersion,
+      resultRef: record.resultRef,
+      effectHash: record.effectHash,
+    };
+  }
+  const proof = record.proof;
+  if (
+    record.kind === "no_effect"
+    && record.observation === "business_empty"
+    && record.reasonCode === "insufficient_supporting_items"
+    && proof && typeof proof === "object" && !Array.isArray(proof)
+    && (proof as Record<string, unknown>).kind === "receipt_before_formal_effect"
+    && typeof (proof as Record<string, unknown>).receiptKey === "string"
+    && (proof as Record<string, unknown>).receiptVersion === 1
+    && (proof as Record<string, unknown>).phase === "candidate_staging"
+    && (proof as Record<string, unknown>).commitPlanAbsent === true
+  ) {
+    return {
+      kind: record.kind,
+      observation: record.observation,
+      reasonCode: record.reasonCode,
+      proof: {
+        kind: "receipt_before_formal_effect",
+        receiptKey: (proof as Record<string, unknown>).receiptKey,
+        receiptVersion: 1,
+        phase: "candidate_staging",
+        commitPlanAbsent: true,
+      },
+    };
+  }
+  return undefined;
+}
+
+function safeProceduralRecoveryEvidence(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const identity = record.identity;
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)) return undefined;
+  const rawIdentity = identity as Record<string, unknown>;
+  const projectedIdentity = Object.fromEntries(
+    ["runId", "unitId", "inputHash"]
+      .filter((key) => typeof rawIdentity[key] === "string" && rawIdentity[key])
+      .map((key) => [key, rawIdentity[key]]),
+  );
+  if (Object.keys(projectedIdentity).length !== 3) return undefined;
+  if (
+    record.schema === "consolidation-procedural-commit/v1"
+    && record.kind === "committed"
+    && typeof record.receiptKey === "string"
+    && record.receiptKey
+    && record.receiptVersion === 1
+    && typeof record.resultRef === "string"
+    && record.resultRef
+    && typeof record.effectHash === "string"
+    && /^[0-9a-f]{64}$/.test(record.effectHash)
+  ) {
+    return {
+      schema: record.schema,
+      kind: record.kind,
+      receiptKey: record.receiptKey,
+      receiptVersion: record.receiptVersion,
+      resultRef: record.resultRef,
+      effectHash: record.effectHash,
+      identity: projectedIdentity,
+    };
+  }
+  const proof = record.proof;
+  if (
+    record.kind === "no_effect"
+    && record.observation === "business_empty"
+    && record.reasonCode === "fewer_than_2_recurring_patterns"
+    && proof && typeof proof === "object" && !Array.isArray(proof)
+    && (proof as Record<string, unknown>).kind === "receipt_before_formal_effect"
+    && typeof (proof as Record<string, unknown>).receiptKey === "string"
+    && (proof as Record<string, unknown>).receiptVersion === 1
+    && (proof as Record<string, unknown>).phase === "candidate_staging"
+    && (proof as Record<string, unknown>).commitPlanAbsent === true
+  ) {
+    return {
+      kind: record.kind,
+      observation: record.observation,
+      reasonCode: record.reasonCode,
+      identity: projectedIdentity,
+      proof: {
+        kind: "receipt_before_formal_effect",
+        receiptKey: (proof as Record<string, unknown>).receiptKey,
+        receiptVersion: 1,
+        phase: "candidate_staging",
+        commitPlanAbsent: true,
+      },
+    };
+  }
+  return undefined;
+}
+
+function safeCrystalRecoveryEvidence(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const identity = record.identity;
+  const group = record.group;
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)) return undefined;
+  if (!group || typeof group !== "object" || Array.isArray(group)) return undefined;
+  const rawIdentity = identity as Record<string, unknown>;
+  const rawGroup = group as Record<string, unknown>;
+  const projectedIdentity = Object.fromEntries(
+    ["runId", "unitId", "inputHash"]
+      .filter((key) => typeof rawIdentity[key] === "string" && rawIdentity[key])
+      .map((key) => [key, rawIdentity[key]]),
+  );
+  const groupId = typeof rawGroup.groupId === "string" ? rawGroup.groupId : "";
+  const actionIds = safeStringArray(rawGroup.actionIds);
+  const actionUpdatedAts = safeStringArray(rawGroup.actionUpdatedAts);
+  if (
+    Object.keys(projectedIdentity).length !== 3
+    || record.schema !== "crystal-recovery/v1"
+    || record.phase !== "committed"
+    || typeof record.receiptKey !== "string"
+    || !record.receiptKey
+    || record.receiptVersion !== 1
+    || !groupId
+    || !actionIds
+    || actionIds.length === 0
+    || !actionUpdatedAts
+    || actionUpdatedAts.length !== actionIds.length
+    || typeof record.resultRef !== "string"
+    || !record.resultRef
+    || typeof record.effectHash !== "string"
+    || !/^[0-9a-f]{64}$/.test(record.effectHash)
+  ) return undefined;
+  return {
+    schema: record.schema,
+    phase: record.phase,
+    receiptKey: record.receiptKey,
+    receiptVersion: record.receiptVersion,
+    resultRef: record.resultRef,
+    effectHash: record.effectHash,
+    identity: projectedIdentity,
+    group: {
+      groupId,
+      actionIds,
+      actionUpdatedAts,
+    },
+  };
+}
+
 function safeUnitResponse(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const projected: Record<string, unknown> = {};
@@ -222,6 +460,41 @@ function safeUnitResponse(value: unknown): Record<string, unknown> | undefined {
     if (safe !== undefined) projected[key] = safe;
   }
   return projected;
+}
+
+function safeDomainEffectEvidence(
+  stage: ExtractionOperationIdentity["stage"],
+  value: unknown,
+): Record<string, unknown> | undefined {
+  if (
+    (stage !== "memory_consolidate" && stage !== "skill_extract")
+    || !value
+    || typeof value !== "object"
+    || Array.isArray(value)
+  ) return undefined;
+  const record = value as Record<string, unknown>;
+  const expectedSchema = stage === "memory_consolidate"
+    ? "memory-consolidate-domain-effect/v1"
+    : "skill-extract-domain-effect/v1";
+  if (
+    Object.keys(record).sort().join(",") !== "auditId,effectHash,proposalHash,resultId,schema"
+    || record.schema !== expectedSchema
+    || typeof record.proposalHash !== "string"
+    || record.proposalHash.length === 0
+    || typeof record.resultId !== "string"
+    || record.resultId.length === 0
+    || typeof record.auditId !== "string"
+    || record.auditId.length === 0
+    || typeof record.effectHash !== "string"
+    || !/^[0-9a-f]{64}$/.test(record.effectHash)
+  ) return undefined;
+  return {
+    schema: record.schema,
+    proposalHash: record.proposalHash,
+    resultId: record.resultId,
+    auditId: record.auditId,
+    effectHash: record.effectHash,
+  };
 }
 
 function safeResponse<T>(stage: ExtractionOperationIdentity["stage"], response: T): T {
@@ -239,6 +512,16 @@ function safeResponse<T>(stage: ExtractionOperationIdentity["stage"], response: 
         : undefined;
     } else if (key === "semanticMemoryCharSizes" || key === "semantic_memory_char_sizes") {
       safe = safeCharSizes(raw);
+    } else if (key === "semanticRecoveryEvidence" || key === "semantic_recovery_evidence") {
+      safe = safeSemanticRecoveryEvidence(raw);
+    } else if (key === "reflectRecoveryEvidence" || key === "reflect_recovery_evidence") {
+      safe = safeReflectRecoveryEvidence(raw);
+    } else if (key === "proceduralRecoveryEvidence" || key === "procedural_recovery_evidence") {
+      safe = safeProceduralRecoveryEvidence(raw);
+    } else if (key === "crystalRecoveryEvidence" || key === "crystal_recovery_evidence") {
+      safe = safeCrystalRecoveryEvidence(raw);
+    } else if (key === "domainEffectEvidence" || key === "domain_effect_evidence") {
+      safe = safeDomainEffectEvidence(stage, raw);
     } else if (key === "groups" || key === "items") {
       safe = Array.isArray(raw)
         ? raw.map((item) => safeUnitResponse(item)).filter((item) => item !== undefined)
@@ -457,7 +740,8 @@ function completedReceipt<T>(
   key: string,
   startedAt: string,
   response: T,
-  retry: ExtractionOperationReceipt<T>["retry"] | undefined,
+  retry: ExtractionOperationReceipt<T>["retry"] | undefined = undefined,
+  stageRecovery: Record<string, unknown> = {},
 ): ExtractionOperationReceipt<T> {
   return {
     ...identity,
@@ -468,6 +752,7 @@ function completedReceipt<T>(
     completedAt: new Date().toISOString(),
     response,
     ...(retry ? { retry } : {}),
+    ...stageRecovery,
   };
 }
 
@@ -480,12 +765,188 @@ export function buildExtractionOperationKey(
   return `xop_${hash.slice(0, 32)}`;
 }
 
+type ReceiptWithStageRecovery = ExtractionOperationReceipt & {
+  semanticRecovery?: { schema?: unknown; phase?: unknown; identity?: unknown };
+  crystalRecovery?: { schema?: unknown; phase?: unknown; identity?: unknown };
+  reflectRecovery?: { schema?: unknown; phase?: unknown; identity?: unknown };
+  proceduralRecovery?: { schema?: unknown; phase?: unknown; identity?: unknown };
+};
+
+const DOMAIN_REVERIFICATION_STAGES = new Set<ExtractionOperationIdentity["stage"]>([
+  "memory_consolidate",
+  "semantic_rollup",
+  "skill_extract",
+  "crystal",
+  "reflect_insight",
+  "consolidation_procedural",
+]);
+const PROPOSAL_REVERIFICATION_STAGES = new Set<ExtractionOperationIdentity["stage"]>([
+  "memory_consolidate",
+  "skill_extract",
+]);
+
+function recoveryIdentityMatchesReceipt(
+  receipt: ExtractionOperationReceipt,
+  recovery: { identity?: unknown },
+  inputHashKey: "inputHash" | "receiptInputHash" = "inputHash",
+): boolean {
+  if (!recovery.identity || typeof recovery.identity !== "object" || Array.isArray(recovery.identity)) {
+    return false;
+  }
+  const identity = recovery.identity as Record<string, unknown>;
+  return identity.runId === receipt.runId
+    && identity.unitId === receipt.unitId
+    && identity[inputHashKey] === receipt.inputHash;
+}
+
+function hasResumableStageRecovery(receipt: ExtractionOperationReceipt): boolean {
+  const recoveries = receipt as ReceiptWithStageRecovery;
+  if (receipt.stage === "semantic_rollup") {
+    return recoveries.semanticRecovery?.schema === "semantic-rollup-recovery/v1"
+      && (recoveries.semanticRecovery.phase === "staged" || recoveries.semanticRecovery.phase === "committed")
+      && recoveryIdentityMatchesReceipt(receipt, recoveries.semanticRecovery, "receiptInputHash");
+  }
+  if (receipt.stage === "crystal") {
+    return recoveries.crystalRecovery?.schema === "crystal-recovery/v1"
+      && (recoveries.crystalRecovery.phase === "staged" || recoveries.crystalRecovery.phase === "committed")
+      && recoveryIdentityMatchesReceipt(receipt, recoveries.crystalRecovery);
+  }
+  const recovery = receipt.stage === "reflect_insight"
+    ? recoveries.reflectRecovery
+    : receipt.stage === "consolidation_procedural"
+      ? recoveries.proceduralRecovery
+      : undefined;
+  const schema = receipt.stage === "reflect_insight"
+    ? "reflect-insight-recovery/v1"
+    : receipt.stage === "consolidation_procedural"
+      ? "consolidation-procedural-recovery/v1"
+      : null;
+  return schema !== null
+    && recovery?.schema === schema
+    && (recovery.phase === "staged" || recovery.phase === "committed")
+    && recoveryIdentityMatchesReceipt(receipt, recovery);
+}
+
+function stageRecoveryFields(receipt: ExtractionOperationReceipt | null | undefined): Record<string, unknown> {
+  if (!receipt) return {};
+  const recoveries = receipt as ReceiptWithStageRecovery;
+  if (receipt.stage === "semantic_rollup" && recoveries.semanticRecovery !== undefined) {
+    return { semanticRecovery: recoveries.semanticRecovery };
+  }
+  if (receipt.stage === "crystal" && recoveries.crystalRecovery !== undefined) {
+    return { crystalRecovery: recoveries.crystalRecovery };
+  }
+  if (receipt.stage === "reflect_insight" && recoveries.reflectRecovery !== undefined) {
+    return { reflectRecovery: recoveries.reflectRecovery };
+  }
+  if (
+    receipt.stage === "consolidation_procedural"
+    && recoveries.proceduralRecovery !== undefined
+  ) {
+    return { proceduralRecovery: recoveries.proceduralRecovery };
+  }
+  return {};
+}
+
+function requiresDomainReverification(
+  receipt: ExtractionOperationReceipt,
+  options: { requireExisting?: boolean },
+): boolean {
+  return options.requireExisting === true
+    && receipt.status === "succeeded"
+    && DOMAIN_REVERIFICATION_STAGES.has(receipt.stage);
+}
+
+function reconciliationRequired<T>(
+  receipt?: ExtractionOperationReceipt<T>,
+  receiptAbsence?: ExtractionOperationReceiptAbsence,
+): ExtractionOperationResult<T> {
+  return {
+    replayed: true,
+    failure: {
+      class: "transient_runtime",
+      cause: "extraction_operation_reconciliation_required",
+    },
+    ...(receipt ? { receipt } : {}),
+    ...(receiptAbsence ? { receiptAbsence } : {}),
+  };
+}
+
+export function createExtractionOperationReceiptAbsence(
+  identity: ExtractionOperationIdentity,
+  observedAt = new Date().toISOString(),
+): ExtractionOperationReceiptAbsence {
+  return {
+    schema: "extraction-operation-receipt-absence/v1",
+    ...identity,
+    key: buildExtractionOperationKey(identity),
+    observedAt,
+  };
+}
+
+export function projectExtractionOperationReceiptAbsence(
+  receiptAbsence: ExtractionOperationReceiptAbsence | undefined,
+  runnerInputHash: string,
+): ExtractionOperationReceiptAbsenceProjection | undefined {
+  return receiptAbsence
+    ? { ...receiptAbsence, runnerInputHash }
+    : undefined;
+}
+
+function failedReverificationResult<T>(
+  failure: StageFailure,
+  receipt: ExtractionOperationReceipt<T>,
+): ExtractionOperationResult<T> {
+  return {
+    replayed: true,
+    failure,
+    receipt,
+  };
+}
+
+function isSucceededDomainReverification(
+  receipt: ExtractionOperationReceipt | null | undefined,
+  options: { requireExisting?: boolean },
+): boolean {
+  return Boolean(receipt && requiresDomainReverification(receipt, options));
+}
+
+function canReverifySucceededReceipt(receipt: ExtractionOperationReceipt): boolean {
+  return PROPOSAL_REVERIFICATION_STAGES.has(receipt.stage)
+    || hasResumableStageRecovery(receipt);
+}
+
+function latestReceiptForCompletion<T>(
+  latest: ExtractionOperationReceipt<T> | null,
+  fallback: ExtractionOperationReceipt<T>,
+): ExtractionOperationReceipt<T> {
+  return latest && latest.inputHash === fallback.inputHash ? latest : fallback;
+}
+
+function hasValidRecoveryAfterVerification(receipt: ExtractionOperationReceipt): boolean {
+  return !DOMAIN_REVERIFICATION_STAGES.has(receipt.stage)
+    || PROPOSAL_REVERIFICATION_STAGES.has(receipt.stage)
+    || hasResumableStageRecovery(receipt);
+}
+
 export async function withExtractionOperationReceipt<T>(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
   execute: () => Promise<T>,
   options: ExtractionOperationReceiptOptions = {},
 ): Promise<ExtractionOperationResult<T>> {
+  if (
+    options.expectedInputHash !== undefined
+    && options.expectedInputHash !== identity.inputHash
+  ) {
+    return {
+      replayed: false,
+      failure: {
+        class: "hard",
+        cause: "extraction_operation_input_hash_drifted_after_absence",
+      },
+    };
+  }
   const key = buildExtractionOperationKey(identity);
   return withKeyedLock(`extraction-operation:${key}`, async () => {
     let existing = await kv.get<ExtractionOperationReceipt<T>>(
@@ -499,10 +960,18 @@ export async function withExtractionOperationReceipt<T>(
       };
       return { replayed: true, failure, receipt: existing };
     }
+    const succeededReverification = isSucceededDomainReverification(existing, options);
     if (existing?.status === "succeeded" && existing.response !== undefined) {
-      return { replayed: true, response: existing.response, receipt: existing };
+      if (!succeededReverification) {
+        return { replayed: true, response: existing.response, receipt: existing };
+      }
+      if (!canReverifySucceededReceipt(existing)) {
+        return reconciliationRequired(existing);
+      }
     }
-    if (existing?.status === "running") {
+    const resumableRunning = existing?.status === "running"
+      && hasResumableStageRecovery(existing);
+    if (existing?.status === "running" && !resumableRunning) {
       const failure: StageFailure = {
         class: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
@@ -575,12 +1044,16 @@ export async function withExtractionOperationReceipt<T>(
         return { replayed: true, failure, receipt: existing };
       }
     }
-    if (options.requireExisting && !reopened) {
-      const failure: StageFailure = {
-        class: "transient_runtime",
-        cause: "extraction_operation_reconciliation_required",
-      };
-      return { replayed: true, failure };
+    if (
+      options.requireExisting
+      && !reopened
+      && !resumableRunning
+      && !succeededReverification
+    ) {
+      return reconciliationRequired(
+        undefined,
+        createExtractionOperationReceiptAbsence(identity),
+      );
     }
 
     let startedAt: string;
@@ -614,6 +1087,20 @@ export async function withExtractionOperationReceipt<T>(
     try {
       rawResponse = await execute();
     } catch (error) {
+      const latest = latestReceiptForCompletion(
+        await kv.get<ExtractionOperationReceipt<T>>(KV.extractionOperationReceipt(key), key),
+        running,
+      );
+      if (succeededReverification) {
+        const failure = error instanceof ExtractionOperationResultUncertainError
+          ? {
+            class: "transient_runtime" as const,
+            cause: "extraction_operation_reconciliation_required",
+            phase: "final_result_persistence" as const,
+          }
+          : causeFromError(error);
+        return failedReverificationResult(failure, latest);
+      }
       if (error instanceof ExtractionOperationResultUncertainError) {
         const timestamp = new Date().toISOString();
         const failure: StageFailure = {
@@ -622,7 +1109,7 @@ export async function withExtractionOperationReceipt<T>(
           phase: "final_result_persistence",
         };
         const uncertain: ExtractionOperationReceipt<T> = {
-          ...running,
+          ...latest,
           failure,
           uncertainty: {
             phase: "final_result_persistence",
@@ -638,13 +1125,27 @@ export async function withExtractionOperationReceipt<T>(
         class: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
       };
-      return { replayed: false, failure, receipt: running };
+      return { replayed: false, failure, receipt: latest };
     }
     const responseFailure = failureFromResponse(rawResponse);
     if (responseFailure) {
+      const latest = latestReceiptForCompletion(
+        await kv.get<ExtractionOperationReceipt<T>>(KV.extractionOperationReceipt(key), key),
+        running,
+      );
+      if (succeededReverification) {
+        return failedReverificationResult(responseFailure, latest);
+      }
+      if (
+        responseFailure.class !== "hard"
+        && latest.status === "running"
+        && hasResumableStageRecovery(latest)
+      ) {
+        return reconciliationRequired(latest);
+      }
       const retry = retryableFailureFromResponse(rawResponse, responseFailure)
         ? {
-          epoch: running.retry?.epoch ?? 0,
+          epoch: latest.retry?.epoch ?? 0,
           lastSafeFailure: {
             errorClass: responseFailure.class,
             cause: responseFailure.cause,
@@ -653,15 +1154,32 @@ export async function withExtractionOperationReceipt<T>(
             ...(responseFailure.diagnostics ? { diagnostics: responseFailure.diagnostics } : {}),
           },
         }
-        : running.retry;
-      const failed = failedReceipt<T>(identity, key, startedAt, responseFailure, retry);
+        : latest.retry;
+      const failed = {
+        ...failedReceipt<T>(identity, key, startedAt, responseFailure, retry),
+        ...stageRecoveryFields(latest),
+      };
       await kv.set(KV.extractionOperationReceipt(key), key, failed);
       return { replayed: false, failure: responseFailure, receipt: failed };
     }
+    const latest = latestReceiptForCompletion(
+      await kv.get<ExtractionOperationReceipt<T>>(KV.extractionOperationReceipt(key), key),
+      running,
+    );
+    if (succeededReverification && !hasValidRecoveryAfterVerification(latest)) {
+      return reconciliationRequired(existing!);
+    }
     const response = safeResponse(identity.stage, rawResponse);
-    const succeeded = completedReceipt(identity, key, startedAt, response, running.retry);
+    const succeeded = completedReceipt(
+      identity,
+      key,
+      startedAt,
+      response,
+      latest.retry,
+      stageRecoveryFields(latest),
+    );
     await kv.set(KV.extractionOperationReceipt(key), key, succeeded);
-    return { replayed: false, response, receipt: succeeded };
+    return { replayed: succeededReverification, response, receipt: succeeded };
   });
 }
 
@@ -669,6 +1187,7 @@ export async function completeModelOperationFromVerifiedResult<T>(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
   verifiedResponse: T,
+  options: { allowMissing?: boolean } = {},
 ): Promise<ExtractionOperationResult<T>> {
   const key = buildExtractionOperationKey(identity);
   return withKeyedLock(`extraction-operation:${key}`, async () => {
@@ -676,6 +1195,17 @@ export async function completeModelOperationFromVerifiedResult<T>(
       KV.extractionOperationReceipt(key),
       key,
     );
+    if (!existing && options.allowMissing === true) {
+      const response = safeResponse(identity.stage, verifiedResponse);
+      const succeeded = completedReceipt(
+        identity,
+        key,
+        new Date().toISOString(),
+        response,
+      );
+      await kv.set(KV.extractionOperationReceipt(key), key, succeeded);
+      return { replayed: true, response, receipt: succeeded };
+    }
     if (!existing || existing.inputHash !== identity.inputHash) {
       const failure: StageFailure = {
         class: "hard",
@@ -718,7 +1248,20 @@ export async function withIdempotentCommitReceipt<T>(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
   executeCommit: () => Promise<T>,
+  options: { requireExisting?: boolean; expectedInputHash?: string } = {},
 ): Promise<ExtractionOperationResult<T>> {
+  if (
+    options.expectedInputHash !== undefined
+    && options.expectedInputHash !== identity.inputHash
+  ) {
+    return {
+      replayed: false,
+      failure: {
+        class: "hard",
+        cause: "extraction_operation_input_hash_drifted_after_absence",
+      },
+    };
+  }
   const key = buildExtractionOperationKey(identity);
   return withKeyedLock(`extraction-operation:${key}`, async () => {
     const existing = await kv.get<ExtractionOperationReceipt<T>>(
@@ -732,8 +1275,14 @@ export async function withIdempotentCommitReceipt<T>(
       };
       return { replayed: true, failure, receipt: existing };
     }
+    const succeededReverification = isSucceededDomainReverification(existing, options);
     if (existing?.status === "succeeded" && existing.response !== undefined) {
-      return { replayed: true, response: existing.response, receipt: existing };
+      if (!succeededReverification) {
+        return { replayed: true, response: existing.response, receipt: existing };
+      }
+      if (!canReverifySucceededReceipt(existing)) {
+        return reconciliationRequired(existing);
+      }
     }
     if (existing?.status === "failed") {
       return {
@@ -741,6 +1290,19 @@ export async function withIdempotentCommitReceipt<T>(
         failure: existing.failure ?? { class: "unit", cause: "extraction_operation_failed" },
         receipt: existing,
       };
+    }
+    if (
+      existing?.status === "running"
+      && existing.stage === "crystal"
+      && !hasResumableStageRecovery(existing)
+    ) {
+      return reconciliationRequired(existing);
+    }
+    if (!existing && options.requireExisting) {
+      return reconciliationRequired(
+        undefined,
+        createExtractionOperationReceiptAbsence(identity),
+      );
     }
 
     const startedAt = existing?.startedAt ?? new Date().toISOString();
@@ -759,31 +1321,100 @@ export async function withIdempotentCommitReceipt<T>(
       rawResponse = await executeCommit();
     } catch (error) {
       const failure = causeFromError(error);
-      const running: ExtractionOperationReceipt<T> = {
+      const fallback = existing ?? {
         ...identity,
         key,
         version: EXTRACTION_OPERATION_RECEIPT_VERSION,
-        status: "running",
+        status: "running" as const,
         startedAt,
       };
-      return { replayed: Boolean(existing), failure, receipt: running };
+      const latest = latestReceiptForCompletion(
+        await kv.get<ExtractionOperationReceipt<T>>(KV.extractionOperationReceipt(key), key),
+        fallback,
+      );
+      if (succeededReverification) {
+        return failedReverificationResult(failure, latest);
+      }
+      return { replayed: Boolean(existing), failure, receipt: latest };
     }
     const responseFailure = failureFromResponse(rawResponse);
     if (responseFailure) {
-      const failed = failedReceipt<T>(identity, key, startedAt, responseFailure);
+      const fallback = existing ?? {
+        ...identity,
+        key,
+        version: EXTRACTION_OPERATION_RECEIPT_VERSION,
+        status: "running" as const,
+        startedAt,
+      };
+      const latest = latestReceiptForCompletion(
+        await kv.get<ExtractionOperationReceipt<T>>(KV.extractionOperationReceipt(key), key),
+        fallback,
+      );
+      if (succeededReverification) {
+        return failedReverificationResult(responseFailure, latest);
+      }
+      if (
+        responseFailure.class !== "hard"
+        && latest.status === "running"
+        && hasResumableStageRecovery(latest)
+      ) {
+        return reconciliationRequired(latest);
+      }
+      const failed = {
+        ...failedReceipt<T>(identity, key, startedAt, responseFailure, undefined),
+        ...stageRecoveryFields(latest),
+      };
       await kv.set(KV.extractionOperationReceipt(key), key, failed);
       return { replayed: Boolean(existing), failure: responseFailure, receipt: failed };
     }
+    const fallback = existing ?? {
+      ...identity,
+      key,
+      version: EXTRACTION_OPERATION_RECEIPT_VERSION,
+      status: "running" as const,
+      startedAt,
+    };
+    const latest = latestReceiptForCompletion(
+      await kv.get<ExtractionOperationReceipt<T>>(KV.extractionOperationReceipt(key), key),
+      fallback,
+    );
+    if (succeededReverification && !hasValidRecoveryAfterVerification(latest)) {
+      return reconciliationRequired(existing!);
+    }
     const response = safeResponse(identity.stage, rawResponse);
-    const succeeded = completedReceipt(identity, key, startedAt, response);
+    const succeeded = completedReceipt(
+      identity,
+      key,
+      startedAt,
+      response,
+      latest.retry,
+      stageRecoveryFields(latest),
+    );
     await kv.set(KV.extractionOperationReceipt(key), key, succeeded);
     return { replayed: Boolean(existing), response, receipt: succeeded };
   });
 }
 
+export interface ExtractionOperationReconciliationVerifiers {
+  findMemoryProposal?: (
+    kv: StateKV,
+    identity: ExtractionOperationIdentity,
+  ) => Promise<Record<string, unknown> | null>;
+  findSkillProposal?: (
+    kv: StateKV,
+    identity: ExtractionOperationIdentity,
+  ) => Promise<Record<string, unknown> | null>;
+  verifyLessonResult?: (
+    kv: StateKV,
+    identity: ExtractionOperationIdentity,
+    runnerInputHash: string,
+  ) => Promise<"absent" | "present" | "drifted">;
+}
+
 export function registerExtractionOperationReceiptFunctions(
   sdk: ISdk,
   kv: StateKV,
+  reconciliationVerifiers: ExtractionOperationReconciliationVerifiers = {},
 ): void {
   sdk.registerFunction(
     "mem::extraction-operation-receipt-get",
@@ -830,7 +1461,7 @@ export function registerExtractionOperationReceiptFunctions(
   sdk.registerFunction(
     "mem::extraction-operation-receipt-reconcile-orphan",
     async (value: unknown) => {
-      const input = normalizeOrphanSummaryReconciliation(value);
+      const input = normalizeOrphanReconciliation(value);
       if (!input) {
         return orphanReconciliationFailure("invalid_orphan_reconciliation_identity");
       }
@@ -857,38 +1488,142 @@ export function registerExtractionOperationReceiptFunctions(
           return orphanReconciliationFailure("orphan_reconciliation_evidence_drifted");
         }
 
-        const [run, activeRun, persistedSummary] = await Promise.all([
-          kv.get<ResumableSummaryRun>(
-            KV.summaryResumableRuns,
-            input.result.resumableRunId,
-          ),
-          kv.get<ResumableSummaryActiveRun>(
-            KV.summaryResumableActiveRuns,
-            input.result.sessionId,
-          ),
-          kv.get(KV.summaries, input.result.sessionId),
-        ]);
-        if (
-          (persistedSummary !== null && persistedSummary !== undefined)
-          || run?.summary !== undefined
-        ) {
-          return orphanReconciliationFailure("orphan_reconciliation_result_present");
-        }
-        if (
-          !run
-          || !activeRun
-          || run.id !== input.result.resumableRunId
-          || run.sessionId !== input.result.sessionId
-          || run.status !== "in_progress"
-          || run.inputHash !== input.result.serviceInputHash
-          || run.attemptId !== input.operation.runId
-          || run.attemptInputHash !== input.result.runnerInputHash
-          || run.generationConfigHash !== input.result.generationConfigHash
-          || activeRun.sessionId !== input.result.sessionId
-          || activeRun.runId !== input.result.resumableRunId
-          || activeRun.inputHash !== input.result.serviceInputHash
-        ) {
-          return orphanReconciliationFailure("orphan_reconciliation_result_binding_drifted");
+        if (input.result.kind === "summary_resumable_run") {
+          const mapPrefix = `${input.result.sessionId}:map:`;
+          const mapIndexText = input.operation.unitId.startsWith(mapPrefix)
+            ? input.operation.unitId.slice(mapPrefix.length)
+            : null;
+          const mapIndex = mapIndexText !== null && /^(?:0|[1-9]\d*)$/.test(mapIndexText)
+            ? Number(mapIndexText)
+            : null;
+          const [run, activeRun, persistedSummary, persistedMapPartial] = await Promise.all([
+            kv.get<ResumableSummaryRun>(
+              KV.summaryResumableRuns,
+              input.result.resumableRunId,
+            ),
+            kv.get<ResumableSummaryActiveRun>(
+              KV.summaryResumableActiveRuns,
+              input.result.sessionId,
+            ),
+            kv.get(KV.summaries, input.result.sessionId),
+            mapIndex === null
+              ? Promise.resolve(null)
+              : kv.get<ResumableSummaryPartial>(
+                  KV.summaryResumablePartials(input.result.resumableRunId),
+                  String(mapIndex),
+                ),
+          ]);
+          if (
+            (persistedSummary !== null && persistedSummary !== undefined)
+            || run?.summary !== undefined
+          ) {
+            return orphanReconciliationFailure("orphan_reconciliation_result_present");
+          }
+          if (
+            !run
+            || !activeRun
+            || run.id !== input.result.resumableRunId
+            || run.sessionId !== input.result.sessionId
+            || run.status !== "in_progress"
+            || run.inputHash !== input.result.serviceInputHash
+            || run.attemptId !== input.operation.runId
+            || run.attemptInputHash !== input.result.runnerInputHash
+            || run.generationConfigHash !== input.result.generationConfigHash
+            || activeRun.sessionId !== input.result.sessionId
+            || activeRun.runId !== input.result.resumableRunId
+            || activeRun.inputHash !== input.result.serviceInputHash
+            || (
+              mapIndex !== null
+              && (
+                !Number.isSafeInteger(run.totalChunks)
+                || mapIndex >= run.totalChunks
+              )
+            )
+          ) {
+            return orphanReconciliationFailure("orphan_reconciliation_result_binding_drifted");
+          }
+          if (mapIndex !== null && persistedMapPartial !== null && persistedMapPartial !== undefined) {
+            if (
+              persistedMapPartial.runId !== run.id
+              || persistedMapPartial.chunkIndex !== mapIndex
+              || persistedMapPartial.status !== "completed"
+              || !persistedMapPartial.summary
+            ) {
+              return orphanReconciliationFailure(
+                "orphan_reconciliation_result_binding_drifted",
+              );
+            }
+            return orphanReconciliationFailure("orphan_reconciliation_result_present");
+          }
+        } else {
+          if (hasResumableStageRecovery(receipt)) {
+            return orphanReconciliationFailure("orphan_reconciliation_result_present");
+          }
+          if (input.operation.stage === "lessons") {
+            const verifyLessonResult = reconciliationVerifiers.verifyLessonResult;
+            if (!verifyLessonResult) {
+              return orphanReconciliationFailure(
+                "orphan_reconciliation_result_binding_drifted",
+              );
+            }
+            const lessonIdentity: ExtractionOperationIdentity = {
+              runId: input.operation.runId,
+              stage: "lessons",
+              unitId: input.operation.unitId,
+              inputHash: input.operation.inputHash,
+            };
+            const lessonResult = await verifyLessonResult(
+              kv,
+              lessonIdentity,
+              input.result.runnerInputHash,
+            );
+            if (lessonResult !== "absent") {
+              return orphanReconciliationFailure(
+                lessonResult === "present"
+                  ? "orphan_reconciliation_result_present"
+                  : "orphan_reconciliation_result_binding_drifted",
+              );
+            }
+          }
+          if (
+            input.operation.stage === "memory_consolidate"
+            || input.operation.stage === "skill_extract"
+          ) {
+            const findProposal = input.operation.stage === "memory_consolidate"
+              ? reconciliationVerifiers.findMemoryProposal
+              : reconciliationVerifiers.findSkillProposal;
+            if (!findProposal) {
+              return orphanReconciliationFailure(
+                "orphan_reconciliation_result_binding_drifted",
+              );
+            }
+            const prepareIdentity: ExtractionOperationIdentity = {
+              runId: input.result.phase === "prepare"
+                ? input.operation.runId
+                : input.result.prepareRunId!,
+              stage: input.operation.stage,
+              unitId: input.operation.unitId,
+              inputHash: input.result.phase === "prepare"
+                ? input.result.runnerInputHash
+                : input.result.prepareInputHash!,
+            };
+            const proposal = await findProposal(kv, prepareIdentity);
+            if (
+              input.result.phase === "prepare"
+                ? proposal !== null
+                : (
+                    proposal === null
+                    || proposal.success !== true
+                    || proposal.status !== "prepared"
+                  )
+            ) {
+              return orphanReconciliationFailure(
+                proposal === null
+                  ? "orphan_reconciliation_result_binding_drifted"
+                  : "orphan_reconciliation_result_present",
+              );
+            }
+          }
         }
 
         let reconciled = receipt;
@@ -908,7 +1643,11 @@ export function registerExtractionOperationReceiptFunctions(
               id: reconciliationId,
               at,
               resultStatus: "absent",
-              resumableRunId: input.result.resumableRunId,
+              proofKind: input.result.kind,
+              phase: input.result.phase,
+              ...(input.result.kind === "summary_resumable_run"
+                ? { resumableRunId: input.result.resumableRunId }
+                : {}),
             },
           };
           await kv.set(KV.extractionOperationReceipt(key), key, reconciled);
@@ -1067,12 +1806,16 @@ function sanitizeExtractionOperationReceipt(receipt: ExtractionOperationReceipt)
   };
 }
 
+type OrphanReconciliationOperation = ExtractionOperationIdentity & {
+  expectedStatus: "running";
+  expectedStartedAt: string;
+};
+
 type OrphanSummaryReconciliationInput = {
-  operation: ExtractionOperationIdentity & {
-    expectedStatus: "running";
-    expectedStartedAt: string;
-  };
+  operation: OrphanReconciliationOperation;
   result: {
+    kind: "summary_resumable_run";
+    phase: "execute";
     sessionId: string;
     resumableRunId: string;
     serviceInputHash: string;
@@ -1080,6 +1823,21 @@ type OrphanSummaryReconciliationInput = {
     generationConfigHash: string;
   };
 };
+
+type OrphanProtocolReconciliationInput = {
+  operation: OrphanReconciliationOperation;
+  result: {
+    kind: "protocol_state";
+    phase: "execute" | "prepare" | "commit";
+    runnerInputHash: string;
+    prepareRunId?: string;
+    prepareInputHash?: string;
+  };
+};
+
+type OrphanReconciliationInput =
+  | OrphanSummaryReconciliationInput
+  | OrphanProtocolReconciliationInput;
 
 const ORPHAN_RECONCILIATION_OPERATION_KEYS = new Set([
   "runId",
@@ -1090,11 +1848,30 @@ const ORPHAN_RECONCILIATION_OPERATION_KEYS = new Set([
   "expectedStartedAt",
 ]);
 const ORPHAN_RECONCILIATION_RESULT_KEYS = new Set([
+  "kind",
+  "phase",
   "sessionId",
   "resumableRunId",
   "serviceInputHash",
   "runnerInputHash",
   "generationConfigHash",
+]);
+const ORPHAN_RECONCILIATION_LEGACY_RESULT_KEYS = new Set([
+  "sessionId",
+  "resumableRunId",
+  "serviceInputHash",
+  "runnerInputHash",
+  "generationConfigHash",
+]);
+const ORPHAN_PROTOCOL_RESULT_BASE_KEYS = new Set([
+  "kind",
+  "phase",
+  "runnerInputHash",
+]);
+const ORPHAN_PROTOCOL_COMMIT_RESULT_KEYS = new Set([
+  ...ORPHAN_PROTOCOL_RESULT_BASE_KEYS,
+  "prepareRunId",
+  "prepareInputHash",
 ]);
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const RESUMABLE_SUMMARY_RUN_ID = /^sumr_[0-9a-f]{24}$/;
@@ -1107,45 +1884,105 @@ function exactObjectKeys(value: unknown, allowed: Set<string>): value is Record<
     && Object.keys(value as Record<string, unknown>).length === allowed.size;
 }
 
-function normalizeOrphanSummaryReconciliation(
+function normalizeOrphanReconciliation(
   value: unknown,
-): OrphanSummaryReconciliationInput | null {
+): OrphanReconciliationInput | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const input = value as Record<string, unknown>;
-  if (
-    !exactObjectKeys(input.operation, ORPHAN_RECONCILIATION_OPERATION_KEYS)
-    || !exactObjectKeys(input.result, ORPHAN_RECONCILIATION_RESULT_KEYS)
-  ) {
-    return null;
-  }
+  if (!exactObjectKeys(input.operation, ORPHAN_RECONCILIATION_OPERATION_KEYS)) return null;
   const operation = input.operation;
   const result = input.result;
+  if (!result || typeof result !== "object" || Array.isArray(result)) return null;
+  let resultRecord = result as Record<string, unknown>;
+  const legacySummaryResult = operation.stage === "summary"
+    && exactObjectKeys(result, ORPHAN_RECONCILIATION_LEGACY_RESULT_KEYS);
+  if (legacySummaryResult) {
+    resultRecord = {
+      ...resultRecord,
+      kind: "summary_resumable_run",
+      phase: "execute",
+    };
+  }
+  const summaryResult = resultRecord.kind === "summary_resumable_run";
+  if (
+    summaryResult
+      ? (
+          !legacySummaryResult
+          && !exactObjectKeys(result, ORPHAN_RECONCILIATION_RESULT_KEYS)
+        )
+      : !exactObjectKeys(
+          result,
+          resultRecord.phase === "commit"
+            ? ORPHAN_PROTOCOL_COMMIT_RESULT_KEYS
+            : ORPHAN_PROTOCOL_RESULT_BASE_KEYS,
+        )
+  ) return null;
+  if (
+    operation.expectedStatus !== "running"
+    || !EXTRACTION_OPERATION_STAGES.has(
+      operation.stage as ExtractionOperationIdentity["stage"],
+    )
+    || !SHA256_HEX.test(String(operation.runId))
+    || !SHA256_HEX.test(String(operation.inputHash))
+    || typeof operation.unitId !== "string"
+    || !operation.unitId
+    || typeof operation.expectedStartedAt !== "string"
+    || Number.isNaN(Date.parse(operation.expectedStartedAt))
+  ) return null;
+  if (!summaryResult) {
+    const stage = operation.stage as ExtractionOperationIdentity["stage"];
+    const phase = resultRecord.phase;
+    const twoPhase = stage === "memory_consolidate" || stage === "skill_extract";
+    if (
+      resultRecord.kind !== "protocol_state"
+      || !SHA256_HEX.test(String(resultRecord.runnerInputHash))
+      || (twoPhase ? !["prepare", "commit"].includes(String(phase)) : phase !== "execute")
+      || stage === "summary"
+      || (
+        phase === "commit"
+        && (
+          !SHA256_HEX.test(String(resultRecord.prepareRunId))
+          || !SHA256_HEX.test(String(resultRecord.prepareInputHash))
+        )
+      )
+    ) return null;
+    return {
+      operation: operation as OrphanProtocolReconciliationInput["operation"],
+      result: resultRecord as OrphanProtocolReconciliationInput["result"],
+    };
+  }
   const strings = [...ORPHAN_RECONCILIATION_OPERATION_KEYS, ...ORPHAN_RECONCILIATION_RESULT_KEYS]
-    .filter((key) => key !== "expectedStatus" && key !== "stage")
+    .filter((key) => !["expectedStatus", "stage", "kind", "phase"].includes(key))
     .map((key) => (
-      Object.prototype.hasOwnProperty.call(operation, key) ? operation[key] : result[key]
+      Object.prototype.hasOwnProperty.call(operation, key) ? operation[key] : resultRecord[key]
     ));
   if (strings.some((item) => typeof item !== "string" || !item.trim())) return null;
   if (
     operation.stage !== "summary"
-    || operation.expectedStatus !== "running"
-    || !SHA256_HEX.test(String(operation.runId))
-    || !SHA256_HEX.test(String(operation.inputHash))
+    || resultRecord.phase !== "execute"
     || !SHA256_HEX.test(String(result.serviceInputHash))
     || !SHA256_HEX.test(String(result.runnerInputHash))
     || !SHA256_HEX.test(String(result.generationConfigHash))
     || !RESUMABLE_SUMMARY_RUN_ID.test(String(result.resumableRunId))
-    || operation.unitId !== `${result.sessionId}:reduce`
+    || !(
+      operation.unitId === `${result.sessionId}:reduce`
+      || new RegExp(`^${escapeRegExp(String(result.sessionId))}:map:(?:0|[1-9]\\d*)$`)
+        .test(String(operation.unitId))
+    )
   ) {
     return null;
   }
   return {
     operation: operation as OrphanSummaryReconciliationInput["operation"],
-    result: result as OrphanSummaryReconciliationInput["result"],
+    result: resultRecord as OrphanSummaryReconciliationInput["result"],
   };
 }
 
-function orphanReconciliationId(input: OrphanSummaryReconciliationInput): string {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function orphanReconciliationId(input: OrphanReconciliationInput): string {
   const hash = createHash("sha256")
     .update(JSON.stringify([
       input.operation.runId,
@@ -1153,11 +1990,23 @@ function orphanReconciliationId(input: OrphanSummaryReconciliationInput): string
       input.operation.unitId,
       input.operation.inputHash,
       input.operation.expectedStartedAt,
-      input.result.sessionId,
-      input.result.resumableRunId,
-      input.result.serviceInputHash,
-      input.result.runnerInputHash,
-      input.result.generationConfigHash,
+      input.result.kind,
+      input.result.phase,
+      ...(
+        input.result.kind === "summary_resumable_run"
+          ? [
+              input.result.sessionId,
+              input.result.resumableRunId,
+              input.result.serviceInputHash,
+              input.result.runnerInputHash,
+              input.result.generationConfigHash,
+            ]
+          : [
+              input.result.runnerInputHash,
+              input.result.prepareRunId,
+              input.result.prepareInputHash,
+            ]
+      ),
     ]))
     .digest("hex");
   return `xrec_${hash.slice(0, 32)}`;
