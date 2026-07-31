@@ -1223,6 +1223,19 @@ test('lesson_no_blocks migration requires and preserves a closed zero-effect pro
     finishedAt: '2026-07-30T00:00:00.000Z',
   });
   assert.equal(manifest.entries[0].decision.action, 'skipped');
+
+  const retryableEvidence = structuredClone(evidence);
+  retryableEvidence.safe_facts.lessonRun.status = 'retryable';
+  const retryableManifest = buildRecoveryMigrationManifest({
+    runId: 'migration-run',
+    stage: 'lessons',
+    events: await journal.readStage('lessons'),
+    safeEvidenceByUnit: { 'lesson-b': retryableEvidence },
+    ...MIGRATION_METADATA,
+  });
+  assert.equal(retryableManifest.entries[0].evidence.kind, 'no_effect');
+  assert.equal(retryableManifest.entries[0].decision.action, 'skipped');
+
   await appendRecoveryContractFence({
     journal,
     stage: 'lessons',

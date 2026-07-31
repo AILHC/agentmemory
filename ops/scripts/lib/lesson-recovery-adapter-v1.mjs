@@ -50,7 +50,7 @@ function zeroEffectProof(data, expected) {
     || !completeCollectionProof(data, expected)
     || run.id !== expected.lessonRunId || run.sessionId !== expected.sessionId
     || run.inputHash !== expected.runInputHash || run.configHash !== expected.configHash
-    || run.status !== 'failed'
+    || !['failed', 'retryable'].includes(run.status)
     || receipt.key !== expected.receiptKey || receipt.runId !== expected.attemptId
     || receipt.unitId !== expected.sessionId || receipt.stage !== 'lessons'
     || receipt.inputHash !== expected.receiptInputHash || receipt.status !== 'failed'

@@ -75,6 +75,15 @@ test('adapts only closed legacy lesson_no_blocks evidence to skipped without bod
   assert.equal(JSON.stringify(result).includes('lesson body sentinel'), false);
 });
 
+test('adapts a closed retryable legacy lesson_no_blocks run to skipped', () => {
+  const value = data();
+  value.lessonRun.status = 'retryable';
+  const result = adapt(value);
+  assert.equal(result.decision.action, 'skipped');
+  assert.equal(result.evidence.kind, 'no_effect');
+  assert.equal(result.evidence.proof.kind, 'legacy_lessons_zero_effect');
+});
+
 test('adapts a bound committed Lesson receipt to verified replay', () => {
   const result = adapt({
     runs: [{ id: 'lesson-run-1', status: 'succeeded' }],
