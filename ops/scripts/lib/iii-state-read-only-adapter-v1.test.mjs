@@ -8,6 +8,7 @@ import test from 'node:test';
 import YAML from 'yaml';
 import {
   assertPinnedIiiVersionOutput,
+  III_STATE_READ_ONLY_RUNTIME_LIMITS,
   openIiiStateReadOnlyWorkingCopy,
   PINNED_III_ENGINE_SHA256,
   PINNED_III_ENGINE_VERSION,
@@ -52,6 +53,29 @@ function processExists(pid) {
     throw error;
   }
 }
+
+test('read-only III runtime uses bounded large-state limits and SDK reconnection fields', () => {
+  assert.deepEqual(III_STATE_READ_ONLY_RUNTIME_LIMITS, {
+    startupTimeoutMs: 300_000,
+    invocationTimeoutMs: 30_000,
+    shutdownTimeoutMs: 5_000,
+    reconnection: {
+      initialDelayMs: 100,
+      maxDelayMs: 1_000,
+      backoffMultiplier: 1.5,
+      jitterFactor: 0.1,
+      maxRetries: 300,
+    },
+  });
+  assert.equal(
+    Object.hasOwn(III_STATE_READ_ONLY_RUNTIME_LIMITS.reconnection, 'initialDelay'),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(III_STATE_READ_ONLY_RUNTIME_LIMITS.reconnection, 'maxDelay'),
+    false,
+  );
+});
 
 async function waitForProcessExit(pid) {
   for (let attempt = 0; attempt < 100; attempt += 1) {

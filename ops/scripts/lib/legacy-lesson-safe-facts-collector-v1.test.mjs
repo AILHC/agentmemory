@@ -202,6 +202,22 @@ test('collects the unique complete legacy Lesson zero-effect proof without bodie
   }
 });
 
+test('accepts a retryable legacy Lesson run only with the same closed zero-effect proof', async () => {
+  const result = await collect(readView({
+    runs: [{ ...run(), status: 'retryable' }],
+  }));
+  assert.equal(result[unitId].safe_facts.lessonRun.status, 'retryable');
+});
+
+test('rejects a non-failure legacy Lesson run even when effect collections are empty', async () => {
+  await assert.rejects(
+    () => collect(readView({
+      runs: [{ ...run(), status: 'succeeded' }],
+    })),
+    /legacy_lesson_collector_zero_effect_not_proven/,
+  );
+});
+
 test('accepts exactly one matching legacy aggregate receipt', async () => {
   const result = await collect(readView({
     currentReceipt: null,

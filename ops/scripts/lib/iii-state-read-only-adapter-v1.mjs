@@ -12,16 +12,29 @@ export const III_STATE_READ_ONLY_ADAPTER_SCHEMA = 'iii-state-read-only-working-c
 export const PINNED_III_ENGINE_VERSION = '0.11.2';
 export const PINNED_III_ENGINE_SHA256 =
   '2447bc21906a6b5be270868da7e74a1c744a4644cf3bd4b37a228ba4e55478ca';
+export const III_STATE_READ_ONLY_RUNTIME_LIMITS = Object.freeze({
+  startupTimeoutMs: 300_000,
+  invocationTimeoutMs: 30_000,
+  shutdownTimeoutMs: 5_000,
+  reconnection: Object.freeze({
+    initialDelayMs: 100,
+    maxDelayMs: 1_000,
+    backoffMultiplier: 1.5,
+    jitterFactor: 0.1,
+    maxRetries: 300,
+  }),
+});
 
 const HASH = /^[0-9a-f]{64}$/;
 const SCOPE = /^[A-Za-z0-9][A-Za-z0-9._:%-]{0,511}$/;
 const KEY = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,511}$/;
 const LOOPBACK_HOST = '127.0.0.1';
-const STARTUP_TIMEOUT_MS = 10_000;
-const INVOCATION_TIMEOUT_MS = 2_000;
+const STARTUP_TIMEOUT_MS = III_STATE_READ_ONLY_RUNTIME_LIMITS.startupTimeoutMs;
+const INVOCATION_TIMEOUT_MS = III_STATE_READ_ONLY_RUNTIME_LIMITS.invocationTimeoutMs;
 const PROBE_TIMEOUT_MS = INVOCATION_TIMEOUT_MS + 250;
-const SHUTDOWN_TIMEOUT_MS = 5_000;
+const SHUTDOWN_TIMEOUT_MS = III_STATE_READ_ONLY_RUNTIME_LIMITS.shutdownTimeoutMs;
 const RUNTIME_OWNER_FILE = '.agentmemory-recovery-runtime-owner';
+const ENGINE_EXITED = Symbol('engine-exited');
 const execFileAsync = promisify(execFile);
 
 function delay(milliseconds) {
@@ -40,6 +53,14 @@ async function withTimeout(promise, milliseconds, code) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function failWhenEngineExits(promise, engineExit) {
+  const result = await Promise.race([promise, engineExit]);
+  if (result === ENGINE_EXITED) {
+    throw new Error('iii_state_read_only_adapter_engine_unavailable');
+  }
+  return result;
 }
 
 function safeChildEnvironment() {
@@ -315,7 +336,7 @@ async function terminateChild(child) {
   }
 }
 
-async function waitForStateReady({ sdk, child }) {
+async function waitForStateReady({ sdk, child, engineExit }) {
   const deadline = Date.now() + STARTUP_TIMEOUT_MS;
   let lastError;
   while (Date.now() < deadline) {
@@ -324,13 +345,16 @@ async function waitForStateReady({ sdk, child }) {
     }
     try {
       await withTimeout(
-        sdk.trigger({
-          function_id: 'state::get',
-          payload: {
-            scope: 'agentmemory:recovery-readiness',
-            key: 'missing',
-          },
-        }),
+        failWhenEngineExits(
+          sdk.trigger({
+            function_id: 'state::get',
+            payload: {
+              scope: 'agentmemory:recovery-readiness',
+              key: 'missing',
+            },
+          }),
+          engineExit,
+        ),
         PROBE_TIMEOUT_MS,
         'iii_state_read_only_adapter_readiness_attempt_timeout',
       );
@@ -348,19 +372,22 @@ async function waitForStateReady({ sdk, child }) {
   });
 }
 
-async function confirmEngineStayedReady({ sdk, child }) {
+async function confirmEngineStayedReady({ sdk, child, engineExit }) {
   await delay(200);
   if (child.exitCode !== null || child.signalCode !== null) {
     throw new Error('iii_state_read_only_adapter_engine_exited_early');
   }
   await withTimeout(
-    sdk.trigger({
-      function_id: 'state::get',
-      payload: {
-        scope: 'agentmemory:recovery-readiness',
-        key: 'ownership-confirmation-missing',
-      },
-    }),
+    failWhenEngineExits(
+      sdk.trigger({
+        function_id: 'state::get',
+        payload: {
+          scope: 'agentmemory:recovery-readiness',
+          key: 'ownership-confirmation-missing',
+        },
+      }),
+      engineExit,
+    ),
     PROBE_TIMEOUT_MS,
     'iii_state_read_only_adapter_readiness_confirmation_failed',
   );
@@ -428,6 +455,7 @@ export async function openIiiStateReadOnlyWorkingCopy({
   let child;
   let stdoutHandle;
   let stderrHandle;
+  let engineExit;
   let closePromise;
   let runtimeCreated = false;
   let runtimeOwnership;
@@ -488,6 +516,9 @@ export async function openIiiStateReadOnlyWorkingCopy({
         stderrHandle.fd,
       ],
     });
+    engineExit = new Promise((resolve) => {
+      child.once('exit', () => resolve(ENGINE_EXITED));
+    });
     const spawnError = new Promise((_, reject) => {
       child.once('error', () => reject(
         new Error('iii_state_read_only_adapter_engine_spawn_failed'),
@@ -498,18 +529,16 @@ export async function openIiiStateReadOnlyWorkingCopy({
       enableMetricsReporting: false,
       invocationTimeoutMs: INVOCATION_TIMEOUT_MS,
       reconnectionConfig: {
-        maxRetries: 3,
-        initialDelay: 50,
-        maxDelay: 250,
+        ...III_STATE_READ_ONLY_RUNTIME_LIMITS.reconnection,
       },
       otel: { enabled: false },
     });
     await Promise.race([
-      waitForStateReady({ sdk, child }),
+      waitForStateReady({ sdk, child, engineExit }),
       spawnError,
     ]);
     await Promise.race([
-      confirmEngineStayedReady({ sdk, child }),
+      confirmEngineStayedReady({ sdk, child, engineExit }),
       spawnError,
     ]);
     await assertEngineLoadedState({ stdoutPath, stderrPath });
@@ -531,7 +560,10 @@ export async function openIiiStateReadOnlyWorkingCopy({
       }
       try {
         return await withTimeout(
-          sdk.trigger({ function_id: functionId, payload }),
+          failWhenEngineExits(
+            sdk.trigger({ function_id: functionId, payload }),
+            engineExit,
+          ),
           INVOCATION_TIMEOUT_MS + 250,
           code,
         );

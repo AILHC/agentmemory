@@ -415,7 +415,7 @@ async function collectUnit({ view, events, unitId, snapshot }) {
     || projectedReceipt.status !== 'failed'
     || projectedReceipt.failure?.class !== 'unit'
     || projectedReceipt.failure?.cause !== 'lesson_no_blocks'
-    || run.status !== 'failed'
+    || !['failed', 'retryable'].includes(run.status)
     || !Array.isArray(run.createdLessonIds)
     || run.createdLessonIds.length !== 0
     || !Array.isArray(run.replacedLessonIds)
