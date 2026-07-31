@@ -6,7 +6,7 @@ import path from 'node:path';
 import test from 'node:test';
 import { RunStateJournalV2 } from './run-state-journal-v2.mjs';
 import {
-  appendRecoveryContractFence,
+  appendRecoveryContractFence as appendRecoveryContractFenceImplementation,
   buildRecoveryMigrationManifest,
   resumeRecoveryMigration,
 } from './recovery-frontier-migration-v1.mjs';
@@ -53,6 +53,14 @@ const MIGRATION_METADATA = Object.freeze({
   authorizedAt: '2026-07-30T00:00:00.000Z',
   authorizationSourceType: 'change_ticket',
 });
+
+function appendRecoveryContractFence(options) {
+  return appendRecoveryContractFenceImplementation({
+    ...options,
+    expectedManifestHash: options.expectedManifestHash
+      ?? options.manifest.manifest_hash,
+  });
+}
 
 function testOnlyTrustedEvidenceVerifier(safeEvidenceByUnit) {
   return async () => ({
@@ -163,6 +171,7 @@ function migrationCliArgs({
   rootDir,
   inputPath,
   snapshotPath,
+  expectedManifestHash,
   confirmations = command === 'fence',
 }) {
   return [
@@ -172,6 +181,9 @@ function migrationCliArgs({
     '--stage', 'lessons',
     '--safe-evidence', inputPath,
     ...(snapshotPath ? ['--evidence-snapshot', snapshotPath] : []),
+    ...(expectedManifestHash
+      ? ['--expected-manifest-hash', expectedManifestHash]
+      : []),
     '--original-contract-version', MIGRATION_METADATA.originalContractVersion,
     '--target-contract-version', MIGRATION_METADATA.targetContractVersion,
     '--original-policy-version', MIGRATION_METADATA.originalPolicyVersion,
@@ -288,6 +300,107 @@ test('preview is deterministic and orders the unresolved frontier by unit identi
     first.evidence_provenance_state,
     'independent_verification_required',
   );
+});
+
+test('fence requires the exact approved manifest hash before acquiring the writer lock', async (context) => {
+  const { rootDir, journal } = await fixture(
+    'agentmemory-migration-approved-manifest',
+  );
+  context.after(() => fs.rm(rootDir, { recursive: true, force: true }));
+  const evidence = { 'lesson-b': zeroEffectEvidence('lesson-b') };
+  const manifest = buildRecoveryMigrationManifest({
+    runId: 'migration-run',
+    stage: 'lessons',
+    events: await journal.readStage('lessons'),
+    safeEvidenceByUnit: evidence,
+    ...MIGRATION_METADATA,
+  });
+  const before = await journal.readStage('lessons');
+  const options = {
+    journal,
+    stage: 'lessons',
+    manifest,
+    verifyOfflineWritersAbsent: async () => ({
+      oldRunnerAbsent: true,
+      writerLockAbsent: true,
+      otherWritersAbsent: true,
+    }),
+    verifyEvidenceProvenance: testOnlyTrustedEvidenceVerifier(evidence),
+  };
+  await assert.rejects(
+    () => appendRecoveryContractFenceImplementation(options),
+    /recovery_migration_approved_manifest_hash_mismatch/,
+  );
+  await assert.rejects(
+    () => appendRecoveryContractFence({
+      ...options,
+      expectedManifestHash: '0'.repeat(64),
+    }),
+    /recovery_migration_approved_manifest_hash_mismatch/,
+  );
+  assert.deepEqual(await journal.readStage('lessons'), before);
+  assert.equal(await fs.access(journal.lockPath).then(() => true, () => false), false);
+});
+
+test('fence fails closed when the fsynced event cannot be verified by an in-lock readback', async (context) => {
+  const { rootDir, journal } = await fixture(
+    'agentmemory-migration-fence-readback',
+  );
+  context.after(() => fs.rm(rootDir, { recursive: true, force: true }));
+  const evidence = { 'lesson-b': zeroEffectEvidence('lesson-b') };
+  const current = await journal.readStage('lessons');
+  const manifest = buildRecoveryMigrationManifest({
+    runId: 'migration-run',
+    stage: 'lessons',
+    events: current,
+    safeEvidenceByUnit: evidence,
+    ...MIGRATION_METADATA,
+  });
+  let readCount = 0;
+  let appendCount = 0;
+  let released = false;
+  const fakeJournal = {
+    runId: 'migration-run',
+    lockPath: path.join(rootDir, 'fake-writer.lock'),
+    acquireLock: async () => {},
+    releaseLock: async () => {
+      released = true;
+    },
+    readStage: async () => {
+      readCount += 1;
+      if (readCount === 1) return structuredClone(current);
+      return [
+        ...structuredClone(current),
+        {
+          seq: manifest.journal_seq + 1,
+          type: 'stage_recovery_contract_fenced',
+          payload: { ...structuredClone(manifest), manifest_hash: '0'.repeat(64) },
+        },
+      ];
+    },
+    appendStageExpectedSeq: async () => {
+      appendCount += 1;
+      return { seq: manifest.journal_seq + 1 };
+    },
+  };
+  await assert.rejects(
+    () => appendRecoveryContractFenceImplementation({
+      journal: fakeJournal,
+      stage: 'lessons',
+      manifest,
+      expectedManifestHash: manifest.manifest_hash,
+      verifyOfflineWritersAbsent: async () => ({
+        oldRunnerAbsent: true,
+        writerLockAbsent: true,
+        otherWritersAbsent: true,
+      }),
+      verifyEvidenceProvenance: testOnlyTrustedEvidenceVerifier(evidence),
+    }),
+    /recovery_migration_fence_readback_failed/,
+  );
+  assert.equal(appendCount, 1);
+  assert.equal(readCount, 2);
+  assert.equal(released, true);
 });
 
 test('fence rejects caller JSON evidence without an independent read-only verifier', async (context) => {
@@ -555,11 +668,19 @@ test('fence requires a snapshot for external entries and passes its verifier int
   const snapshotPath = path.join(rootDir, 'evidence-snapshot');
   const evidence = { 'lesson-b': zeroEffectEvidence('lesson-b') };
   await fs.writeFile(inputPath, JSON.stringify({ safeEvidenceByUnit: evidence }));
+  const expectedManifestHash = buildRecoveryMigrationManifest({
+    runId: 'migration-run',
+    stage: 'lessons',
+    events: await journal.readStage('lessons'),
+    safeEvidenceByUnit: evidence,
+    ...MIGRATION_METADATA,
+  }).manifest_hash;
   await assert.rejects(
     () => runMigrationCli(migrationCliArgs({
       command: 'fence',
       rootDir,
       inputPath,
+      expectedManifestHash,
     }), {
       writeOutput: () => {},
     }),
@@ -578,6 +699,7 @@ test('fence requires a snapshot for external entries and passes its verifier int
     rootDir,
     inputPath,
     snapshotPath,
+    expectedManifestHash,
   }), {
     createEvidenceVerifier: injectedEvidenceVerifier(evidence, {
       onRequest: (value) => {
@@ -627,6 +749,13 @@ test('fence rejects collector mismatch or snapshot drift before appending', asyn
     await fs.writeFile(inputPath, JSON.stringify({
       safeEvidenceByUnit: evidence,
     }));
+    const expectedManifestHash = buildRecoveryMigrationManifest({
+      runId: 'migration-run',
+      stage: 'lessons',
+      events: await journal.readStage('lessons'),
+      safeEvidenceByUnit: evidence,
+      ...MIGRATION_METADATA,
+    }).manifest_hash;
     const mismatch = structuredClone(evidence);
     mismatch['lesson-b'].safe_facts.expectedConfigHash = '0'.repeat(64);
     await assert.rejects(
@@ -635,6 +764,7 @@ test('fence rejects collector mismatch or snapshot drift before appending', asyn
         rootDir,
         inputPath,
         snapshotPath,
+        expectedManifestHash,
       }), {
         createEvidenceVerifier: injectedEvidenceVerifier(
           mode === 'mismatch' ? mismatch : evidence,
@@ -664,11 +794,19 @@ test('journal-only fence remains available without an evidence snapshot', async 
   context.after(() => fs.rm(rootDir, { recursive: true, force: true }));
   const inputPath = path.join(rootDir, 'caller-evidence.json');
   await fs.writeFile(inputPath, JSON.stringify({ safeEvidenceByUnit: {} }));
+  const expectedManifestHash = buildRecoveryMigrationManifest({
+    runId: 'migration-run',
+    stage: 'lessons',
+    events: await journal.readStage('lessons'),
+    safeEvidenceByUnit: {},
+    ...MIGRATION_METADATA,
+  }).manifest_hash;
   let verifierCreated = false;
   await runMigrationCli(migrationCliArgs({
     command: 'fence',
     rootDir,
     inputPath,
+    expectedManifestHash,
   }), {
     createEvidenceVerifier: () => {
       verifierCreated = true;
@@ -731,6 +869,67 @@ test('evidence snapshot arguments fail closed for relative, duplicate, migrate, 
       '--confirm-old-runner-absent',
     ], { writeOutput: () => {} }),
     /writer confirmations are valid only for fence/,
+  );
+});
+
+test('approved manifest hash arguments are mandatory, unique, and fence-only', async (context) => {
+  const { rootDir, journal } = await fixture(
+    'agentmemory-migration-cli-approved-manifest',
+    [],
+  );
+  context.after(() => fs.rm(rootDir, { recursive: true, force: true }));
+  const inputPath = path.join(rootDir, 'caller-evidence.json');
+  await fs.writeFile(inputPath, JSON.stringify({ safeEvidenceByUnit: {} }));
+  const manifestHash = buildRecoveryMigrationManifest({
+    runId: 'migration-run',
+    stage: 'lessons',
+    events: await journal.readStage('lessons'),
+    safeEvidenceByUnit: {},
+    ...MIGRATION_METADATA,
+  }).manifest_hash;
+  await assert.rejects(
+    () => runMigrationCli(migrationCliArgs({
+      command: 'fence',
+      rootDir,
+      inputPath,
+    }), { writeOutput: () => {} }),
+    /--expected-manifest-hash must be a lowercase SHA-256 hash/,
+  );
+  await assert.rejects(
+    () => runMigrationCli(migrationCliArgs({
+      command: 'fence',
+      rootDir,
+      inputPath,
+      expectedManifestHash: '0'.repeat(64),
+    }), { writeOutput: () => {} }),
+    /recovery_migration_approved_manifest_hash_mismatch/,
+  );
+  await assert.rejects(
+    () => runMigrationCli([
+      ...migrationCliArgs({
+        command: 'fence',
+        rootDir,
+        inputPath,
+        expectedManifestHash: manifestHash,
+      }),
+      '--expected-manifest-hash', manifestHash,
+    ], { writeOutput: () => {} }),
+    /--expected-manifest-hash may be provided only once/,
+  );
+  await assert.rejects(
+    () => runMigrationCli(migrationCliArgs({
+      command: 'preview',
+      rootDir,
+      inputPath,
+      expectedManifestHash: manifestHash,
+    }), { writeOutput: () => {} }),
+    /--expected-manifest-hash is valid only for fence/,
+  );
+  assert.equal(
+    (await journal.readStage('lessons')).some(
+      (event) => event.type === 'stage_recovery_contract_fenced',
+    ),
+    false,
   );
 });
 
@@ -998,12 +1197,23 @@ realIiiTest('migration appends recovery events without rewriting legacy events r
   await fs.writeFile(inputPath, JSON.stringify({
     safeEvidenceByUnit: evidenceProof.safeEvidenceByUnit,
   }));
+  const expectedManifestHash = buildRecoveryMigrationManifest({
+    runId: 'migration-run',
+    stage: 'lessons',
+    events: await new RunStateJournalV2({
+      rootDir,
+      runId: 'migration-run',
+    }).readStage('lessons'),
+    safeEvidenceByUnit: evidenceProof.safeEvidenceByUnit,
+    ...MIGRATION_METADATA,
+  }).manifest_hash;
   let fenceOutput = '';
   await runMigrationCli(migrationCliArgs({
     command: 'fence',
     rootDir,
     inputPath,
     snapshotPath: fixtureState.snapshotDir,
+    expectedManifestHash,
   }), {
     writeOutput: (value) => {
       fenceOutput += value;

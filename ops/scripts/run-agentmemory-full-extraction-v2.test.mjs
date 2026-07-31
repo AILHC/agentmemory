@@ -180,6 +180,7 @@ test('new runner refuses business APIs while a fenced migration is incomplete', 
     journal,
     stage: 'lessons',
     manifest,
+    expectedManifestHash: manifest.manifest_hash,
     verifyOfflineWritersAbsent: async () => ({
       oldRunnerAbsent: true,
       writerLockAbsent: true,

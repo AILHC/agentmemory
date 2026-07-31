@@ -17,6 +17,8 @@ import {
   openIiiStateReadOnlyWorkingCopy,
 } from './lib/iii-state-read-only-adapter-v1.mjs';
 
+const SHA256 = /^[0-9a-f]{64}$/;
+
 function takeValue(argv, index, argument) {
   const value = argv[index + 1];
   if (!value || value.startsWith('--')) {
@@ -40,6 +42,13 @@ function parseArgs(argv) {
         throw new Error('--evidence-snapshot may be provided only once');
       }
       options.evidenceSnapshot = takeValue(argv, index, argument);
+      index += 1;
+    }
+    else if (argument === '--expected-manifest-hash') {
+      if (options.expectedManifestHash) {
+        throw new Error('--expected-manifest-hash may be provided only once');
+      }
+      options.expectedManifestHash = takeValue(argv, index, argument);
       index += 1;
     }
     else if (argument === '--original-contract-version') {
@@ -82,6 +91,13 @@ function parseArgs(argv) {
   }
   if (options.command === 'migrate' && options.evidenceSnapshot) {
     throw new Error('--evidence-snapshot is not valid for migrate');
+  }
+  if (options.command === 'fence') {
+    if (!SHA256.test(String(options.expectedManifestHash || ''))) {
+      throw new Error('--expected-manifest-hash must be a lowercase SHA-256 hash');
+    }
+  } else if (options.expectedManifestHash) {
+    throw new Error('--expected-manifest-hash is valid only for fence');
   }
   if (
     options.command !== 'fence'
@@ -253,6 +269,7 @@ export async function main(
       journal,
       stage: options.stage,
       manifest: result.manifest,
+      expectedManifestHash: options.expectedManifestHash,
       verifyOfflineWritersAbsent: async () => ({
         oldRunnerAbsent: options.oldRunnerAbsent === true,
         writerLockAbsent: true,

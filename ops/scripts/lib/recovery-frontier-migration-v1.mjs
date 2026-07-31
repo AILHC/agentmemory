@@ -577,10 +577,17 @@ export async function appendRecoveryContractFence({
   journal,
   stage,
   manifest,
+  expectedManifestHash,
   verifyOfflineWritersAbsent,
   verifyEvidenceProvenance,
 }) {
   validateRecoveryMigrationManifest(manifest, manifest.journal_seq + 1);
+  if (
+    !/^[0-9a-f]{64}$/.test(String(expectedManifestHash || ''))
+    || manifest.manifest_hash !== expectedManifestHash
+  ) {
+    throw new Error('recovery_migration_approved_manifest_hash_mismatch');
+  }
   if (manifest.stage !== stage || manifest.run_id !== journal.runId) {
     throw new Error('recovery_migration_manifest_identity_mismatch');
   }
@@ -604,17 +611,43 @@ export async function appendRecoveryContractFence({
     ) {
       throw new Error('recovery_migration_input_drifted');
     }
+    if (manifest.manifest_hash !== expectedManifestHash) {
+      throw new Error('recovery_migration_approved_manifest_hash_mismatch');
+    }
     await assertFenceEvidenceProvenance({
       manifest,
       events: current,
       verifyEvidenceProvenance,
     });
-    return await journal.appendStageExpectedSeq(
+    const appended = await journal.appendStageExpectedSeq(
       stage,
       manifest.journal_seq,
       'stage_recovery_contract_fenced',
       manifest,
     );
+    const after = await journal.readStage(stage);
+    const tail = after.at(-1);
+    const prefix = after.slice(0, -1);
+    let gate;
+    try {
+      gate = inspectRecoveryMigrationGate(after);
+    } catch {
+      throw new Error('recovery_migration_fence_readback_failed');
+    }
+    if (
+      after.length !== current.length + 1
+      || hashRecoveryValue(prefix) !== manifest.input_summary_hash
+      || tail?.seq !== manifest.journal_seq + 1
+      || tail?.type !== 'stage_recovery_contract_fenced'
+      || hashRecoveryValue(tail?.payload) !== hashRecoveryValue(manifest)
+      || tail?.payload?.manifest_hash !== expectedManifestHash
+      || gate.state !== 'fenced'
+      || gate.completedSteps !== 0
+      || gate.manifest?.manifest_hash !== expectedManifestHash
+    ) {
+      throw new Error('recovery_migration_fence_readback_failed');
+    }
+    return appended;
   } finally {
     await journal.releaseLock();
   }
