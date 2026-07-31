@@ -7,6 +7,7 @@ import {
 import {
   assertRecoveryMigrationPrivileges,
   inspectRecoveryMigrationGate,
+  isSupersededLegacyVerifierBlock,
 } from './recovery-migration-contract-v1.mjs';
 
 const ACCEPTED_RESOLUTIONS = new Set(['succeeded', 'skipped']);
@@ -575,6 +576,7 @@ export function reduceRecoveryJournal(events) {
     }
     const unitId = event.payload?.unit_id || null;
     if (event.type.startsWith('run_')) {
+      if (isSupersededLegacyVerifierBlock(event, units, migrationGate)) continue;
       const runUnit = unitId ? units.get(unitId) : null;
       if (applyGenericEvent(event, runUnit, run, units)) continue;
       throw new Error(`recovery_journal_event_unsupported_at_seq_${event.seq}:${event.type}`);
@@ -731,6 +733,7 @@ export function reduceRecoveryJournal(events) {
         transitionError(event, 'unit_record');
       }
       unit.recorded = true;
+      unit.recorded_seq = event.seq;
     } else {
       throw new Error(`recovery_journal_event_unsupported_at_seq_${event.seq}:${event.type}`);
     }

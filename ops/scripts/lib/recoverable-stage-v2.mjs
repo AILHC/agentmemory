@@ -2,6 +2,8 @@ import { foldRecoveryStageEvents } from './run-state-journal-v2.mjs';
 import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
 import {
   inspectRecoveryMigrationGate,
+  isAuthenticatedLegacyRecordedTerminal,
+  isSupersededLegacyVerifierBlock,
   recoveryMigrationStepForEvent,
 } from './recovery-migration-contract-v1.mjs';
 import { resolveOperationRecovery } from './recovery-policy-v1.mjs';
@@ -185,6 +187,7 @@ function applyAuthorizedMigrationProjection(event, unit, mode) {
   }
   if (event.type === 'unit_recorded') {
     unit.recorded = true;
+    unit.recorded_seq = event.seq;
     unit.migration_recorded = payload;
     return true;
   }
@@ -257,6 +260,7 @@ function validateStageEvents(events, mode) {
     }
     if (event.type === 'run_blocked') {
       if (!planCompleted) transitionError(mode, event, 'before_plan_completed');
+      if (isSupersededLegacyVerifierBlock(event, units, migrationGate)) continue;
       runBlocked = event.payload;
       continue;
     }
@@ -769,6 +773,7 @@ function validateStageEvents(events, mode) {
         transitionError(mode, event, 'record_attempt_identity');
       }
       unit.recorded = true;
+      unit.recorded_seq = event.seq;
       continue;
     }
     transitionError(mode, event, 'unhandled_event');
@@ -777,6 +782,7 @@ function validateStageEvents(events, mode) {
     units,
     planCompleted,
     completed,
+    migrationGate,
     runBlocked: migrationBlock || runBlocked,
     runAttentionRequired,
   };
@@ -1198,6 +1204,7 @@ export async function runSinglePhaseStage({
       if (
         !frozenPlanSkipVerified(plannedUnit, unit.terminal_payload)
         && !authenticatedMigrationTerminal(unit)
+        && !isAuthenticatedLegacyRecordedTerminal(unit, state.migrationGate)
       ) {
         const completedOperation = unit.completed_operations.at(-1);
         if (
@@ -2123,6 +2130,7 @@ export async function runTwoPhaseStage({
       recoveredAcceptedTerminal
       && !frozenPlanSkipVerified(plannedUnit, unit.terminal_payload)
       && !authenticatedMigrationTerminal(unit)
+      && !isAuthenticatedLegacyRecordedTerminal(unit, state.migrationGate)
     ) {
       if (typeof verifyRecoveredTerminal !== 'function') {
         const detail = recoveredTerminalBlock(

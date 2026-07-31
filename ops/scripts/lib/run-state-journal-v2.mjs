@@ -3,6 +3,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import {
   assertLegacyRecoveryContractCompatible,
+  inspectRecoveryMigrationGate,
+  isSupersededLegacyVerifierBlock,
 } from './recovery-migration-contract-v1.mjs';
 
 const LARGE_EVENTS = new Set(['stage_plan_completed', 'unit_planned', 'unit_prepared', 'unit_split']);
@@ -437,7 +439,7 @@ export class RunStateJournalV2 {
 
 }
 
-function foldStageEventsUnchecked(events) {
+function foldStageEventsUnchecked(events, migrationGate = { state: 'open', manifest: null }) {
   const units = new Map();
   let planCompleted = false;
   let completed = false;
@@ -447,7 +449,10 @@ function foldStageEventsUnchecked(events) {
     const unitId = event.payload?.unit_id;
     if (event.type === 'stage_plan_completed') planCompleted = true;
     if (event.type === 'stage_completed') completed = true;
-    if (event.type === 'run_blocked') runBlocked = event.payload;
+    if (
+      event.type === 'run_blocked'
+      && !isSupersededLegacyVerifierBlock(event, units, migrationGate)
+    ) runBlocked = event.payload;
     if (event.type === 'run_attention_required') runAttentionRequired = event.payload;
     if (!unitId) continue;
     const unit = units.get(unitId) || {
@@ -519,6 +524,7 @@ function foldStageEventsUnchecked(events) {
     if (event.type === 'unit_terminal' || event.type === 'unit_resolution') {
       unit.terminal = event.payload.status;
       unit.terminal_payload = event.payload;
+      if (Number.isSafeInteger(event.seq)) unit.terminal_seq = event.seq;
     }
     if (event.type === 'unit_isolated') {
       unit.terminal = 'failed';
@@ -563,7 +569,10 @@ function foldStageEventsUnchecked(events) {
       unit.terminal_payload = undefined;
       unit.retry_authorization = event.payload;
     }
-    if (event.type === 'unit_recorded') unit.recorded = true;
+    if (event.type === 'unit_recorded') {
+      unit.recorded = true;
+      if (Number.isSafeInteger(event.seq)) unit.recorded_seq = event.seq;
+    }
     units.set(unitId, unit);
   }
   return {
@@ -581,5 +590,5 @@ export function foldStageEvents(events) {
 }
 
 export function foldRecoveryStageEvents(events) {
-  return foldStageEventsUnchecked(events);
+  return foldStageEventsUnchecked(events, inspectRecoveryMigrationGate(events));
 }

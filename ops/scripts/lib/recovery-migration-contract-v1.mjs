@@ -237,6 +237,35 @@ export function recoveryMigrationStepForEvent(event, gate) {
   return expected;
 }
 
+export function isAuthenticatedLegacyRecordedTerminal(unit, gate) {
+  return (
+    gate?.state === 'migrated'
+    && unit?.recorded === true
+    && Number.isSafeInteger(unit.recorded_seq)
+    && unit.recorded_seq <= gate.manifest.journal_seq
+    && Number.isSafeInteger(unit.terminal_seq)
+    && unit.terminal_seq <= gate.manifest.journal_seq
+    && ['succeeded', 'skipped'].includes(unit.terminal)
+  );
+}
+
+export function isSupersededLegacyVerifierBlock(event, units, gate) {
+  const payload = event?.payload;
+  const migrationLastSeq = gate?.manifest
+    ? gate.manifest.fence_seq + gate.manifest.steps.length
+    : -1;
+  const unit = units?.get(payload?.blocked_unit_id);
+  return (
+    event?.type === 'run_blocked'
+    && gate?.state === 'migrated'
+    && event.seq > migrationLastSeq
+    && payload?.code === 'receipt_integrity_error'
+    && payload?.stage === gate.manifest.stage
+    && payload?.reason === 'recovered_terminal_verifier_required'
+    && isAuthenticatedLegacyRecordedTerminal(unit, gate)
+  );
+}
+
 export function assertRecoveryMigrationPrivileges(events, gate) {
   const tagged = events.filter((event) => (
     typeof event.payload?.migration_id === 'string'
