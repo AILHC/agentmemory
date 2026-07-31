@@ -16,6 +16,68 @@ const STAGE_NAME = /^[a-z][a-z0-9_-]{0,63}$/;
 const APPEND_OPEN_RETRY_DELAYS_MS = [25, 50, 100, 200, 400, 800];
 const RETRYABLE_APPEND_OPEN_CODES = new Set(['EPERM', 'EACCES', 'EBUSY']);
 
+function controlTransitionError(event, reason) {
+  throw new Error(`v2_control_transition_invalid_at_${event.seq}:${reason}`);
+}
+
+export function reduceRunControlLifecycle(events) {
+  let runId = null;
+  let state = 'new';
+  let pause = null;
+  for (const event of events) {
+    const payload = event.payload || {};
+    if (event.type === 'run_started') {
+      if (state !== 'new' || typeof payload.run_id !== 'string' || !payload.run_id) {
+        controlTransitionError(event, 'run_started');
+      }
+      runId = payload.run_id;
+      state = 'running';
+      continue;
+    }
+    if (event.type === 'run_paused') {
+      if (
+        state !== 'running'
+        || payload.run_id !== runId
+        || typeof payload.reason_code !== 'string'
+        || !payload.reason_code
+        || !STAGE_NAME.test(String(payload.stage || ''))
+        || typeof payload.unit_id !== 'string'
+        || !payload.unit_id
+        || !Number.isSafeInteger(payload.processed_unit_count)
+        || payload.processed_unit_count < 1
+        || !Number.isSafeInteger(payload.max_units_per_resume)
+        || payload.max_units_per_resume < payload.processed_unit_count
+      ) {
+        controlTransitionError(event, 'run_paused');
+      }
+      pause = { seq: event.seq, payload };
+      state = 'paused';
+      continue;
+    }
+    if (event.type === 'run_resumed') {
+      if (
+        state !== 'paused'
+        || payload.run_id !== runId
+        || payload.previous_pause_seq !== pause?.seq
+      ) {
+        controlTransitionError(event, 'run_resumed');
+      }
+      state = 'running';
+      continue;
+    }
+    if (event.type === 'run_completed') {
+      if (
+        state !== 'running'
+        || (payload.run_id !== undefined && payload.run_id !== runId)
+      ) {
+        controlTransitionError(event, 'run_completed');
+      }
+      state = 'completed';
+    }
+  }
+  return { runId, state, pause };
+}
+
 function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }

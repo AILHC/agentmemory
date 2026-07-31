@@ -880,6 +880,7 @@ export async function runSinglePhaseStage({
   maxRetryAttempts = 1,
   stage = 'stage',
   dependencyStates = new Map(),
+  executionBoundary = null,
 }) {
   const events = [...initialEvents];
   let state = await ensurePlan({ events, plan, planMetadata, append, mode: 'single' });
@@ -896,35 +897,10 @@ export async function runSinglePhaseStage({
     let unit = state.units.get(plannedUnit.unit_id);
     let retryAttemptStartedNow = false;
     if (unit.split) continue;
-    if (unit.retry_scheduled) {
-      if (Date.parse(unit.retry_scheduled.retry_at) > now().getTime()) continue;
-      const previousAttemptId = unit.attempt_id;
-      const attemptNumber = unit.retry_scheduled.attempt_number;
-      const retryAttemptId = attemptIdForUnit(plannedUnit, attemptNumber);
-      await appendAndTrack(events, append, 'unit_attempt_started', {
-        unit_id: unit.unit_id,
-        input_hash: unit.input_hash,
-        attempt_id: retryAttemptId,
-        previous_attempt_id: previousAttemptId,
-        attempt_number: attemptNumber,
-        attempts_used: unit.retry_scheduled.attempts_used,
-        max_attempts: unit.retry_scheduled.max_attempts,
-      });
-      unit = {
-        ...unit,
-        attempt_id: retryAttemptId,
-        attempt_number: attemptNumber,
-        retry_attempts_used: unit.retry_scheduled.attempts_used,
-        retry_max_attempts: unit.retry_scheduled.max_attempts,
-        retry_scheduled: null,
-        active_operation: null,
-        blocked: false,
-        blocked_payload: undefined,
-        recovery_state: 'running',
-      };
-      state.units.set(unit.unit_id, unit);
-      retryAttemptStartedNow = true;
-    }
+    if (
+      unit.retry_scheduled
+      && Date.parse(unit.retry_scheduled.retry_at) > now().getTime()
+    ) continue;
     if (unit.blocked) {
       continue;
     }
@@ -965,6 +941,41 @@ export async function runSinglePhaseStage({
     const dependenciesReady = dependencies.every(dependencyAccepted);
     if (!dependenciesReady) {
       continue;
+    }
+    if (
+      !unit.recorded
+      && executionBoundary
+      && !executionBoundary.claim({ stage, unitId: unit.unit_id })
+    ) {
+      break;
+    }
+    if (unit.retry_scheduled) {
+      const previousAttemptId = unit.attempt_id;
+      const attemptNumber = unit.retry_scheduled.attempt_number;
+      const retryAttemptId = attemptIdForUnit(plannedUnit, attemptNumber);
+      await appendAndTrack(events, append, 'unit_attempt_started', {
+        unit_id: unit.unit_id,
+        input_hash: unit.input_hash,
+        attempt_id: retryAttemptId,
+        previous_attempt_id: previousAttemptId,
+        attempt_number: attemptNumber,
+        attempts_used: unit.retry_scheduled.attempts_used,
+        max_attempts: unit.retry_scheduled.max_attempts,
+      });
+      unit = {
+        ...unit,
+        attempt_id: retryAttemptId,
+        attempt_number: attemptNumber,
+        retry_attempts_used: unit.retry_scheduled.attempts_used,
+        retry_max_attempts: unit.retry_scheduled.max_attempts,
+        retry_scheduled: null,
+        active_operation: null,
+        blocked: false,
+        blocked_payload: undefined,
+        recovery_state: 'running',
+      };
+      state.units.set(unit.unit_id, unit);
+      retryAttemptStartedNow = true;
     }
     const attemptId = unit.attempt_id || attemptIdForUnit(plannedUnit);
     const recovered = unit.started && !retryAttemptStartedNow;
@@ -1409,6 +1420,13 @@ export async function runSinglePhaseStage({
   }
 
   state = validateStageEvents(events, 'single');
+  if (executionBoundary?.reached()) {
+    return {
+      status: 'paused',
+      unitId: executionBoundary.lastUnitId(),
+      processedCount: executionBoundary.processedCount(),
+    };
+  }
   const requiredUnits = [...state.units.values()].filter((unit) => !unit.split);
   const acceptanceReady = requiredUnits.every((unit) => (
     !unit.blocked && ACCEPTED_TERMINALS.has(unit.terminal) && unit.recorded
@@ -1473,6 +1491,7 @@ export async function runTwoPhaseStage({
   dependencyStates = new Map(),
   recoverPrepare = false,
   recoverCommit = false,
+  executionBoundary = null,
 }) {
   const events = [...initialEvents];
   let state = await ensurePlan({ events, plan, planMetadata, append, mode: 'two_phase' });
@@ -1522,6 +1541,13 @@ export async function runTwoPhaseStage({
       continue;
     }
     if (!dependencies.every(dependencyAccepted)) continue;
+    if (
+      !unit.recorded
+      && executionBoundary
+      && !executionBoundary.claim({ stage, unitId: unit.unit_id })
+    ) {
+      break;
+    }
     const prepareAttemptId = unit.prepare_attempt_id || prepareAttemptIdForUnit(plannedUnit);
     const prepareRecovered = unit.started;
     if (!unit.started) {
@@ -2011,6 +2037,13 @@ export async function runTwoPhaseStage({
   }
 
   state = validateStageEvents(events, 'two_phase');
+  if (executionBoundary?.reached()) {
+    return {
+      status: 'paused',
+      unitId: executionBoundary.lastUnitId(),
+      processedCount: executionBoundary.processedCount(),
+    };
+  }
   const requiredUnits = [...state.units.values()].filter((unit) => !unit.split);
   const acceptanceReady = requiredUnits.every((unit) => (
     !unit.blocked && ACCEPTED_TERMINALS.has(unit.terminal) && unit.recorded

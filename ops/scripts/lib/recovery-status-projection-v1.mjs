@@ -3,6 +3,7 @@ import {
   RECOVERY_SYSTEM_FAULT_CODES,
 } from './recovery-policy-v1.mjs';
 import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
+import { reduceRunControlLifecycle } from './run-state-journal-v2.mjs';
 
 const SAFE_SYSTEM_CODES = new Set([
   ...RECOVERY_SYSTEM_FAULT_CODES,
@@ -20,8 +21,7 @@ function latestTimestamp(events) {
 
 function safeSystemCode(reduced) {
   const candidate = reduced.run.block?.code
-    || reduced.run.block?.decision?.code
-    || reduced.run.fence && 'recovery_migration_incomplete';
+    || reduced.run.block?.decision?.code;
   return SAFE_SYSTEM_CODES.has(candidate) ? candidate : null;
 }
 
@@ -46,6 +46,7 @@ export function projectSafeRecoveryStatus({
   stageEvents = {},
   requiredStages = [],
 }) {
+  const controlLifecycle = reduceRunControlLifecycle(controlEvents);
   const normalizedRequiredStages = [...new Set(
     requiredStages.filter((stage) => typeof stage === 'string' && stage),
   )];
@@ -75,7 +76,7 @@ export function projectSafeRecoveryStatus({
   for (const stage of selectedStages) {
     for (const key of Object.keys(counts)) counts[key] += stage.counts[key] || 0;
   }
-  const runCompleted = controlEvents.some((event) => event.type === 'run_completed');
+  const runCompleted = controlLifecycle.state === 'completed';
   const acceptanceReady = (
     selectedStages.length > 0
     && missingRequiredStages.length === 0
@@ -95,15 +96,17 @@ export function projectSafeRecoveryStatus({
     .filter(Boolean);
   const status = counts.system_blocked > 0
     ? 'blocked'
-    : counts.isolated > 0 || counts.dependency_blocked > 0
-      ? 'attention_required'
-      : acceptanceReady
-        ? 'completed'
-        : counts.runnable > 0 || counts.running > 0
-          ? 'running'
-          : counts.retry_wait > 0 || counts.reconciling > 0
-            ? 'waiting'
-            : 'running';
+    : controlLifecycle.state === 'paused'
+      ? 'paused'
+      : counts.isolated > 0 || counts.dependency_blocked > 0
+        ? 'attention_required'
+        : acceptanceReady
+          ? 'completed'
+          : counts.runnable > 0 || counts.running > 0
+            ? 'running'
+            : counts.retry_wait > 0 || counts.reconciling > 0
+              ? 'waiting'
+              : 'running';
   const started = controlEvents.find((event) => event.type === 'run_started');
   const contractVersions = new Set(
     stages.map((stage) => stage.recovery_contract_version).filter(Boolean),

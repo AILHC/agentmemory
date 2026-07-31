@@ -3,7 +3,11 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { foldStageEvents, RunStateJournalV2 } from './run-state-journal-v2.mjs';
+import {
+  foldStageEvents,
+  reduceRunControlLifecycle,
+  RunStateJournalV2,
+} from './run-state-journal-v2.mjs';
 
 async function makeJournal(name) {
   const rootDir = await fs.mkdtemp(path.join(os.tmpdir(), `${name}-`));
@@ -496,5 +500,49 @@ test('legacy journal fold explicitly rejects a recovery contract fence', () => {
       payload: {},
     }]),
     /legacy_runner_recovery_contract_fenced_at_seq_0/,
+  );
+});
+
+test('control lifecycle binds every resume to the current durable pause', () => {
+  const runId = 'controlled-run';
+  const started = { seq: 0, type: 'run_started', payload: { run_id: runId } };
+  const paused = {
+    seq: 1,
+    type: 'run_paused',
+    payload: {
+      run_id: runId,
+      reason_code: 'resume_unit_limit_reached',
+      stage: 'lessons',
+      unit_id: 'lesson-1',
+      processed_unit_count: 1,
+      max_units_per_resume: 1,
+    },
+  };
+  const resumed = {
+    seq: 2,
+    type: 'run_resumed',
+    payload: { run_id: runId, previous_pause_seq: 1 },
+  };
+
+  assert.deepEqual(reduceRunControlLifecycle([started, paused, resumed]), {
+    runId,
+    state: 'running',
+    pause: { seq: 1, payload: paused.payload },
+  });
+  assert.throws(
+    () => reduceRunControlLifecycle([
+      started,
+      paused,
+      { ...resumed, payload: { ...resumed.payload, previous_pause_seq: 0 } },
+    ]),
+    /v2_control_transition_invalid_at_2:run_resumed/,
+  );
+  assert.throws(
+    () => reduceRunControlLifecycle([
+      started,
+      { seq: 1, type: 'run_completed', payload: { run_id: runId } },
+      { ...paused, seq: 2 },
+    ]),
+    /v2_control_transition_invalid_at_2:run_paused/,
   );
 });

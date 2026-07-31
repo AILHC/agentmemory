@@ -11,8 +11,14 @@ import {
   buildRecoveryMigrationManifest,
 } from './lib/recovery-frontier-migration-v1.mjs';
 import { RECOVERY_POLICY_VERSION } from './lib/recovery-policy-v1.mjs';
+import { projectSafeRecoveryStatus } from './lib/recovery-status-projection-v1.mjs';
 import { reconcileSummaryOrphan } from './reconcile-agentmemory-extraction-orphan.mjs';
-import { mainForTest, stableHash } from './run-agentmemory-full-extraction.mjs';
+import {
+  buildConfigFromOptions,
+  mainForTest,
+  parseArgs,
+  stableHash,
+} from './run-agentmemory-full-extraction.mjs';
 
 function mainForEarlyStages(argv, dependencies = {}) {
   return mainForTest(argv, {
@@ -128,6 +134,211 @@ function committedLessonResponse(runId = 'lesson-run-1') {
     },
   };
 }
+
+test('v2 controlled resume processes one unresolved unit and records a durable pause', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-controlled-resume-'));
+  context.after(async () => {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  await withServer((request, response) => {
+    assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      success: true,
+      sessions: [
+        { id: 's1', startedAt: '2026-07-22T00:00:00.000Z' },
+        { id: 's2', startedAt: '2026-07-22T00:01:00.000Z' },
+      ],
+    }));
+  }, async (baseUrl) => {
+    const runId = 'controlled-resume';
+    const argv = [
+      '--base-url', baseUrl,
+      '--state-dir', stateDir,
+      '--run-id', runId,
+      '--run-state-format', 'v2',
+    ];
+    assert.equal(await mainForEarlyStages([...argv, '--dry-run']), 0);
+
+    const regularOptions = parseArgs([...argv, '--resume']);
+    const controlledOptions = parseArgs([
+      ...argv,
+      '--resume',
+      '--max-units-per-resume', '1',
+    ]);
+    assert.deepEqual(
+      buildConfigFromOptions(controlledOptions),
+      buildConfigFromOptions(regularOptions),
+    );
+    assert.throws(
+      () => parseArgs([...argv, '--max-units-per-resume', '1']),
+      /仅允许用于非 dry-run 的 v2 --resume/,
+    );
+    for (const invalid of ['1junk', '1.5', '9007199254740992']) {
+      assert.throws(
+        () => parseArgs([...argv, '--resume', '--max-units-per-resume', invalid]),
+        /必须是(?:安全)?正整数/,
+      );
+    }
+
+    let summaryDispatches = 0;
+    let lessonDispatches = 0;
+    const exitCode = await mainForEarlyStages([
+      ...argv,
+      '--resume',
+      '--max-units-per-resume', '1',
+    ], {
+      v2SummaryRemote: {
+        advance: async (request) => {
+          summaryDispatches += 1;
+          return successfulSummaryResponse(request, 'controlled summary');
+        },
+        record: async () => {},
+      },
+      v2LessonsRemote: {
+        start: async () => {
+          lessonDispatches += 1;
+          return committedLessonResponse('must-not-run');
+        },
+        record: async () => {},
+      },
+    });
+    assert.equal(exitCode, 75);
+    assert.equal(summaryDispatches, 1);
+    assert.equal(lessonDispatches, 0);
+
+    const runRoot = path.join(stateDir, `${runId}.v2`);
+    const readJournal = async (name) => (await fs.readFile(
+      path.join(runRoot, `${name}.jsonl`),
+      'utf8',
+    )).trim().split('\n').filter(Boolean).map(JSON.parse);
+    const control = await readJournal('control');
+    const summary = await readJournal('summary');
+    const lessons = await readJournal('lessons');
+    assert.equal(summary.filter((event) => event.type === 'unit_recorded').length, 1);
+    assert.equal(summary.some((event) => event.type === 'stage_completed'), false);
+    assert.equal(lessons.some((event) => event.type === 'unit_started'), false);
+    assert.equal(control.at(-1).type, 'run_paused');
+    assert.deepEqual(control.at(-1).payload, {
+      run_id: runId,
+      reason_code: 'resume_unit_limit_reached',
+      stage: 'summary',
+      unit_id: 's1',
+      processed_unit_count: 1,
+      max_units_per_resume: 1,
+    });
+
+    const status = JSON.parse(await fs.readFile(path.join(runRoot, 'status.json'), 'utf8'));
+    assert.equal(status.status, 'paused');
+    assert.equal(status.current_stage, 'summary');
+    assert.equal(status.pause_reason_code, 'resume_unit_limit_reached');
+    assert.equal(status.processed_units_this_invocation, 1);
+    await assert.rejects(
+      fs.access(path.join(runRoot, 'writer.lock.json')),
+      (error) => error?.code === 'ENOENT',
+    );
+
+    const safeStatus = projectSafeRecoveryStatus({
+      runId,
+      controlEvents: control,
+      stageEvents: { summary, lessons },
+      requiredStages: ['summary', 'lessons'],
+    });
+    assert.equal(safeStatus.run_status, 'paused');
+    assert.equal(safeStatus.counts.succeeded, 1);
+    assert.equal(safeStatus.acceptance_ready, false);
+
+    await assert.rejects(
+      () => mainForEarlyStages([
+        ...argv,
+        '--resume',
+        '--max-units-per-resume', '1',
+      ], {
+        v2SummaryRemote: {
+          advance: async () => assert.fail('summary must not run before resume is durable'),
+          record: async () => {},
+        },
+        v2LessonsRemote: {
+          start: async () => assert.fail('lessons must remain undispatched'),
+          record: async () => {},
+        },
+        onV2DurableEvent: async ({ scope, type }) => {
+          if (scope === 'control' && type === 'run_resumed') {
+            throw new Error('injected_crash_after_run_resumed');
+          }
+        },
+      }),
+      /injected_crash_after_run_resumed/,
+    );
+    const controlAfterResumeCrash = await readJournal('control');
+    assert.equal(controlAfterResumeCrash.at(-1).type, 'run_resumed');
+    const statusAfterResumeCrash = JSON.parse(await fs.readFile(
+      path.join(runRoot, 'status.json'),
+      'utf8',
+    ));
+    assert.equal(statusAfterResumeCrash.status, 'paused');
+    await assert.rejects(
+      fs.access(path.join(runRoot, 'writer.lock.json')),
+      (error) => error?.code === 'ENOENT',
+    );
+
+    let runningStatusObserved = false;
+    const resumedSummaryCalls = [];
+    const secondExitCode = await mainForEarlyStages([
+      ...argv,
+      '--resume',
+      '--max-units-per-resume', '1',
+    ], {
+      v2SummaryRemote: {
+        advance: async (request) => {
+          resumedSummaryCalls.push({
+            sessionId: request.sessionId,
+            requireExistingReceipt: request.requireExistingReceipt === true,
+          });
+          return successfulSummaryResponse(request, 'controlled summary');
+        },
+        record: async () => {},
+      },
+      v2LessonsRemote: {
+        start: async () => assert.fail('lessons must remain undispatched'),
+        record: async () => {},
+      },
+      onV2DurableEvent: async ({ scope, type, payload }) => {
+        if (scope !== 'summary' || type !== 'unit_started' || payload.unit_id !== 's2') return;
+        const resumedStatus = JSON.parse(await fs.readFile(
+          path.join(runRoot, 'status.json'),
+          'utf8',
+        ));
+        assert.equal(resumedStatus.status, 'running');
+        assert.equal(resumedStatus.resumed_from_pause_seq, control.at(-1).seq);
+        runningStatusObserved = true;
+      },
+    });
+    assert.equal(secondExitCode, 75);
+    assert.equal(runningStatusObserved, true);
+    assert.deepEqual(resumedSummaryCalls, [
+      { sessionId: 's1', requireExistingReceipt: true },
+      { sessionId: 's2', requireExistingReceipt: false },
+    ]);
+    const resumedControl = await readJournal('control');
+    assert.deepEqual(
+      resumedControl.slice(-2).map((event) => event.type),
+      ['run_resumed', 'run_paused'],
+    );
+    assert.equal(
+      resumedControl.filter((event) => event.type === 'run_resumed').length,
+      1,
+    );
+    const resumedSummary = await readJournal('summary');
+    assert.equal(resumedSummary.filter((event) => event.type === 'unit_recorded').length, 2);
+    assert.equal(resumedSummary.some((event) => event.type === 'stage_completed'), false);
+  });
+});
 
 test('new runner refuses business APIs while a fenced migration is incomplete', async (context) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-fenced-runner-'));

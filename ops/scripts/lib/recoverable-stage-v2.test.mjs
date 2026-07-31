@@ -34,6 +34,24 @@ function makeHarness() {
   };
 }
 
+function makeExecutionBoundary(limit) {
+  let remaining = limit;
+  let processed = 0;
+  let last = null;
+  return {
+    claim({ stage, unitId }) {
+      if (remaining <= 0) return false;
+      remaining -= 1;
+      processed += 1;
+      last = { stage, unitId };
+      return true;
+    },
+    reached: () => processed > 0 && remaining === 0,
+    processedCount: () => processed,
+    lastUnitId: () => last?.unitId || null,
+  };
+}
+
 const plan = [{ unit_id: 'unit-1', input_hash: 'input-1' }];
 
 function reconciliationBinding({
@@ -573,6 +591,90 @@ test('single-phase persists retry budget and Retry-After only extends backoff', 
   assert.equal(
     harness.events.filter((event) => event.type === 'unit_attempt_started').length,
     1,
+  );
+});
+
+test('single-phase due retry consumes the boundary before starting another unit', async () => {
+  const harness = makeHarness();
+  const retryPlan = [
+    { unit_id: 'retrying', input_hash: 'input-retrying' },
+    { unit_id: 'next', input_hash: 'input-next' },
+  ];
+  let clock = Date.parse('2026-07-30T00:00:00.000Z');
+  const calls = [];
+  const execute = async ({
+    unit,
+    attemptId,
+    recoveryBudget,
+    activeOperation,
+    startOperation,
+    completeOperation,
+  }) => {
+    calls.push({ unitId: unit.unit_id, attemptId });
+    if (unit.unit_id === 'retrying' && recoveryBudget.attemptsUsed === 0) {
+      await startOperation({ operationId: 'retrying:dispatch:0' });
+      return {
+        status: 'pending',
+        recovery: noEffectRecovery({
+          attemptsUsed: 0,
+          maxAttempts: 1,
+        }),
+      };
+    }
+    const operation = activeOperation || await startOperation({
+      operationId: `${unit.unit_id}:dispatch:${recoveryBudget.attemptsUsed}`,
+    });
+    const terminalResult = {
+      status: 'succeeded',
+      payload: { result_ids: [unit.unit_id] },
+    };
+    await completeOperation({
+      operationId: operation.operation_id,
+      status: 'succeeded',
+      terminal_result: terminalResult,
+    });
+    return terminalResult;
+  };
+  const invoke = (executionBoundary) => runSinglePhaseStage({
+    events: harness.events,
+    plan: retryPlan,
+    append: harness.append,
+    attemptIdForUnit: (unit, attemptNumber = 0) => (
+      `attempt-${unit.unit_id}-${attemptNumber}`
+    ),
+    now: () => new Date(clock),
+    retryBackoffMs: 1_000,
+    maxRetryAttempts: 1,
+    execute,
+    record: async () => {},
+    executionBoundary,
+    stage: 'summary',
+  });
+
+  assert.equal((await invoke(makeExecutionBoundary(1))).status, 'paused');
+  const retryAt = harness.events.find(
+    (event) => event.type === 'unit_retry_scheduled',
+  ).payload.retry_at;
+  clock = Date.parse(retryAt);
+  const result = await invoke(makeExecutionBoundary(1));
+
+  assert.deepEqual(result, {
+    status: 'paused',
+    unitId: 'retrying',
+    processedCount: 1,
+  });
+  assert.deepEqual(calls.map((call) => call.unitId), ['retrying', 'retrying']);
+  assert.deepEqual(
+    harness.events
+      .filter((event) => event.type === 'unit_attempt_started')
+      .map((event) => event.payload.unit_id),
+    ['retrying'],
+  );
+  assert.equal(
+    harness.events.some((event) => (
+      event.type === 'unit_started' && event.payload.unit_id === 'next'
+    )),
+    false,
   );
 });
 
@@ -2142,6 +2244,78 @@ test('two-phase prepare can finish directly without entering commit', async () =
     'unit_recorded',
     'stage_completed',
   ]);
+});
+
+test('single-phase execution boundary never dispatches a second unresolved unit', async () => {
+  const harness = makeHarness();
+  const controlledPlan = ['unit-1', 'unit-2'].map((unitId) => ({
+    unit_id: unitId,
+    input_hash: `${unitId}-input`,
+    skip_reason: 'no eligible input',
+  }));
+  const executed = [];
+  const recorded = [];
+
+  const result = await runSinglePhaseStage({
+    events: harness.events,
+    plan: controlledPlan,
+    append: harness.append,
+    attemptIdForUnit: (unit) => `${unit.unit_id}-attempt`,
+    execute: async ({ unit }) => {
+      executed.push(unit.unit_id);
+      return { status: 'skipped', payload: { reason: 'no eligible input' } };
+    },
+    record: async ({ unit }) => recorded.push(unit.unit_id),
+    executionBoundary: makeExecutionBoundary(1),
+    stage: 'lessons',
+  });
+
+  assert.deepEqual(result, {
+    status: 'paused',
+    unitId: 'unit-1',
+    processedCount: 1,
+  });
+  assert.deepEqual(executed, ['unit-1']);
+  assert.deepEqual(recorded, ['unit-1']);
+  assert.equal(harness.events.filter((event) => event.type === 'unit_recorded').length, 1);
+  assert.equal(harness.events.some((event) => event.type === 'stage_completed'), false);
+});
+
+test('two-phase execution boundary keeps prepare and commit within one claimed unit', async () => {
+  const harness = makeHarness();
+  const controlledPlan = ['unit-1', 'unit-2'].map((unitId) => ({
+    unit_id: unitId,
+    input_hash: `${unitId}-input`,
+    skip_reason: 'no eligible input',
+  }));
+  const prepared = [];
+  const recorded = [];
+
+  const result = await runTwoPhaseStage({
+    events: harness.events,
+    plan: controlledPlan,
+    append: harness.append,
+    prepareAttemptIdForUnit: (unit) => `${unit.unit_id}-prepare`,
+    commitAttemptIdForUnit: (unit) => `${unit.unit_id}-commit`,
+    prepare: async ({ unit }) => {
+      prepared.push(unit.unit_id);
+      return { status: 'skipped', payload: { reason: 'no eligible input' } };
+    },
+    commit: async () => assert.fail('skipped unit must not commit'),
+    record: async ({ unit }) => recorded.push(unit.unit_id),
+    executionBoundary: makeExecutionBoundary(1),
+    stage: 'memory_consolidate',
+  });
+
+  assert.deepEqual(result, {
+    status: 'paused',
+    unitId: 'unit-1',
+    processedCount: 1,
+  });
+  assert.deepEqual(prepared, ['unit-1']);
+  assert.deepEqual(recorded, ['unit-1']);
+  assert.equal(harness.events.filter((event) => event.type === 'unit_recorded').length, 1);
+  assert.equal(harness.events.some((event) => event.type === 'stage_completed'), false);
 });
 
 test('two-phase prepare reconciliation stays pending and never becomes attention', async () => {

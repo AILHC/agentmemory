@@ -4,6 +4,7 @@ import {
   RECOVERY_POLICY_VERSION,
   decideRecovery,
 } from './recovery-policy-v1.mjs';
+import { buildRecoveryMigrationManifest } from './recovery-frontier-migration-v1.mjs';
 import { reduceRecoveryJournal } from './recovery-journal-reducer-v1.mjs';
 import {
   monitorSafeRecoveryStatus,
@@ -216,4 +217,93 @@ test('safe status cannot accept a run while any required stage is absent', () =>
   assert.equal(status.run_status, 'running');
   assert.deepEqual(status.missing_required_stages, ['lessons']);
   assert.equal(status.stages[0].acceptance_ready, true);
+});
+
+test('migration reason clears only after every frozen migration step is durable', () => {
+  const runId = 'migrated-status-run';
+  const legacyEvents = completedStage('summary-a');
+  const manifest = buildRecoveryMigrationManifest({
+    runId,
+    stage: 'summary',
+    events: legacyEvents,
+    safeEvidenceByUnit: {},
+    originalContractVersion: 'run-state-journal-v2/legacy',
+    targetContractVersion: RECOVERY_POLICY_VERSION,
+    originalPolicyVersion: 'legacy-stage-recovery/v2',
+    targetPolicyVersion: RECOVERY_POLICY_VERSION,
+    upgradeAt: '2026-07-30T00:00:00.000Z',
+    authorizedAt: '2026-07-30T00:00:00.000Z',
+    authorizationSourceType: 'change_ticket',
+  });
+  const fencedEvents = [
+    ...legacyEvents,
+    event(manifest.fence_seq, 'stage_recovery_contract_fenced', manifest),
+  ];
+  const controlEvents = [event(0, 'run_started', { run_id: runId })];
+
+  const fenced = projectSafeRecoveryStatus({
+    runId,
+    controlEvents,
+    stageEvents: { summary: fencedEvents },
+    requiredStages: ['summary'],
+  });
+  assert.equal(fenced.run_status, 'blocked');
+  assert.deepEqual(fenced.system_block_reason_codes, ['recovery_migration_incomplete']);
+
+  const migrated = projectSafeRecoveryStatus({
+    runId,
+    controlEvents,
+    stageEvents: {
+      summary: [
+        ...fencedEvents,
+        ...manifest.steps.map((step) => event(
+          step.expected_seq + 1,
+          step.type,
+          step.payload,
+        )),
+      ],
+    },
+    requiredStages: ['summary'],
+  });
+  assert.equal(migrated.run_status, 'completed');
+  assert.deepEqual(migrated.system_block_reason_codes, []);
+  assert.equal(migrated.stages[0].system_block_reason_code, null);
+});
+
+test('the latest control event distinguishes an operator pause from a resumed run', () => {
+  const stageEvents = {
+    summary: [
+      event(0, 'unit_planned', { unit_id: 'summary-a' }),
+      event(1, 'stage_plan_completed', { unit_count: 1 }),
+    ],
+  };
+  const pausedControl = [
+    event(0, 'run_started', { run_id: 'paused-run' }),
+    event(1, 'run_paused', {
+      run_id: 'paused-run',
+      reason_code: 'resume_unit_limit_reached',
+      stage: 'summary',
+      unit_id: 'summary-a',
+      processed_unit_count: 1,
+      max_units_per_resume: 1,
+    }),
+  ];
+  const paused = projectSafeRecoveryStatus({
+    runId: 'paused-run',
+    controlEvents: pausedControl,
+    stageEvents,
+    requiredStages: ['summary'],
+  });
+  assert.equal(paused.run_status, 'paused');
+
+  const resumed = projectSafeRecoveryStatus({
+    runId: 'paused-run',
+    controlEvents: [
+      ...pausedControl,
+      event(2, 'run_resumed', { run_id: 'paused-run', previous_pause_seq: 1 }),
+    ],
+    stageEvents,
+    requiredStages: ['summary'],
+  });
+  assert.equal(resumed.run_status, 'running');
 });
