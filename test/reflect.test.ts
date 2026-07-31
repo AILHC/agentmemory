@@ -5,7 +5,17 @@ vi.mock("../src/logger.js", () => ({
 }));
 
 import { registerReflectFunctions, runReflectInsightWindow } from "../src/functions/reflect.js";
-import type { Insight, GraphNode, GraphEdge, SemanticMemory, Lesson, Crystal } from "../src/types.js";
+import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
+import { fingerprintId, KV } from "../src/state/schema.js";
+import type {
+  AuditEntry,
+  Insight,
+  GraphNode,
+  GraphEdge,
+  SemanticMemory,
+  Lesson,
+  Crystal,
+} from "../src/types.js";
 import { ProviderCallError } from "../src/providers/provider-call-result.js";
 
 function mockKV() {
@@ -430,6 +440,63 @@ describe("Reflect", () => {
         expect.objectContaining({ metadataStatus: "supported", metadata }),
       ]);
     });
+
+    it("leaves a provider-failed reflect receipt running without insight effects", async () => {
+      (provider as any).summarizeWithMetadata = vi.fn(async () => {
+        throw new ProviderCallError("pi_stream_failed");
+      });
+      await kv.set(KV.semantic, "sem_provider_failure", makeSemantic(
+        "security validation is important",
+        "sem_provider_failure",
+      ));
+      await kv.set(KV.lessons, "lsn_provider_failure", makeLesson(
+        "Use security headers",
+        ["security"],
+      ));
+      await kv.set(KV.crystals, "crys_provider_failure", makeCrystal(
+        "Completed security validation cleanup",
+        ["security"],
+      ));
+      const recoveryIdentity = {
+        runId: "reflect-provider-failure",
+        unitId: "reflect-provider-failure-window",
+        inputHash: "a".repeat(64),
+      };
+      const receiptKey = buildExtractionOperationKey({
+        ...recoveryIdentity,
+        stage: "reflect_insight",
+      });
+      const runningReceipt = {
+        ...recoveryIdentity,
+        stage: "reflect_insight",
+        key: receiptKey,
+        version: 1,
+        status: "running",
+        startedAt: "2026-07-30T00:00:00.000Z",
+      };
+      await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, runningReceipt);
+
+      const result = await runReflectInsightWindow({
+        kv: kv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: ["sem_provider_failure"],
+        lessonIds: ["lsn_provider_failure"],
+        crystalIds: ["crys_provider_failure"],
+        recoveryIdentity,
+      });
+
+      expect(result).toMatchObject({
+        success: false,
+        status: "failed",
+        error: "pi_stream_failed",
+      });
+      expect((provider as any).summarizeWithMetadata).toHaveBeenCalledTimes(1);
+      expect(await kv.get(KV.extractionOperationReceipt(receiptKey), receiptKey))
+        .toEqual(runningReceipt);
+      expect(await kv.list(KV.insights)).toEqual([]);
+      expect(await kv.list(KV.audit)).toEqual([]);
+    });
   });
 
   describe("mem::insight-list", () => {
@@ -527,5 +594,276 @@ describe("Reflect", () => {
       const after = await kv.get<Insight>("mem:insights", "ins_weak");
       expect(after!.deleted).toBe(true);
     });
+  });
+
+  it("recovers a full insight commit without re-calling the model or double-reinforcing", async () => {
+    const identity = {
+      runId: "reflect-recovery-run",
+      unitId: "reflect-recovery-unit",
+      inputHash: "reflect-recovery-input",
+    };
+    const key = buildExtractionOperationKey({ ...identity, stage: "reflect_insight" });
+    await kv.set("mem:extraction-operation-receipt:" + key, key, {
+      ...identity,
+      stage: "reflect_insight",
+      key,
+      version: 1,
+      status: "running",
+      startedAt: "2026-07-30T00:00:00.000Z",
+    });
+    await kv.set("mem:semantic", "sem_recovery", makeSemantic("security validation is important", "sem_recovery"));
+    await kv.set("mem:lessons", "lsn_Use sec", makeLesson("Use security headers", ["security"]));
+    await kv.set("mem:crystals", "crys_Complete", makeCrystal("Completed security validation cleanup", ["security"]));
+    const reinforcedContent = "Security requires layered protection: input validation, safe APIs, and deny-lists together.";
+    const reinforcedId = fingerprintId("ins", reinforcedContent.toLowerCase());
+    await kv.set("mem:insights", reinforcedId, {
+      id: reinforcedId,
+      title: "Defense in Depth",
+      content: reinforcedContent,
+      confidence: 0.85,
+      reinforcements: 0,
+      sourceConceptCluster: [],
+      sourceMemoryIds: [],
+      sourceLessonIds: [],
+      sourceCrystalIds: [],
+      tags: [],
+      createdAt: "2026-07-29T00:00:00.000Z",
+      updatedAt: "2026-07-29T00:00:00.000Z",
+      decayRate: 0.05,
+    });
+
+    const input = {
+      kv: kv as never,
+      provider: provider as never,
+      useGraph: false,
+      semanticMemoryIds: ["sem_recovery"],
+      lessonIds: ["lsn_Use sec"],
+      crystalIds: ["crys_Complete"],
+      recoveryIdentity: identity,
+    };
+    const first = await runReflectInsightWindow(input);
+    const second = await runReflectInsightWindow(input);
+
+    expect(first.success).toBe(true);
+    expect(second).toMatchObject({
+      success: true,
+      insightIds: first.insightIds,
+      newInsights: first.newInsights,
+      reinforced: first.reinforced,
+    });
+    expect(first).toMatchObject({ newInsights: 1, reinforced: 1 });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    const insights = await kv.list<Insight>("mem:insights");
+    expect(insights).toHaveLength(2);
+    expect((await kv.get<Insight>("mem:insights", reinforcedId))!.reinforcements).toBe(1);
+    expect((first as any).reflectRecoveryEvidence).toMatchObject({
+      kind: "committed",
+      receiptKey: key,
+    });
+    const audits = await kv.list<AuditEntry>(KV.audit);
+    expect(audits).toEqual([
+      expect.objectContaining({
+        id: expect.stringMatching(/^aud_/),
+        timestamp: "2026-07-30T00:00:00.000Z",
+        operation: "reflect",
+        targetIds: first.insightIds,
+      }),
+    ]);
+    await kv.set(KV.audit, audits[0].id, {
+      ...audits[0],
+      details: { ...audits[0].details, newInsights: 999 },
+    });
+    await expect(runReflectInsightWindow(input)).resolves.toMatchObject({
+      success: false,
+      error: "reflect_insight_audit_conflict",
+      failure: {
+        class: "hard",
+        cause: "reflect_insight_audit_conflict",
+      },
+    });
+    await kv.delete(KV.audit, audits[0].id);
+    await expect(runReflectInsightWindow(input)).resolves.toMatchObject({
+      success: false,
+      error: "reflect_insight_committed_audit_missing",
+      failure: {
+        class: "hard",
+        cause: "reflect_insight_committed_audit_missing",
+      },
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("serializes different recovery identities that share an insight baseline", async () => {
+    const identities = [
+      {
+        runId: "reflect-concurrent-run-a",
+        unitId: "reflect-concurrent-unit-a",
+        inputHash: "a".repeat(64),
+      },
+      {
+        runId: "reflect-concurrent-run-b",
+        unitId: "reflect-concurrent-unit-b",
+        inputHash: "b".repeat(64),
+      },
+    ];
+    for (const identity of identities) {
+      const key = buildExtractionOperationKey({ ...identity, stage: "reflect_insight" });
+      await kv.set(KV.extractionOperationReceipt(key), key, {
+        ...identity,
+        stage: "reflect_insight",
+        key,
+        version: 1,
+        status: "running",
+        startedAt: "2026-07-30T00:00:00.000Z",
+      });
+    }
+    await kv.set(KV.semantic, "sem_concurrent", makeSemantic(
+      "security validation is important",
+      "sem_concurrent",
+    ));
+    await kv.set(KV.lessons, "lsn_concurrent", makeLesson(
+      "Use security headers",
+      ["security"],
+    ));
+    await kv.set(KV.crystals, "crys_concurrent", makeCrystal(
+      "Completed security validation cleanup",
+      ["security"],
+    ));
+    const sharedContent =
+      "Security requires layered protection: input validation, safe APIs, and deny-lists together.";
+    const sharedInsightId = fingerprintId("ins", sharedContent.toLowerCase());
+    await kv.set(KV.insights, sharedInsightId, {
+      id: sharedInsightId,
+      title: "Defense in Depth",
+      content: sharedContent,
+      confidence: 0.85,
+      reinforcements: 0,
+      sourceConceptCluster: [],
+      sourceMemoryIds: [],
+      sourceLessonIds: [],
+      sourceCrystalIds: [],
+      tags: [],
+      createdAt: "2026-07-29T00:00:00.000Z",
+      updatedAt: "2026-07-29T00:00:00.000Z",
+      decayRate: 0.05,
+    });
+
+    for (const identity of identities) {
+      let loseStagedResponse = true;
+      const stagingKv = {
+        ...kv,
+        set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+          const stored = await kv.set(scope, key, data);
+          const recovery = (data as { reflectRecovery?: { phase?: string } }).reflectRecovery;
+          if (loseStagedResponse && recovery?.phase === "staged") {
+            loseStagedResponse = false;
+            throw new Error("staged response lost");
+          }
+          return stored;
+        },
+      };
+      const staged = await runReflectInsightWindow({
+        kv: stagingKv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: ["sem_concurrent"],
+        lessonIds: ["lsn_concurrent"],
+        crystalIds: ["crys_concurrent"],
+        recoveryIdentity: identity,
+      });
+      expect(staged).toMatchObject({ success: false, error: "staged response lost" });
+    }
+
+    const snapshotKv = {
+      ...kv,
+      get: async <T>(scope: string, key: string): Promise<T | null> => {
+        const value = await kv.get<T>(scope, key);
+        return value === null ? null : structuredClone(value);
+      },
+    };
+    const results = await Promise.all(identities.map((recoveryIdentity) =>
+      runReflectInsightWindow({
+        kv: snapshotKv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: ["sem_concurrent"],
+        lessonIds: ["lsn_concurrent"],
+        crystalIds: ["crys_concurrent"],
+        recoveryIdentity,
+      })));
+
+    expect(results.filter((result) => result.success === true)).toHaveLength(1);
+    expect(results.filter(
+      (result) => result.error === "reflect_insight_source_mutation_conflict",
+    )).toHaveLength(1);
+    const finalInsight = await kv.get<Insight & {
+      sourceMutationWatermarks?: Record<string, string>;
+    }>(KV.insights, sharedInsightId);
+    expect(finalInsight?.reinforcements).toBe(1);
+    expect(Object.keys(finalInsight?.sourceMutationWatermarks ?? {})).toHaveLength(1);
+    const audits = (await kv.list<AuditEntry>(KV.audit))
+      .filter((audit) => audit.operation === "reflect");
+    expect(audits).toHaveLength(1);
+    const receipts = await Promise.all(identities.map((identity) => {
+      const key = buildExtractionOperationKey({ ...identity, stage: "reflect_insight" });
+      return kv.get<{ reflectRecovery?: { phase?: string } }>(
+        KV.extractionOperationReceipt(key),
+        key,
+      );
+    }));
+    expect(receipts.filter(
+      (receipt) => receipt?.reflectRecovery?.phase === "committed",
+    )).toHaveLength(1);
+    expect(provider.summarize).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a committed reflect receipt when a formal insight is missing", async () => {
+    const identity = {
+      runId: "reflect-committed-verification-run",
+      unitId: "reflect-committed-verification-unit",
+      inputHash: "reflect-committed-verification-input",
+    };
+    const key = buildExtractionOperationKey({ ...identity, stage: "reflect_insight" });
+    await kv.set("mem:extraction-operation-receipt:" + key, key, {
+      ...identity,
+      stage: "reflect_insight",
+      key,
+      version: 1,
+      status: "running",
+      startedAt: "2026-07-30T00:00:00.000Z",
+    });
+    await kv.set("mem:semantic", "sem_verify", makeSemantic("security validation is important", "sem_verify"));
+    await kv.set("mem:lessons", "lsn_verify", makeLesson("Use security headers", ["security"]));
+    await kv.set("mem:crystals", "crys_verify", makeCrystal("Completed security cleanup", ["security"]));
+    const input = {
+      kv: kv as never,
+      provider: provider as never,
+      useGraph: false,
+      semanticMemoryIds: ["sem_verify"],
+      lessonIds: ["lsn_verify"],
+      crystalIds: ["crys_verify"],
+      recoveryIdentity: identity,
+    };
+
+    const first = await runReflectInsightWindow(input);
+    expect(first.success).toBe(true);
+    const committedReceipt = await kv.get<Record<string, unknown>>(
+      "mem:extraction-operation-receipt:" + key,
+      key,
+    );
+    await kv.set("mem:extraction-operation-receipt:" + key, key, {
+      ...committedReceipt,
+      status: "succeeded",
+      completedAt: "2026-07-30T00:01:00.000Z",
+      response: { success: true, insightIds: first.insightIds },
+    });
+    await kv.delete("mem:insights", first.insightIds![0]);
+
+    const verified = await runReflectInsightWindow(input);
+    expect(verified).toMatchObject({
+      success: false,
+      error: "reflect_insight_source_mutation_conflict",
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
   });
 });

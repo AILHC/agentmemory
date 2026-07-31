@@ -1,5 +1,4 @@
 import { createHash } from 'node:crypto';
-import { RECOVERY_POLICY_VERSION, decideRecovery } from './recovery-policy-v1.mjs';
 
 function receiptKey(attemptId, unitId) {
   return `xop_${createHash('sha256').update(JSON.stringify([attemptId, 'lessons', unitId])).digest('hex').slice(0, 32)}`;
@@ -64,7 +63,7 @@ function zeroEffectProof(data, expected) {
   return { kind: 'legacy_lessons_zero_effect', lessonRunId: run.id, receiptKey: receipt.key, inputHash: run.inputHash, configHash: run.configHash, createdLessonCount: 0, replacedLessonCount: 0, chunkLessonCount: 0, finishedAt: run.finishedAt };
 }
 
-export function adaptLessonOperationEvidence({ result, unit, attemptId, operationId, budget = { attemptsUsed: 0, maxAttempts: 0 } }) {
+export function adaptLessonOperationEvidence({ result, unit, attemptId, operationId }) {
   const data = result?.data || result || {};
   const key = receiptKey(attemptId, unit.unit_id);
   const structured = Array.isArray(data?.lessonEvidence) ? data.lessonEvidence[0] : data?.lessonEvidence;
@@ -99,16 +98,37 @@ export function adaptLessonOperationEvidence({ result, unit, attemptId, operatio
   }
   if (!evidence) evidence = { kind: 'unknown', receiptKey: key, reasonCode: 'legacy_lessons_effect_unknown' };
   const effectVerification = evidence.kind === 'committed' ? 'all_applied' : undefined;
+  let snapshot = {};
+  if (evidence.kind === 'committed') {
+    snapshot = {
+      receipt: {
+        key: evidence.receiptKey,
+        version: evidence.receiptVersion,
+        resultRef: evidence.resultRef,
+        effectHash: evidence.effectHash,
+        status: 'committed',
+      },
+    };
+  } else if (evidence.kind === 'no_effect' && evidence.proof?.kind === 'legacy_lessons_zero_effect') {
+    snapshot = {
+      receipt: {
+        key: evidence.proof.receiptKey,
+        formalEffect: false,
+      },
+      lessonRun: {
+        id: evidence.proof.lessonRunId,
+        inputHash: evidence.proof.inputHash,
+        configHash: evidence.proof.configHash,
+        createdLessonCount: evidence.proof.createdLessonCount,
+        replacedLessonCount: evidence.proof.replacedLessonCount,
+        chunkLessonCount: evidence.proof.chunkLessonCount,
+        finishedAt: evidence.proof.finishedAt,
+      },
+    };
+  }
   return {
-    policyVersion: RECOVERY_POLICY_VERSION,
-    evidence,
-    budget,
-    decision: decideRecovery({
-      policyVersion: RECOVERY_POLICY_VERSION,
-      evidence,
-      budget,
-      effectVerification,
-    }),
+    candidateEvidence: evidence,
+    snapshot,
     ...(effectVerification ? { effectVerification } : {}),
   };
 }

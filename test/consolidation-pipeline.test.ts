@@ -23,9 +23,17 @@ import {
   runConsolidationProceduralWindow,
 } from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled, resolveStageModelCallOptions, resolveStageModelMetadata } from "../src/config.js";
-import type { SessionSummary, Memory, SemanticMemory, ProceduralMemory } from "../src/types.js";
+import type {
+  AuditEntry,
+  SessionSummary,
+  Memory,
+  SemanticMemory,
+  ProceduralMemory,
+} from "../src/types.js";
 import { ProviderCallError } from "../src/providers/provider-call-result.js";
 import { logger } from "../src/logger.js";
+import { KV } from "../src/state/schema.js";
+import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -485,6 +493,62 @@ describe("Consolidation Pipeline", () => {
     ]);
   });
 
+  it("leaves a provider-failed procedural receipt running without formal effects", async () => {
+    const provider = {
+      name: "pi-agent-sdk",
+      compress: vi.fn(),
+      summarize: vi.fn(),
+      summarizeWithMetadata: vi.fn(async () => {
+        throw new ProviderCallError("pi_stream_failed");
+      }),
+    };
+    await kv.set(KV.memories, "mem_provider_failure_1", {
+      ...makePattern(1),
+      id: "mem_provider_failure_1",
+    });
+    await kv.set(KV.memories, "mem_provider_failure_2", {
+      ...makePattern(2),
+      id: "mem_provider_failure_2",
+    });
+    const recoveryIdentity = {
+      runId: "procedural-provider-failure",
+      unitId: "procedural-provider-failure-window",
+      inputHash: "a".repeat(64),
+    };
+    const receiptKey = buildExtractionOperationKey({
+      ...recoveryIdentity,
+      stage: "consolidation_procedural",
+    });
+    const runningReceipt = {
+      ...recoveryIdentity,
+      stage: "consolidation_procedural",
+      key: receiptKey,
+      version: 1,
+      status: "running",
+      startedAt: "2026-07-30T00:00:00.000Z",
+    };
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, runningReceipt);
+
+    const result = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["mem_provider_failure_1", "mem_provider_failure_2"],
+      recoveryIdentity,
+    });
+
+    expect(result).toMatchObject({
+      success: false,
+      status: "failed",
+      error: "pi_stream_failed",
+    });
+    expect(provider.summarizeWithMetadata).toHaveBeenCalledTimes(1);
+    expect(await kv.get(KV.extractionOperationReceipt(receiptKey), receiptKey))
+      .toEqual(runningReceipt);
+    expect(await kv.list(KV.procedural)).toEqual([]);
+    expect(await kv.list(KV.audit)).toEqual([]);
+    expect(await kv.list(KV.memories)).toHaveLength(2);
+  });
+
   it("blocks procedural extraction before the provider", async () => {
     process.env.AGENTMEMORY_EVALUATION_MODE = "context-strategy";
     process.env.AGENTMEMORY_CONTEXT_PREFLIGHT_POLICY = JSON.stringify({
@@ -556,6 +620,400 @@ describe("Consolidation Pipeline", () => {
     expect(stored[0].name).toBe("Full Procedure");
     expect(resolveStageModelMetadata).toHaveBeenCalledWith("procedural", provider, undefined);
     expect(resolveStageModelCallOptions).toHaveBeenCalledWith("procedural", undefined);
+  });
+
+  it("recovers a frozen procedural commit without another model call or duplicate reinforcement", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<procedures><procedure name="New Procedure" trigger="when new"><step>Record</step></procedure><procedure name="Existing Procedure" trigger="when existing"><step>Reinforce</step></procedure></procedures>`,
+      ),
+    };
+    await kv.set(KV.memories, "mem_recovery_1", { ...makePattern(1), id: "mem_recovery_1" });
+    await kv.set(KV.memories, "mem_recovery_2", { ...makePattern(2), id: "mem_recovery_2" });
+    await kv.set(KV.procedural, "proc_existing", {
+      id: "proc_existing",
+      name: "Existing Procedure",
+      steps: ["Old step"],
+      triggerCondition: "when existing",
+      frequency: 4,
+      sourceSessionIds: [],
+      strength: 0.6,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const recoveryIdentity = {
+      runId: "run-procedural-recovery",
+      unitId: "cpw-recovery-1",
+      inputHash: "a".repeat(64),
+    };
+    const receiptKey = buildExtractionOperationKey({
+      ...recoveryIdentity,
+      stage: "consolidation_procedural",
+    });
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+      ...recoveryIdentity,
+      stage: "consolidation_procedural",
+      key: receiptKey,
+      version: 1,
+      status: "running",
+      startedAt: "2026-01-01T00:00:00.000Z",
+    });
+    let interruptAfterReinforcement = true;
+    const interruptingKv = {
+      ...kv,
+      set: async <T>(scope: string, key: string, data: T): Promise<T> => {
+        const stored = await kv.set(scope, key, data);
+        if (interruptAfterReinforcement && scope === KV.procedural && key === "proc_existing") {
+          interruptAfterReinforcement = false;
+          throw new Error("interrupted after durable procedural mutation");
+        }
+        return stored;
+      },
+    };
+
+    const interrupted = await runConsolidationProceduralWindow({
+      kv: interruptingKv as never,
+      provider: provider as never,
+      memoryIds: ["mem_recovery_1", "mem_recovery_2"],
+      recoveryIdentity,
+    });
+    expect(interrupted.success).toBe(false);
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    await kv.delete(KV.memories, "mem_recovery_2");
+
+    const resumed = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["mem_recovery_1", "mem_recovery_2"],
+      recoveryIdentity,
+    });
+    expect(resumed).toMatchObject({
+      success: true,
+      usedFallback: true,
+      newProcedures: 1,
+      patternsAnalyzed: 2,
+      inputHash: recoveryIdentity.inputHash,
+      proceduralRecoveryEvidence: expect.objectContaining({
+        schema: "consolidation-procedural-commit/v1",
+        receiptKey,
+        identity: recoveryIdentity,
+      }),
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    const procedures = await kv.list<ProceduralMemory>(KV.procedural);
+    expect(procedures).toHaveLength(2);
+    expect(procedures.find((procedure) => procedure.id === "proc_existing")?.frequency).toBe(5);
+    const audits = await kv.list<AuditEntry>(KV.audit);
+    expect(audits).toEqual([
+      expect.objectContaining({
+        id: resumed.auditId,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        operation: "consolidate",
+        functionId: "mem::consolidate-procedural-window",
+        targetIds: resumed.proceduralMemoryIds,
+      }),
+    ]);
+    await kv.set(KV.audit, audits[0].id, {
+      ...audits[0],
+      details: { ...audits[0].details, patternsAnalyzed: 999 },
+    });
+    await expect(runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["mem_recovery_1", "mem_recovery_2"],
+      recoveryIdentity,
+    })).resolves.toMatchObject({
+      success: false,
+      error: "consolidation_procedural_audit_conflict",
+      failure: {
+        class: "hard",
+        cause: "consolidation_procedural_audit_conflict",
+      },
+    });
+    await kv.delete(KV.audit, audits[0].id);
+    await expect(runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["mem_recovery_1", "mem_recovery_2"],
+      recoveryIdentity,
+    })).resolves.toMatchObject({
+      success: false,
+      error: "consolidation_procedural_committed_audit_missing",
+      failure: {
+        class: "hard",
+        cause: "consolidation_procedural_committed_audit_missing",
+      },
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("serializes different procedural recoveries that share one baseline", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<procedures><procedure name="Shared Procedure" trigger="when shared"><step>Reinforce</step></procedure></procedures>`,
+      ),
+    };
+    await kv.set(KV.memories, "mem_concurrent_1", {
+      ...makePattern(1),
+      id: "mem_concurrent_1",
+    });
+    await kv.set(KV.memories, "mem_concurrent_2", {
+      ...makePattern(2),
+      id: "mem_concurrent_2",
+    });
+    await kv.set(KV.procedural, "proc_concurrent", {
+      id: "proc_concurrent",
+      name: "Shared Procedure",
+      steps: ["Original"],
+      triggerCondition: "when shared",
+      frequency: 4,
+      sourceSessionIds: [],
+      strength: 0.6,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const identities = [
+      {
+        runId: "run-procedural-concurrent-a",
+        unitId: "cpw-concurrent-a",
+        inputHash: "a".repeat(64),
+      },
+      {
+        runId: "run-procedural-concurrent-b",
+        unitId: "cpw-concurrent-b",
+        inputHash: "b".repeat(64),
+      },
+    ];
+    for (const identity of identities) {
+      const key = buildExtractionOperationKey({
+        ...identity,
+        stage: "consolidation_procedural",
+      });
+      await kv.set(KV.extractionOperationReceipt(key), key, {
+        ...identity,
+        stage: "consolidation_procedural",
+        key,
+        version: 1,
+        status: "running",
+        startedAt: "2026-07-30T00:00:00.000Z",
+      });
+      let loseStagedResponse = true;
+      const stagingKv = {
+        ...kv,
+        set: async <T>(scope: string, receiptKey: string, data: T): Promise<T> => {
+          const stored = await kv.set(scope, receiptKey, data);
+          const recovery = (
+            data as { proceduralRecovery?: { phase?: string } }
+          ).proceduralRecovery;
+          if (loseStagedResponse && recovery?.phase === "staged") {
+            loseStagedResponse = false;
+            throw new Error("staged response lost");
+          }
+          return stored;
+        },
+      };
+      const staged = await runConsolidationProceduralWindow({
+        kv: stagingKv as never,
+        provider: provider as never,
+        memoryIds: ["mem_concurrent_1", "mem_concurrent_2"],
+        recoveryIdentity: identity,
+      });
+      expect(staged).toMatchObject({ success: false, error: "staged response lost" });
+    }
+
+    const snapshotKv = {
+      ...kv,
+      get: async <T>(scope: string, key: string): Promise<T | null> => {
+        const value = await kv.get<T>(scope, key);
+        return value === null ? null : structuredClone(value);
+      },
+    };
+    const results = await Promise.all(identities.map((recoveryIdentity) =>
+      runConsolidationProceduralWindow({
+        kv: snapshotKv as never,
+        provider: provider as never,
+        memoryIds: ["mem_concurrent_1", "mem_concurrent_2"],
+        recoveryIdentity,
+      })));
+
+    expect(results.filter((result) => result.success === true)).toHaveLength(1);
+    expect(results.filter(
+      (result) => result.error === "consolidation_procedural_source_mutation_conflict",
+    )).toHaveLength(1);
+    const finalProcedure = await kv.get<ProceduralMemory & {
+      sourceMutationWatermarks?: Record<string, string>;
+    }>(KV.procedural, "proc_concurrent");
+    expect(finalProcedure?.frequency).toBe(5);
+    expect(finalProcedure?.strength).toBeCloseTo(0.7);
+    expect(Object.keys(finalProcedure?.sourceMutationWatermarks ?? {})).toHaveLength(1);
+    const audits = (await kv.list<AuditEntry>(KV.audit))
+      .filter((audit) => audit.operation === "consolidate");
+    expect(audits).toHaveLength(1);
+    const receipts = await Promise.all(identities.map((identity) => {
+      const key = buildExtractionOperationKey({
+        ...identity,
+        stage: "consolidation_procedural",
+      });
+      return kv.get<{ proceduralRecovery?: { phase?: string } }>(
+        KV.extractionOperationReceipt(key),
+        key,
+      );
+    }));
+    expect(receipts.filter(
+      (receipt) => receipt?.proceduralRecovery?.phase === "committed",
+    )).toHaveLength(1);
+    expect(provider.summarize).toHaveBeenCalledTimes(2);
+  });
+
+  it("rejects a committed procedural receipt when a formal effect is missing", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        `<procedures><procedure name="Durable Procedure" trigger="when recurring"><step>Record</step></procedure></procedures>`,
+      ),
+    };
+    await kv.set(KV.memories, "mem_committed_1", { ...makePattern(1), id: "mem_committed_1" });
+    await kv.set(KV.memories, "mem_committed_2", { ...makePattern(2), id: "mem_committed_2" });
+    const recoveryIdentity = {
+      runId: "run-procedural-committed-verification",
+      unitId: "cpw-committed-verification",
+      inputHash: "e".repeat(64),
+    };
+    const receiptKey = buildExtractionOperationKey({
+      ...recoveryIdentity,
+      stage: "consolidation_procedural",
+    });
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+      ...recoveryIdentity,
+      stage: "consolidation_procedural",
+      key: receiptKey,
+      version: 1,
+      status: "running",
+      startedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const first = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["mem_committed_1", "mem_committed_2"],
+      recoveryIdentity,
+    });
+    expect(first.success).toBe(true);
+    const committedReceipt = await kv.get<Record<string, unknown>>(
+      KV.extractionOperationReceipt(receiptKey),
+      receiptKey,
+    );
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+      ...committedReceipt,
+      status: "succeeded",
+      completedAt: "2026-01-01T00:01:00.000Z",
+      response: { success: true, proceduralMemoryIds: first.proceduralMemoryIds },
+    });
+    await kv.delete(KV.procedural, first.proceduralMemoryIds![0]);
+
+    const verified = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["mem_committed_1", "mem_committed_2"],
+      recoveryIdentity,
+    });
+    expect(verified).toMatchObject({
+      success: false,
+      error: "consolidation_procedural_source_mutation_conflict",
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects a procedural recovery identity that is not bound to its receipt", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(),
+    };
+    await kv.set(KV.memories, "mem_identity_1", { ...makePattern(1), id: "mem_identity_1" });
+    await kv.set(KV.memories, "mem_identity_2", { ...makePattern(2), id: "mem_identity_2" });
+    const identity = {
+      runId: "run-procedural-identity",
+      unitId: "cpw-identity-1",
+      inputHash: "b".repeat(64),
+    };
+    const receiptKey = buildExtractionOperationKey({ ...identity, stage: "consolidation_procedural" });
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+      ...identity,
+      inputHash: "c".repeat(64),
+      stage: "consolidation_procedural",
+      key: receiptKey,
+      version: 1,
+      status: "running",
+      startedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const result = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["mem_identity_1", "mem_identity_2"],
+      recoveryIdentity: identity,
+    });
+    expect(result).toMatchObject({
+      success: false,
+      error: "consolidation_procedural_recovery_receipt_unavailable",
+    });
+    expect(provider.summarize).not.toHaveBeenCalled();
+  });
+
+  it("records receipt-bound business-empty evidence for a procedural recovery skip", async () => {
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(),
+    };
+    await kv.set(KV.memories, "mem_skip_only", { ...makePattern(1), id: "mem_skip_only" });
+    const recoveryIdentity = {
+      runId: "run-procedural-skip",
+      unitId: "cpw-skip-1",
+      inputHash: "d".repeat(64),
+    };
+    const receiptKey = buildExtractionOperationKey({ ...recoveryIdentity, stage: "consolidation_procedural" });
+    await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+      ...recoveryIdentity,
+      stage: "consolidation_procedural",
+      key: receiptKey,
+      version: 1,
+      status: "running",
+      startedAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    const result = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: ["mem_skip_only"],
+      recoveryIdentity,
+    });
+    expect(result).toMatchObject({
+      success: true,
+      status: "skipped",
+      skipped: true,
+      inputHash: recoveryIdentity.inputHash,
+      proceduralRecoveryEvidence: {
+        kind: "no_effect",
+        observation: "business_empty",
+        reasonCode: "fewer_than_2_recurring_patterns",
+        identity: recoveryIdentity,
+        proof: {
+          kind: "receipt_before_formal_effect",
+          receiptKey,
+          receiptVersion: 1,
+          phase: "candidate_staging",
+          commitPlanAbsent: true,
+        },
+      },
+    });
+    expect(provider.summarize).not.toHaveBeenCalled();
   });
 
   it("consolidation records an audit entry", async () => {

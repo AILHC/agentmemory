@@ -10,6 +10,10 @@ import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { stableStringify } from "./lesson-extraction-runs.js";
+import {
+  assertLessonExtractionGenerationBinding,
+  withLessonExtractionSessionLock,
+} from "./lesson-extraction-generation.js";
 
 export const LESSON_COMMIT_RECOVERY_POLICY_VERSION = "effect-state-recovery/v1";
 
@@ -153,7 +157,13 @@ export async function freezeLessonCommitPlan(kv: StateKV, input: {
 }
 
 export async function applySessionLessonDelta(kv: StateKV, delta: ApplySessionLessonDelta): Promise<"applied" | "replayed"> {
-  return withLessonKeyLock(delta.lessonId, async () => {
+  return withLessonExtractionSessionLock(delta.sessionId, async () => {
+    await assertLessonExtractionGenerationBinding(kv, {
+      sessionId: delta.sessionId,
+      runId: delta.sourceRunId,
+      generation: delta.generation,
+    });
+    return withLessonKeyLock(delta.lessonId, async () => {
     const current = await kv.get<Lesson>(KV.lessons, delta.lessonId);
     const watermark = current?.sourceWatermarks?.[delta.sessionId];
     if (watermark) {
@@ -184,8 +194,14 @@ export async function applySessionLessonDelta(kv: StateKV, delta: ApplySessionLe
         }
         if (!next.context && (delta.candidate.context || delta.fallbackContext)) next.context = delta.candidate.context || delta.fallbackContext;
         next.sourceRunId = delta.sourceRunId;
+        if (current.source === "heuristic" && current.origin === "replay-import-heuristic") {
+          next.source = "llm";
+          next.origin = "llm-session-extraction";
+          next.deleted = undefined;
+          next.lastReinforcedAt = now;
+        }
       }
-      if (delta.removeHeuristicSource && current.source === "heuristic" && current.origin === "replay-import-heuristic") {
+      if (!delta.candidate && delta.removeHeuristicSource && current.source === "heuristic" && current.origin === "replay-import-heuristic") {
         next.sourceIds = next.sourceIds.filter((id) => id !== delta.sessionId);
         if (next.sourceIds.length === 0) next.deleted = true;
       }
@@ -194,6 +210,7 @@ export async function applySessionLessonDelta(kv: StateKV, delta: ApplySessionLe
     next.sourceWatermarks = { ...next.sourceWatermarks, [delta.sessionId]: { generation: delta.generation, mutationId: delta.mutationId } };
     await kv.set(KV.lessons, next.id, next);
     return "applied";
+    });
   });
 }
 

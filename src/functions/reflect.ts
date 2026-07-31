@@ -1,5 +1,7 @@
+import { createHash } from "node:crypto";
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import type {
   Insight,
@@ -9,8 +11,14 @@ import type {
   Lesson,
   Crystal,
   MemoryProvider,
+  ExtractionOperationReceipt,
 } from "../types.js";
-import { recordAudit } from "./audit.js";
+import {
+  AUDIT_ENTRY_CONFLICT,
+  AUDIT_ENTRY_MISSING,
+  recordAudit,
+} from "./audit.js";
+import { buildExtractionOperationKey } from "./extraction-operation-receipts.js";
 import { REFLECT_SYSTEM, buildReflectPrompt } from "../prompts/reflect.js";
 import { REFLECT_OUTPUT_CONTRACT } from "../prompts/reflect.js";
 import { withOutputLanguagePolicy } from "../prompts/output-language.js";
@@ -56,6 +64,73 @@ export interface ReflectInsightWindowOptions {
   project?: string;
   useGraph?: boolean;
   model?: string;
+  recoveryIdentity?: { runId: string; unitId: string; inputHash: string };
+}
+
+const REFLECT_RECOVERY_SCHEMA = "reflect-insight-recovery/v1";
+const REFLECT_RECOVERY_COMMIT_LOCK = "recovery-effect-commit:reflect-insight";
+const REFLECT_RECOVERY_HARD_FAILURES = new Set([
+  "reflect_insight_recovery_identity_conflict",
+  "reflect_insight_recovery_receipt_unavailable",
+  "reflect_insight_source_mutation_conflict",
+  "reflect_insight_committed_result_missing",
+  "reflect_insight_committed_result_conflict",
+  "reflect_insight_audit_conflict",
+  "reflect_insight_committed_audit_missing",
+]);
+
+interface ReflectRecoveryItem {
+  id: string;
+  title: string;
+  content: string;
+  confidence: number;
+  action: "create" | "reinforce";
+  mutationId: string;
+  baselineDeletedHash?: string;
+  baselineUpdatedAt?: string;
+  baselineReinforcements?: number;
+}
+
+interface ReflectRecoveryState {
+  schema: typeof REFLECT_RECOVERY_SCHEMA;
+  identity: { runId: string; unitId: string; inputHash: string };
+  phase: "staged" | "committed";
+  cluster: ConceptCluster;
+  items: ReflectRecoveryItem[];
+  totalItems: number;
+  promptChars: number;
+  model: {
+    responseHash: string;
+    response: string;
+    telemetry: ProviderCallTelemetry[];
+    metadata: Record<string, unknown>;
+  };
+  result?: {
+    newInsights: number;
+    reinforced: number;
+    totalInsights: number;
+    insightIds: string[];
+    auditId: string;
+  };
+}
+
+type RecoverableInsight = Insight & {
+  sourceMutationWatermarks?: Record<string, string>;
+};
+
+type ReflectRecoveryReceipt = ExtractionOperationReceipt<Record<string, unknown>> & {
+  reflectRecovery?: ReflectRecoveryState;
+};
+
+function stableHash(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(Object.entries(item as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, normalize(child)]));
+  };
+  return createHash("sha256").update(JSON.stringify(normalize(value))).digest("hex");
 }
 
 function reinforceInsight(insight: Insight): void {
@@ -337,6 +412,300 @@ async function loadReflectWindowCluster(
   };
 }
 
+function parseReflectInsightItems(response: string, maxInsights: number): Array<{
+  id: string;
+  title: string;
+  content: string;
+  confidence: number;
+}> {
+  const insightRegex =
+    /<insight\s+confidence="([^"]+)"\s+title="([^"]+)">([\s\S]*?)<\/insight>/g;
+  const items: Array<{ id: string; title: string; content: string; confidence: number }> = [];
+  let match;
+  while ((match = insightRegex.exec(response)) !== null && items.length < maxInsights) {
+    const content = match[3].trim();
+    if (!content) continue;
+    const parsedConfidence = parseFloat(match[1]);
+    items.push({
+      id: fingerprintId("ins", content.toLowerCase()),
+      title: match[2].trim(),
+      content,
+      confidence: Number.isNaN(parsedConfidence)
+        ? 0.5
+        : Math.max(0, Math.min(1, parsedConfidence)),
+    });
+  }
+  return items;
+}
+
+function recoveryReceiptKey(identity: NonNullable<ReflectInsightWindowOptions["recoveryIdentity"]>): string {
+  return buildExtractionOperationKey({
+    runId: identity.runId,
+    stage: "reflect_insight",
+    unitId: identity.unitId,
+  });
+}
+
+function sameRecoveryIdentity(
+  left: ReflectRecoveryState["identity"],
+  right: NonNullable<ReflectInsightWindowOptions["recoveryIdentity"]>,
+): boolean {
+  return left.runId === right.runId
+    && left.unitId === right.unitId
+    && left.inputHash === right.inputHash;
+}
+
+async function readReflectRecovery(
+  kv: StateKV,
+  identity: NonNullable<ReflectInsightWindowOptions["recoveryIdentity"]>,
+): Promise<{ receipt: ReflectRecoveryReceipt; recovery: ReflectRecoveryState } | null> {
+  const key = recoveryReceiptKey(identity);
+  const receipt = await kv.get<ReflectRecoveryReceipt>(KV.extractionOperationReceipt(key), key);
+  const recovery = receipt?.reflectRecovery;
+  if (!recovery) return null;
+  const validReceiptStatus = receipt.status === "running"
+    || (receipt.status === "succeeded" && recovery.phase === "committed");
+  if (
+    recovery.schema !== REFLECT_RECOVERY_SCHEMA
+    || receipt.key !== key
+    || receipt.stage !== "reflect_insight"
+    || receipt.runId !== identity.runId
+    || receipt.unitId !== identity.unitId
+    || receipt.inputHash !== identity.inputHash
+    || !validReceiptStatus
+    || !sameRecoveryIdentity(recovery.identity, identity)
+    || !["staged", "committed"].includes(recovery.phase)
+  ) {
+    throw new Error("reflect_insight_recovery_identity_conflict");
+  }
+  return { receipt, recovery };
+}
+
+async function stageReflectRecovery(options: {
+  kv: StateKV;
+  identity: NonNullable<ReflectInsightWindowOptions["recoveryIdentity"]>;
+  cluster: ConceptCluster;
+  response: string;
+  totalItems: number;
+  promptChars: number;
+  telemetry: ProviderCallTelemetry[];
+  metadata: Record<string, unknown>;
+  maxInsights: number;
+}): Promise<{ receipt: ReflectRecoveryReceipt; recovery: ReflectRecoveryState }> {
+  const existing = await readReflectRecovery(options.kv, options.identity);
+  if (existing) return existing;
+  const key = recoveryReceiptKey(options.identity);
+  const receipt = await options.kv.get<ReflectRecoveryReceipt>(KV.extractionOperationReceipt(key), key);
+  if (
+    !receipt
+    || receipt.status !== "running"
+    || receipt.stage !== "reflect_insight"
+    || receipt.runId !== options.identity.runId
+    || receipt.unitId !== options.identity.unitId
+    || receipt.inputHash !== options.identity.inputHash
+  ) {
+    throw new Error("reflect_insight_recovery_receipt_unavailable");
+  }
+  const mutationSource = fingerprintId("rimsrc", JSON.stringify(options.identity));
+  const items = await Promise.all(parseReflectInsightItems(options.response, options.maxInsights)
+    .map(async (item): Promise<ReflectRecoveryItem> => {
+      const existingInsight = await options.kv.get<RecoverableInsight>(KV.insights, item.id);
+      return {
+        ...item,
+        action: existingInsight && !existingInsight.deleted ? "reinforce" : "create",
+        mutationId: fingerprintId("rimm", JSON.stringify([
+          mutationSource,
+          item.id,
+          stableHash({ title: item.title, content: item.content, confidence: item.confidence }),
+        ])),
+        ...(existingInsight && !existingInsight.deleted
+          ? {
+            baselineUpdatedAt: existingInsight.updatedAt,
+            baselineReinforcements: existingInsight.reinforcements,
+          }
+          : existingInsight?.deleted
+            ? { baselineDeletedHash: stableHash(existingInsight) }
+            : {}),
+      };
+    }));
+  const recovery: ReflectRecoveryState = {
+    schema: REFLECT_RECOVERY_SCHEMA,
+    identity: options.identity,
+    phase: "staged",
+    cluster: options.cluster,
+    items,
+    totalItems: options.totalItems,
+    promptChars: options.promptChars,
+    model: {
+      responseHash: stableHash(options.response),
+      response: options.response,
+      telemetry: [...options.telemetry],
+      metadata: options.metadata,
+    },
+  };
+  const staged = { ...receipt, reflectRecovery: recovery };
+  await options.kv.set(KV.extractionOperationReceipt(key), key, staged);
+  return { receipt: staged, recovery };
+}
+
+function mutationSource(identity: ReflectRecoveryState["identity"]): string {
+  return fingerprintId("rimsrc", JSON.stringify(identity));
+}
+
+function recoveryResultEvidence(
+  receipt: ReflectRecoveryReceipt,
+  recovery: ReflectRecoveryState,
+): Record<string, unknown> {
+  const result = recovery.result!;
+  const resultRef = `reflect-insight-recoveries:${recoveryReceiptKey(recovery.identity)}`;
+  return {
+    schema: "reflect-insight-commit/v1",
+    kind: "committed",
+    receiptKey: receipt.key,
+    receiptVersion: receipt.version ?? 1,
+    resultRef,
+    effectHash: stableHash({
+      identity: recovery.identity,
+      items: recovery.items.map((item) => [item.id, item.mutationId]),
+      result,
+    }),
+  };
+}
+
+type ReflectRecoveryCommitOptions = {
+  kv: StateKV;
+  receipt: ReflectRecoveryReceipt;
+  recovery: ReflectRecoveryState;
+  project?: string;
+};
+
+async function commitReflectRecovery(
+  options: ReflectRecoveryCommitOptions,
+): Promise<ReflectRecoveryState> {
+  return withKeyedLock(
+    REFLECT_RECOVERY_COMMIT_LOCK,
+    () => commitReflectRecoveryLocked(options),
+  );
+}
+
+async function commitReflectRecoveryLocked(
+  options: ReflectRecoveryCommitOptions,
+): Promise<ReflectRecoveryState> {
+  const verifyingCommitted = options.recovery.phase === "committed";
+  if (verifyingCommitted && !options.recovery.result) {
+    throw new Error("reflect_insight_committed_result_missing");
+  }
+  const source = mutationSource(options.recovery.identity);
+  for (const item of options.recovery.items) {
+    const existing = await options.kv.get<RecoverableInsight>(KV.insights, item.id);
+    const watermark = existing?.sourceMutationWatermarks?.[source];
+    if (verifyingCommitted) {
+      if (!existing || watermark !== item.mutationId) {
+        throw new Error("reflect_insight_source_mutation_conflict");
+      }
+      continue;
+    }
+    if (watermark === item.mutationId) continue;
+    if (watermark !== undefined) throw new Error("reflect_insight_source_mutation_conflict");
+    if (item.action === "create") {
+      if (
+        existing
+          ? !existing.deleted || stableHash(existing) !== item.baselineDeletedHash
+          : item.baselineDeletedHash !== undefined
+      ) {
+        throw new Error("reflect_insight_source_mutation_conflict");
+      }
+      const now = new Date().toISOString();
+      const insight: RecoverableInsight = {
+        id: item.id,
+        title: item.title,
+        content: item.content,
+        confidence: item.confidence,
+        reinforcements: 0,
+        sourceConceptCluster: options.recovery.cluster.concepts,
+        sourceMemoryIds: options.recovery.cluster.factIds,
+        sourceLessonIds: options.recovery.cluster.lessonIds,
+        sourceCrystalIds: options.recovery.cluster.crystalIds,
+        project: options.project,
+        tags: options.recovery.cluster.concepts,
+        createdAt: now,
+        updatedAt: now,
+        decayRate: 0.05,
+        sourceMutationWatermarks: { [source]: item.mutationId },
+      };
+      await options.kv.set(KV.insights, insight.id, insight);
+      continue;
+    }
+    if (
+      !existing
+      || existing.deleted
+      || existing.updatedAt !== item.baselineUpdatedAt
+      || existing.reinforcements !== item.baselineReinforcements
+    ) throw new Error("reflect_insight_source_mutation_conflict");
+    reinforceInsight(existing);
+    existing.sourceMutationWatermarks = {
+      ...existing.sourceMutationWatermarks,
+      [source]: item.mutationId,
+    };
+    await options.kv.set(KV.insights, existing.id, existing);
+  }
+  const result = {
+    newInsights: options.recovery.items.filter((item) => item.action === "create").length,
+    reinforced: options.recovery.items.filter((item) => item.action === "reinforce").length,
+    totalInsights: options.recovery.items.length,
+    insightIds: options.recovery.items.map((item) => item.id),
+    auditId: fingerprintId("aud", JSON.stringify([
+      recoveryReceiptKey(options.recovery.identity),
+      stableHash(options.recovery.items.map((item) => [item.id, item.mutationId])),
+    ])),
+  };
+  if (
+    verifyingCommitted
+    && stableHash(options.recovery.result) !== stableHash(result)
+  ) {
+    throw new Error("reflect_insight_committed_result_conflict");
+  }
+  try {
+    await recordAudit(
+      options.kv,
+      "reflect",
+      "mem::reflect-insight-window",
+      result.insightIds,
+      {
+        newInsights: result.newInsights,
+        reinforced: result.reinforced,
+        totalItems: options.recovery.totalItems,
+        useGraph: false,
+      },
+      undefined,
+      undefined,
+      {
+        id: result.auditId,
+        timestamp: options.receipt.startedAt,
+        requireExisting: verifyingCommitted,
+      },
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === AUDIT_ENTRY_CONFLICT) {
+      throw new Error("reflect_insight_audit_conflict");
+    }
+    if (message === AUDIT_ENTRY_MISSING) {
+      throw new Error("reflect_insight_committed_audit_missing");
+    }
+    throw error;
+  }
+  if (verifyingCommitted) return options.recovery;
+  const committed: ReflectRecoveryState = {
+    ...options.recovery,
+    phase: "committed",
+    result,
+  };
+  const receipt = { ...options.receipt, reflectRecovery: committed };
+  await options.kv.set(KV.extractionOperationReceipt(receipt.key), receipt.key, receipt);
+  return committed;
+}
+
 async function persistReflectInsights(options: {
   kv: StateKV;
   response: string;
@@ -418,18 +787,61 @@ export async function runReflectInsightWindow(
     };
   }
   try {
+    const recovered = options.recoveryIdentity
+      ? await readReflectRecovery(options.kv, options.recoveryIdentity)
+      : null;
+    if (recovered) {
+      const committed = await commitReflectRecovery({
+        kv: options.kv,
+        receipt: recovered.receipt,
+        recovery: recovered.recovery,
+        project: options.project,
+      });
+      const persisted = committed.result!;
+      return {
+        success: true,
+        newInsights: persisted.newInsights,
+        reinforced: persisted.reinforced,
+        totalInsights: persisted.totalInsights,
+        insightIds: persisted.insightIds,
+        totalItems: committed.totalItems,
+        usedFallback: true,
+        ...committed.model.metadata,
+        promptChars: committed.promptChars,
+        telemetry: committed.model.telemetry,
+        parseFailures: persisted.insightIds.length > 0 ? 0 : 1,
+        reflectRecoveryEvidence: recoveryResultEvidence(recovered.receipt, committed),
+      };
+    }
     if (!options.provider?.summarize) {
       return { success: false, error: "provider.summarize is required", ...responseMetadata("failed") };
     }
     const cluster = await loadReflectWindowCluster(options);
     const totalItems = cluster.facts.length + cluster.lessons.length + cluster.crystalNarratives.length;
     if (totalItems < 3) {
+      const receiptKey = options.recoveryIdentity
+        ? recoveryReceiptKey(options.recoveryIdentity)
+        : undefined;
       return {
         success: true,
         skipped: true,
         reason: "fewer than 3 supporting items",
         totalItems,
         ...responseMetadata("skipped", { parseFailures: 0 }),
+        ...(receiptKey ? {
+          reflectRecoveryEvidence: {
+            kind: "no_effect",
+            observation: "business_empty",
+            reasonCode: "insufficient_supporting_items",
+            proof: {
+              kind: "receipt_before_formal_effect",
+              receiptKey,
+              receiptVersion: 1,
+              phase: "candidate_staging",
+              commitPlanAbsent: true,
+            },
+          },
+        } : {}),
       };
     }
 
@@ -455,6 +867,42 @@ export async function runReflectInsightWindow(
       telemetry,
       0,
     );
+    if (options.recoveryIdentity) {
+      const staged = await stageReflectRecovery({
+        kv: options.kv,
+        identity: options.recoveryIdentity,
+        cluster,
+        response,
+        totalItems,
+        promptChars: prompt.length,
+        telemetry: sortProviderCallTelemetry(telemetry),
+        metadata: responseMetadata("succeeded", {
+          charBudget: options.charBudget,
+        }),
+        maxInsights: options.maxItemsPerWindow ?? 50,
+      });
+      const committed = await commitReflectRecovery({
+        kv: options.kv,
+        receipt: staged.receipt,
+        recovery: staged.recovery,
+        project: options.project,
+      });
+      const persisted = committed.result!;
+      return {
+        success: true,
+        newInsights: persisted.newInsights,
+        reinforced: persisted.reinforced,
+        totalInsights: persisted.totalInsights,
+        insightIds: persisted.insightIds,
+        totalItems,
+        usedFallback: true,
+        ...committed.model.metadata,
+        promptChars: committed.promptChars,
+        telemetry: committed.model.telemetry,
+        parseFailures: persisted.insightIds.length > 0 ? 0 : 1,
+        reflectRecoveryEvidence: recoveryResultEvidence(staged.receipt, committed),
+      };
+    }
     const persisted = await persistReflectInsights({
       kv: options.kv,
       response,
@@ -484,7 +932,16 @@ export async function runReflectInsightWindow(
       const status = providerPreflightStatus(err);
       return { success: false, error: status, ...responseMetadata(status) };
     }
-    return { success: false, error: err instanceof Error ? err.message : String(err), ...responseMetadata("failed") };
+    const error = err instanceof Error ? err.message : String(err);
+    if (REFLECT_RECOVERY_HARD_FAILURES.has(error)) {
+      return {
+        success: false,
+        error,
+        failure: { class: "hard", cause: error },
+        ...responseMetadata("failed"),
+      };
+    }
+    return { success: false, error, ...responseMetadata("failed") };
   }
 }
 
@@ -514,6 +971,7 @@ export function registerReflectFunctions(
       lessonIds?: string[];
       crystalIds?: string[];
       model?: string;
+      recoveryIdentity?: { runId: string; unitId: string; inputHash: string };
     }) => runReflectInsightWindow({ kv, provider, ...data }),
   );
 

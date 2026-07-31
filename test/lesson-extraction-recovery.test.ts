@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { bindLessonExtractionGeneration } from "../src/functions/lesson-extraction-generation.js";
 import { LessonExtractionGenerationConflictError } from "../src/functions/lesson-extraction-generation.js";
 import { lessonCandidateOperationIdentityHash, stageLessonCandidates } from "../src/functions/lesson-candidate-staging.js";
+import { applySessionLessonDelta } from "../src/functions/lesson-commit.js";
 import { proveLegacyLessonNoBlocksZeroEffect } from "../src/functions/legacy-lesson-zero-effect-proof.js";
 import { KV } from "../src/state/schema.js";
 import type { LessonExtractionRun, MemoryProvider } from "../src/types.js";
@@ -55,10 +56,134 @@ describe("lesson extraction recovery state", () => {
     expect((await bindLessonExtractionGeneration(kv, target)).extractionGeneration).toBe(3);
   });
 
+  it("serializes run binding with watermark commits so a generation is never reused", async () => {
+    const kv = mockKV();
+    const target = run("run-concurrent-watermark");
+    await kv.set(KV.lessonExtractionRuns, target.id, target);
+    let releaseWatermarkWrite!: () => void;
+    const watermarkWriteReleased = new Promise<void>((resolve) => {
+      releaseWatermarkWrite = resolve;
+    });
+    let watermarkWriteStarted!: () => void;
+    const watermarkWriteObserved = new Promise<void>((resolve) => {
+      watermarkWriteStarted = resolve;
+    });
+    let pauseWatermarkWrite = true;
+    const controlledKV = {
+      ...kv,
+      set: async <T>(scope: string, key: string, value: T): Promise<T> => {
+        if (pauseWatermarkWrite && scope === KV.lessons && key === "lesson-concurrent-watermark") {
+          pauseWatermarkWrite = false;
+          watermarkWriteStarted();
+          await watermarkWriteReleased;
+        }
+        return kv.set(scope, key, value);
+      },
+    };
+    const delta = {
+      lessonId: "lesson-concurrent-watermark",
+      sessionId: target.sessionId,
+      generation: 1,
+      mutationId: "mutation-concurrent-watermark",
+      sourceRunId: "prior-run",
+      appliedAt: "2026-07-29T00:00:00.000Z",
+      fallbackContext: "",
+      removeHeuristicSource: false,
+      candidate: {
+        content: "concurrent watermark",
+        context: "",
+        confidence: 0.8,
+        importance: 0.8,
+        tags: [],
+        evidence: "",
+        source: "llm" as const,
+      },
+    };
+
+    const watermarkCommit = applySessionLessonDelta(controlledKV, delta);
+    await watermarkWriteObserved;
+    const binding = bindLessonExtractionGeneration(controlledKV, target);
+    releaseWatermarkWrite();
+
+    expect(await watermarkCommit).toBe("applied");
+    expect((await binding).extractionGeneration).toBe(2);
+  });
+
+  it("rejects an old watermark commit after the generation was bound to another run", async () => {
+    const kv = mockKV();
+    const target = run("run-bound-before-old-commit");
+    await kv.set(KV.lessonExtractionRuns, target.id, target);
+    const bound = await bindLessonExtractionGeneration(kv, target);
+    expect(bound.extractionGeneration).toBe(1);
+    const delta = {
+      lessonId: "lesson-old-generation",
+      sessionId: target.sessionId,
+      generation: 1,
+      mutationId: "mutation-old-generation",
+      sourceRunId: "superseded-run",
+      appliedAt: "2026-07-29T00:00:00.000Z",
+      fallbackContext: "",
+      removeHeuristicSource: false,
+      candidate: {
+        content: "old generation",
+        context: "",
+        confidence: 0.8,
+        importance: 0.8,
+        tags: [],
+        evidence: "",
+        source: "llm" as const,
+      },
+    };
+
+    await expect(applySessionLessonDelta(kv, delta))
+      .rejects.toBeInstanceOf(LessonExtractionGenerationConflictError);
+    expect(await kv.get(KV.lessons, delta.lessonId)).toBeNull();
+    expect(await applySessionLessonDelta(kv, {
+      ...delta,
+      sourceRunId: bound.id,
+    })).toBe("applied");
+  });
+
   it("fails closed when one generation is bound to two lesson runs", async () => {
     const kv = mockKV();
     const first = { ...run("run-1"), extractionGeneration: 1 };
     const second = { ...run("run-2"), extractionGeneration: 1 };
+    await kv.set(KV.lessonExtractionRuns, first.id, first);
+    await kv.set(KV.lessonExtractionRuns, second.id, second);
+    await expect(bindLessonExtractionGeneration(kv, first)).rejects.toBeInstanceOf(
+      LessonExtractionGenerationConflictError,
+    );
+  });
+
+  it("fails closed on mutation and registry identity conflicts", async () => {
+    const kv = mockKV();
+    const delta = {
+      lessonId: "lesson-conflict",
+      sessionId: "session-1",
+      generation: 1,
+      mutationId: "mutation-1",
+      sourceRunId: "run-1",
+      appliedAt: "2026-07-29T00:00:00.000Z",
+      fallbackContext: "",
+      removeHeuristicSource: false,
+      candidate: {
+        content: "identity conflict",
+        context: "",
+        confidence: 0.8,
+        importance: 0.8,
+        tags: [],
+        evidence: "",
+        source: "llm" as const,
+      },
+    };
+    expect(await applySessionLessonDelta(kv, delta)).toBe("applied");
+    await expect(applySessionLessonDelta(kv, {
+      ...delta,
+      mutationId: "mutation-2",
+    })).rejects.toThrow("lesson_watermark_conflict");
+
+    const first = { ...run("registry-run-1"), extractionGeneration: 2 };
+    const second = { ...run("registry-run-2"), extractionGeneration: 2 };
     await kv.set(KV.lessonExtractionRuns, first.id, first);
     await kv.set(KV.lessonExtractionRuns, second.id, second);
     await expect(bindLessonExtractionGeneration(kv, first)).rejects.toBeInstanceOf(

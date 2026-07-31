@@ -8,17 +8,30 @@ import {
   buildEligibleCrystalActionGroups,
   registerCrystallizeFunction,
 } from "../src/functions/crystallize.js";
-import type { Action, Crystal, MemoryProvider } from "../src/types.js";
+import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
+import { registerLessonsFunctions } from "../src/functions/lessons.js";
+import { KV } from "../src/state/schema.js";
+import type {
+  Action,
+  AuditEntry,
+  Crystal,
+  Lesson,
+  MemoryProvider,
+} from "../src/types.js";
 
-function mockKV() {
+function mockKV(jsonRoundTrip = false) {
   const store = new Map<string, Map<string, unknown>>();
+  const persistedValue = <T>(value: T): T => (
+    jsonRoundTrip ? JSON.parse(JSON.stringify(value)) as T : value
+  );
   return {
     get: async <T>(scope: string, key: string): Promise<T | null> => {
-      return (store.get(scope)?.get(key) as T) ?? null;
+      const value = store.get(scope)?.get(key) as T | undefined;
+      return value === undefined ? null : persistedValue(value);
     },
     set: async <T>(scope: string, key: string, data: T): Promise<T> => {
       if (!store.has(scope)) store.set(scope, new Map());
-      store.get(scope)!.set(key, data);
+      store.get(scope)!.set(key, persistedValue(data));
       return data;
     },
     delete: async (scope: string, key: string): Promise<void> => {
@@ -46,6 +59,7 @@ function mockSdk() {
       if (!fn) throw new Error(`No function: ${id}`);
       return fn(payload);
     },
+    getFunction: (id: string) => functions.get(id),
   };
 }
 
@@ -76,6 +90,27 @@ function makeAction(overrides: Partial<Action> & { id: string }): Action {
   };
 }
 
+async function seedRunningCrystalReceipt(
+  kv: ReturnType<typeof mockKV>,
+  payload: { runId: string; unitId: string; inputHash: string },
+): Promise<string> {
+  const identity = {
+    runId: payload.runId,
+    stage: "crystal" as const,
+    unitId: payload.unitId,
+    inputHash: payload.inputHash,
+  };
+  const key = buildExtractionOperationKey(identity);
+  await kv.set(KV.extractionOperationReceipt(key), key, {
+    ...identity,
+    key,
+    version: 1,
+    status: "running",
+    startedAt: "2026-07-29T00:00:00.000Z",
+  });
+  return key;
+}
+
 describe("Crystallize Functions", () => {
   let sdk: ReturnType<typeof mockSdk>;
   let kv: ReturnType<typeof mockKV>;
@@ -86,6 +121,7 @@ describe("Crystallize Functions", () => {
     kv = mockKV();
     delete process.env.AGENTMEMORY_OUTPUT_LANGUAGE;
     provider = mockProvider();
+    registerLessonsFunctions(sdk as never, kv as never);
     registerCrystallizeFunction(sdk as never, kv as never, provider);
   });
 
@@ -664,6 +700,547 @@ describe("Crystallize Functions", () => {
           error: expect.stringContaining("provider failed"),
         }),
       ]);
+    });
+
+    it("leaves a provider-failed crystal receipt running without formal effects", async () => {
+      (provider.summarize as ReturnType<typeof vi.fn>)
+        .mockRejectedValue(new Error("pi_stream_failed"));
+      const action = makeAction({
+        id: "act_crystal_provider_failure",
+        status: "done",
+        project: "provider-failure",
+      });
+      await kv.set(KV.actions, action.id, action);
+      const payload = {
+        groupId: "crystal-group:provider-failure",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        project: action.project,
+        runId: "crystal-provider-failure",
+        unitId: "crystal-group:provider-failure",
+        inputHash: "a".repeat(64),
+      };
+      const receiptKey = await seedRunningCrystalReceipt(kv, payload);
+      const runningReceipt = await kv.get(
+        KV.extractionOperationReceipt(receiptKey),
+        receiptKey,
+      );
+
+      const result = await sdk.trigger("mem::full-crystals-auto", payload);
+
+      expect(result).toMatchObject({
+        success: false,
+        groupCount: 1,
+        crystalIds: [],
+        groups: [
+          expect.objectContaining({
+            groupId: payload.groupId,
+            status: "failed",
+            crystalIds: [],
+            error: expect.stringContaining("pi_stream_failed"),
+          }),
+        ],
+      });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect(await kv.get(KV.extractionOperationReceipt(receiptKey), receiptKey))
+        .toEqual(runningReceipt);
+      expect(await kv.list(KV.crystals)).toEqual([]);
+      expect(await kv.list(KV.lessons)).toEqual([]);
+      expect(await kv.list(KV.audit)).toEqual([]);
+      expect(await kv.get<Action>(KV.actions, action.id)).toEqual(action);
+    });
+
+    it("replays one pinned full-stage operation without repeating provider work", async () => {
+      const action = makeAction({
+        id: "act_full_replay",
+        status: "done",
+        project: "replay",
+      });
+      await kv.set("mem:actions", action.id, action);
+      const payload = {
+        groupId: "crystal-group:replay",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        project: "replay",
+        runId: "run-crystal-replay",
+        unitId: "crystal-group:replay",
+        inputHash: "a".repeat(64),
+      };
+      const receiptKey = await seedRunningCrystalReceipt(kv, payload);
+
+      const first = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        crystalIds: string[];
+        crystalRecoveryEvidence: {
+          schema: string;
+          phase: string;
+          receiptKey: string;
+          receiptVersion: number;
+          resultRef: string;
+          effectHash: string;
+          identity: {
+            runId: string;
+            unitId: string;
+            inputHash: string;
+          };
+          group: {
+            groupId: string;
+            actionIds: string[];
+            actionUpdatedAts: string[];
+          };
+        };
+      };
+      const committedReceipt = await kv.get<Record<string, unknown>>(
+        KV.extractionOperationReceipt(receiptKey),
+        receiptKey,
+      );
+      await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
+        ...committedReceipt,
+        status: "succeeded",
+        completedAt: "2026-07-29T00:01:00.000Z",
+        response: { success: true, crystalIds: first.crystalIds },
+      });
+      const replayed = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        crystalIds: string[];
+        crystalRecoveryEvidence: typeof first.crystalRecoveryEvidence;
+      };
+
+      expect(first.success).toBe(true);
+      expect(replayed.success).toBe(true);
+      expect(replayed.crystalIds).toEqual(first.crystalIds);
+      expect(first.crystalRecoveryEvidence).toEqual({
+        schema: "crystal-recovery/v1",
+        phase: "committed",
+        receiptKey: expect.stringMatching(/^xop_[0-9a-f]{32}$/),
+        receiptVersion: 1,
+        resultRef: `crystal:${first.crystalIds[0]}`,
+        effectHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+        identity: {
+          runId: payload.runId,
+          unitId: payload.unitId,
+          inputHash: payload.inputHash,
+        },
+        group: {
+          groupId: payload.groupId,
+          actionIds: payload.actionIds,
+          actionUpdatedAts: payload.actionUpdatedAts,
+        },
+      });
+      expect(replayed.crystalRecoveryEvidence).toEqual(first.crystalRecoveryEvidence);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect(await kv.list<Crystal>("mem:crystals")).toHaveLength(1);
+      const audits = await kv.list<AuditEntry>(KV.audit);
+      const crystalAudits = audits.filter((audit) => audit.operation === "crystallize");
+      expect(crystalAudits).toEqual([
+        expect.objectContaining({
+          id: expect.stringMatching(/^aud_/),
+          timestamp: "2026-07-29T00:00:00.000Z",
+          functionId: "mem::crystallize",
+          targetIds: first.crystalIds,
+        }),
+      ]);
+      await kv.set(KV.audit, crystalAudits[0].id, {
+        ...crystalAudits[0],
+        details: { ...crystalAudits[0].details, actionIds: ["foreign-action"] },
+      });
+      const conflictingAudit = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        failure: { class: string; cause: string };
+      };
+      expect(conflictingAudit).toMatchObject({
+        success: false,
+        failure: {
+          class: "hard",
+          cause: "crystal_audit_conflict",
+        },
+      });
+      await kv.delete(KV.audit, crystalAudits[0].id);
+      const missingAudit = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        failure: { class: string; cause: string };
+      };
+      expect(missingAudit).toMatchObject({
+        success: false,
+        failure: {
+          class: "hard",
+          cause: "crystal_committed_audit_missing",
+        },
+      });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+    });
+
+    it("resumes a frozen crystal after a lesson commit failure", async () => {
+      const action = makeAction({
+        id: "act_full_resume",
+        status: "done",
+        project: "resume",
+      });
+      await kv.set("mem:actions", action.id, action);
+      let failLessonCommit = true;
+      const lessonSave = sdk.getFunction("mem::lesson-save")!;
+      sdk.registerFunction("mem::lesson-save", async (data: unknown) => {
+        if (failLessonCommit) {
+          failLessonCommit = false;
+          return { success: false, error: "lesson unavailable" };
+        }
+        return lessonSave(data);
+      });
+      const payload = {
+        groupId: "crystal-group:resume",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        project: "resume",
+        runId: "run-crystal-resume",
+        unitId: "crystal-group:resume",
+        inputHash: "b".repeat(64),
+      };
+      await seedRunningCrystalReceipt(kv, payload);
+
+      const failed = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+      };
+      expect(failed.success).toBe(false);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect(await kv.list<Crystal>("mem:crystals")).toHaveLength(1);
+      expect((await kv.get<Action>("mem:actions", action.id))?.crystallizedInto).toBeUndefined();
+
+      const resumed = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        crystalIds: string[];
+      };
+      expect(resumed.success).toBe(true);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect((await kv.get<Action>("mem:actions", action.id))?.crystallizedInto)
+        .toBe(resumed.crystalIds[0]);
+    });
+
+    it("persists the frozen recovery plan before effects and resumes without a second provider call", async () => {
+      const action = makeAction({
+        id: "act_full_stage_loss",
+        status: "done",
+        project: "stage-loss",
+      });
+      await kv.set(KV.actions, action.id, action);
+      const payload = {
+        groupId: "crystal-group:stage-loss",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        project: "stage-loss",
+        runId: "run-crystal-stage-loss",
+        unitId: "crystal-group:stage-loss",
+        inputHash: "c".repeat(64),
+      };
+      const receiptKey = await seedRunningCrystalReceipt(kv, payload);
+      const originalSet = kv.set;
+      let loseStagedResponse = true;
+      kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+        const persisted = await originalSet(scope, key, data);
+        const recovery = (data as { crystalRecovery?: { phase?: string } }).crystalRecovery;
+        if (loseStagedResponse && key === receiptKey && recovery?.phase === "staged") {
+          loseStagedResponse = false;
+          throw new Error("staged_response_lost");
+        }
+        return persisted;
+      };
+
+      const interrupted = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        retrySameIdentity?: boolean;
+      };
+      expect(interrupted).toMatchObject({ success: false, retrySameIdentity: true });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect(await kv.list<Crystal>(KV.crystals)).toEqual([]);
+      await expect(kv.get<Record<string, unknown>>(
+        KV.extractionOperationReceipt(receiptKey),
+        receiptKey,
+      )).resolves.toMatchObject({
+        status: "running",
+        crystalRecovery: {
+          schema: "crystal-recovery/v1",
+          phase: "staged",
+          identity: {
+            runId: payload.runId,
+            unitId: payload.unitId,
+            inputHash: payload.inputHash,
+          },
+          group: {
+            groupId: payload.groupId,
+            actionIds: payload.actionIds,
+            actionUpdatedAts: payload.actionUpdatedAts,
+          },
+          digest: {
+            narrative: "test",
+            lessons: ["learned"],
+          },
+          plan: {
+            crystal: { sourceActionIds: payload.actionIds },
+            lessons: [{
+              sourceMutationId: expect.stringMatching(/^crystal:.*:lesson:0$/),
+            }],
+            actions: [{
+              actionId: action.id,
+              expectedUpdatedAt: action.updatedAt,
+            }],
+            effectHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+          },
+        },
+      });
+
+      const resumed = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+      };
+      expect(resumed.success).toBe(true);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+    });
+
+    it("serializes crystal effect commits across different recovery identities", async () => {
+      provider.summarize = vi.fn().mockResolvedValue(
+        '{"narrative":"shared","keyOutcomes":["done"],"filesAffected":[],"lessons":[]}',
+      );
+      const action = makeAction({
+        id: "act_full_concurrent",
+        status: "done",
+        project: "concurrent",
+      });
+      await kv.set(KV.actions, action.id, action);
+      const payloads = [
+        {
+          groupId: "crystal-group:concurrent-a",
+          actionIds: [action.id],
+          actionUpdatedAts: [action.updatedAt],
+          project: "concurrent",
+          runId: "run-crystal-concurrent-a",
+          unitId: "crystal-group:concurrent-a",
+          inputHash: "a".repeat(64),
+        },
+        {
+          groupId: "crystal-group:concurrent-b",
+          actionIds: [action.id],
+          actionUpdatedAts: [action.updatedAt],
+          project: "concurrent",
+          runId: "run-crystal-concurrent-b",
+          unitId: "crystal-group:concurrent-b",
+          inputHash: "b".repeat(64),
+        },
+      ];
+      const receiptKeys = await Promise.all(
+        payloads.map((payload) => seedRunningCrystalReceipt(kv, payload)),
+      );
+      const originalSet = kv.set;
+      kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+        const persisted = await originalSet(scope, key, data);
+        const recovery = (data as { crystalRecovery?: { phase?: string } }).crystalRecovery;
+        if (recovery?.phase === "staged") {
+          throw new Error("staged response lost");
+        }
+        return persisted;
+      };
+      for (const payload of payloads) {
+        const staged = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+          success: boolean;
+          retrySameIdentity?: boolean;
+        };
+        expect(staged).toMatchObject({ success: false, retrySameIdentity: true });
+      }
+
+      let activeCrystalWrites = 0;
+      let maxConcurrentCrystalWrites = 0;
+      kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+        if (scope !== KV.crystals) return originalSet(scope, key, data);
+        activeCrystalWrites += 1;
+        maxConcurrentCrystalWrites = Math.max(
+          maxConcurrentCrystalWrites,
+          activeCrystalWrites,
+        );
+        try {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          return await originalSet(scope, key, data);
+        } finally {
+          activeCrystalWrites -= 1;
+        }
+      };
+      const results = await Promise.all(payloads.map((payload) =>
+        sdk.trigger("mem::full-crystals-auto", payload) as Promise<{
+          success: boolean;
+          failure?: { class: string; cause: string };
+        }>));
+
+      expect(maxConcurrentCrystalWrites).toBe(1);
+      expect(results.filter((result) => result.success)).toHaveLength(1);
+      expect(results.filter(
+        (result) => result.failure?.cause === "crystal_formal_effect_conflict",
+      )).toHaveLength(1);
+      const audits = (await kv.list<AuditEntry>(KV.audit))
+        .filter((audit) => audit.operation === "crystallize");
+      expect(audits).toHaveLength(1);
+      const receipts = await Promise.all(receiptKeys.map((key) =>
+        kv.get<{ crystalRecovery?: { phase?: string } }>(
+          KV.extractionOperationReceipt(key),
+          key,
+        )));
+      expect(receipts.filter(
+        (receipt) => receipt?.crystalRecovery?.phase === "committed",
+      )).toHaveLength(1);
+      expect(provider.summarize).toHaveBeenCalledTimes(2);
+    });
+
+    it("resumes a projectless frozen plan after JSON persistence drops undefined fields", async () => {
+      kv = mockKV(true);
+      sdk = mockSdk();
+      registerLessonsFunctions(sdk as never, kv as never);
+      registerCrystallizeFunction(sdk as never, kv as never, provider);
+      const action = makeAction({
+        id: "act_full_json_round_trip",
+        status: "done",
+        project: undefined,
+      });
+      await kv.set(KV.actions, action.id, action);
+      const payload = {
+        groupId: "crystal-group:json-round-trip",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        runId: "run-crystal-json-round-trip",
+        unitId: "crystal-group:json-round-trip",
+        inputHash: "d".repeat(64),
+      };
+      const receiptKey = await seedRunningCrystalReceipt(kv, payload);
+      const originalSet = kv.set;
+      let loseStagedResponse = true;
+      kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+        const persisted = await originalSet(scope, key, data);
+        const recovery = (data as { crystalRecovery?: { phase?: string } }).crystalRecovery;
+        if (loseStagedResponse && key === receiptKey && recovery?.phase === "staged") {
+          loseStagedResponse = false;
+          throw new Error("staged_response_lost");
+        }
+        return persisted;
+      };
+
+      const interrupted = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        retrySameIdentity?: boolean;
+      };
+      expect(interrupted).toMatchObject({ success: false, retrySameIdentity: true });
+
+      const resumed = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        crystalIds: string[];
+      };
+      expect(resumed.success).toBe(true);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      const crystal = await kv.get<Crystal>(KV.crystals, resumed.crystalIds[0]);
+      expect(crystal).not.toHaveProperty("sessionId");
+      expect(crystal).not.toHaveProperty("project");
+    });
+
+    it("re-verifies a committed plan and fills missing crystal, lesson, and action effects", async () => {
+      const action = makeAction({
+        id: "act_full_committed_gap",
+        status: "done",
+        project: "committed-gap",
+      });
+      await kv.set(KV.actions, action.id, action);
+      const payload = {
+        groupId: "crystal-group:committed-gap",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        project: "committed-gap",
+        runId: "run-crystal-committed-gap",
+        unitId: "crystal-group:committed-gap",
+        inputHash: "d".repeat(64),
+      };
+      await seedRunningCrystalReceipt(kv, payload);
+      const first = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        crystalIds: string[];
+      };
+      const [lesson] = await kv.list<Lesson>(KV.lessons);
+      expect(first.success).toBe(true);
+      await kv.delete(KV.crystals, first.crystalIds[0]);
+      await kv.delete(KV.lessons, lesson.id);
+      await kv.set(KV.actions, action.id, action);
+
+      const repaired = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        crystalIds: string[];
+      };
+      expect(repaired.success).toBe(true);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect(await kv.get<Crystal>(KV.crystals, first.crystalIds[0])).not.toBeNull();
+      expect((await kv.get<Lesson>(KV.lessons, lesson.id))
+        ?.sourceWatermarks?.[`crystal:${first.crystalIds[0]}:lesson:0`]?.mutationId)
+        .toBe(`crystal:${first.crystalIds[0]}:lesson:0`);
+      expect((await kv.get<Action>(KV.actions, action.id))?.crystallizedInto)
+        .toBe(first.crystalIds[0]);
+    });
+
+    it("fails closed when a committed crystal conflicts with the frozen plan", async () => {
+      const action = makeAction({
+        id: "act_full_committed_conflict",
+        status: "done",
+        project: "committed-conflict",
+      });
+      await kv.set(KV.actions, action.id, action);
+      const payload = {
+        groupId: "crystal-group:committed-conflict",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        project: "committed-conflict",
+        runId: "run-crystal-committed-conflict",
+        unitId: "crystal-group:committed-conflict",
+        inputHash: "e".repeat(64),
+      };
+      await seedRunningCrystalReceipt(kv, payload);
+      const first = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        crystalIds: string[];
+      };
+      const crystal = await kv.get<Crystal>(KV.crystals, first.crystalIds[0]);
+      await kv.set(KV.crystals, crystal!.id, { ...crystal!, narrative: "foreign edit" });
+
+      const conflicted = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+        failure: { class: string; cause: string };
+      };
+      expect(conflicted).toMatchObject({
+        success: false,
+        failure: { class: "hard", cause: "crystal_formal_effect_conflict" },
+      });
+      expect((await kv.get<Crystal>(KV.crystals, crystal!.id))?.narrative)
+        .toBe("foreign edit");
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not revive a derived lesson soft-deleted after the committed mutation", async () => {
+      const action = makeAction({
+        id: "act_full_soft_deleted_lesson",
+        status: "done",
+        project: "soft-deleted",
+      });
+      await kv.set(KV.actions, action.id, action);
+      const payload = {
+        groupId: "crystal-group:soft-deleted",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        project: "soft-deleted",
+        runId: "run-crystal-soft-deleted",
+        unitId: "crystal-group:soft-deleted",
+        inputHash: "f".repeat(64),
+      };
+      await seedRunningCrystalReceipt(kv, payload);
+      const first = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        crystalIds: string[];
+      };
+      const [lesson] = await kv.list<Lesson>(KV.lessons);
+      await kv.set(KV.lessons, lesson.id, { ...lesson, deleted: true });
+      await kv.set(KV.actions, action.id, action);
+
+      const replayed = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        success: boolean;
+      };
+      expect(replayed.success).toBe(true);
+      expect((await kv.get<Lesson>(KV.lessons, lesson.id))?.deleted).toBe(true);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
     });
 
     it("filters by project when specified", async () => {

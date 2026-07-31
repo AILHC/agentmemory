@@ -1,10 +1,20 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { adaptSummaryOperationEvidence } from './summary-recovery-adapter-v1.mjs';
+import {
+  adaptSummaryOperationEvidence as adaptSummaryOperationEvidenceFacts,
+} from './summary-recovery-adapter-v1.mjs';
+import { resolveOperationRecovery } from './recovery-policy-v1.mjs';
 
 const unit = { unit_id: 'session-1', input_hash: 'runner-input' };
 const attemptId = 'attempt-1';
 const operationId = 'session-1:reduce';
+
+function adaptSummaryOperationEvidence(args) {
+  return resolveOperationRecovery({
+    ...adaptSummaryOperationEvidenceFacts(args),
+    budget: args.budget || { attemptsUsed: 0, maxAttempts: 0 },
+  });
+}
 
 function summaryResult(overrides = {}) {
   const summary = {
@@ -27,7 +37,7 @@ function summaryResult(overrides = {}) {
         kind: 'committed',
         receiptKey: 'receipt-1',
         receiptVersion: 1,
-        resultRef: 'summary-resumable-runs:summary-run-1',
+        resultRef: 'mem:summary-resumable:runs:summary-run-1',
         effectHash: 'bbd7feb740b1c81ad54d8d8333eb4abed6859eaf2159363cd505d182a408ab47',
       },
       ...overrides,
@@ -78,6 +88,34 @@ test('successful and response-lost Summary results use committed replay evidence
   assert.equal(first.evidence.kind, 'committed');
   assert.equal(first.decision.action, 'replay');
   assert.match(first.evidence.effectHash, /^[0-9a-f]{64}$/);
+});
+
+test('Summary adapter reports facts without owning the recovery decision', () => {
+  const facts = adaptSummaryOperationEvidenceFacts({
+    result: summaryResult(),
+    unit,
+    attemptId,
+    operationId,
+  });
+  assert.equal(facts.candidateEvidence.kind, 'committed');
+  assert.equal('decision' in facts, false);
+  assert.equal('policyVersion' in facts, false);
+});
+
+test('Summary adapter rejects the legacy result reference namespace', () => {
+  const adapted = adaptSummaryOperationEvidence({
+    result: summaryResult({
+      recoveryEvidence: {
+        ...summaryResult().data.recoveryEvidence,
+        resultRef: 'summary-resumable-runs:summary-run-1',
+      },
+    }),
+    unit,
+    attemptId,
+    operationId,
+  });
+  assert.equal(adapted.evidence.kind, 'unknown');
+  assert.equal(adapted.decision.action, 'reconcile');
 });
 
 test('structured skipped and infeasible results preserve distinct business meaning', () => {

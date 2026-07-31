@@ -1,8 +1,4 @@
 import { createHash } from 'node:crypto';
-import {
-  RECOVERY_POLICY_VERSION,
-  decideRecovery,
-} from './recovery-policy-v1.mjs';
 
 function sortObject(value) {
   if (Array.isArray(value)) return value.map(sortObject);
@@ -57,10 +53,22 @@ function successfulEvidence({ data, unit, attemptId }) {
   const evidence = data.recoveryEvidence;
   if (
     evidence?.kind !== 'committed'
-    || evidence.resultRef !== `summary-resumable-runs:${data.resumableRunId}`
+    || evidence.resultRef !== `mem:summary-resumable:runs:${data.resumableRunId}`
     || evidence.effectHash !== hash(summaryFields(data.summary))
   ) return null;
-  return { evidence, effectVerification: 'all_applied' };
+  return {
+    evidence,
+    snapshot: {
+      receipt: {
+        key: evidence.receiptKey,
+        version: evidence.receiptVersion,
+        resultRef: evidence.resultRef,
+        effectHash: evidence.effectHash,
+        status: 'succeeded',
+      },
+    },
+    effectVerification: 'all_applied',
+  };
 }
 
 function noEffectEvidence({ data, observation }) {
@@ -69,7 +77,31 @@ function noEffectEvidence({ data, observation }) {
     evidence?.kind !== 'no_effect'
     || evidence.observation !== observation
   ) return null;
-  return { evidence };
+  let snapshot = {};
+  if (evidence.proof?.kind === 'receipt_before_formal_effect') {
+    snapshot = {
+      receipt: {
+        key: evidence.proof.receiptKey,
+        version: evidence.proof.receiptVersion,
+        phase: evidence.proof.phase,
+        commitPlanAbsent: true,
+        formalEffect: false,
+      },
+    };
+  } else if (evidence.proof?.kind === 'legacy_summary_before_final_write') {
+    snapshot = {
+      receipt: {
+        key: evidence.proof.receiptKey,
+        formalEffect: false,
+      },
+      summaryRun: {
+        id: evidence.proof.summaryRunId,
+        inputHash: evidence.proof.inputHash,
+        completedFinalWrites: evidence.proof.completedFinalWrites,
+      },
+    };
+  }
+  return { evidence, snapshot };
 }
 
 export function adaptSummaryOperationEvidence({
@@ -77,7 +109,6 @@ export function adaptSummaryOperationEvidence({
   unit,
   attemptId,
   operationId,
-  budget = { attemptsUsed: 0, maxAttempts: 0 },
 }) {
   const data = result?.data || result || {};
   let adapted;
@@ -134,18 +165,9 @@ export function adaptSummaryOperationEvidence({
     };
   }
 
-  const evidence = adapted.evidence;
-  const decision = decideRecovery({
-    policyVersion: RECOVERY_POLICY_VERSION,
-    evidence,
-    budget,
-    effectVerification: adapted.effectVerification,
-  });
   return {
-    policyVersion: RECOVERY_POLICY_VERSION,
-    evidence,
-    decision,
-    budget,
+    candidateEvidence: adapted.evidence,
+    snapshot: adapted.snapshot || {},
     ...(adapted.effectVerification
       ? { effectVerification: adapted.effectVerification }
       : {}),

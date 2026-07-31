@@ -4,7 +4,13 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { recordAudit, recordExtractionRunAudit, queryAudit } from "../src/functions/audit.js";
+import {
+  AUDIT_ENTRY_CONFLICT,
+  AUDIT_ENTRY_MISSING,
+  recordAudit,
+  recordExtractionRunAudit,
+  queryAudit,
+} from "../src/functions/audit.js";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -69,6 +75,78 @@ describe("Audit Functions", () => {
     expect(entry.details).toEqual({ count: 2 });
     expect(entry.qualityScore).toBe(0.85);
     expect(entry.userId).toBe("user-1");
+  });
+
+  it("reuses a matching deterministic audit entry", async () => {
+    const options = {
+      id: "aud_deterministic",
+      timestamp: "2026-07-30T00:00:00.000Z",
+    };
+    const first = await recordAudit(
+      kv as never,
+      "reflect",
+      "mem::reflect-insight-window",
+      ["ins_1"],
+      { newInsights: 1 },
+      undefined,
+      undefined,
+      options,
+    );
+    const second = await recordAudit(
+      kv as never,
+      "reflect",
+      "mem::reflect-insight-window",
+      ["ins_1"],
+      { newInsights: 1 },
+      undefined,
+      undefined,
+      { ...options, requireExisting: true },
+    );
+
+    expect(second).toEqual(first);
+    expect(await kv.list("mem:audit")).toEqual([first]);
+  });
+
+  it("fails closed for a conflicting or missing deterministic audit entry", async () => {
+    const options = {
+      id: "aud_guarded",
+      timestamp: "2026-07-30T00:00:00.000Z",
+    };
+    await recordAudit(
+      kv as never,
+      "consolidate",
+      "mem::consolidate-procedural-window",
+      ["proc_1"],
+      { patternsAnalyzed: 2 },
+      undefined,
+      undefined,
+      options,
+    );
+
+    await expect(recordAudit(
+      kv as never,
+      "consolidate",
+      "mem::consolidate-procedural-window",
+      ["proc_1"],
+      { patternsAnalyzed: 3 },
+      undefined,
+      undefined,
+      options,
+    )).rejects.toThrow(AUDIT_ENTRY_CONFLICT);
+    await expect(recordAudit(
+      kv as never,
+      "crystallize",
+      "mem::crystallize",
+      ["crys_1"],
+      {},
+      undefined,
+      undefined,
+      {
+        id: "aud_missing",
+        timestamp: options.timestamp,
+        requireExisting: true,
+      },
+    )).rejects.toThrow(AUDIT_ENTRY_MISSING);
   });
 
   it("queryAudit returns entries sorted by timestamp desc", async () => {

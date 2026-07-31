@@ -2,7 +2,10 @@ import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
 import { KV, fingerprintId } from "../state/schema.js";
 import type {
+  ExtractionOperationIdentity,
+  ExtractionOperationReceipt,
   Lesson,
+  LessonCommitPlan,
   LessonExtractionChunkRun,
   LessonExtractionRun,
   LessonExtractionCandidateStaging,
@@ -10,6 +13,7 @@ import type {
 } from "../types.js";
 import {
   enqueueLlmLessonExtractionRun,
+  inspectLlmLessonExtractionRun,
   listRunnableRuns,
   processLlmLessonExtractionRun,
   resolveLlmLessonExtractionRuntimeConfig,
@@ -19,6 +23,7 @@ import { recordAudit } from "./audit.js";
 import {
   completeModelOperationFromVerifiedResult,
   normalizeFailedExtractionOperationRetryAuthorization,
+  projectExtractionOperationReceiptAbsence,
   withExtractionOperationReceipt,
   type FailedExtractionOperationRetryAuthorization,
 } from "./extraction-operation-receipts.js";
@@ -219,6 +224,71 @@ function isExpiredRunningRun(run: LessonExtractionRun, now = new Date()): boolea
   return new Date(run.runningLeaseUntil).getTime() <= now.getTime();
 }
 
+export type LessonOperationResultState = "absent" | "present" | "drifted";
+
+export async function verifyLessonOperationResultState(
+  kv: StateKV,
+  identity: ExtractionOperationIdentity,
+  runnerInputHash: string,
+  now = new Date(),
+): Promise<LessonOperationResultState> {
+  const matchingRuns = (await kv.list<LessonExtractionRun>(KV.lessonExtractionRuns))
+    .filter((run) => (
+      run.sessionId === identity.unitId
+      && stableLessonOperationHash({
+        runnerInputHash,
+        serviceInputHash: run.inputHash,
+        configHash: run.configHash,
+      }) === identity.inputHash
+    ));
+  if (matchingRuns.length !== 1) return "drifted";
+
+  const run = matchingRuns[0];
+  const [stagedCandidates, commitPlans] = await Promise.all([
+    kv.list<LessonExtractionCandidateStaging>(KV.lessonExtractionCandidates(run.id)),
+    kv.list<LessonCommitPlan>(KV.lessonCommitPlans(run.id)),
+  ]);
+  if (
+    stagedCandidates.length > 0
+    || commitPlans.length > 0
+    || Boolean(run.candidateStagingId)
+    || run.createdLessonIds.length > 0
+    || run.replacedLessonIds.length > 0
+    || run.status === "succeeded"
+    || run.status === "skipped"
+  ) {
+    return "present";
+  }
+  if (
+    !Number.isSafeInteger(run.extractionGeneration)
+    || (run.extractionGeneration ?? 0) <= 0
+  ) {
+    return "drifted";
+  }
+  if (run.status === "running") {
+    return run.runningLeaseUntil && isExpiredRunningRun(run, now) ? "absent" : "drifted";
+  }
+  return ["pending", "retryable", "failed"].includes(run.status) ? "absent" : "drifted";
+}
+
+function lessonOperationReceiptProjection(
+  receipt: ExtractionOperationReceipt | undefined,
+  runnerInputHash: string,
+): Record<string, unknown> | undefined {
+  if (!receipt) return undefined;
+  return {
+    key: receipt.key,
+    version: receipt.version,
+    status: receipt.status,
+    runId: receipt.runId,
+    stage: receipt.stage,
+    unitId: receipt.unitId,
+    inputHash: receipt.inputHash,
+    runnerInputHash,
+    startedAt: receipt.startedAt,
+  };
+}
+
 export function registerLessonsFunctions(
   sdk: ISdk,
   kv: StateKV,
@@ -235,6 +305,13 @@ export function registerLessonsFunctions(
       origin?: Lesson["origin"];
       sourceIds?: string[];
       sourceRunId?: string;
+      sourceMutationId?: string;
+      sourceMutationPrecondition?: {
+        lessonId: string;
+        baselineKind: "absent" | "active" | "deleted";
+        baselineStateHash?: string;
+        predecessorMutationId?: string;
+      };
     }) => {
       if (!data.content?.trim()) {
         return { success: false, error: "content is required" };
@@ -251,11 +328,82 @@ export function registerLessonsFunctions(
       const fp = canonical?.id ?? legacy?.id ?? canonicalId;
       return withLessonKeyLock(fp, async () => {
       const existing = await kv.get<Lesson>(KV.lessons, fp);
+      const sourceMutationId = data.sourceMutationId?.trim();
+      const sourceMutationAlreadyApplied = Boolean(
+        sourceMutationId
+        && existing?.sourceWatermarks?.[sourceMutationId]?.mutationId === sourceMutationId,
+      );
+
+      if (existing && sourceMutationAlreadyApplied) {
+        return {
+          success: true,
+          action: "replayed",
+          lesson: existing,
+        };
+      }
+
+      const precondition = data.sourceMutationPrecondition;
+      if (precondition) {
+        const validPrecondition = Boolean(
+          sourceMutationId
+          && precondition.lessonId === fp
+          && ["absent", "active", "deleted"].includes(precondition.baselineKind)
+          && (
+            precondition.baselineKind === "absent"
+              ? precondition.baselineStateHash === undefined
+              : typeof precondition.baselineStateHash === "string"
+                && SHA256_HEX.test(precondition.baselineStateHash)
+          )
+          && (
+            precondition.predecessorMutationId === undefined
+            || (
+              typeof precondition.predecessorMutationId === "string"
+              && precondition.predecessorMutationId.length > 0
+            )
+          )
+        );
+        if (!validPrecondition) {
+          return { success: false, error: "lesson source mutation precondition invalid" };
+        }
+        if (precondition.predecessorMutationId) {
+          if (
+            !existing
+            || existing.deleted
+            || existing.sourceWatermarks?.[precondition.predecessorMutationId]?.mutationId
+              !== precondition.predecessorMutationId
+          ) {
+            return { success: false, error: "lesson source mutation precondition conflict" };
+          }
+        } else if (precondition.baselineKind === "absent") {
+          if (existing) {
+            return { success: false, error: "lesson source mutation precondition conflict" };
+          }
+        } else if (
+          !existing
+          || stableLessonOperationHash(existing) !== precondition.baselineStateHash
+          || (precondition.baselineKind === "active" && existing.deleted)
+          || (precondition.baselineKind === "deleted" && !existing.deleted)
+        ) {
+          return { success: false, error: "lesson source mutation precondition conflict" };
+        }
+      }
 
       if (existing && !existing.deleted) {
         reinforceLesson(existing);
         if (data.context && !existing.context) {
           existing.context = data.context;
+        }
+        existing.sourceIds = [
+          ...new Set([...(existing.sourceIds ?? []), ...(data.sourceIds ?? [])]),
+        ];
+        if (sourceMutationId) {
+          existing.sourceWatermarks = {
+            ...(existing.sourceWatermarks ?? {}),
+            [sourceMutationId]: {
+              generation: 1,
+              mutationId: sourceMutationId,
+            },
+          };
         }
         await kv.set(KV.lessons, existing.id, existing);
 
@@ -291,7 +439,15 @@ export function registerLessonsFunctions(
         origin: data.origin ?? existing?.origin,
         sourceRunId: data.sourceRunId ?? existing?.sourceRunId,
         sourceIds: [...new Set([...(existing?.sourceIds ?? []), ...(data.sourceIds ?? [])])],
-        sourceWatermarks: existing?.sourceWatermarks,
+        sourceWatermarks: sourceMutationId
+          ? {
+              ...(existing?.sourceWatermarks ?? {}),
+              [sourceMutationId]: {
+                generation: 1,
+                mutationId: sourceMutationId,
+              },
+            }
+          : existing?.sourceWatermarks,
         project: data.project ?? existing?.project,
         tags: [...new Set([...(existing?.tags ?? []), ...(data.tags ?? [])])],
         createdAt: existing?.createdAt ?? now,
@@ -326,6 +482,7 @@ export function registerLessonsFunctions(
       attemptId?: unknown;
       inputHash?: unknown;
       requireExistingReceipt?: unknown;
+      expectedReceiptInputHash?: unknown;
       failedReceiptRetryAuthorization?: unknown;
       failedLessonRunEvidence?: unknown;
     }) => {
@@ -339,6 +496,12 @@ export function registerLessonsFunctions(
       }
       const attemptId = typeof data.attemptId === "string" ? data.attemptId.trim() : "";
       const runnerInputHash = typeof data.inputHash === "string" ? data.inputHash.trim() : "";
+      const expectedReceiptInputHash = data.expectedReceiptInputHash === undefined
+        ? undefined
+        : typeof data.expectedReceiptInputHash === "string"
+          && /^[0-9a-f]{64}$/.test(data.expectedReceiptInputHash)
+          ? data.expectedReceiptInputHash
+          : null;
       if (Boolean(attemptId) !== Boolean(runnerInputHash)) {
         return {
           success: false,
@@ -357,6 +520,19 @@ export function registerLessonsFunctions(
         };
       }
       if (data.requireExistingReceipt === true && !attemptId) {
+        return {
+          success: false,
+          status: "failed",
+          failure: { class: "hard", cause: "invalid_extraction_operation_identity" },
+        };
+      }
+      if (
+        expectedReceiptInputHash === null
+        || (
+          expectedReceiptInputHash !== undefined
+          && (data.requireExistingReceipt === true || !attemptId)
+        )
+      ) {
         return {
           success: false,
           status: "failed",
@@ -415,16 +591,22 @@ export function registerLessonsFunctions(
       const now = new Date();
 
       for (const sessionId of sessionIds) {
-        const baseRun = await enqueueLlmLessonExtractionRun({
+        const inspection = await inspectLlmLessonExtractionRun({
           kv,
           sessionId,
-          missingOnly: missingOnly ?? true,
-          retryFailed: retryFailed ?? true,
-          force: force ?? false,
           config,
         });
 
         if (!attemptId) {
+          const baseRun = await enqueueLlmLessonExtractionRun({
+            kv,
+            sessionId,
+            missingOnly: missingOnly ?? true,
+            retryFailed: retryFailed ?? true,
+            force: force ?? false,
+            config,
+            inspection,
+          });
           if (
             baseRun.status === "pending" ||
             baseRun.status === "retryable" ||
@@ -443,15 +625,29 @@ export function registerLessonsFunctions(
           unitId: sessionId,
           inputHash: stableLessonOperationHash({
             runnerInputHash,
-            serviceInputHash: baseRun.inputHash,
-            configHash: baseRun.configHash,
+            serviceInputHash: inspection.inputHash,
+            configHash: inspection.configHash,
           }),
         };
+        if (
+          expectedReceiptInputHash !== undefined
+          && expectedReceiptInputHash !== receiptIdentity.inputHash
+        ) {
+          return {
+            success: false,
+            status: "failed",
+            failure: {
+              class: "hard",
+              cause: "extraction_operation_input_hash_drifted_after_absence",
+            },
+          };
+        }
         const legacyRetryAuthorized = failedReceiptRetryAuthorization
           && failedLessonRunEvidence
+          && inspection.existing
           ? await legacyLessonRetryEvidenceMatches(
             kv,
-            baseRun,
+            inspection.existing,
             receiptIdentity.inputHash,
             failedReceiptRetryAuthorization,
             failedLessonRunEvidence,
@@ -468,6 +664,15 @@ export function registerLessonsFunctions(
           };
         }
         const execute = async () => {
+          const baseRun = await enqueueLlmLessonExtractionRun({
+            kv,
+            sessionId,
+            missingOnly: missingOnly ?? true,
+            retryFailed: retryFailed ?? true,
+            force: force ?? false,
+            config,
+            inspection,
+          });
           if (baseRun.status === "running" && !isExpiredRunningRun(baseRun, now)) {
             throw new Error("lesson extraction is already running");
           }
@@ -501,6 +706,9 @@ export function registerLessonsFunctions(
           execute,
           {
             requireExisting: data.requireExistingReceipt === true,
+            ...(expectedReceiptInputHash
+              ? { expectedInputHash: expectedReceiptInputHash }
+              : {}),
             retryFailed: true,
             ...(failedReceiptRetryAuthorization
               ? { failedRetryAuthorization: failedReceiptRetryAuthorization }
@@ -510,22 +718,44 @@ export function registerLessonsFunctions(
         );
         if (
           operation.failure?.cause === "extraction_operation_reconciliation_required"
-          && (baseRun.status === "succeeded" || baseRun.status === "skipped")
+          && (
+            inspection.existing?.status === "succeeded"
+            || inspection.existing?.status === "skipped"
+          )
         ) {
           operation = await completeModelOperationFromVerifiedResult(
             kv,
             receiptIdentity,
-            { success: true, status: baseRun.status, runs: [baseRun] },
+            {
+              success: true,
+              status: inspection.existing.status,
+              runs: [inspection.existing],
+            },
+            { allowMissing: true },
           );
         }
         if (operation.failure) {
-          return { success: false, status: "failed", failure: operation.failure };
+          const operationReceipt = lessonOperationReceiptProjection(
+            operation.receipt,
+            runnerInputHash,
+          );
+          const operationReceiptAbsence = projectExtractionOperationReceiptAbsence(
+            operation.receiptAbsence,
+            runnerInputHash,
+          );
+          return {
+            success: false,
+            status: "failed",
+            failure: operation.failure,
+            ...(operationReceipt ? { operationReceipt } : {}),
+            ...(operationReceiptAbsence ? { operationReceiptAbsence } : {}),
+          };
         }
         const response = operation.response as { runs?: LessonExtractionRun[] } | undefined;
         const responseRun = response?.runs?.[0];
         const completedRun = await kv.get<LessonExtractionRun>(
           KV.lessonExtractionRuns,
-          baseRun.id,
+          responseRun?.id ?? inspection.runId,
         );
         if (!completedRun) {
           return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_run_missing" } };

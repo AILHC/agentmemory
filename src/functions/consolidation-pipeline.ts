@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { ISdk } from "iii-sdk";
 import type {
   SemanticMemory,
@@ -6,9 +7,11 @@ import type {
   Memory,
   MemoryProvider,
   MemoryProviderCallOptions,
+  ExtractionOperationReceipt,
 } from "../types.js";
-import { KV, generateId } from "../state/schema.js";
+import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type { StateKV } from "../state/kv.js";
+import { withKeyedLock } from "../state/keyed-mutex.js";
 import {
   SEMANTIC_MERGE_SYSTEM,
   buildSemanticMergePrompt,
@@ -24,7 +27,11 @@ import {
   parseFactResponse,
   type ParsedSemanticFact,
 } from "../prompts/facts.js";
-import { recordAudit } from "./audit.js";
+import {
+  AUDIT_ENTRY_CONFLICT,
+  AUDIT_ENTRY_MISSING,
+  recordAudit,
+} from "./audit.js";
 import {
   getConsolidationDecayDays,
   isConsolidationEnabled,
@@ -39,6 +46,7 @@ import {
   sortProviderCallTelemetry,
   type ProviderCallTelemetry,
 } from "../providers/provider-call-result.js";
+import { buildExtractionOperationKey } from "./extraction-operation-receipts.js";
 
 export interface ConsolidationProceduralWindow {
   windowId: string;
@@ -53,7 +61,69 @@ export interface ConsolidationProceduralWindowOptions {
   project?: string;
   maxItemsPerWindow?: number;
   model?: string;
+  recoveryIdentity?: { runId: string; unitId: string; inputHash: string };
 }
+
+const PROCEDURAL_RECOVERY_SCHEMA = "consolidation-procedural-recovery/v1";
+const PROCEDURAL_RECOVERY_COMMIT_LOCK =
+  "recovery-effect-commit:consolidation-procedural";
+const PROCEDURAL_RECOVERY_HARD_FAILURES = new Set([
+  "consolidation_procedural_recovery_identity_conflict",
+  "consolidation_procedural_recovery_receipt_unavailable",
+  "consolidation_procedural_source_mutation_conflict",
+  "consolidation_procedural_committed_result_missing",
+  "consolidation_procedural_committed_result_conflict",
+  "consolidation_procedural_audit_conflict",
+  "consolidation_procedural_committed_audit_missing",
+]);
+
+interface ProceduralRecoverySourcePattern {
+  memoryId: string;
+  content: string;
+  frequency: number;
+  updatedAt: string;
+}
+
+interface ProceduralRecoveryItem {
+  id: string;
+  name: string;
+  steps: string[];
+  triggerCondition: string;
+  action: "create" | "reinforce";
+  mutationId: string;
+  baselineUpdatedAt?: string;
+  baselineFrequency?: number;
+  baselineStrength?: number;
+}
+
+interface ProceduralRecoveryState {
+  schema: typeof PROCEDURAL_RECOVERY_SCHEMA;
+  identity: { runId: string; unitId: string; inputHash: string };
+  phase: "staged" | "committed";
+  sourcePatterns: ProceduralRecoverySourcePattern[];
+  promptChars: number;
+  items: ProceduralRecoveryItem[];
+  model: {
+    responseHash: string;
+    response: string;
+    telemetry: ProviderCallTelemetry[];
+    metadata: Record<string, unknown>;
+  };
+  result?: {
+    newProcedures: number;
+    patternsAnalyzed: number;
+    proceduralMemoryIds: string[];
+    auditId: string;
+  };
+}
+
+type RecoverableProceduralMemory = ProceduralMemory & {
+  sourceMutationWatermarks?: Record<string, string>;
+};
+
+type ProceduralRecoveryReceipt = ExtractionOperationReceipt<Record<string, unknown>> & {
+  proceduralRecovery?: ProceduralRecoveryState;
+};
 
 function hasChinese(input: string): boolean {
   return /[\u4e00-\u9fff]/.test(input);
@@ -130,6 +200,328 @@ export async function planConsolidationProceduralWindows(options: {
   }
 
   return { success: true, windows, totalPatterns: patterns.length };
+}
+
+function stableHash(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(Object.entries(item as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, normalize(child)]));
+  };
+  return createHash("sha256").update(JSON.stringify(normalize(value))).digest("hex");
+}
+
+function recoveryReceiptKey(
+  identity: NonNullable<ConsolidationProceduralWindowOptions["recoveryIdentity"]>,
+): string {
+  return buildExtractionOperationKey({
+    runId: identity.runId,
+    stage: "consolidation_procedural",
+    unitId: identity.unitId,
+  });
+}
+
+function sameRecoveryIdentity(
+  left: ProceduralRecoveryState["identity"],
+  right: NonNullable<ConsolidationProceduralWindowOptions["recoveryIdentity"]>,
+): boolean {
+  return left.runId === right.runId
+    && left.unitId === right.unitId
+    && left.inputHash === right.inputHash;
+}
+
+async function readProceduralRecovery(
+  kv: StateKV,
+  identity: NonNullable<ConsolidationProceduralWindowOptions["recoveryIdentity"]>,
+): Promise<{ receipt: ProceduralRecoveryReceipt; recovery: ProceduralRecoveryState } | null> {
+  const key = recoveryReceiptKey(identity);
+  const receipt = await kv.get<ProceduralRecoveryReceipt>(KV.extractionOperationReceipt(key), key);
+  const recovery = receipt?.proceduralRecovery;
+  if (!recovery) return null;
+  const validReceiptStatus = receipt.status === "running"
+    || (receipt.status === "succeeded" && recovery.phase === "committed");
+  if (
+    recovery.schema !== PROCEDURAL_RECOVERY_SCHEMA
+    || receipt.key !== key
+    || receipt.stage !== "consolidation_procedural"
+    || receipt.runId !== identity.runId
+    || receipt.unitId !== identity.unitId
+    || receipt.inputHash !== identity.inputHash
+    || !validReceiptStatus
+    || !sameRecoveryIdentity(recovery.identity, identity)
+    || !["staged", "committed"].includes(recovery.phase)
+  ) {
+    throw new Error("consolidation_procedural_recovery_identity_conflict");
+  }
+  return { receipt, recovery };
+}
+
+async function requireProceduralRecoveryReceipt(
+  kv: StateKV,
+  identity: NonNullable<ConsolidationProceduralWindowOptions["recoveryIdentity"]>,
+): Promise<ProceduralRecoveryReceipt> {
+  const key = recoveryReceiptKey(identity);
+  const receipt = await kv.get<ProceduralRecoveryReceipt>(KV.extractionOperationReceipt(key), key);
+  if (
+    !receipt
+    || receipt.status !== "running"
+    || receipt.stage !== "consolidation_procedural"
+    || receipt.runId !== identity.runId
+    || receipt.unitId !== identity.unitId
+    || receipt.inputHash !== identity.inputHash
+  ) {
+    throw new Error("consolidation_procedural_recovery_receipt_unavailable");
+  }
+  return receipt;
+}
+
+function parseProceduralRecoveryCandidates(response: string): Array<{
+  name: string;
+  steps: string[];
+  triggerCondition: string;
+}> {
+  const procRegex = /<procedure\s+name="([^"]+)"\s+trigger="([^"]+)">([\s\S]*?)<\/procedure>/g;
+  const candidates = new Map<string, { name: string; steps: string[]; triggerCondition: string }>();
+  let match: RegExpExecArray | null;
+  while ((match = procRegex.exec(response)) !== null) {
+    const steps: string[] = [];
+    const stepRegex = /<step>([^<]+)<\/step>/g;
+    let stepMatch: RegExpExecArray | null;
+    while ((stepMatch = stepRegex.exec(match[3])) !== null) steps.push(stepMatch[1].trim());
+    const name = match[1].trim();
+    const triggerCondition = match[2].trim();
+    if (!name || !triggerCondition) continue;
+    const candidate = { name, steps, triggerCondition };
+    candidates.set(name.toLowerCase(), candidate);
+  }
+  return [...candidates.values()];
+}
+
+async function stageProceduralRecovery(options: {
+  kv: StateKV;
+  identity: NonNullable<ConsolidationProceduralWindowOptions["recoveryIdentity"]>;
+  sourcePatterns: ProceduralRecoverySourcePattern[];
+  response: string;
+  promptChars: number;
+  telemetry: ProviderCallTelemetry[];
+  metadata: Record<string, unknown>;
+}): Promise<{ receipt: ProceduralRecoveryReceipt; recovery: ProceduralRecoveryState }> {
+  const existing = await readProceduralRecovery(options.kv, options.identity);
+  if (existing) return existing;
+  const receipt = await requireProceduralRecoveryReceipt(options.kv, options.identity);
+  const existingProcedures = await options.kv.list<RecoverableProceduralMemory>(KV.procedural);
+  const mutationSource = fingerprintId("cpmsrc", JSON.stringify(options.identity));
+  const items = parseProceduralRecoveryCandidates(options.response).map((candidate) => {
+    const existingProcedure = existingProcedures.find(
+      (procedure) => procedure.name.toLowerCase() === candidate.name.toLowerCase(),
+    );
+    const id = existingProcedure?.id ?? generateId("proc");
+    return {
+      ...candidate,
+      id,
+      action: existingProcedure ? "reinforce" as const : "create" as const,
+      mutationId: fingerprintId("cpmm", JSON.stringify([
+        mutationSource,
+        id,
+        stableHash(candidate),
+      ])),
+      ...(existingProcedure ? {
+        baselineUpdatedAt: existingProcedure.updatedAt,
+        baselineFrequency: existingProcedure.frequency,
+        baselineStrength: existingProcedure.strength,
+      } : {}),
+    };
+  });
+  const recovery: ProceduralRecoveryState = {
+    schema: PROCEDURAL_RECOVERY_SCHEMA,
+    identity: options.identity,
+    phase: "staged",
+    sourcePatterns: options.sourcePatterns,
+    promptChars: options.promptChars,
+    items,
+    model: {
+      responseHash: stableHash(options.response),
+      response: options.response,
+      telemetry: options.telemetry,
+      metadata: options.metadata,
+    },
+  };
+  const staged = { ...receipt, proceduralRecovery: recovery };
+  await options.kv.set(KV.extractionOperationReceipt(receipt.key), receipt.key, staged);
+  return { receipt: staged, recovery };
+}
+
+function proceduralMutationSource(identity: ProceduralRecoveryState["identity"]): string {
+  return fingerprintId("cpmsrc", JSON.stringify(identity));
+}
+
+function proceduralAuditId(recovery: ProceduralRecoveryState): string {
+  return fingerprintId("aud", JSON.stringify([
+    recoveryReceiptKey(recovery.identity),
+    stableHash(recovery.items.map((item) => [item.id, item.mutationId])),
+  ]));
+}
+
+async function recordProceduralRecoveryAudit(options: {
+  kv: StateKV;
+  receipt: ProceduralRecoveryReceipt;
+  recovery: ProceduralRecoveryState;
+  result: NonNullable<ProceduralRecoveryState["result"]>;
+  requireExisting: boolean;
+}): Promise<void> {
+  try {
+    await recordAudit(
+      options.kv,
+      "consolidate",
+      "mem::consolidate-procedural-window",
+      options.result.proceduralMemoryIds,
+      {
+        runId: options.recovery.identity.runId,
+        unitId: options.recovery.identity.unitId,
+        inputHash: options.recovery.identity.inputHash,
+        newProcedures: options.result.newProcedures,
+        patternsAnalyzed: options.result.patternsAnalyzed,
+      },
+      undefined,
+      undefined,
+      {
+        id: options.result.auditId,
+        timestamp: options.receipt.startedAt,
+        requireExisting: options.requireExisting,
+      },
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message === AUDIT_ENTRY_CONFLICT) {
+      throw new Error("consolidation_procedural_audit_conflict");
+    }
+    if (message === AUDIT_ENTRY_MISSING) {
+      throw new Error("consolidation_procedural_committed_audit_missing");
+    }
+    throw error;
+  }
+}
+
+type ProceduralRecoveryCommitOptions = {
+  kv: StateKV;
+  receipt: ProceduralRecoveryReceipt;
+  recovery: ProceduralRecoveryState;
+};
+
+async function commitProceduralRecovery(
+  options: ProceduralRecoveryCommitOptions,
+): Promise<ProceduralRecoveryState> {
+  return withKeyedLock(
+    PROCEDURAL_RECOVERY_COMMIT_LOCK,
+    () => commitProceduralRecoveryLocked(options),
+  );
+}
+
+async function commitProceduralRecoveryLocked(
+  options: ProceduralRecoveryCommitOptions,
+): Promise<ProceduralRecoveryState> {
+  const verifyingCommitted = options.recovery.phase === "committed";
+  if (verifyingCommitted && !options.recovery.result) {
+    throw new Error("consolidation_procedural_committed_result_missing");
+  }
+  const source = proceduralMutationSource(options.recovery.identity);
+  for (const item of options.recovery.items) {
+    const existing = await options.kv.get<RecoverableProceduralMemory>(KV.procedural, item.id);
+    const watermark = existing?.sourceMutationWatermarks?.[source];
+    if (verifyingCommitted) {
+      if (!existing || watermark !== item.mutationId) {
+        throw new Error("consolidation_procedural_source_mutation_conflict");
+      }
+      continue;
+    }
+    if (watermark === item.mutationId) continue;
+    if (watermark !== undefined) throw new Error("consolidation_procedural_source_mutation_conflict");
+    if (item.action === "create") {
+      if (existing) throw new Error("consolidation_procedural_source_mutation_conflict");
+      const now = new Date().toISOString();
+      const procedure: RecoverableProceduralMemory = {
+        id: item.id,
+        name: item.name,
+        steps: item.steps,
+        triggerCondition: item.triggerCondition,
+        frequency: 1,
+        sourceSessionIds: [],
+        strength: 0.5,
+        createdAt: now,
+        updatedAt: now,
+        sourceMutationWatermarks: { [source]: item.mutationId },
+      };
+      await options.kv.set(KV.procedural, procedure.id, procedure);
+      continue;
+    }
+    if (
+      !existing
+      || existing.updatedAt !== item.baselineUpdatedAt
+      || existing.frequency !== item.baselineFrequency
+      || existing.strength !== item.baselineStrength
+    ) throw new Error("consolidation_procedural_source_mutation_conflict");
+    existing.frequency++;
+    existing.strength = Math.min(1, existing.strength + 0.1);
+    existing.updatedAt = new Date().toISOString();
+    existing.sourceMutationWatermarks = {
+      ...existing.sourceMutationWatermarks,
+      [source]: item.mutationId,
+    };
+    await options.kv.set(KV.procedural, existing.id, existing);
+  }
+  const result = {
+    newProcedures: options.recovery.items.filter((item) => item.action === "create").length,
+    patternsAnalyzed: options.recovery.sourcePatterns.length,
+    proceduralMemoryIds: options.recovery.items.map((item) => item.id),
+    auditId: proceduralAuditId(options.recovery),
+  };
+  if (verifyingCommitted) {
+    if (stableHash(options.recovery.result) !== stableHash(result)) {
+      throw new Error("consolidation_procedural_committed_result_conflict");
+    }
+    await recordProceduralRecoveryAudit({
+      ...options,
+      result,
+      requireExisting: true,
+    });
+    return options.recovery;
+  }
+  await recordProceduralRecoveryAudit({
+    ...options,
+    result,
+    requireExisting: false,
+  });
+  const committed: ProceduralRecoveryState = {
+    ...options.recovery,
+    phase: "committed",
+    result,
+  };
+  const receipt = { ...options.receipt, proceduralRecovery: committed };
+  await options.kv.set(KV.extractionOperationReceipt(receipt.key), receipt.key, receipt);
+  return committed;
+}
+
+function proceduralRecoveryEvidence(
+  receipt: ProceduralRecoveryReceipt,
+  recovery: ProceduralRecoveryState,
+): Record<string, unknown> {
+  return {
+    schema: "consolidation-procedural-commit/v1",
+    kind: "committed",
+    receiptKey: receipt.key,
+    receiptVersion: receipt.version ?? 1,
+    resultRef: `procedural-recoveries:${recoveryReceiptKey(recovery.identity)}`,
+    effectHash: stableHash({
+      identity: recovery.identity,
+      sourcePatterns: recovery.sourcePatterns,
+      modelResponseHash: recovery.model.responseHash,
+      items: recovery.items.map((item) => [item.id, item.mutationId]),
+      result: recovery.result,
+    }),
+    identity: recovery.identity,
+  };
 }
 
 async function extractProceduralMemories(
@@ -227,8 +619,27 @@ export async function runConsolidationProceduralWindow(
   });
   try {
     resolveOutputLanguage();
-    if (!options.provider?.summarize) {
-      return { success: false, error: "provider.summarize is required", ...responseMetadata("failed") };
+    if (options.recoveryIdentity) {
+      const recovered = await readProceduralRecovery(options.kv, options.recoveryIdentity);
+      if (recovered) {
+        const committed = await commitProceduralRecovery({
+          kv: options.kv,
+          receipt: recovered.receipt,
+          recovery: recovered.recovery,
+        });
+        const persisted = committed.result!;
+        return {
+          success: true,
+          ...persisted,
+          inputHash: committed.identity.inputHash,
+          usedFallback: true,
+          ...committed.model.metadata,
+          promptChars: committed.promptChars,
+          telemetry: committed.model.telemetry,
+          parseFailures: persisted.proceduralMemoryIds.length > 0 ? 0 : 1,
+          proceduralRecoveryEvidence: proceduralRecoveryEvidence(recovered.receipt, committed),
+        };
+      }
     }
     const allMemories = await options.kv.list<Memory>(KV.memories);
     const selectedIds = new Set(options.memoryIds ?? []);
@@ -243,18 +654,91 @@ export async function runConsolidationProceduralWindow(
         content: m.content,
         frequency: m.sessionIds.length || 1,
       }));
+    const sourcePatterns = eligible
+      .slice(0, maxItems)
+      .map((memory) => ({
+        memoryId: memory.id,
+        content: memory.content,
+        frequency: memory.sessionIds.length || 1,
+        updatedAt: memory.updatedAt,
+      }));
 
     if (patterns.length < 2) {
+      const receipt = options.recoveryIdentity
+        ? await requireProceduralRecoveryReceipt(options.kv, options.recoveryIdentity)
+        : undefined;
       return {
         success: true,
         skipped: true,
         reason: "fewer than 2 recurring patterns",
         patternsAnalyzed: patterns.length,
         ...responseMetadata("skipped", { parseFailures: 0 }),
+        ...(receipt && options.recoveryIdentity ? {
+          inputHash: options.recoveryIdentity.inputHash,
+          proceduralRecoveryEvidence: {
+            kind: "no_effect",
+            observation: "business_empty",
+            reasonCode: "fewer_than_2_recurring_patterns",
+            identity: options.recoveryIdentity,
+            proof: {
+              kind: "receipt_before_formal_effect",
+              receiptKey: receipt.key,
+              receiptVersion: receipt.version ?? 1,
+              phase: "candidate_staging",
+              commitPlanAbsent: true,
+            },
+          },
+        } : {}),
       };
     }
 
     const promptChars = buildProceduralExtractionPrompt(patterns).length;
+    if (options.recoveryIdentity) {
+      if (!options.provider?.summarize) {
+        return { success: false, error: "provider.summarize is required", ...responseMetadata("failed") };
+      }
+      await requireProceduralRecoveryReceipt(options.kv, options.recoveryIdentity);
+      const prompt = buildProceduralExtractionPrompt(patterns);
+      const response = await callProviderWithTelemetry({
+        provider: options.provider,
+        operation: "summarize",
+        callRole: "window",
+        callIndex: 0,
+        systemPrompt: withOutputLanguagePolicy(PROCEDURAL_EXTRACTION_SYSTEM),
+        userPrompt: prompt,
+        callOptions: resolveStageModelCallOptions("procedural", options.model),
+        telemetry,
+      });
+      const staged = await stageProceduralRecovery({
+        kv: options.kv,
+        identity: options.recoveryIdentity,
+        sourcePatterns,
+        response,
+        promptChars,
+        telemetry: sortProviderCallTelemetry(telemetry),
+        metadata: responseMetadata("succeeded"),
+      });
+      const committed = await commitProceduralRecovery({
+        kv: options.kv,
+        receipt: staged.receipt,
+        recovery: staged.recovery,
+      });
+      const persisted = committed.result!;
+      return {
+        success: true,
+        ...persisted,
+        inputHash: committed.identity.inputHash,
+        usedFallback: true,
+        ...committed.model.metadata,
+        promptChars: committed.promptChars,
+        telemetry: committed.model.telemetry,
+        parseFailures: persisted.proceduralMemoryIds.length > 0 ? 0 : 1,
+        proceduralRecoveryEvidence: proceduralRecoveryEvidence(staged.receipt, committed),
+      };
+    }
+    if (!options.provider?.summarize) {
+      return { success: false, error: "provider.summarize is required", ...responseMetadata("failed") };
+    }
     const result = await extractProceduralMemories(
       options.kv,
       options.provider,
@@ -278,6 +762,14 @@ export async function runConsolidationProceduralWindow(
     }
     const msg = err instanceof Error ? err.message : String(err);
     logger.error("Full procedural extraction failed", { error: msg });
+    if (PROCEDURAL_RECOVERY_HARD_FAILURES.has(msg)) {
+      return {
+        success: false,
+        error: msg,
+        failure: { class: "hard", cause: msg },
+        ...responseMetadata("failed"),
+      };
+    }
     return { success: false, error: msg, ...responseMetadata("failed") };
   }
 }
@@ -300,6 +792,7 @@ export function registerConsolidationPipelineFunction(
       memoryIds?: string[];
       maxItemsPerWindow?: number;
       model?: string;
+      recoveryIdentity?: { runId: string; unitId: string; inputHash: string };
     }) =>
       runConsolidationProceduralWindow({ kv, provider, ...data }),
   );

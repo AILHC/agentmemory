@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 
 import { registerApiTriggers } from "../src/triggers/api.js";
+
+function stableHash(value: unknown): string {
+  const normalize = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(normalize);
+    if (!item || typeof item !== "object") return item;
+    return Object.fromEntries(Object.entries(item as Record<string, unknown>)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => [key, normalize(child)]));
+  };
+  return createHash("sha256").update(JSON.stringify(normalize(value))).digest("hex");
+}
 
 function mockSdk() {
   const functions = new Map<string, Function>();
@@ -63,29 +75,47 @@ describe("semantic rollup REST wrappers", () => {
     registerApiTriggers(sdk as never, mockKV() as never, "");
     const handler = sdk.getFunction("api::semantic-rollup");
 
+    const runnerInputHash = "d".repeat(64);
+    const sourceSummaryHashes = {
+      "ses-a": "a".repeat(64),
+      "ses-b": "b".repeat(64),
+    };
     const response = await handler({
       headers: {},
       body: {
         runId: " run-1 ",
         stage: "semantic_rollup",
         unitId: " win-1 ",
-        inputHash: " input-1 ",
+        inputHash: ` ${runnerInputHash} `,
         windowId: " win-1 ",
         mark: " full ",
         kind: "window",
         sessionIds: [" ses-a ", "ses-b", ""],
+        sourceSummaryHashes,
       },
     });
 
     expect(response.status_code).toBe(200);
+    const payload = {
+      runId: "run-1",
+      windowId: "win-1",
+      mark: "full",
+      kind: "window",
+      sessionIds: ["ses-a", "ses-b"],
+      sourceSummaryHashes,
+      runnerInputHash,
+    };
+    const receiptIdentity = {
+      runId: "run-1",
+      stage: "semantic_rollup",
+      unitId: "win-1",
+      inputHash: stableHash({ runnerInputHash, payload }),
+    };
     expect(sdk.trigger).toHaveBeenCalledWith({
       function_id: "mem::semantic-rollup",
       payload: {
-        runId: "run-1",
-        windowId: "win-1",
-        mark: "full",
-        kind: "window",
-        sessionIds: ["ses-a", "ses-b"],
+        ...payload,
+        recoveryIdentity: receiptIdentity,
       },
     });
   });

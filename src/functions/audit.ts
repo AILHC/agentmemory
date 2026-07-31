@@ -15,6 +15,14 @@ const EXTRACTION_AUDIT_STATE_KEY = "audit";
 const EXTRACTION_AUDIT_EVENT_KEY = "event";
 const EXTRACTION_AUDIT_PAGE_CAPACITY = 128;
 const EXTRACTION_AUDIT_MAX_EVENT_BYTES = 64 * 1024;
+export const AUDIT_ENTRY_CONFLICT = "audit_entry_conflict";
+export const AUDIT_ENTRY_MISSING = "audit_entry_missing";
+
+export interface RecordAuditOptions {
+  id?: string;
+  timestamp?: string;
+  requireExisting?: boolean;
+}
 
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
@@ -25,6 +33,10 @@ function stableJson(value: unknown): string {
       .join(",")}}`;
   }
   return JSON.stringify(value);
+}
+
+function stablePersistedJson(value: unknown): string {
+  return stableJson(JSON.parse(JSON.stringify(value)));
 }
 
 async function listExtractionAuditEntries(kv: StateKV): Promise<AuditEntry[]> {
@@ -99,19 +111,39 @@ export async function recordAudit(
   details: Record<string, unknown> = {},
   qualityScore?: number,
   userId?: string,
+  options: RecordAuditOptions = {},
 ): Promise<AuditEntry> {
   const entry: AuditEntry = {
-    id: generateId("aud"),
-    timestamp: new Date().toISOString(),
+    id: options.id ?? generateId("aud"),
+    timestamp: options.timestamp ?? new Date().toISOString(),
     operation,
-    userId,
     functionId,
     targetIds,
     details,
-    qualityScore,
+    ...(qualityScore === undefined ? {} : { qualityScore }),
+    ...(userId === undefined ? {} : { userId }),
   };
-  await kv.set(KV.audit, entry.id, entry);
-  return entry;
+  if (options.requireExisting && options.id === undefined) {
+    throw new Error(AUDIT_ENTRY_MISSING);
+  }
+  if (options.id === undefined) {
+    await kv.set(KV.audit, entry.id, entry);
+    return entry;
+  }
+  return withKeyedLock(`audit-entry:${entry.id}`, async () => {
+    const existing = await kv.get<AuditEntry>(KV.audit, entry.id);
+    if (existing) {
+      if (stablePersistedJson(existing) !== stablePersistedJson(entry)) {
+        throw new Error(AUDIT_ENTRY_CONFLICT);
+      }
+      return existing;
+    }
+    if (options.requireExisting) {
+      throw new Error(AUDIT_ENTRY_MISSING);
+    }
+    await kv.set(KV.audit, entry.id, entry);
+    return entry;
+  });
 }
 
 export async function safeAudit(

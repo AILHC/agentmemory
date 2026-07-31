@@ -44,7 +44,10 @@ import { registerContextFunction } from "./functions/context.js";
 import { registerSummarizeFunction } from "./functions/summarize.js";
 import { registerMigrateFunction } from "./functions/migrate.js";
 import { registerFileIndexFunction } from "./functions/file-index.js";
-import { registerConsolidateFunction } from "./functions/consolidate.js";
+import {
+  findMemoryConsolidationProposalResult,
+  registerConsolidateFunction,
+} from "./functions/consolidate.js";
 import { registerPatternsFunction } from "./functions/patterns.js";
 import { registerRememberFunction } from "./functions/remember.js";
 import { registerEvictFunction } from "./functions/evict.js";
@@ -82,11 +85,17 @@ import { registerDiagnosticsFunction } from "./functions/diagnostics.js";
 import { registerFacetsFunction } from "./functions/facets.js";
 import { registerVerifyFunction } from "./functions/verify.js";
 import { registerCascadeFunction } from "./functions/cascade.js";
-import { registerLessonsFunctions } from "./functions/lessons.js";
+import {
+  registerLessonsFunctions,
+  verifyLessonOperationResultState,
+} from "./functions/lessons.js";
 import { registerObsidianExportFunction } from "./functions/obsidian-export.js";
 import { registerReflectFunctions } from "./functions/reflect.js";
 import { registerWorkingMemoryFunctions } from "./functions/working-memory.js";
-import { registerSkillExtractFunctions } from "./functions/skill-extract.js";
+import {
+  findSkillPreparationResult,
+  registerSkillExtractFunctions,
+} from "./functions/skill-extract.js";
 import { registerSlidingWindowFunction } from "./functions/sliding-window.js";
 import { registerQueryExpansionFunction } from "./functions/query-expansion.js";
 import { registerTemporalGraphFunctions } from "./functions/temporal-graph.js";
@@ -322,7 +331,11 @@ async function main() {
   registerConsolidationPipelineFunction(sdk, kv, provider);
   registerSemanticRollupFunction(sdk, kv, provider);
   registerExtractionRunIndexFunction(sdk, kv);
-  registerExtractionOperationReceiptFunctions(sdk, kv);
+  registerExtractionOperationReceiptFunctions(sdk, kv, {
+    findMemoryProposal: findMemoryConsolidationProposalResult,
+    findSkillProposal: findSkillPreparationResult,
+    verifyLessonResult: verifyLessonOperationResultState,
+  });
   bootLog(`Consolidation pipeline: registered (CONSOLIDATION_ENABLED=${isConsolidationEnabled() ? "true" : "false"})`);
 
   if (isAutoCompressEnabled()) {

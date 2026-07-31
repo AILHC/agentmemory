@@ -53,11 +53,48 @@ function watermarkGeneration(lesson: Lesson, sessionId: string): number | undefi
     : undefined;
 }
 
+export function withLessonExtractionSessionLock<T>(
+  sessionId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return withKeyedLock(`lesson-extraction-generation:${sessionId}`, fn);
+}
+
+export async function assertLessonExtractionGenerationBinding(
+  kv: StateKV,
+  identity: { sessionId: string; runId: string; generation: number },
+): Promise<void> {
+  const registry = await kv.get<LessonExtractionGenerationRegistry>(
+    KV.lessonExtractionGeneration(identity.sessionId),
+    identity.sessionId,
+  );
+  if (!registry) return;
+  const run = await kv.get<LessonExtractionRun>(
+    KV.lessonExtractionRuns,
+    identity.runId,
+  );
+  const binding = registry.bindings[identity.runId];
+  if (
+    !registryIsConsistent(registry)
+    || registry.sessionId !== identity.sessionId
+    || !run
+    || run.sessionId !== identity.sessionId
+    || run.extractionGeneration !== identity.generation
+    || !binding
+    || binding.sessionId !== identity.sessionId
+    || binding.generation !== identity.generation
+    || binding.inputHash !== run.inputHash
+    || binding.configHash !== run.configHash
+  ) {
+    throw new LessonExtractionGenerationConflictError();
+  }
+}
+
 export async function bindLessonExtractionGeneration(
   kv: StateKV,
   suppliedRun: LessonExtractionRun,
 ): Promise<LessonExtractionRun> {
-  return withKeyedLock(`lesson-extraction-generation:${suppliedRun.sessionId}`, async () => {
+  return withLessonExtractionSessionLock(suppliedRun.sessionId, async () => {
     const persistedBefore = await kv.get<LessonExtractionRun>(KV.lessonExtractionRuns, suppliedRun.id);
     if (!persistedBefore || !sameRunIdentity(suppliedRun, persistedBefore)) {
       throw new LessonExtractionGenerationConflictError();

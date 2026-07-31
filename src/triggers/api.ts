@@ -52,6 +52,7 @@ import {
   buildExtractionOperationKey,
   completeModelOperationFromVerifiedResult,
   normalizeFailedExtractionOperationRetryAuthorization,
+  projectExtractionOperationReceiptAbsence,
   withExtractionOperationReceipt,
   withIdempotentCommitReceipt,
   type FailedExtractionOperationRetryAuthorization,
@@ -400,6 +401,11 @@ function parseOptionalStrictBoolean(value: unknown): boolean | undefined | null 
   return typeof value === "boolean" ? value : null;
 }
 
+function parseOptionalReceiptInputHash(value: unknown): string | undefined | null {
+  if (value === undefined || value === null) return undefined;
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value) ? value : null;
+}
+
 const allowedGraphBuildCreateKeys = new Set(["batchSize", "maxSessions"]);
 const allowedGraphBuildProcessKeys = new Set(["taskId", "maxBatches"]);
 const allowedSemanticRollupKeys = new Set([
@@ -412,8 +418,10 @@ const allowedSemanticRollupKeys = new Set([
   "kind",
   "sessionIds",
   "semanticMemoryIds",
+  "sourceSummaryHashes",
   "model",
   "requireExistingReceipt",
+  "expectedReceiptInputHash",
 ]);
 const extractionOperationIdentityKeys = ["runId", "stage", "unitId", "inputHash"] as const;
 const allowedFullSkillExtractKeys = new Set([
@@ -422,6 +430,7 @@ const allowedFullSkillExtractKeys = new Set([
   "model",
   "operationReceiptManaged",
   "requireExistingReceipt",
+  "expectedReceiptInputHash",
 ]);
 const allowedFullConsolidatePlanKeys = new Set([
   "project",
@@ -449,6 +458,7 @@ const allowedFullConsolidateWindowKeys = new Set([
   "minObservations",
   "model",
   "requireExistingReceipt",
+  "expectedReceiptInputHash",
 ]);
 const allowedFullConsolidateCommitKeys = new Set([
   ...extractionOperationIdentityKeys,
@@ -456,6 +466,8 @@ const allowedFullConsolidateCommitKeys = new Set([
   "proposalHash",
   "prepareRunId",
   "prepareInputHash",
+  "requireExistingReceipt",
+  "expectedReceiptInputHash",
 ]);
 const allowedFullProceduralPlanKeys = new Set(["project", "maxItemsPerWindow"]);
 const allowedFullProceduralWindowKeys = new Set([
@@ -466,6 +478,7 @@ const allowedFullProceduralWindowKeys = new Set([
   "maxItemsPerWindow",
   "model",
   "requireExistingReceipt",
+  "expectedReceiptInputHash",
 ]);
 const allowedFullReflectPlanKeys = new Set([
   "project",
@@ -485,6 +498,7 @@ const allowedFullReflectWindowKeys = new Set([
   "crystalIds",
   "model",
   "requireExistingReceipt",
+  "expectedReceiptInputHash",
 ]);
 const allowedFullCrystalAutoKeys = new Set([
   ...extractionOperationIdentityKeys,
@@ -496,6 +510,7 @@ const allowedFullCrystalAutoKeys = new Set([
   "actionIds",
   "actionUpdatedAts",
   "requireExistingReceipt",
+  "expectedReceiptInputHash",
 ]);
 const allowedExtractionRunRecordKeys = new Set([
   "runId",
@@ -535,31 +550,121 @@ function invalidExtractionOperationIdentityResponse(stage: ExtractionOperationSt
   };
 }
 
+function operationReceiptProjection(
+  receipt: ExtractionOperationReceipt | undefined,
+  runnerInputHash: string,
+): Record<string, unknown> | undefined {
+  if (!receipt) return undefined;
+  return {
+    key: receipt.key,
+    version: receipt.version,
+    status: receipt.status,
+    runId: receipt.runId,
+    stage: receipt.stage,
+    unitId: receipt.unitId,
+    inputHash: receipt.inputHash,
+    runnerInputHash,
+    startedAt: receipt.startedAt,
+  };
+}
+
+function isRunningOperationReceiptProjection(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const receipt = value as Record<string, unknown>;
+  return /^xop_[0-9a-f]{32}$/.test(String(receipt.key ?? ""))
+    && receipt.version === 1
+    && receipt.status === "running"
+    && typeof receipt.runId === "string"
+    && receipt.runId.length > 0
+    && typeof receipt.stage === "string"
+    && receipt.stage.length > 0
+    && typeof receipt.unitId === "string"
+    && receipt.unitId.length > 0
+    && /^[0-9a-f]{64}$/.test(String(receipt.inputHash ?? ""))
+    && typeof receipt.runnerInputHash === "string"
+    && receipt.runnerInputHash.length > 0
+    && typeof receipt.startedAt === "string"
+    && !Number.isNaN(Date.parse(receipt.startedAt));
+}
+
+function responseWithOperationReceipt<T>(
+  response: T,
+  receipt: ExtractionOperationReceipt | undefined,
+  runnerInputHash: string,
+): T {
+  if (!response || typeof response !== "object" || Array.isArray(response)) return response;
+  const operationReceipt = operationReceiptProjection(receipt, runnerInputHash);
+  return operationReceipt
+    ? { ...(response as Record<string, unknown>), operationReceipt } as T
+    : response;
+}
+
 async function executeExtractionOperation<T>(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
   execute: () => Promise<T>,
   requireExistingReceiptValue?: unknown,
+  expectedReceiptInputHashValue?: unknown,
+  runnerInputHash = identity.inputHash,
 ): Promise<Response> {
   const requireExistingReceipt = parseOptionalStrictBoolean(requireExistingReceiptValue);
-  if (requireExistingReceipt === null) {
+  const expectedReceiptInputHash = parseOptionalReceiptInputHash(expectedReceiptInputHashValue);
+  if (
+    requireExistingReceipt === null
+    || expectedReceiptInputHash === null
+    || (requireExistingReceipt === true && expectedReceiptInputHash !== undefined)
+  ) {
     return {
       status_code: 400,
-      body: { error: "requireExistingReceipt must be a boolean" },
+      body: {
+        error:
+          "requireExistingReceipt must be a boolean and expectedReceiptInputHash is only valid for a fresh retry",
+      },
     };
   }
   const result = await withExtractionOperationReceipt(
     kv,
     identity,
     execute,
-    { requireExisting: requireExistingReceipt === true },
+    {
+      requireExisting: requireExistingReceipt === true,
+      ...(expectedReceiptInputHash
+        ? { expectedInputHash: expectedReceiptInputHash }
+        : {}),
+    },
   );
   if (result.response !== undefined) {
-    return { status_code: 200, body: result.response };
+    return {
+      status_code: 200,
+      body: responseWithOperationReceipt(
+        result.response,
+        result.receipt,
+        runnerInputHash,
+      ),
+    };
   }
+  const operationReceipt = operationReceiptProjection(result.receipt, runnerInputHash);
+  const operationReceiptAbsence = projectExtractionOperationReceiptAbsence(
+    result.receiptAbsence,
+    runnerInputHash,
+  );
+  const reconciliationEvidence = operationReceiptAbsence
+    || (
+      requireExistingReceipt === true
+      && isRunningOperationReceiptProjection(operationReceipt)
+    );
   return {
-    status_code: result.failure?.class === "hard" ? 409 : 503,
-    body: { success: false, failure: result.failure },
+    status_code: reconciliationEvidence
+      ? 200
+      : result.failure?.class === "hard"
+        ? 409
+        : 503,
+    body: {
+      success: false,
+      failure: result.failure,
+      ...(operationReceipt ? { operationReceipt } : {}),
+      ...(operationReceiptAbsence ? { operationReceiptAbsence } : {}),
+    },
   };
 }
 
@@ -567,17 +672,68 @@ async function executeIdempotentCommitOperation<T>(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
   execute: () => Promise<T>,
+  requireExistingReceiptValue?: unknown,
+  expectedReceiptInputHashValue?: unknown,
+  runnerInputHash = identity.inputHash,
 ): Promise<Response> {
-  const result = await withIdempotentCommitReceipt(kv, identity, execute);
-  if (result.response !== undefined) {
-    return { status_code: 200, body: result.response };
+  const requireExistingReceipt = parseOptionalStrictBoolean(requireExistingReceiptValue);
+  const expectedReceiptInputHash = parseOptionalReceiptInputHash(expectedReceiptInputHashValue);
+  if (
+    requireExistingReceipt === null
+    || expectedReceiptInputHash === null
+    || (requireExistingReceipt === true && expectedReceiptInputHash !== undefined)
+  ) {
+    return {
+      status_code: 400,
+      body: {
+        error:
+          "requireExistingReceipt must be a boolean and expectedReceiptInputHash is only valid for a fresh retry",
+      },
+    };
   }
+  const result = await withIdempotentCommitReceipt(
+    kv,
+    identity,
+    execute,
+    {
+      requireExisting: requireExistingReceipt === true,
+      ...(expectedReceiptInputHash
+        ? { expectedInputHash: expectedReceiptInputHash }
+        : {}),
+    },
+  );
+  if (result.response !== undefined) {
+    return {
+      status_code: 200,
+      body: responseWithOperationReceipt(
+        result.response,
+        result.receipt,
+        runnerInputHash,
+      ),
+    };
+  }
+  const operationReceipt = operationReceiptProjection(result.receipt, runnerInputHash);
+  const operationReceiptAbsence = projectExtractionOperationReceiptAbsence(
+    result.receiptAbsence,
+    runnerInputHash,
+  );
+  const reconciliationEvidence = operationReceiptAbsence
+    || (
+      requireExistingReceipt === true
+      && isRunningOperationReceiptProjection(operationReceipt)
+    );
   return {
-    status_code: result.failure?.class === "hard" ? 409 : 503,
+    status_code: reconciliationEvidence
+      ? 200
+      : result.failure?.class === "hard"
+        ? 409
+        : 503,
     body: {
       success: false,
       failure: result.failure,
       ...(result.receipt?.status === "running" ? { retrySameIdentity: true } : {}),
+      ...(operationReceipt ? { operationReceipt } : {}),
+      ...(operationReceiptAbsence ? { operationReceiptAbsence } : {}),
     },
   };
 }
@@ -912,7 +1068,7 @@ export function registerApiTriggers(
           status_code: 400,
           body: {
             error:
-              "invalid semantic rollup payload: only runId, windowId, mark, kind, sessionIds, semanticMemoryIds, model are allowed",
+              "invalid semantic rollup payload: only operation identity, windowId, mark, kind, sessionIds, semanticMemoryIds, sourceSummaryHashes, model, and requireExistingReceipt are allowed",
           },
         };
       }
@@ -940,12 +1096,19 @@ export function registerApiTriggers(
       const semanticMemoryIds = body.semanticMemoryIds === undefined
         ? undefined
         : parseStringArray(body.semanticMemoryIds);
+      const sourceSummaryHashes = body.sourceSummaryHashes === undefined
+        ? undefined
+        : parseStringRecord(body.sourceSummaryHashes);
       const model = optionalModelString(body);
       if (model === null) return invalidModelResponse();
-      if (sessionIds === null || semanticMemoryIds === null) {
+      if (
+        sessionIds === null
+        || semanticMemoryIds === null
+        || sourceSummaryHashes === null
+      ) {
         return {
           status_code: 400,
-          body: { error: "sessionIds and semanticMemoryIds must be string arrays" },
+          body: { error: "sessionIds, semanticMemoryIds, and sourceSummaryHashes are invalid" },
         };
       }
       if (kind === "window" && (!sessionIds || sessionIds.length === 0)) {
@@ -957,19 +1120,35 @@ export function registerApiTriggers(
 
       const identity = extractionOperationIdentity(body, "semantic_rollup");
       if (!identity) return invalidExtractionOperationIdentityResponse("semantic_rollup");
+      if (
+        identity.unitId !== windowId
+        || !/^[0-9a-f]{64}$/.test(identity.inputHash)
+        || !sourceSummaryHashes
+        || Object.keys(sourceSummaryHashes).length !== sessionIds!.length
+        || sessionIds!.some((sessionId) =>
+          !/^[0-9a-f]{64}$/.test(sourceSummaryHashes[sessionId] ?? ""))
+      ) {
+        return {
+          status_code: 400,
+          body: { error: "semantic rollup source hashes and runner input identity must match the window" },
+        };
+      }
 
       const payload: Record<string, unknown> = { runId, windowId, mark, kind };
       if (sessionIds) payload.sessionIds = sessionIds;
       if (semanticMemoryIds) payload.semanticMemoryIds = semanticMemoryIds;
+      payload.sourceSummaryHashes = sourceSummaryHashes;
+      payload.runnerInputHash = identity.inputHash;
       if (model) payload.model = model;
       const receiptIdentity = {
         ...identity,
         inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
       };
+      payload.recoveryIdentity = receiptIdentity;
       return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
         function_id: "mem::semantic-rollup",
         payload,
-      }), body.requireExistingReceipt);
+      }), body.requireExistingReceipt, body.expectedReceiptInputHash, identity.inputHash);
     },
   );
   sdk.registerTrigger({
@@ -1016,7 +1195,7 @@ export function registerApiTriggers(
         ...bodyResult,
         proceduralMemoryIds: skillId ? [skillId] : [],
       };
-    }, body.requireExistingReceipt);
+    }, body.requireExistingReceipt, body.expectedReceiptInputHash);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1040,9 +1219,14 @@ export function registerApiTriggers(
     const model = optionalModelString(body);
     const operationReceiptManaged = parseOptionalBoolean(body.operationReceiptManaged);
     const requireExistingReceipt = parseOptionalStrictBoolean(body.requireExistingReceipt);
+    const expectedReceiptInputHash = parseOptionalReceiptInputHash(
+      body.expectedReceiptInputHash,
+    );
     if (
       !identity || !sessionId || model === null || operationReceiptManaged === null
       || requireExistingReceipt === null
+      || expectedReceiptInputHash === null
+      || (requireExistingReceipt === true && expectedReceiptInputHash !== undefined)
       || (operationReceiptManaged !== undefined && operationReceiptManaged !== true)
     ) {
       return { status_code: 400, body: { error: "invalid skill extract prepare identity or payload" } };
@@ -1053,8 +1237,9 @@ export function registerApiTriggers(
         identity,
         sessionId,
         ...(model ? { model } : {}),
-        ...(operationReceiptManaged ? { operationReceiptManaged: true } : {}),
+        operationReceiptManaged: true,
         ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+        ...(expectedReceiptInputHash ? { expectedReceiptInputHash } : {}),
       },
     });
     return { status_code: 200, body: result };
@@ -1128,7 +1313,7 @@ export function registerApiTriggers(
     return executeIdempotentCommitOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-skill-extract-commit",
       payload: { identity: prepareIdentity, preparedHandle, proposalHash },
-    }));
+    }), body.requireExistingReceipt, body.expectedReceiptInputHash);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1273,7 +1458,7 @@ export function registerApiTriggers(
     return executeExtractionOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-memory-consolidate-window",
       payload,
-    }), body.requireExistingReceipt);
+    }), body.requireExistingReceipt, body.expectedReceiptInputHash);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1331,11 +1516,29 @@ export function registerApiTriggers(
       KV.extractionOperationReceipt(receiptKey),
       receiptKey,
     );
-    if (receipt?.status === "running") {
+    const verifyPersistedProposal = receipt?.status === "running"
+      || (receipt?.status === "succeeded" && body.requireExistingReceipt === true);
+    if (verifyPersistedProposal) {
       const proposalResult = await findMemoryConsolidationProposalResult(kv, identity);
       if (proposalResult) {
         if (proposalResult.success === false) {
           return { status_code: 409, body: proposalResult };
+        }
+        if (
+          receipt?.status === "succeeded"
+          && (
+            receipt.response?.preparedHandle !== proposalResult.preparedHandle
+            || receipt.response?.proposalHash !== proposalResult.proposalHash
+            || receipt.response?.inputHash !== proposalResult.inputHash
+          )
+        ) {
+          return {
+            status_code: 409,
+            body: {
+              success: false,
+              failure: { class: "hard", cause: "extraction_operation_result_conflict" },
+            },
+          };
         }
         const reconciled = await completeModelOperationFromVerifiedResult(
           kv,
@@ -1350,11 +1553,34 @@ export function registerApiTriggers(
           body: { success: false, failure: reconciled.failure },
         };
       }
+      if (receipt?.status === "succeeded") {
+        if (
+          receipt.response?.success === true
+          && receipt.response?.status === "skipped"
+          && receipt.response?.consolidated === 0
+        ) {
+          return {
+            status_code: 200,
+            body: responseWithOperationReceipt(
+              receipt.response,
+              receipt,
+              identity.inputHash,
+            ),
+          };
+        }
+        return {
+          status_code: 409,
+          body: {
+            success: false,
+            failure: { class: "hard", cause: "memory_consolidate_proposal_missing" },
+          },
+        };
+      }
     }
     return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
       function_id: "mem::full-memory-consolidate-window-prepare",
       payload: { ...payload, operationReceiptManaged: true },
-    }), body.requireExistingReceipt);
+    }), body.requireExistingReceipt, body.expectedReceiptInputHash, identity.inputHash);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1425,7 +1651,7 @@ export function registerApiTriggers(
     return executeIdempotentCommitOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-memory-consolidate-window-commit",
       payload: { identity: prepareIdentity, preparedHandle, proposalHash },
-    }));
+    }), body.requireExistingReceipt, body.expectedReceiptInputHash);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1499,10 +1725,11 @@ export function registerApiTriggers(
       ...identity,
       inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
     };
+    payload.recoveryIdentity = receiptIdentity;
     return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
       function_id: "mem::full-consolidation-procedural-window",
       payload,
-    }), body.requireExistingReceipt);
+    }), body.requireExistingReceipt, body.expectedReceiptInputHash, identity.inputHash);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1596,10 +1823,11 @@ export function registerApiTriggers(
       ...identity,
       inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
     };
+    payload.recoveryIdentity = receiptIdentity;
     return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
       function_id: "mem::full-reflect-insight-window",
       payload,
-    }), body.requireExistingReceipt);
+    }), body.requireExistingReceipt, body.expectedReceiptInputHash, identity.inputHash);
   });
   sdk.registerTrigger({
     type: "http",
@@ -1682,10 +1910,30 @@ export function registerApiTriggers(
       ...identity,
       inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
     };
-    return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
-      function_id: "mem::full-crystals-auto",
-      payload,
-    }), body.requireExistingReceipt);
+    payload.runId = receiptIdentity.runId;
+    payload.unitId = receiptIdentity.unitId;
+    payload.inputHash = receiptIdentity.inputHash;
+    return executeIdempotentCommitOperation(
+      kv,
+      receiptIdentity,
+      async () => {
+        const result = await sdk.trigger({
+          function_id: "mem::full-crystals-auto",
+          payload,
+        }) as Record<string, unknown>;
+        if (result?.retrySameIdentity === true) {
+          throw new Error(
+            typeof result.error === "string"
+              ? result.error
+              : "crystal_commit_incomplete",
+          );
+        }
+        return result;
+      },
+      body.requireExistingReceipt,
+      body.expectedReceiptInputHash,
+      identity.inputHash,
+    );
   });
   sdk.registerTrigger({
     type: "http",
@@ -2261,10 +2509,11 @@ export function registerApiTriggers(
         sessionId: string;
         model?: string;
         attemptId?: string;
-        inputHash?: string;
-        operationUnitId?: string;
-        requireExistingReceipt?: boolean;
-        failedReceiptRetryAuthorization?: FailedExtractionOperationRetryAuthorization;
+         inputHash?: string;
+         operationUnitId?: string;
+         requireExistingReceipt?: boolean;
+         expectedReceiptInputHash?: string;
+         failedReceiptRetryAuthorization?: FailedExtractionOperationRetryAuthorization;
       }>,
     ): Promise<Response> => {
       const body = (req.body as Record<string, unknown>) || {};
@@ -2278,6 +2527,9 @@ export function registerApiTriggers(
       const inputHash = optionalNonEmptyString(body, "inputHash");
       const operationUnitId = optionalNonEmptyString(body, "operationUnitId");
       const requireExistingReceipt = parseOptionalStrictBoolean(body.requireExistingReceipt);
+      const expectedReceiptInputHash = parseOptionalReceiptInputHash(
+        body.expectedReceiptInputHash,
+      );
       const failedReceiptRetryAuthorization = parseFailedReceiptRetryAuthorization(
         body.failedReceiptRetryAuthorization,
       );
@@ -2307,9 +2559,14 @@ export function registerApiTriggers(
         || inputHash === null
         || operationUnitId === null
         || requireExistingReceipt === null
+        || expectedReceiptInputHash === null
         || Boolean(attemptId) !== Boolean(inputHash)
         || (requireExistingReceipt === true && !attemptId)
         || (requireExistingReceipt === true && !operationUnitId)
+        || (
+          expectedReceiptInputHash !== undefined
+          && (requireExistingReceipt === true || !attemptId || !operationUnitId)
+        )
       ) {
         return invalidExtractionOperationIdentityResponse("summary");
       }
@@ -2321,6 +2578,7 @@ export function registerApiTriggers(
           ...(attemptId ? { attemptId, inputHash } : {}),
           ...(operationUnitId ? { operationUnitId } : {}),
           ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+          ...(expectedReceiptInputHash ? { expectedReceiptInputHash } : {}),
           ...(failedReceiptRetryAuthorization
             ? { failedReceiptRetryAuthorization }
             : {}),
@@ -4912,6 +5170,7 @@ export function registerApiTriggers(
       "attemptId",
       "inputHash",
       "requireExistingReceipt",
+      "expectedReceiptInputHash",
       "failedReceiptRetryAuthorization",
       "failedLessonRunEvidence",
     ]);
@@ -4981,6 +5240,9 @@ export function registerApiTriggers(
     const attemptId = optionalNonEmptyString(body, "attemptId");
     const inputHash = optionalNonEmptyString(body, "inputHash");
     const requireExistingReceipt = parseOptionalStrictBoolean(body.requireExistingReceipt);
+    const expectedReceiptInputHash = parseOptionalReceiptInputHash(
+      body.expectedReceiptInputHash,
+    );
     const failedReceiptRetryAuthorization =
       body.failedReceiptRetryAuthorization === undefined
         ? undefined
@@ -4994,8 +5256,13 @@ export function registerApiTriggers(
       attemptId === null
       || inputHash === null
       || requireExistingReceipt === null
+      || expectedReceiptInputHash === null
       || Boolean(attemptId) !== Boolean(inputHash)
       || (requireExistingReceipt === true && !attemptId)
+      || (
+        expectedReceiptInputHash !== undefined
+        && (requireExistingReceipt === true || !attemptId)
+      )
       || failedReceiptRetryAuthorization === null
       || failedLessonRunEvidence === null
       || Boolean(failedReceiptRetryAuthorization) !== Boolean(failedLessonRunEvidence)
@@ -5046,6 +5313,7 @@ export function registerApiTriggers(
         attemptId,
         inputHash,
         ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+        ...(expectedReceiptInputHash ? { expectedReceiptInputHash } : {}),
         ...(failedReceiptRetryAuthorization
           ? { failedReceiptRetryAuthorization }
           : {}),
@@ -5054,10 +5322,21 @@ export function registerApiTriggers(
     }) as {
       success?: boolean;
       failure?: StageFailure;
+      operationReceipt?: Record<string, unknown>;
+      operationReceiptAbsence?: Record<string, unknown>;
     };
     if (result?.failure) {
+      const reconciliationEvidence = result.operationReceiptAbsence
+        || (
+          requireExistingReceipt === true
+          && isRunningOperationReceiptProjection(result.operationReceipt)
+        );
       return {
-        status_code: result.failure.class === "hard" ? 409 : 503,
+        status_code: reconciliationEvidence
+          ? 200
+          : result.failure.class === "hard"
+            ? 409
+            : 503,
         body: result,
       };
     }

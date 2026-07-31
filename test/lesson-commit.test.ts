@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { applySessionLessonDelta, buildSessionLessonDeltas, executeLessonCommitPlan, freezeLessonCommitPlan, reconcileLessonCommit } from "../src/functions/lesson-commit.js";
+import { applySessionLessonDelta, buildSessionLessonDeltas, executeLessonCommitPlan, freezeLessonCommitPlan, reconcileLessonCommit, withLessonKeyLock } from "../src/functions/lesson-commit.js";
 import { replaceSessionHeuristicLessons } from "../src/functions/lesson-extraction-runs.js";
 import { registerLessonsFunctions } from "../src/functions/lessons.js";
 import { KV, fingerprintId } from "../src/state/schema.js";
@@ -107,11 +107,13 @@ describe("lesson commit", () => {
     expect(lesson).toMatchObject({
       confidence: .9,
       reinforcements: 0,
-      sourceIds: [],
+      source: "llm",
+      origin: "llm-session-extraction",
+      sourceIds: ["session"],
       tags: ["old", "new"],
       project: "project-a",
       sourceRunId: "run",
-      deleted: true,
+      deleted: undefined,
       updatedAt: "2026-02-03T04:05:06.000Z",
     });
     const frozenResult = structuredClone(lesson);
@@ -169,21 +171,57 @@ describe("lesson commit", () => {
       candidate:{ content, context:"", confidence:.8, importance:.8, tags:["extracted"], evidence:"", source:"llm" },
     };
 
+    let releaseBlock!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      releaseBlock = resolve;
+    });
+    let lockEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      lockEntered = resolve;
+    });
+    const blocker = withLessonKeyLock(id, async () => {
+      lockEntered();
+      await blocked;
+    });
+    await entered;
+    const decayedPromise = sdk.trigger("mem::lesson-decay-sweep", {});
+    await new Promise((resolve) => setImmediate(resolve));
+    const replacedPromise = replaceSessionHeuristicLessons(kv as never, "session");
+    await new Promise((resolve) => setImmediate(resolve));
+    const appliedPromise = applySessionLessonDelta(kv as never, delta);
+    await new Promise((resolve) => setImmediate(resolve));
+    const manualPromise = sdk.trigger("mem::lesson-save", {
+      content,
+      context: "manual context",
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    const strengthenedPromise = sdk.trigger("mem::lesson-strengthen", { lessonId:id });
+    await new Promise((resolve) => setImmediate(resolve));
+    releaseBlock();
+    await blocker;
     const [manual, strengthened, decayed, replaced, applied] = await Promise.all([
-      sdk.trigger("mem::lesson-save", { content }),
-      sdk.trigger("mem::lesson-strengthen", { lessonId:id }),
-      sdk.trigger("mem::lesson-decay-sweep", {}),
-      replaceSessionHeuristicLessons(kv as never, "session"),
-      applySessionLessonDelta(kv as never, delta),
+      manualPromise,
+      strengthenedPromise,
+      decayedPromise,
+      replacedPromise,
+      appliedPromise,
     ]) as any[];
 
     expect(manual.success).toBe(true);
     expect(strengthened.success).toBe(true);
-    expect(decayed.success).toBe(true);
-    expect(Array.isArray(replaced)).toBe(true);
+    expect(decayed).toMatchObject({ success:true, decayed:0, softDeleted:1 });
+    expect(replaced).toEqual([id]);
     expect(applied).toBe("applied");
     expect(await kv.get<any>(KV.lessons, id)).toMatchObject({
+      context:"manual context",
+      source:"llm",
+      origin:"llm-session-extraction",
+      sourceIds:["session"],
       tags:expect.arrayContaining(["extracted"]),
+      reinforcements:3,
+      deleted:undefined,
+      lastDecayedAt:expect.any(String),
+      lastReinforcedAt:expect.any(String),
       sourceWatermarks:{ session:{ generation:2, mutationId:"extraction-mutation" } },
     });
   });

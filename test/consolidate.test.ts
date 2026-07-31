@@ -64,6 +64,45 @@ function observation(id: string, importance: number): CompressedObservation {
   };
 }
 
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right, "en"))
+    .filter(([, child]) => child !== undefined)
+    .map(([key, child]) => [key, canonical(child)]));
+}
+
+function stableStringify(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter((key) => record[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
+}
+
+function proposalHashFor(value: {
+  parsed: Record<string, unknown>;
+  sourceObservationIds: string[];
+  project?: string;
+  concept: string;
+}): string {
+  return createHash("sha256")
+    .update(stableStringify([
+      value.parsed,
+      value.sourceObservationIds,
+      value.project,
+      value.concept,
+    ]))
+    .digest("hex");
+}
+
 describe("consolidate full window helpers", () => {
   afterEach(() => {
     delete process.env.AGENTMEMORY_MEMORY_CONSOLIDATE_COMPRESS_TIMEOUT_MS;
@@ -86,8 +125,21 @@ describe("consolidate full window helpers", () => {
       identity.stage,
       identity.unitId,
     ]));
-    const proposalHash = "proposal-hash";
-    const handle = "mcph-handle";
+    const concept = "windows";
+    const sourceObservationIds = ["obs-1"];
+    const parsed = {
+      type: "workflow" as const,
+      title: "Stable workflow",
+      content: "Use a stable workflow.",
+      concepts: ["windows"],
+      files: [],
+      sessionIds: ["ses-1"],
+      strength: 8,
+      version: 1,
+      isLatest: true,
+    };
+    const proposalHash = proposalHashFor({ parsed, sourceObservationIds, concept });
+    const handle = fingerprintId("mcph", `${key}:${proposalHash}`);
     await kv.set(KV.memoryConsolidationProposal(key), key, {
       ...identity,
       key,
@@ -95,22 +147,14 @@ describe("consolidate full window helpers", () => {
       proposalHash,
       status: "prepared",
       preparedAt: "2026-07-18T00:00:00.000Z",
-      concept: "windows",
-      sourceObservationIds: ["obs-1"],
-      parsed: {
-        type: "workflow",
-        title: "Stable workflow",
-        content: "Use a stable workflow.",
-        concepts: ["windows"],
-        files: [],
-        sessionIds: ["ses-1"],
-        strength: 8,
-        version: 1,
-        isLatest: true,
-      },
+      concept,
+      sourceObservationIds,
+      parsed,
       totalObservations: 1,
       promptChars: 120,
     });
+    const staged = await kv.get<any>(KV.memoryConsolidationProposal(key), key);
+    await kv.set(KV.memoryConsolidationProposal(key), key, canonical(staged));
 
     const first = await commitMemoryConsolidationProposal({
       kv: kv as never,
@@ -150,6 +194,47 @@ describe("consolidate full window helpers", () => {
       success: false,
       failure: { class: "hard", cause: "proposal_identity_conflict" },
     });
+
+    const committedProposal = (await kv.get<any>(KV.memoryConsolidationProposal(key), key))!;
+    const intent = committedProposal.commitIntent;
+    const persistedAudit = await kv.get<any>(KV.audit, intent.auditId);
+    kv.store.get(KV.audit)!.delete(intent.auditId);
+    await expect(commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: handle,
+      proposalHash,
+    })).resolves.toMatchObject({
+      success: false,
+      failure: { class: "hard", cause: "memory_consolidate_committed_effect_missing" },
+    });
+    await kv.set(KV.audit, intent.auditId, persistedAudit);
+
+    const persistedMemory = await kv.get<any>(KV.memories, intent.resultId);
+    await kv.set(KV.memories, intent.resultId, { ...persistedMemory, title: "drifted" });
+    await expect(commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: handle,
+      proposalHash,
+    })).resolves.toMatchObject({
+      success: false,
+      failure: { class: "hard", cause: "memory_consolidate_committed_effect_conflict" },
+    });
+    await kv.set(KV.memories, intent.resultId, persistedMemory);
+    await kv.set(KV.memoryConsolidationProposal(key), key, {
+      ...committedProposal,
+      parsed: { ...committedProposal.parsed, content: "coordinated drift" },
+    });
+    await expect(commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: handle,
+      proposalHash,
+    })).resolves.toMatchObject({
+      success: false,
+      failure: { class: "hard", cause: "proposal_identity_conflict" },
+    });
   });
 
   it.each([
@@ -172,6 +257,21 @@ describe("consolidate full window helpers", () => {
       identity.unitId,
     ]));
     const parentId = "mem-parent";
+    const concept = "windows";
+    const sourceObservationIds = ["obs-1"];
+    const parsed = {
+      type: "workflow" as const,
+      title: "Stable workflow",
+      content: "New content.",
+      concepts: ["windows"],
+      files: [],
+      sessionIds: ["ses-1"],
+      strength: 8,
+      version: 1,
+      isLatest: true,
+    };
+    const proposalHash = proposalHashFor({ parsed, sourceObservationIds, concept });
+    const handle = fingerprintId("mcph", `${key}:${proposalHash}`);
     await kv.set(KV.memories, parentId, {
       id: parentId,
       type: "workflow",
@@ -190,23 +290,13 @@ describe("consolidate full window helpers", () => {
     await kv.set(KV.memoryConsolidationProposal(key), key, {
       ...identity,
       key,
-      handle: "mcph-handle",
-      proposalHash: "proposal-hash",
+      handle,
+      proposalHash,
       status: "prepared",
       preparedAt: "2026-07-18T00:00:00.000Z",
-      concept: "windows",
-      sourceObservationIds: ["obs-1"],
-      parsed: {
-        type: "workflow",
-        title: "Stable workflow",
-        content: "New content.",
-        concepts: ["windows"],
-        files: [],
-        sessionIds: ["ses-1"],
-        strength: 8,
-        version: 1,
-        isLatest: true,
-      },
+      concept,
+      sourceObservationIds,
+      parsed,
       totalObservations: 1,
       promptChars: 120,
     });
@@ -242,8 +332,8 @@ describe("consolidate full window helpers", () => {
     const commit = () => commitMemoryConsolidationProposal({
       kv: kv as never,
       identity,
-      preparedHandle: "mcph-handle",
-      proposalHash: "proposal-hash",
+      preparedHandle: handle,
+      proposalHash,
     });
     await expect(commit()).rejects.toThrow(`interrupted after ${faultPoint}`);
     await expect(commit()).resolves.toMatchObject({
@@ -272,8 +362,21 @@ describe("consolidate full window helpers", () => {
       identity.stage,
       identity.unitId,
     ]));
-    const proposalHash = "proposal-hash";
-    const handle = "mcph-handle";
+    const concept = "windows";
+    const sourceObservationIds = ["obs-1"];
+    const parsed = {
+      type: "workflow" as const,
+      title: "Stable workflow",
+      content: "New content.",
+      concepts: ["windows"],
+      files: [],
+      sessionIds: ["ses-1"],
+      strength: 8,
+      version: 1,
+      isLatest: true,
+    };
+    const proposalHash = proposalHashFor({ parsed, sourceObservationIds, concept });
+    const handle = fingerprintId("mcph", `${key}:${proposalHash}`);
     const parentId = "mem-parent";
     const preparedProposal = {
       ...identity,
@@ -282,19 +385,9 @@ describe("consolidate full window helpers", () => {
       proposalHash,
       status: "prepared" as const,
       preparedAt: "2026-07-18T00:00:00.000Z",
-      concept: "windows",
-      sourceObservationIds: ["obs-1"],
-      parsed: {
-        type: "workflow" as const,
-        title: "Stable workflow",
-        content: "New content.",
-        concepts: ["windows"],
-        files: [],
-        sessionIds: ["ses-1"],
-        strength: 8,
-        version: 1,
-        isLatest: true,
-      },
+      concept,
+      sourceObservationIds,
+      parsed,
       totalObservations: 1,
       promptChars: 120,
     };
@@ -358,6 +451,26 @@ describe("consolidate full window helpers", () => {
     expect((await kv.list<any>(KV.audit))[0].id).toBe(
       fingerprintId("aud", JSON.stringify([key, proposalHash])),
     );
+    await kv.set(KV.memories, parentId, { ...persistedParent, isLatest: true });
+    await expect(commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: handle,
+      proposalHash,
+    })).resolves.toMatchObject({
+      success: false,
+      failure: { class: "hard", cause: "memory_consolidate_committed_effect_conflict" },
+    });
+    kv.store.get(KV.memories)!.delete(parentId);
+    await expect(commitMemoryConsolidationProposal({
+      kv: kv as never,
+      identity,
+      preparedHandle: handle,
+      proposalHash,
+    })).resolves.toMatchObject({
+      success: false,
+      failure: { class: "hard", cause: "memory_consolidate_committed_effect_missing" },
+    });
   });
 
   it("prepares once, replays the same handle, and rejects a server-recomputed hash conflict", async () => {

@@ -120,6 +120,20 @@ function stableHash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
+function stableStringify(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(",")}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record)
+    .sort()
+    .filter((key) => record[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`)
+    .join(",")}}`;
+}
+
 function modelOptionsFromMemoryConsolidate(model?: string): MemoryProviderCallOptions | undefined {
   return resolveStageModelCallOptions("memory_consolidate", model);
 }
@@ -877,6 +891,131 @@ function proposalResponse(proposal: MemoryConsolidationProposal): Record<string,
   };
 }
 
+function committedMemoryFailure(cause: string): Record<string, unknown> {
+  return {
+    success: false,
+    status: "failed",
+    failure: { class: "hard", cause },
+  };
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+function memoryProposalHash(proposal: Pick<
+  MemoryConsolidationProposal,
+  "parsed" | "sourceObservationIds" | "project" | "concept"
+>): string {
+  return createHash("sha256")
+    .update(stableStringify([
+      proposal.parsed,
+      proposal.sourceObservationIds,
+      proposal.project,
+      proposal.concept,
+    ]))
+    .digest("hex");
+}
+
+async function verifyCommittedMemoryProposal(
+  kv: StateKV,
+  proposal: MemoryConsolidationProposal,
+): Promise<Record<string, unknown> | null> {
+  const intent = proposal.commitIntent;
+  const response = proposal.response;
+  if (!intent || !response) {
+    return committedMemoryFailure("memory_consolidate_committed_effect_missing");
+  }
+  const [memory, audit, parent] = await Promise.all([
+    kv.get<Memory>(KV.memories, intent.resultId),
+    kv.get<AuditEntry>(KV.audit, intent.auditId),
+    intent.parentId
+      ? kv.get<Memory>(KV.memories, intent.parentId)
+      : Promise.resolve(null),
+  ]);
+  if (!memory || !audit || (intent.parentId && !parent)) {
+    return committedMemoryFailure("memory_consolidate_committed_effect_missing");
+  }
+  const expectedAction = intent.parentId ? "evolved" : "created";
+  const expectedAuditOperation = intent.parentId ? "evolve" : "remember";
+  const expectedAuditAction = intent.parentId ? "evolve_memory" : "create_memory";
+  const parsed = proposal.parsed;
+  const stableFieldsMatch = (
+    memory.id === intent.resultId
+    && memory.createdAt === intent.createdAt
+    && memory.type === parsed.type
+    && memory.title === parsed.title
+    && memory.content === parsed.content
+    && memory.strength === parsed.strength
+    && sameJsonValue(memory.concepts, parsed.concepts)
+    && sameJsonValue(memory.files, parsed.files)
+    && sameJsonValue(memory.sessionIds, parsed.sessionIds)
+    && sameJsonValue(memory.sourceObservationIds, proposal.sourceObservationIds)
+    && memory.project === proposal.project
+    && memory.parentId === intent.parentId
+    && (
+      intent.parentId
+        ? (
+          parent?.isLatest === false
+          && memory.version === (parent.version || 1) + 1
+          && sameJsonValue(memory.supersedes, [intent.parentId, ...(parent.supersedes || [])])
+        )
+        : (
+          memory.version === 1
+          && (memory.supersedes === undefined || sameJsonValue(memory.supersedes, []))
+        )
+    )
+  );
+  const auditDetails = audit.details as Record<string, unknown> | undefined;
+  const auditMatches = (
+    audit.id === intent.auditId
+    && audit.timestamp === intent.createdAt
+    && audit.operation === expectedAuditOperation
+    && audit.functionId === "mem::full-memory-consolidate-window-commit"
+    && sameJsonValue(audit.targetIds, [intent.resultId])
+    && auditDetails?.action === expectedAuditAction
+    && auditDetails?.newId === intent.resultId
+    && auditDetails?.concept === proposal.concept
+    && (
+      intent.parentId
+        ? auditDetails?.oldId === intent.parentId
+        : auditDetails?.oldId === undefined
+    )
+  );
+  const responseMatches = (
+    response.success === true
+    && response.status === "succeeded"
+    && response.memoryId === intent.resultId
+    && sameJsonValue(response.memoryIds, [intent.resultId])
+    && response.action === expectedAction
+    && response.parentId === intent.parentId
+  );
+  return stableFieldsMatch && auditMatches && responseMatches
+    ? null
+    : committedMemoryFailure("memory_consolidate_committed_effect_conflict");
+}
+
+function memoryDomainEffectEvidence(
+  proposal: MemoryConsolidationProposal,
+): Record<string, unknown> {
+  const intent = proposal.commitIntent!;
+  return {
+    schema: "memory-consolidate-domain-effect/v1",
+    proposalHash: proposal.proposalHash,
+    resultId: intent.resultId,
+    auditId: intent.auditId,
+    effectHash: createHash("sha256")
+      .update(JSON.stringify([
+        proposal.key,
+        proposal.proposalHash,
+        intent.resultId,
+        intent.auditId,
+        intent.createdAt,
+      ]))
+      .digest("hex"),
+  };
+}
+
 export async function findMemoryConsolidationProposalResult(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
@@ -892,6 +1031,17 @@ export async function findMemoryConsolidationProposalResult(
       status: "failed",
       failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
     };
+  }
+  const expectedHash = memoryProposalHash(proposal);
+  if (
+    proposal.key !== proposalKey(identity)
+    || proposal.runId !== identity.runId
+    || proposal.stage !== identity.stage
+    || proposal.unitId !== identity.unitId
+    || proposal.proposalHash !== expectedHash
+    || proposal.handle !== fingerprintId("mcph", `${proposal.key}:${expectedHash}`)
+  ) {
+    return committedMemoryFailure("proposal_identity_conflict");
   }
   return proposalResponse(proposal);
 }
@@ -918,11 +1068,25 @@ async function storeMemoryConsolidationProposal(
         failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
       };
     }
+    const expectedHash = memoryProposalHash(existing);
+    if (
+      existing.key !== key
+      || existing.runId !== identity.runId
+      || existing.stage !== identity.stage
+      || existing.unitId !== identity.unitId
+      || existing.proposalHash !== expectedHash
+      || existing.handle !== fingerprintId("mcph", `${key}:${expectedHash}`)
+    ) {
+      return committedMemoryFailure("proposal_identity_conflict");
+    }
     return proposalResponse(existing);
   }
-  const proposalHash = createHash("sha256")
-    .update(JSON.stringify([parsed, sourceObservationIds, options.project, concept]))
-    .digest("hex");
+  const proposalHash = memoryProposalHash({
+    parsed,
+    sourceObservationIds,
+    project: options.project,
+    concept,
+  });
   const proposal: MemoryConsolidationProposal = {
     ...identity,
     key,
@@ -957,15 +1121,27 @@ export async function commitMemoryConsolidationProposal(options: {
     if (!proposal) {
       return { success: false, status: "failed", failure: { class: "hard", cause: "proposal_not_found" } };
     }
+    const expectedProposalHash = memoryProposalHash(proposal);
     if (
-      proposal.inputHash !== options.identity.inputHash
+      proposal.key !== key
+      || proposal.runId !== options.identity.runId
+      || proposal.unitId !== options.identity.unitId
+      || proposal.inputHash !== options.identity.inputHash
       || proposal.handle !== options.preparedHandle
+      || proposal.proposalHash !== expectedProposalHash
+      || proposal.handle !== fingerprintId("mcph", `${key}:${expectedProposalHash}`)
       || (options.proposalHash !== undefined && proposal.proposalHash !== options.proposalHash)
       || proposal.stage !== "memory_consolidate"
     ) {
       return { success: false, status: "failed", failure: { class: "hard", cause: "proposal_identity_conflict" } };
     }
-    if (proposal.status === "committed" && proposal.response) return proposalResponse(proposal);
+    if (proposal.status === "committed") {
+      return await verifyCommittedMemoryProposal(options.kv, proposal)
+        ?? {
+          ...proposalResponse(proposal),
+          domainEffectEvidence: memoryDomainEffectEvidence(proposal),
+        };
+    }
 
     const deterministicResultId = fingerprintId(
       "mem",
@@ -1054,7 +1230,11 @@ export async function commitMemoryConsolidationProposal(options: {
       ...(evolvedParentId ? { parentId: evolvedParentId } : {}),
     };
     await options.kv.set(KV.memoryConsolidationProposal(key), key, proposal);
-    return proposalResponse(proposal);
+    return await verifyCommittedMemoryProposal(options.kv, proposal)
+      ?? {
+        ...proposalResponse(proposal),
+        domainEffectEvidence: memoryDomainEffectEvidence(proposal),
+      };
   });
 }
 

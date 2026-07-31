@@ -39,6 +39,7 @@ export interface EnqueueLlmLessonExtractionRunInput {
   retryFailed?: boolean;
   force?: boolean;
   config: LlmLessonExtractionRuntimeConfig;
+  inspection?: LlmLessonExtractionRunInspection;
 }
 
 export interface ProcessLlmLessonExtractionRunInput {
@@ -46,6 +47,15 @@ export interface ProcessLlmLessonExtractionRunInput {
   provider: MemoryProvider;
   runId: string;
   attemptId?: string;
+}
+
+export interface LlmLessonExtractionRunInspection {
+  sessionId: string;
+  session: Session | null;
+  inputHash: string;
+  configHash: string;
+  runId: string;
+  existing: LessonExtractionRun | null;
 }
 
 export function stableStringify(value: unknown): string {
@@ -103,6 +113,27 @@ export function runIdForSession(
   configHash: string,
 ): string {
   return fingerprintId("lex", `${sessionId}:${inputHash}:${configHash}`);
+}
+
+export async function inspectLlmLessonExtractionRun(
+  input: Pick<EnqueueLlmLessonExtractionRunInput, "kv" | "sessionId" | "config">,
+): Promise<LlmLessonExtractionRunInspection> {
+  const { kv, sessionId, config } = input;
+  const [session, observations] = await Promise.all([
+    kv.get<Session>(KV.sessions, sessionId),
+    kv.list<RawObservation>(KV.observations(sessionId)),
+  ]);
+  const inputHash = computeLessonExtractionInputHash(observations);
+  const configHash = computeLessonExtractionConfigHash(config);
+  const runId = runIdForSession(sessionId, inputHash, configHash);
+  return {
+    sessionId,
+    session,
+    inputHash,
+    configHash,
+    runId,
+    existing: await kv.get<LessonExtractionRun>(KV.lessonExtractionRuns, runId),
+  };
 }
 
 function parsePositiveInt(value: unknown, fallback: number): number {
@@ -266,14 +297,33 @@ export async function replaceSessionHeuristicLessons(
 export async function enqueueLlmLessonExtractionRun(
   input: EnqueueLlmLessonExtractionRunInput,
 ): Promise<LessonExtractionRun> {
-  const { kv, sessionId, missingOnly = false, retryFailed = false, force = false, config } = input;
+  const {
+    kv,
+    sessionId,
+    missingOnly = false,
+    retryFailed = false,
+    force = false,
+    config,
+  } = input;
   const now = new Date().toISOString();
-  const session = await kv.get<Session>(KV.sessions, sessionId);
-  const observations = await kv.list<RawObservation>(KV.observations(sessionId));
-  const inputHash = computeLessonExtractionInputHash(observations);
-  const configHash = computeLessonExtractionConfigHash(config);
-  const runId = runIdForSession(sessionId, inputHash, configHash);
-  const existing = await kv.get<LessonExtractionRun>(KV.lessonExtractionRuns, runId);
+  const inspection = input.inspection
+    ?? await inspectLlmLessonExtractionRun({ kv, sessionId, config });
+  const expectedConfigHash = computeLessonExtractionConfigHash(config);
+  if (
+    inspection.sessionId !== sessionId
+    || inspection.configHash !== expectedConfigHash
+    || inspection.runId
+      !== runIdForSession(sessionId, inspection.inputHash, inspection.configHash)
+  ) {
+    throw new LessonExtractionGenerationConflictError();
+  }
+  const {
+    session,
+    inputHash,
+    configHash,
+    runId,
+    existing,
+  } = inspection;
 
   if (!session) {
     const skipped: LessonExtractionRun = {
@@ -376,6 +426,16 @@ export async function processLlmLessonExtractionRun(
     });
   }
 
+  const [session, observations] = await Promise.all([
+    kv.get<Session>(KV.sessions, run.sessionId),
+    kv.list<RawObservation>(KV.observations(run.sessionId)),
+  ]);
+  if (
+    !session
+    || computeLessonExtractionInputHash(observations) !== run.inputHash
+  ) {
+    throw new LessonExtractionGenerationConflictError();
+  }
   const now = new Date();
   const runningPatch = await saveRunStatus(kv, run, "running", {
     attempts: run.attempts + 1,
@@ -383,16 +443,6 @@ export async function processLlmLessonExtractionRun(
     startedAt: run.startedAt ?? now.toISOString(),
     lastError: undefined,
   });
-
-  const session = await kv.get<Session>(KV.sessions, run.sessionId);
-  if (!session) {
-    return saveRunStatus(kv, runningPatch, "retryable", {
-      lastError: `session ${run.sessionId} not found`,
-      status: "retryable",
-    });
-  }
-
-  const observations = await kv.list<RawObservation>(KV.observations(run.sessionId));
   const { extractLlmLessonsFromObservations } = await import("./lesson-extract.js");
   const extraction = await extractLlmLessonsFromObservations({
     kv,

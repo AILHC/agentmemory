@@ -23,10 +23,13 @@ import { withKeyedLock } from "../state/keyed-mutex.js";
 import {
   buildExtractionOperationKey,
   completeModelOperationFromVerifiedResult,
+  createExtractionOperationReceiptAbsence,
   EXTRACTION_OPERATION_RECEIPT_VERSION,
   ExtractionOperationResultUncertainError,
   normalizeFailedExtractionOperationRetryAuthorization,
+  projectExtractionOperationReceiptAbsence,
   withExtractionOperationReceipt,
+  type ExtractionOperationReceiptAbsenceProjection,
   type FailedExtractionOperationRetryAuthorization,
 } from "./extraction-operation-receipts.js";
 import {
@@ -262,6 +265,20 @@ type ResumableSummaryResponse = {
   failure?: StageFailure;
   telemetry?: ProviderCallTelemetry[];
   recoveryEvidence?: SummaryRecoveryEvidence;
+  operationReceipt?: SummaryOperationReceiptProjection;
+  operationReceiptAbsence?: ExtractionOperationReceiptAbsenceProjection;
+};
+
+type SummaryOperationReceiptProjection = {
+  key: string;
+  version?: number;
+  status: ExtractionOperationReceipt["status"];
+  runId: string;
+  stage: "summary";
+  unitId: string;
+  inputHash: string;
+  runnerInputHash: string;
+  startedAt: string;
 };
 
 type SummaryRecoveryEvidence =
@@ -1055,6 +1072,8 @@ function resumableResponse(
     resumableRunId?: string;
     operationUnitId?: string;
     recoveryEvidence?: SummaryRecoveryEvidence;
+    operationReceipt?: SummaryOperationReceiptProjection;
+    operationReceiptAbsence?: ExtractionOperationReceiptAbsenceProjection;
   } = {},
 ): ResumableSummaryResponse {
   const failure = options.failure
@@ -1080,11 +1099,33 @@ function resumableResponse(
     ...(options.error ? { error: options.error } : {}),
     ...(options.operationUnitId ? { operationUnitId: options.operationUnitId } : {}),
     ...(options.recoveryEvidence ? { recoveryEvidence: options.recoveryEvidence } : {}),
+    ...(options.operationReceipt ? { operationReceipt: options.operationReceipt } : {}),
+    ...(options.operationReceiptAbsence
+      ? { operationReceiptAbsence: options.operationReceiptAbsence }
+      : {}),
     ...(options.failureCause ? { failureCause: options.failureCause } : {}),
     ...(failure ? { failure } : {}),
     ...(options.telemetry
       ? { telemetry: sortProviderCallTelemetry(options.telemetry) }
       : {}),
+  };
+}
+
+function summaryOperationReceiptProjection(
+  receipt: ExtractionOperationReceipt | undefined,
+  runnerInputHash: string,
+): SummaryOperationReceiptProjection | undefined {
+  if (!receipt || receipt.stage !== "summary") return undefined;
+  return {
+    key: receipt.key,
+    ...(receipt.version ? { version: receipt.version } : {}),
+    status: receipt.status,
+    runId: receipt.runId,
+    stage: "summary",
+    unitId: receipt.unitId,
+    inputHash: receipt.inputHash,
+    runnerInputHash,
+    startedAt: receipt.startedAt,
   };
 }
 
@@ -1229,6 +1270,7 @@ async function bindSucceededSummaryReuseReceipt(
   runnerInputHash: string,
   modelOperationInputHash: string,
   requireExisting: boolean,
+  expectedReceiptInputHash?: string,
   operationUnitId?: string,
 ): Promise<
   | {
@@ -1257,7 +1299,12 @@ async function bindSucceededSummaryReuseReceipt(
       status: "succeeded",
       resultRef,
     }),
-    { requireExisting },
+    {
+      requireExisting,
+      ...(expectedReceiptInputHash
+        ? { expectedInputHash: expectedReceiptInputHash }
+        : {}),
+    },
   );
   if (
     receipt.failure?.cause === "extraction_operation_reconciliation_required"
@@ -1272,6 +1319,7 @@ async function bindSucceededSummaryReuseReceipt(
         inputHash: modelOperationInputHash,
       },
       { success: true, status: "succeeded", resultRef },
+      { allowMissing: true },
     );
   }
   if (receipt.failure) return { failure: receipt.failure };
@@ -1364,6 +1412,7 @@ async function runResumableSummaryStep(
     inputHash?: string;
     operationUnitId?: string;
     requireExistingReceipt?: boolean;
+    expectedReceiptInputHash?: string;
     failedReceiptRetryAuthorization?: FailedExtractionOperationRetryAuthorization;
   } | undefined,
   kv: StateKV,
@@ -1381,6 +1430,12 @@ async function runResumableSummaryStep(
   const operationUnitId = typeof data.operationUnitId === "string"
     ? data.operationUnitId.trim()
     : "";
+  const expectedReceiptInputHash = data.expectedReceiptInputHash === undefined
+    ? undefined
+    : typeof data.expectedReceiptInputHash === "string"
+      && /^[0-9a-f]{64}$/.test(data.expectedReceiptInputHash)
+      ? data.expectedReceiptInputHash
+      : null;
   const failedReceiptRetryAuthorization = data.failedReceiptRetryAuthorization === undefined
     ? undefined
     : normalizeFailedExtractionOperationRetryAuthorization(
@@ -1407,6 +1462,11 @@ async function runResumableSummaryStep(
     )
     || (data.requireExistingReceipt === true && !attemptId)
     || (data.requireExistingReceipt === true && !operationUnitId)
+    || expectedReceiptInputHash === null
+    || (
+      expectedReceiptInputHash !== undefined
+      && (data.requireExistingReceipt === true || !attemptId || !operationUnitId)
+    )
   ) {
     return resumableResponse("failed", 0, 0, 0, {
       error: "attemptId and inputHash must be provided together",
@@ -1809,6 +1869,7 @@ async function runResumableSummaryStep(
             externalInputHash,
             modelOperationInputHash,
             data.requireExistingReceipt === true,
+            expectedReceiptInputHash,
             operationUnitId || undefined,
           );
           if ("failure" in reuse) {
@@ -1964,19 +2025,50 @@ async function runResumableSummaryStep(
           inputHash: modelOperationInputHash,
         };
         const key = buildExtractionOperationKey(identity);
-        const receipt = await kv.get<ExtractionOperationReceipt<Record<string, unknown>>>(
+        let receipt = await kv.get<ExtractionOperationReceipt<Record<string, unknown>>>(
           KV.extractionOperationReceipt(key),
           key,
         );
+        const partial = partialByIndex.get(requestedMapIndex);
         if (!receipt) {
-          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
-            error: "extraction_operation_reconciliation_required",
-            failure: {
-              class: "transient_runtime",
-              cause: "extraction_operation_reconciliation_required",
-            },
-            telemetry,
-          });
+          if (partial?.status === "completed" && partial.summary) {
+            const resultRef = {
+              scope: KV.summaryResumablePartials(runId),
+              key: String(requestedMapIndex),
+              chunkIndex: requestedMapIndex,
+            };
+            const completed = await completeModelOperationFromVerifiedResult(
+              kv,
+              identity,
+              { success: true, status: "succeeded", resultRef },
+              { allowMissing: true },
+            );
+            if (completed.failure || !completed.receipt) {
+              return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+                error: completed.failure?.cause ?? "extraction_operation_reconciliation_required",
+                failure: completed.failure ?? {
+                  class: "transient_runtime",
+                  cause: "extraction_operation_reconciliation_required",
+                },
+                telemetry,
+              });
+            }
+            receipt = completed.receipt;
+          } else {
+            const operationReceiptAbsence = projectExtractionOperationReceiptAbsence(
+              createExtractionOperationReceiptAbsence(identity),
+              data.inputHash,
+            );
+            return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+              error: "extraction_operation_reconciliation_required",
+              failure: {
+                class: "transient_runtime",
+                cause: "extraction_operation_reconciliation_required",
+              },
+              telemetry,
+              operationReceiptAbsence,
+            });
+          }
         }
         if (receipt.inputHash !== modelOperationInputHash) {
           return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
@@ -1999,8 +2091,8 @@ async function runResumableSummaryStep(
             telemetry,
           });
         }
-        const partial = partialByIndex.get(requestedMapIndex);
         if (partial?.status !== "completed" || !partial.summary) {
+          const operationReceipt = summaryOperationReceiptProjection(receipt, data.inputHash);
           return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
             error: "extraction_operation_reconciliation_required",
             failure: {
@@ -2008,6 +2100,7 @@ async function runResumableSummaryStep(
               cause: "extraction_operation_reconciliation_required",
             },
             telemetry,
+            ...(operationReceipt ? { operationReceipt } : {}),
           });
         }
         const resultRef = {
@@ -2021,6 +2114,7 @@ async function runResumableSummaryStep(
             kv,
             identity,
             { success: true, status: "succeeded", resultRef },
+            { allowMissing: true },
           );
           if (completed.failure) {
             return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
@@ -2169,7 +2263,12 @@ async function runResumableSummaryStep(
                 },
               };
             },
-            { requireExisting: data.requireExistingReceipt === true },
+            {
+              requireExisting: data.requireExistingReceipt === true,
+              ...(expectedReceiptInputHash
+                ? { expectedInputHash: expectedReceiptInputHash }
+                : {}),
+            },
           );
           if (receipt.failure) {
             const recoveryEvidence = await summaryNoEffectRecoveryEvidence(
@@ -2177,10 +2276,20 @@ async function runResumableSummaryStep(
               receipt.receipt,
               run,
             );
+            const operationReceipt = summaryOperationReceiptProjection(
+              receipt.receipt,
+              data.inputHash,
+            );
+            const operationReceiptAbsence = projectExtractionOperationReceiptAbsence(
+              receipt.receiptAbsence,
+              data.inputHash,
+            );
             return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
               error: receipt.failure.cause,
               failure: receipt.failure,
               telemetry,
+              ...(operationReceipt ? { operationReceipt } : {}),
+              ...(operationReceiptAbsence ? { operationReceiptAbsence } : {}),
               ...(recoveryEvidence ? { recoveryEvidence } : {}),
             });
           }
@@ -2536,6 +2645,9 @@ async function runResumableSummaryStep(
           },
           {
             requireExisting: data.requireExistingReceipt === true,
+            ...(expectedReceiptInputHash
+              ? { expectedInputHash: expectedReceiptInputHash }
+              : {}),
             retryFailed: true,
             ...(failedReceiptRetryAuthorization
               ? { failedRetryAuthorization: failedReceiptRetryAuthorization }
@@ -2549,10 +2661,20 @@ async function runResumableSummaryStep(
               receipt.receipt,
               run,
             );
+            const operationReceipt = summaryOperationReceiptProjection(
+              receipt.receipt,
+              data.inputHash,
+            );
+            const operationReceiptAbsence = projectExtractionOperationReceiptAbsence(
+              receipt.receiptAbsence,
+              data.inputHash,
+            );
             return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
               error: receipt.failure.cause,
               failure: receipt.failure,
               telemetry,
+              ...(operationReceipt ? { operationReceipt } : {}),
+              ...(operationReceiptAbsence ? { operationReceiptAbsence } : {}),
               ...(recoveryEvidence ? { recoveryEvidence } : {}),
             });
           }
@@ -2934,6 +3056,7 @@ export function registerSummarizeFunction(
       inputHash?: string;
       operationUnitId?: string;
       requireExistingReceipt?: boolean;
+      expectedReceiptInputHash?: string;
       failedReceiptRetryAuthorization?: FailedExtractionOperationRetryAuthorization;
     } | undefined) =>
       runResumableSummaryStep(data, kv, provider, retryOptions),

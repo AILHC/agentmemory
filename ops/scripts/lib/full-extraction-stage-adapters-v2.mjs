@@ -1,3 +1,20 @@
+import {
+  adaptCrystalOperationEvidence,
+} from './crystal-recovery-adapter-v1.mjs';
+import {
+  adaptSemanticRollupOperationEvidence,
+} from './semantic-rollup-recovery-adapter-v1.mjs';
+import {
+  adaptMemoryConsolidateOperationEvidence,
+  adaptSkillExtractOperationEvidence,
+} from './safe-stage-recovery-adapters-v1.mjs';
+import {
+  adaptReflectInsightOperationEvidence,
+} from './reflect-insight-recovery-adapter-v1.mjs';
+import {
+  adaptConsolidationProceduralOperationEvidence,
+} from './consolidation-procedural-recovery-adapter-v1.mjs';
+
 function firstArray(value, keys) {
   for (const key of keys) {
     if (Array.isArray(value?.[key])) return value[key];
@@ -10,6 +27,86 @@ function responseData(response) {
   if (Object.prototype.hasOwnProperty.call(response, 'data')) return response.data;
   if (Object.prototype.hasOwnProperty.call(response, 'response')) return response.response;
   return response;
+}
+
+export function extractionOperationReconciliationBinding(
+  response,
+  {
+    attemptId,
+    stage,
+    unitId,
+    runnerInputHash,
+    expectedReceiptInputHash,
+    stableHash,
+  },
+) {
+  const receipt = responseData(response)?.operationReceipt;
+  const expectedKey = `xop_${stableHash([attemptId, stage, unitId]).slice(0, 32)}`;
+  if (
+    !receipt
+    || typeof receipt !== 'object'
+    || Array.isArray(receipt)
+    || receipt.key !== expectedKey
+    || receipt.version !== 1
+    || receipt.status !== 'running'
+    || receipt.runId !== attemptId
+    || receipt.stage !== stage
+    || receipt.unitId !== unitId
+    || receipt.runnerInputHash !== runnerInputHash
+    || !/^[0-9a-f]{64}$/.test(String(receipt.inputHash || ''))
+    || (
+      expectedReceiptInputHash !== undefined
+      && receipt.inputHash !== expectedReceiptInputHash
+    )
+    || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(
+      String(receipt.startedAt || ''),
+    )
+    || Number.isNaN(Date.parse(receipt.startedAt))
+  ) return null;
+  return {
+    receipt_key: receipt.key,
+    receipt_run_id: receipt.runId,
+    receipt_stage: receipt.stage,
+    receipt_unit_id: receipt.unitId,
+    receipt_input_hash: receipt.inputHash,
+    receipt_started_at: receipt.startedAt,
+  };
+}
+
+export function exactExtractionOperationReceiptAbsence(
+  response,
+  {
+    attemptId,
+    stage,
+    unitId,
+    runnerInputHash,
+    stableHash,
+  },
+) {
+  const data = responseData(response);
+  const absence = data?.operationReceiptAbsence;
+  const observedAt = String(absence?.observedAt || '');
+  const expectedKey = `xop_${stableHash([attemptId, stage, unitId]).slice(0, 32)}`;
+  const matches = failureCause(response, data) === 'extraction_operation_reconciliation_required'
+    && absence
+    && typeof absence === 'object'
+    && !Array.isArray(absence)
+    && Object.keys(absence).sort().join(',')
+      === 'inputHash,key,observedAt,runId,runnerInputHash,schema,stage,unitId'
+    && absence.schema === 'extraction-operation-receipt-absence/v1'
+    && absence.key === expectedKey
+    && absence.runId === attemptId
+    && absence.stage === stage
+    && absence.unitId === unitId
+    && absence.runnerInputHash === runnerInputHash
+    && /^[0-9a-f]{64}$/.test(String(absence.inputHash || ''))
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(observedAt)
+    && !Number.isNaN(Date.parse(observedAt));
+  return matches ? absence : null;
+}
+
+export function matchesExtractionOperationReceiptAbsence(response, expected) {
+  return exactExtractionOperationReceiptAbsence(response, expected) !== null;
 }
 
 function failureCause(response, data = responseData(response)) {
@@ -124,18 +221,42 @@ export function classifyIdempotentCommitResponse(response, resultFields) {
   return classifyResponse(response, resultFields);
 }
 
-export async function executeReceiptAwareRequest({ recovered, invoke }) {
+export async function executeReceiptAwareRequest({
+  recovered,
+  invoke,
+  acceptReceiptAbsence = () => false,
+}) {
   let requireExistingReceipt = recovered;
-  while (true) {
-    const response = await invoke(requireExistingReceipt);
+  let absenceConsumed = false;
+  let expectedReceiptInputHash;
+  let freshDispatchCount = 0;
+  for (let requestCount = 0; requestCount < 3; requestCount += 1) {
+    if (!requireExistingReceipt) freshDispatchCount += 1;
+    const response = await invoke(requireExistingReceipt, expectedReceiptInputHash);
+    const absence = requireExistingReceipt ? acceptReceiptAbsence(response) : null;
+    if (
+      absence
+      && typeof absence === 'object'
+      && /^[0-9a-f]{64}$/.test(String(absence.inputHash || ''))
+      && !absenceConsumed
+      && freshDispatchCount < 2
+    ) {
+      absenceConsumed = true;
+      expectedReceiptInputHash = absence.inputHash;
+      requireExistingReceipt = false;
+      continue;
+    }
     const rawStatusCode = response?.status_code ?? response?.statusCode;
-    const transportFailed = response?.ok === false
+    const statusCode = Number(rawStatusCode);
+    const dispatchUncertain = response?.ok === false
       && rawStatusCode !== undefined
-      && Number(rawStatusCode) === 0;
-    if (!transportFailed) return { response };
+      && [0, 500, 502, 504].includes(statusCode);
+    if (!dispatchUncertain) return { response, expectedReceiptInputHash };
     if (requireExistingReceipt) return { pending: true };
+    if (absenceConsumed || freshDispatchCount >= 2) return { pending: true };
     requireExistingReceipt = true;
   }
+  return { pending: true };
 }
 
 function normalizePlanItems(data) {
@@ -252,7 +373,67 @@ function singleAdapter({
   stableHash,
   buildPayload,
   splitUnit,
+  idempotentCommit = false,
+  adaptRecoveryEvidence,
 }) {
+  const classify = (response) => (
+    idempotentCommit
+      ? classifyIdempotentCommitResponse(response, resultFields)
+      : classifyResponse(response, resultFields)
+  );
+  const receiptExpectation = ({
+    unit,
+    attemptId,
+    runnerInputHash = unit.input_hash,
+    expectedReceiptInputHash,
+  }) => ({
+    attemptId,
+    stage,
+    unitId: unit.unit_id,
+    runnerInputHash,
+    expectedReceiptInputHash,
+    stableHash,
+  });
+  const invoke = ({
+    unit,
+    attemptId,
+    requireExistingReceipt,
+    expectedReceiptInputHash,
+  }) => request(
+    endpoint,
+    buildFormalBody({
+      stage,
+      unit,
+      attemptId,
+      payload: {
+        ...buildPayload(unit),
+        ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+        ...(expectedReceiptInputHash ? { expectedReceiptInputHash } : {}),
+      },
+    }),
+  );
+  const terminalMatches = (classified, terminal) => (
+    classified.status === terminal?.status
+    && JSON.stringify(classified.payload?.result_ids || [])
+      === JSON.stringify(terminal?.result_ids || terminal?.payload?.result_ids || [])
+    && (
+      classified.status !== 'skipped'
+      || classified.payload?.reason === (terminal?.reason || terminal?.payload?.reason)
+    )
+  );
+  const blockedFromRecovery = (recovery, fallback, response, expected) => {
+    const reconciliationBinding = extractionOperationReconciliationBinding(
+      response,
+      expected,
+    );
+    return {
+      status: 'blocked',
+      reason: recovery.decision.code || fallback,
+      payload: { error: recovery.decision.code || fallback },
+      recovery,
+      ...(reconciliationBinding ? { reconciliationBinding } : {}),
+    };
+  };
   return {
     attemptIdForUnit: (unit) => stableHash({
       run_id: runId,
@@ -260,27 +441,203 @@ function singleAdapter({
       unit_id: unit.unit_id,
       phase: 'execute',
     }),
-    execute: async ({ unit, attemptId, recovered }) => {
+    ...(adaptRecoveryEvidence ? {
+      verifyRecoveredTerminal: async ({
+        unit,
+        attemptId,
+        terminal,
+        completedOperations,
+      }) => {
+        const operationId = completedOperations.at(-1)?.operation_id || unit.unit_id;
+        const result = await invoke({
+          unit,
+          attemptId,
+          requireExistingReceipt: true,
+        });
+        const classified = classify(result);
+        return {
+          recoveryCandidate: adaptRecoveryEvidence({
+            result: terminalMatches(classified, terminal)
+              ? result
+              : {
+                  ok: false,
+                  data: {
+                    error: `${stage}_recovered_terminal_unverified`,
+                  },
+                },
+            unit,
+            attemptId,
+            operationId,
+          }),
+        };
+      },
+    } : {}),
+    execute: async ({
+      unit,
+      attemptId,
+      recovered,
+      activeOperation,
+      completedOperations = [],
+      startOperation,
+      completeOperation,
+      resolveOutcome,
+    }) => {
       if (unit.skip_reason) {
         return { status: 'skipped', payload: { reason: unit.skip_reason, result_ids: [] } };
       }
-      const requestResult = await executeReceiptAwareRequest({
-        recovered,
-        invoke: (requireExistingReceipt) => request(endpoint, buildFormalBody({
-          stage,
+      const recoveryEnabled = Boolean(
+        adaptRecoveryEvidence
+        && startOperation
+        && completeOperation
+        && resolveOutcome,
+      );
+      const operationId = activeOperation?.operation_id
+        || completedOperations.at(-1)?.operation_id
+        || unit.unit_id;
+      const completedTerminal = completedOperations.at(-1)?.terminal_result;
+      if (recoveryEnabled && completedTerminal) {
+        const result = await invoke({
           unit,
           attemptId,
-          payload: {
-            ...buildPayload(unit),
-            ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+          requireExistingReceipt: true,
+        });
+        const classified = classify(result);
+        const recovery = await resolveOutcome({
+          operationId,
+          verification: true,
+          ...adaptRecoveryEvidence({
+            result: terminalMatches(classified, completedTerminal)
+              ? result
+              : {
+                  ok: false,
+                  data: {
+                    error: `${stage}_recovered_terminal_unverified`,
+                  },
+                },
+            unit,
+            attemptId,
+            operationId,
+          }),
+        });
+        if (recovery.decision.action === 'replay') {
+          return { ...completedTerminal, recovery };
+        }
+        return blockedFromRecovery(
+          recovery,
+          `${stage}_recovered_terminal_unverified`,
+          result,
+          receiptExpectation({ unit, attemptId }),
+        );
+      }
+      if (recoveryEnabled && !activeOperation) {
+        await startOperation({ operationId });
+      }
+      const requestResult = await executeReceiptAwareRequest({
+        recovered: recovered || Boolean(activeOperation),
+        invoke: (requireExistingReceipt, expectedReceiptInputHash) => invoke({
+          unit,
+          attemptId,
+          requireExistingReceipt,
+          expectedReceiptInputHash,
+        }),
+        acceptReceiptAbsence: (response) => exactExtractionOperationReceiptAbsence(
+          response,
+          {
+            attemptId,
+            stage,
+            unitId: unit.unit_id,
+            runnerInputHash: unit.input_hash,
+            stableHash,
           },
-        })),
+        ),
       });
       if (requestResult.pending) return { status: 'pending' };
       const response = requestResult.response;
       const children = inputTooLarge(response) ? splitUnit?.(unit) || [] : [];
-      if (children.length > 0) return { status: 'split', children };
-      return classifyResponse(response, resultFields);
+      if (children.length > 0) {
+        if (recoveryEnabled) {
+          await completeOperation({
+            operationId,
+            status: 'split',
+            child_unit_ids: children.map((child) => child.unit_id),
+          });
+        }
+        return { status: 'split', children };
+      }
+      const classified = classify(response);
+      if (!recoveryEnabled) return classified;
+      const recovery = await resolveOutcome({
+        operationId,
+        ...adaptRecoveryEvidence({
+          result: response,
+          unit,
+          attemptId,
+          operationId,
+        }),
+      });
+      if (recovery.decision.action === 'replay' && classified.status === 'succeeded') {
+        const terminalResult = {
+          status: 'succeeded',
+          payload: classified.payload,
+        };
+        await completeOperation({
+          operationId,
+          status: 'succeeded',
+          terminal_result: terminalResult,
+        });
+        return {
+          ...terminalResult,
+          recovery,
+        };
+      }
+      if (recovery.decision.action === 'skipped' && classified.status === 'skipped') {
+        const terminalResult = {
+          status: 'skipped',
+          payload: classified.payload,
+        };
+        await completeOperation({
+          operationId,
+          status: 'skipped',
+          terminal_result: terminalResult,
+        });
+        return {
+          ...terminalResult,
+          recovery,
+        };
+      }
+      if (['retry', 'resume_commit', 'reconcile_commit'].includes(recovery.decision.action)) {
+        return { status: 'pending', recovery };
+      }
+      if (recovery.decision.action === 'reconcile') {
+        return blockedFromRecovery(
+          recovery,
+          `${stage}_reconciliation_required`,
+          response,
+          receiptExpectation({
+            unit,
+            attemptId,
+            expectedReceiptInputHash: requestResult.expectedReceiptInputHash,
+          }),
+        );
+      }
+      if (recovery.decision.action === 'isolate') {
+        const terminalResult = {
+          status: 'failed',
+          payload: { error: recovery.evidence.reasonCode || `${stage}_isolated` },
+        };
+        await completeOperation({
+          operationId,
+          status: 'failed',
+          terminal_result: terminalResult,
+        });
+        return { ...terminalResult, recovery };
+      }
+      return blockedFromRecovery(
+        recovery,
+        `${stage}_recovery_contract_invalid`,
+        response,
+        receiptExpectation({ unit, attemptId }),
+      );
     },
     record: recordAdapter({ request, runId, mark, stage, resultType }),
   };
@@ -298,8 +655,143 @@ function twoPhaseAdapter({
   stableHash,
   buildPreparePayload,
   splitUnit,
+  adaptRecoveryEvidence,
 }) {
+  const commitInputHash = ({ unit, prepared }) => stableHash({
+    prepareRunId: prepared.attempt_id,
+    unitId: unit.unit_id,
+    prepareInputHash: prepared.prepare_input_hash,
+    preparedHandle: prepared.prepared_handle,
+    proposalHash: prepared.proposal_hash,
+  });
+  const receiptExpectation = ({
+    unit,
+    attemptId,
+    runnerInputHash,
+    expectedReceiptInputHash,
+  }) => ({
+    attemptId,
+    stage,
+    unitId: unit.unit_id,
+    runnerInputHash,
+    expectedReceiptInputHash,
+    stableHash,
+  });
+  const commitRecoveryFacts = ({ unit, attemptId, prepared, result, inputHash }) => (
+    adaptRecoveryEvidence({
+      unit: { ...unit, input_hash: inputHash },
+      attemptId,
+      result,
+      safeFacts: {
+        response: responseData(result),
+        receipt: responseData(result)?.operationReceipt,
+        commitContext: {
+          preparedHandle: prepared.prepared_handle,
+          proposalHash: prepared.proposal_hash,
+          prepareAttemptId: prepared.attempt_id,
+          prepareInputHash: prepared.prepare_input_hash,
+        },
+      },
+    })
+  );
+  const terminalMatches = (classified, terminal) => (
+    classified.status === terminal?.status
+    && JSON.stringify(classified.payload?.result_ids || [])
+      === JSON.stringify(terminal?.result_ids || terminal?.payload?.result_ids || [])
+    && (
+      classified.status !== 'skipped'
+      || classified.payload?.reason === (terminal?.reason || terminal?.payload?.reason)
+    )
+  );
   return {
+    recoverPrepare: Boolean(adaptRecoveryEvidence),
+    recoverCommit: Boolean(adaptRecoveryEvidence),
+    ...(adaptRecoveryEvidence ? {
+      verifyRecoveredTerminal: async ({
+        unit,
+        prepareAttemptId,
+        commitAttemptId,
+        prepared,
+        terminal,
+      }) => {
+        if (terminal?.status === 'succeeded' && prepared && commitAttemptId) {
+          const inputHash = commitInputHash({ unit, prepared });
+          const result = await request(
+            commitEndpoint,
+            buildFormalBody({
+              stage,
+              unit,
+              attemptId: commitAttemptId,
+              inputHash,
+              payload: {
+                prepareRunId: prepared.attempt_id,
+                prepareInputHash: prepared.prepare_input_hash,
+                preparedHandle: prepared.prepared_handle,
+                proposalHash: prepared.proposal_hash,
+                requireExistingReceipt: true,
+              },
+            }),
+          );
+          const classified = classifyIdempotentCommitResponse(result, resultFields);
+          return {
+            recoveryCandidate: commitRecoveryFacts({
+              unit,
+              attemptId: commitAttemptId,
+              prepared,
+              result: terminalMatches(classified, terminal)
+                ? result
+                : {
+                    ok: false,
+                    data: { error: `${stage}_recovered_terminal_unverified` },
+                  },
+              inputHash,
+            }),
+          };
+        }
+        if (terminal?.status === 'skipped' && prepareAttemptId) {
+          const result = await request(
+            prepareEndpoint,
+            buildFormalBody({
+              stage,
+              unit,
+              attemptId: prepareAttemptId,
+              payload: {
+                ...buildPreparePayload(unit),
+                requireExistingReceipt: true,
+              },
+            }),
+          );
+          const classified = classifyResponse(result, resultFields);
+          const response = responseData(result);
+          return {
+            recoveryCandidate: adaptRecoveryEvidence({
+              unit,
+              attemptId: prepareAttemptId,
+              result: terminalMatches(classified, terminal)
+                ? result
+                : {
+                    ok: false,
+                    data: { error: `${stage}_recovered_terminal_unverified` },
+                  },
+              safeFacts: {
+                response,
+                receipt: response?.operationReceipt,
+              },
+            }),
+          };
+        }
+        return {
+          recoveryCandidate: adaptRecoveryEvidence({
+            unit,
+            attemptId: commitAttemptId || prepareAttemptId,
+            result: {
+              ok: false,
+              data: { error: `${stage}_recovered_terminal_unverified` },
+            },
+          }),
+        };
+      },
+    } : {}),
     prepareAttemptIdForUnit: (unit) => stableHash({
       run_id: runId,
       stage,
@@ -320,26 +812,70 @@ function twoPhaseAdapter({
       if (unit.skip_reason) {
         return { status: 'skipped', payload: { reason: unit.skip_reason, result_ids: [] } };
       }
-      const requestResult = await executeReceiptAwareRequest({
-        recovered,
-        invoke: (requireExistingReceipt) => request(prepareEndpoint, buildFormalBody({
+      const invokePrepare = (requireExistingReceipt, expectedReceiptInputHash) => request(
+        prepareEndpoint,
+        buildFormalBody({
           stage,
           unit,
           attemptId,
           payload: {
             ...buildPreparePayload(unit),
             ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+            ...(expectedReceiptInputHash ? { expectedReceiptInputHash } : {}),
           },
-        })),
+        }),
+      );
+      let requestResult = await executeReceiptAwareRequest({
+        recovered,
+        invoke: invokePrepare,
+        acceptReceiptAbsence: (response) => exactExtractionOperationReceiptAbsence(
+          response,
+          {
+            attemptId,
+            stage,
+            unitId: unit.unit_id,
+            runnerInputHash: unit.input_hash,
+            stableHash,
+          },
+        ),
       });
       if (requestResult.pending) return { status: 'pending' };
-      const response = requestResult.response;
+      let response = requestResult.response;
+      let data = responseData(response);
+      let cause = failureCause(response, data);
       const children = inputTooLarge(response) ? splitUnit?.(unit) || [] : [];
       if (children.length > 0) return { status: 'split', children };
-      const data = responseData(response);
-      const cause = failureCause(response, data);
       if (cause === 'extraction_operation_reconciliation_required') {
-        return { status: 'blocked', reason: cause, payload: { error: cause } };
+        const reconciliationBinding = extractionOperationReconciliationBinding(
+          response,
+          receiptExpectation({
+            unit,
+            attemptId,
+            runnerInputHash: unit.input_hash,
+            expectedReceiptInputHash: requestResult.expectedReceiptInputHash,
+          }),
+        );
+        return {
+          status: 'blocked',
+          reason: cause,
+          payload: { error: cause },
+          ...(adaptRecoveryEvidence ? {
+            recoveryCandidate: adaptRecoveryEvidence({
+              unit: {
+                ...unit,
+                input_hash: responseData(response)?.operationReceipt?.inputHash
+                  || unit.input_hash,
+              },
+              attemptId,
+              result: response,
+              safeFacts: {
+                response: responseData(response),
+                receipt: responseData(response)?.operationReceipt,
+              },
+            }),
+          } : {}),
+          ...(reconciliationBinding ? { reconciliationBinding } : {}),
+        };
       }
       const preparedHandle = data?.preparedHandle || data?.prepared_handle;
       const proposalHash = data?.proposalHash || data?.proposal_hash;
@@ -359,27 +895,154 @@ function twoPhaseAdapter({
       }
       return classifyResponse(response, resultFields);
     },
-    commit: async ({ unit, attemptId, prepared }) => {
-      const commitInputHash = stableHash({
-        prepareRunId: prepared.attempt_id,
-        unitId: unit.unit_id,
-        prepareInputHash: prepared.prepare_input_hash,
-        preparedHandle: prepared.prepared_handle,
-        proposalHash: prepared.proposal_hash,
+    commit: async ({
+      unit,
+      attemptId,
+      prepared,
+      recovered,
+      activeOperation,
+      completedOperations = [],
+      completeOperation,
+      resolveOutcome,
+    }) => {
+      const operationId = activeOperation?.operation_id
+        || completedOperations.at(-1)?.operation_id
+        || `${unit.unit_id}:commit`;
+      const inputHash = commitInputHash({ unit, prepared });
+      const invokeCommit = (requireExistingReceipt, expectedReceiptInputHash) => request(
+        commitEndpoint,
+        buildFormalBody({
+          stage,
+          unit,
+          attemptId,
+          inputHash,
+          payload: {
+            prepareRunId: prepared.attempt_id,
+            prepareInputHash: prepared.prepare_input_hash,
+            preparedHandle: prepared.prepared_handle,
+            proposalHash: prepared.proposal_hash,
+            ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
+            ...(expectedReceiptInputHash ? { expectedReceiptInputHash } : {}),
+          },
+        }),
+      );
+      const recoveryEnabled = Boolean(
+        adaptRecoveryEvidence
+        && completeOperation
+        && resolveOutcome,
+      );
+      const completedTerminal = completedOperations.at(-1)?.terminal_result;
+      if (recoveryEnabled && completedTerminal) {
+        const response = await invokeCommit(true);
+        const classified = classifyIdempotentCommitResponse(response, resultFields);
+        const terminalMatches = classified.status === completedTerminal.status
+          && JSON.stringify(classified.payload?.result_ids || [])
+            === JSON.stringify(completedTerminal.payload?.result_ids || []);
+        const recovery = await resolveOutcome({
+          operationId,
+          verification: true,
+          ...commitRecoveryFacts({
+            unit,
+            attemptId,
+            prepared,
+            result: terminalMatches
+              ? response
+              : {
+                  ok: false,
+                  data: { error: `${stage}_recovered_terminal_unverified` },
+                },
+            inputHash,
+          }),
+        });
+        const reconciliationBinding = extractionOperationReconciliationBinding(
+          response,
+          receiptExpectation({ unit, attemptId, runnerInputHash: inputHash }),
+        );
+        return recovery.decision.action === 'replay'
+          ? {
+              ...completedTerminal,
+              recovery,
+            }
+          : {
+              status: 'blocked',
+              reason: `${stage}_recovered_terminal_unverified`,
+              payload: { error: `${stage}_recovered_terminal_unverified` },
+              recovery,
+              ...(reconciliationBinding ? { reconciliationBinding } : {}),
+            };
+      }
+      const requestResult = await executeReceiptAwareRequest({
+        recovered,
+        invoke: invokeCommit,
+        acceptReceiptAbsence: (response) => exactExtractionOperationReceiptAbsence(
+          response,
+          {
+            attemptId,
+            stage,
+            unitId: unit.unit_id,
+            runnerInputHash: inputHash,
+            stableHash,
+          },
+        ),
       });
-      const response = await request(commitEndpoint, buildFormalBody({
-        stage,
-        unit,
-        attemptId,
-        inputHash: commitInputHash,
+      if (requestResult.pending) return { status: 'pending' };
+      const response = requestResult.response;
+      const classified = classifyIdempotentCommitResponse(response, resultFields);
+      if (!recoveryEnabled) return classified;
+      const recovery = await resolveOutcome({
+        operationId,
+        ...commitRecoveryFacts({
+          unit,
+          attemptId,
+          prepared,
+          result: response,
+          inputHash,
+        }),
+      });
+      if (recovery.decision.action === 'replay' && classified.status === 'succeeded') {
+        const terminalResult = {
+          status: 'succeeded',
+          payload: classified.payload,
+        };
+        await completeOperation({
+          operationId,
+          status: 'succeeded',
+          terminal_result: terminalResult,
+        });
+        return {
+          ...terminalResult,
+          recovery,
+        };
+      }
+      if (['resume_commit', 'reconcile_commit'].includes(recovery.decision.action)) {
+        return { status: 'pending', recovery };
+      }
+      if (recovery.decision.action === 'reconcile') {
+        const reconciliationBinding = extractionOperationReconciliationBinding(
+          response,
+          receiptExpectation({
+            unit,
+            attemptId,
+            runnerInputHash: inputHash,
+            expectedReceiptInputHash: requestResult.expectedReceiptInputHash,
+          }),
+        );
+        return {
+          status: 'blocked',
+          reason: `${stage}_commit_reconciliation_required`,
+          payload: { error: `${stage}_commit_reconciliation_required` },
+          recovery,
+          ...(reconciliationBinding ? { reconciliationBinding } : {}),
+        };
+      }
+      return {
+        status: 'blocked',
+        reason: recovery.decision.code || `${stage}_commit_recovery_contract_invalid`,
         payload: {
-          prepareRunId: prepared.attempt_id,
-          prepareInputHash: prepared.prepare_input_hash,
-          preparedHandle: prepared.prepared_handle,
-          proposalHash: prepared.proposal_hash,
+          error: recovery.decision.code || `${stage}_commit_recovery_contract_invalid`,
         },
-      }));
-      return classifyIdempotentCommitResponse(response, resultFields);
+        recovery,
+      };
     },
     record: recordAdapter({ request, runId, mark, stage, resultType }),
   };
@@ -644,8 +1307,24 @@ export async function runV2RemainingStages({
   stableHash,
   runSingleStage,
   runTwoPhaseStage,
+  eligibleStages = {},
 }) {
-  let result = await runTwoPhaseStage({
+  const results = new Map();
+  const eligible = (stage) => eligibleStages[stage] !== false;
+  const remember = (stage, result) => {
+    results.set(stage, result);
+    return result;
+  };
+  const blocked = () => [...results.values()].find((result) => result.status === 'blocked');
+  const aggregate = () => (
+    blocked()
+    || [...results.values()].find((result) => !stageAccepted(result))
+    || [...results.values()].at(-1)
+    || { status: 'completed', acceptedCount: 0 }
+  );
+
+  if (eligible('memory_consolidate')) {
+    remember('memory_consolidate', await runTwoPhaseStage({
     stage: 'memory_consolidate',
     plan: async () => planOrNone(await memoryPlan({
       request,
@@ -682,16 +1361,19 @@ export async function runV2RemainingStages({
         charBudget: config.memory_consolidate_char_budget,
       }, options, 'memory_consolidate'),
       splitUnit: (unit) => splitMemoryUnit(unit, stableHash),
+      adaptRecoveryEvidence: adaptMemoryConsolidateOperationEvidence,
     }),
-  });
-  if (!stageAccepted(result)) return result;
+    }));
+    if (blocked()) return aggregate();
+  }
 
   let sessionsPromise;
   const selectedSessions = () => {
     sessionsPromise ||= loadSelectedSessions();
     return sessionsPromise;
   };
-  result = await runSingleStage({
+  if (eligible('semantic_rollup')) {
+    remember('semantic_rollup', await runSingleStage({
     stage: 'semantic_rollup',
     plan: async () => planOrNone(
       semanticPlan(await selectedSessions(), config, stableHash),
@@ -712,13 +1394,17 @@ export async function runV2RemainingStages({
         mark: options.mark,
         kind: 'window',
         sessionIds: unit.source_session_ids || unit.source_ids,
+        sourceSummaryHashes: unit.source_summary_hashes,
       }, options, 'semantic_rollup'),
       splitUnit: (unit) => splitSemanticUnit(unit, stableHash),
+      adaptRecoveryEvidence: adaptSemanticRollupOperationEvidence,
     }),
-  });
-  if (!stageAccepted(result)) return result;
+    }));
+    if (blocked()) return aggregate();
+  }
 
-  result = await runTwoPhaseStage({
+  if (eligible('skill_extract')) {
+    remember('skill_extract', await runTwoPhaseStage({
     stage: 'skill_extract',
     plan: async () => planOrNone(
       skillPlan(await selectedSessions(), stableHash),
@@ -739,11 +1425,14 @@ export async function runV2RemainingStages({
         sessionId: unit.session_id,
         operationReceiptManaged: true,
       }, options, 'skill_extract'),
+      adaptRecoveryEvidence: adaptSkillExtractOperationEvidence,
     }),
-  });
-  if (!stageAccepted(result)) return result;
+    }));
+    if (blocked()) return aggregate();
+  }
 
-  result = await runSingleStage({
+  if (eligible('crystal')) {
+    remember('crystal', await runSingleStage({
     stage: 'crystal',
     plan: async () => {
       const crystalGroups = await serverPlan({
@@ -782,11 +1471,15 @@ export async function runV2RemainingStages({
         actionUpdatedAts: unit.action_updated_ats,
         ...(unit.project ? { project: unit.project } : {}),
       }, options, 'crystal'),
+      idempotentCommit: true,
+      adaptRecoveryEvidence: adaptCrystalOperationEvidence,
     }),
-  });
-  if (!stageAccepted(result)) return result;
+    }));
+    if (blocked()) return aggregate();
+  }
 
-  result = await runSingleStage({
+  if (eligible('consolidation_procedural')) {
+    remember('consolidation_procedural', await runSingleStage({
     stage: 'consolidation_procedural',
     plan: async () => planOrNone(await serverPlan({
       request,
@@ -815,11 +1508,22 @@ export async function runV2RemainingStages({
           'source_ids',
         ]),
       }, options, 'consolidation_procedural'),
+      adaptRecoveryEvidence: adaptConsolidationProceduralOperationEvidence,
     }),
-  });
-  if (!stageAccepted(result)) return result;
+    }));
+    if (blocked()) return aggregate();
+  }
 
-  return runSingleStage({
+  const semanticAccepted = !eligible('semantic_rollup')
+    || stageAccepted(results.get('semantic_rollup'));
+  const crystalAccepted = !eligible('crystal')
+    || stageAccepted(results.get('crystal'));
+  if (
+    eligible('reflect_insight')
+    && semanticAccepted
+    && crystalAccepted
+  ) {
+    remember('reflect_insight', await runSingleStage({
     stage: 'reflect_insight',
     plan: async () => planOrNone(await serverPlan({
       request,
@@ -845,6 +1549,9 @@ export async function runV2RemainingStages({
         crystalIds: firstArray(unit, ['crystalIds', 'crystal_ids']),
         charBudget: config.reflect_insight_char_budget,
       }, options, 'reflect_insight'),
+      adaptRecoveryEvidence: adaptReflectInsightOperationEvidence,
     }),
-  });
+    }));
+  }
+  return aggregate();
 }

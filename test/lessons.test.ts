@@ -4,7 +4,10 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerLessonsFunctions } from "../src/functions/lessons.js";
+import {
+  registerLessonsFunctions,
+  verifyLessonOperationResultState,
+} from "../src/functions/lessons.js";
 import {
   computeLessonExtractionConfigHash,
   computeLessonExtractionInputHash,
@@ -169,6 +172,74 @@ describe("Lessons", () => {
       expect(result.lesson.source).toBe("crystal");
       expect(result.lesson.sourceIds).toEqual(["crys_123"]);
       expect(result.lesson.confidence).toBe(0.6);
+    });
+
+    it("replays the same source mutation without reinforcing twice", async () => {
+      const payload = {
+        content: "Crystal mutation is exact once",
+        source: "crystal" as const,
+        sourceIds: ["crys_exact_once"],
+        sourceMutationId: "crystal:crys_exact_once:lesson:0",
+      };
+      const first = (await sdk.trigger("mem::lesson-save", payload)) as {
+        action: string;
+        lesson: Lesson;
+      };
+      const replayed = (await sdk.trigger("mem::lesson-save", payload)) as {
+        action: string;
+        lesson: Lesson;
+      };
+
+      expect(first.action).toBe("created");
+      expect(replayed.action).toBe("replayed");
+      expect(replayed.lesson.reinforcements).toBe(0);
+      expect(replayed.lesson.sourceIds).toEqual(["crys_exact_once"]);
+      expect(replayed.lesson.sourceWatermarks?.[payload.sourceMutationId]).toEqual({
+        generation: 1,
+        mutationId: payload.sourceMutationId,
+      });
+
+      const distinct = (await sdk.trigger("mem::lesson-save", {
+        ...payload,
+        sourceMutationId: "crystal:crys_exact_once:lesson:1",
+      })) as { action: string; lesson: Lesson };
+      expect(distinct.action).toBe("strengthened");
+      expect(distinct.lesson.reinforcements).toBe(1);
+    });
+
+    it("replays an applied source mutation without reviving a soft-deleted lesson", async () => {
+      const payload = {
+        content: "Deleted crystal lessons stay deleted on replay",
+        source: "crystal" as const,
+        sourceIds: ["crys_soft_deleted"],
+        sourceMutationId: "crystal:crys_soft_deleted:lesson:0",
+      };
+      const first = (await sdk.trigger("mem::lesson-save", payload)) as {
+        lesson: Lesson;
+      };
+      await kv.set(KV.lessons, first.lesson.id, {
+        ...first.lesson,
+        deleted: true,
+      });
+
+      const replayed = (await sdk.trigger("mem::lesson-save", payload)) as {
+        success: boolean;
+        action: string;
+        lesson: Lesson;
+      };
+      expect(replayed).toMatchObject({
+        success: true,
+        action: "replayed",
+        lesson: {
+          id: first.lesson.id,
+          deleted: true,
+          reinforcements: 0,
+        },
+      });
+      expect(replayed.lesson.sourceWatermarks?.[payload.sourceMutationId]).toEqual({
+        generation: 1,
+        mutationId: payload.sourceMutationId,
+      });
     });
 
     it("preserves source watermarks when manually reviving a soft-deleted lesson", async () => {
@@ -618,6 +689,7 @@ describe("Lessons", () => {
         sessionIds: ["session-orphan"],
         attemptId: identity.runId,
         inputHash: runnerInputHash,
+        requireExistingReceipt: true,
       };
 
       const blocked = await sdk.trigger("mem::lessons::extract-llm", request);
@@ -627,6 +699,16 @@ describe("Lessons", () => {
           class: "transient_runtime",
           cause: "extraction_operation_reconciliation_required",
         },
+        operationReceipt: {
+          key: receiptKey,
+          status: "running",
+          runId: identity.runId,
+          stage: "lessons",
+          unitId: identity.unitId,
+          inputHash: identity.inputHash,
+          runnerInputHash,
+          startedAt: "2026-07-24T00:00:00.000Z",
+        },
       });
       expect(provider.compress).not.toHaveBeenCalled();
 
@@ -635,6 +717,7 @@ describe("Lessons", () => {
       }) as { runs: Array<{ status: string }> };
       expect(legacyResult.runs[0].status).toBe("succeeded");
       expect(provider.compress).toHaveBeenCalledTimes(1);
+      await kv.delete(KV.extractionOperationReceipt(receiptKey), receiptKey);
 
       const reconciled = await sdk.trigger("mem::lessons::extract-llm", request);
       expect(reconciled).toMatchObject({
@@ -685,8 +768,104 @@ describe("Lessons", () => {
           class: "transient_runtime",
           cause: "extraction_operation_reconciliation_required",
         },
+        operationReceiptAbsence: {
+          schema: "extraction-operation-receipt-absence/v1",
+          key: buildExtractionOperationKey({
+            runId: "attempt-missing-receipt",
+            stage: "lessons",
+            unitId: "session-missing-receipt",
+          }),
+          runId: "attempt-missing-receipt",
+          stage: "lessons",
+          unitId: "session-missing-receipt",
+          runnerInputHash: "runner-session-freshness",
+          inputHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+        },
       });
       expect(provider.compress).not.toHaveBeenCalled();
+      expect(await kv.list(KV.lessonExtractionRuns)).toEqual([]);
+
+      const absenceInputHash = (
+        result as {
+          operationReceiptAbsence: { inputHash: string };
+        }
+      ).operationReceiptAbsence.inputHash;
+      await kv.set(KV.observations("session-missing-receipt"), "obs-2", {
+        id: "obs-2",
+        sessionId: "session-missing-receipt",
+        timestamp: "2026-07-24T00:00:02.000Z",
+        hookType: "user",
+        userPrompt: "The service input changed after the absence proof.",
+        raw: {},
+        sourceEventIndex: 2,
+      });
+
+      const drifted = await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-missing-receipt"],
+        attemptId: "attempt-missing-receipt",
+        inputHash: "runner-session-freshness",
+        expectedReceiptInputHash: absenceInputHash,
+      });
+
+      expect(drifted).toMatchObject({
+        success: false,
+        failure: {
+          class: "hard",
+          cause: "extraction_operation_input_hash_drifted_after_absence",
+        },
+      });
+      expect(provider.compress).not.toHaveBeenCalled();
+      expect(await kv.list(KV.lessonExtractionRuns)).toEqual([]);
+    });
+
+    it("proves an orphaned lesson operation absent only before candidate staging", async () => {
+      const runnerInputHash = "1".repeat(64);
+      const serviceInputHash = "2".repeat(64);
+      const configHash = "3".repeat(64);
+      const operation = {
+        runId: "4".repeat(64),
+        stage: "lessons" as const,
+        unitId: "session-lesson-absence",
+        inputHash: stableHash({ runnerInputHash, serviceInputHash, configHash }),
+      };
+      const run = {
+        id: "lesson-run-absence",
+        sessionId: operation.unitId,
+        strategy: "llm" as const,
+        status: "pending" as const,
+        inputHash: serviceInputHash,
+        configHash,
+        extractionGeneration: 1,
+        providerName: "mock-llm",
+        config: {
+          textLimit: 100,
+          saveLimit: 10,
+          chunkSize: 10,
+          chunkConcurrency: 1,
+          timeoutMs: 1000,
+        },
+        attempts: 0,
+        createdLessonIds: [],
+        replacedLessonIds: [],
+        createdAt: "2026-07-30T00:00:00.000Z",
+        updatedAt: "2026-07-30T00:00:00.000Z",
+      };
+      await kv.set(KV.lessonExtractionRuns, run.id, run);
+
+      await expect(verifyLessonOperationResultState(
+        kv as never,
+        operation,
+        runnerInputHash,
+      )).resolves.toBe("absent");
+
+      await kv.set(KV.lessonExtractionCandidates(run.id), "candidate", {
+        id: "candidate",
+      });
+      await expect(verifyLessonOperationResultState(
+        kv as never,
+        operation,
+        runnerInputHash,
+      )).resolves.toBe("present");
     });
 
     it("marks retryable provider failures as receipt-safe while keeping deterministic failures terminal", async () => {

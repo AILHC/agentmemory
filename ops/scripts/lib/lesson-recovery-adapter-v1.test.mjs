@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
-import { adaptLessonOperationEvidence } from './lesson-recovery-adapter-v1.mjs';
+import {
+  adaptLessonOperationEvidence as adaptLessonOperationEvidenceFacts,
+} from './lesson-recovery-adapter-v1.mjs';
+import { resolveOperationRecovery } from './recovery-policy-v1.mjs';
 
 const attemptId = 'attempt-1';
 const sessionId = 'session-1';
@@ -42,8 +45,28 @@ function data(overrides = {}) {
 }
 
 function adapt(value) {
-  return adaptLessonOperationEvidence({ result: value, unit: { unit_id: sessionId }, attemptId, operationId: sessionId, budget: { attemptsUsed: 0, maxAttempts: 1 } });
+  return resolveOperationRecovery({
+    ...adaptLessonOperationEvidenceFacts({
+      result: value,
+      unit: { unit_id: sessionId },
+      attemptId,
+      operationId: sessionId,
+    }),
+    budget: { attemptsUsed: 0, maxAttempts: 1 },
+  });
 }
+
+test('Lesson adapter reports facts without owning the recovery decision', () => {
+  const facts = adaptLessonOperationEvidenceFacts({
+    result: data(),
+    unit: { unit_id: sessionId },
+    attemptId,
+    operationId: sessionId,
+  });
+  assert.equal(facts.candidateEvidence.kind, 'no_effect');
+  assert.equal('decision' in facts, false);
+  assert.equal('policyVersion' in facts, false);
+});
 
 test('adapts only closed legacy lesson_no_blocks evidence to skipped without body fields', () => {
   const result = adapt(data());

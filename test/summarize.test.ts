@@ -1478,6 +1478,46 @@ describe("mem::summarize-resumable", () => {
     ]);
   });
 
+  it("rebuilds a missing map receipt from its exact persisted partial", async () => {
+    process.env.SUMMARIZE_CHUNK_SIZE = "1";
+    const kv = mockKV();
+    const sessionId = "ses_v2_missing_map_receipt_with_partial";
+    const attemptId = "attempt-missing-map-receipt-with-partial";
+    const session = await seedSummarySession(kv, sessionId, 2);
+    const inputHash = summarySessionInputHash(session);
+    const provider = makeProvider([summaryXml({ title: "persisted first chunk" })]);
+    const { handler } = setupResumableHandler(kv, provider);
+
+    await handler({ sessionId, attemptId, inputHash });
+    const [receipt] = extractionReceipts(kv);
+    await kv.delete(KV.extractionOperationReceipt(receipt.key), receipt.key);
+
+    const recovered = await handler({
+      sessionId,
+      attemptId,
+      inputHash,
+      operationUnitId: `${sessionId}:map:0`,
+      requireExistingReceipt: true,
+    });
+
+    expect(recovered).toMatchObject({
+      status: "in_progress",
+      advanced: "completed",
+      completedChunks: 1,
+      totalChunks: 2,
+    });
+    expect(provider.calls).toHaveLength(1);
+    expect(extractionReceipts(kv)).toEqual([
+      expect.objectContaining({
+        status: "succeeded",
+        unitId: `${sessionId}:map:0`,
+        response: expect.objectContaining({
+          resultRef: expect.objectContaining({ key: "0", chunkIndex: 0 }),
+        }),
+      }),
+    ]);
+  });
+
   it("does not fall back to an older map receipt when the exact uncertain receipt is missing", async () => {
     process.env.SUMMARIZE_CHUNK_SIZE = "1";
     const kv = mockKV();
@@ -1817,6 +1857,14 @@ describe("mem::summarize-resumable", () => {
         class: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
       },
+      operationReceipt: {
+        status: "running",
+        runId: attemptId,
+        stage: "summary",
+        unitId: `${sessionId}:map:0`,
+        runnerInputHash: inputHash,
+        startedAt: expect.any(String),
+      },
     });
     expect(provider.calls).toHaveLength(1);
   });
@@ -1841,6 +1889,18 @@ describe("mem::summarize-resumable", () => {
       failure: {
         class: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
+      },
+      operationReceiptAbsence: {
+        schema: "extraction-operation-receipt-absence/v1",
+        key: buildExtractionOperationKey({
+          runId: "attempt-missing-receipt",
+          stage: "summary",
+          unitId: `${sessionId}:map:0`,
+        }),
+        runId: "attempt-missing-receipt",
+        stage: "summary",
+        unitId: `${sessionId}:map:0`,
+        runnerInputHash: summarySessionInputHash(session),
       },
     });
     expect(provider.calls).toHaveLength(0);

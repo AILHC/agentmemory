@@ -21,6 +21,7 @@ import {
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
   return {
+    store,
     get: async <T>(scope: string, key: string): Promise<T | null> => {
       return (store.get(scope)?.get(key) as T) ?? null;
     },
@@ -41,11 +42,15 @@ function mockKV() {
 
 function mockSdk(triggerImpl?: (input: { function_id: string; payload: unknown }) => Promise<unknown>) {
   const functions = new Map<string, Function>();
-  const trigger = vi.fn(triggerImpl ?? (async (input: { function_id: string; payload: unknown }) => ({
-    success: true,
-    functionId: input.function_id,
-    payload: input.payload,
-  })));
+  const trigger = vi.fn(triggerImpl ?? (async (input: { function_id: string; payload: unknown }) => {
+    const handler = functions.get(input.function_id);
+    if (handler) return handler(input.payload);
+    return {
+      success: true,
+      functionId: input.function_id,
+      payload: input.payload,
+    };
+  }));
   return {
     registerFunction: (id: string, handler: Function) => {
       functions.set(id, handler);
@@ -130,6 +135,79 @@ describe("full extraction REST wrappers", () => {
     });
   });
 
+  it("persists and replays a provider failure through the real memory prepare endpoint", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const provider = {
+      name: "test",
+      compress: vi.fn().mockRejectedValue(new Error("pi_stream_failed")),
+      summarize: vi.fn(),
+    };
+    registerConsolidateFunction(sdk as never, kv as never, provider as never);
+    registerApiTriggers(sdk as never, kv as never, "");
+    const observationId = "obs-provider-failure";
+    const unitId = "window-provider-failure";
+    const inputHash = createHash("sha256")
+      .update(JSON.stringify({ unitId, sourceIds: [observationId] }))
+      .digest("hex");
+    await kv.set(KV.observations("ses-provider-failure"), observationId, {
+      id: observationId,
+      sessionId: "ses-provider-failure",
+      timestamp: "2026-07-30T00:00:00.000Z",
+      type: "decision",
+      title: "Provider failure source",
+      facts: [],
+      narrative: "This source must not produce a memory when the provider fails.",
+      concepts: ["recovery"],
+      files: [],
+      importance: 8,
+    });
+    const body = {
+      runId: "memory-provider-failure",
+      stage: "memory_consolidate",
+      unitId,
+      inputHash,
+      concept: "recovery",
+      sourceObservationIds: [observationId],
+      observationSessionIds: { [observationId]: "ses-provider-failure" },
+      minObservations: 1,
+    };
+    const handler = sdk.getFunction("api::full-memory-consolidate-window-prepare");
+
+    const first = await handler({ headers: {}, body });
+    const replay = await handler({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    });
+
+    expect(first.status_code).toBe(503);
+    expect(first.body).toMatchObject({
+      success: false,
+      failure: { class: "transient_provider", cause: "pi_stream_failed" },
+      operationReceipt: { status: "failed", runnerInputHash: inputHash },
+    });
+    expect(replay.status_code).toBe(503);
+    expect(replay.body).toMatchObject({
+      success: false,
+      failure: { class: "transient_provider", cause: "pi_stream_failed" },
+      operationReceipt: { status: "failed", runnerInputHash: inputHash },
+    });
+    expect(provider.compress).toHaveBeenCalledTimes(1);
+    const receipts = [...kv.store.entries()]
+      .filter(([scope]) => scope.startsWith("mem:extraction-operation-receipt:"))
+      .flatMap(([, entries]) => [...entries.values()]);
+    expect(receipts).toEqual([
+      expect.objectContaining({
+        status: "failed",
+        failure: { class: "transient_provider", cause: "pi_stream_failed" },
+      }),
+    ]);
+    expect(await kv.list(KV.memories)).toEqual([]);
+    expect(await kv.list(KV.audit)).toEqual([]);
+    expect([...kv.store.keys()].some((scope) =>
+      scope.startsWith("mem:memory-consolidation-proposal:"))).toBe(false);
+  });
+
   it("hard-stops an orphaned v2 memory prepare receipt", async () => {
     const sdk = mockSdk();
     const kv = mockKV();
@@ -154,6 +232,7 @@ describe("full extraction REST wrappers", () => {
     await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
       ...receiptIdentity,
       key: receiptKey,
+      version: 1,
       status: "running",
       startedAt: "2026-07-24T00:00:00.000Z",
     });
@@ -163,8 +242,30 @@ describe("full extraction REST wrappers", () => {
       headers: {},
       body: { ...identity, concept: "windows", sourceObservationIds: ["obs-1"] },
     });
+    const recovered = await sdk.getFunction("api::full-memory-consolidate-window-prepare")({
+      headers: {},
+      body: {
+        ...identity,
+        concept: "windows",
+        sourceObservationIds: ["obs-1"],
+        requireExistingReceipt: true,
+      },
+    });
 
     expect(response.status_code).toBe(503);
+    expect(recovered.status_code).toBe(200);
+    expect(recovered.body).toMatchObject({
+      operationReceipt: {
+        key: receiptKey,
+        version: 1,
+        status: "running",
+        runId: receiptIdentity.runId,
+        stage: receiptIdentity.stage,
+        unitId: receiptIdentity.unitId,
+        inputHash: receiptIdentity.inputHash,
+        runnerInputHash: identity.inputHash,
+      },
+    });
     expect(response.body).toMatchObject({
       failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" },
     });
@@ -189,11 +290,60 @@ describe("full extraction REST wrappers", () => {
       },
     });
 
-    expect(response.status_code).toBe(503);
+    expect(response.status_code).toBe(200);
     expect(response.body).toMatchObject({
       failure: {
         class: "transient_runtime",
         cause: "extraction_operation_reconciliation_required",
+      },
+      operationReceiptAbsence: {
+        schema: "extraction-operation-receipt-absence/v1",
+        key: buildExtractionOperationKey({
+          runId: "prepare-missing",
+          stage: "memory_consolidate",
+          unitId: "window-1",
+        }),
+        runId: "prepare-missing",
+        stage: "memory_consolidate",
+        unitId: "window-1",
+        inputHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+        runnerInputHash: "input-1",
+      },
+    });
+    expect(sdk.trigger).not.toHaveBeenCalled();
+  });
+
+  it("rejects a memory prepare whose fresh retry drifted from the absence input hash", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    const body = {
+      runId: "prepare-drifted",
+      stage: "memory_consolidate",
+      unitId: "window-1",
+      inputHash: "input-1",
+      concept: "windows",
+      sourceObservationIds: ["obs-1"],
+    };
+
+    const probe = await sdk.getFunction("api::full-memory-consolidate-window-prepare")({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    });
+    const observedInputHash = probe.body.operationReceiptAbsence.inputHash as string;
+    const driftedInputHash = observedInputHash === "f".repeat(64)
+      ? "e".repeat(64)
+      : "f".repeat(64);
+    const retry = await sdk.getFunction("api::full-memory-consolidate-window-prepare")({
+      headers: {},
+      body: { ...body, expectedReceiptInputHash: driftedInputHash },
+    });
+
+    expect(retry.status_code).toBe(409);
+    expect(retry.body).toMatchObject({
+      failure: {
+        class: "hard",
+        cause: "extraction_operation_input_hash_drifted_after_absence",
       },
     });
     expect(sdk.trigger).not.toHaveBeenCalled();
@@ -253,6 +403,11 @@ describe("full extraction REST wrappers", () => {
       identity.stage,
       identity.unitId,
     ]));
+    const parsed = {};
+    const sourceObservationIds = ["obs-1"];
+    const concept = "windows";
+    const proposalHash = stableHash([parsed, sourceObservationIds, undefined, concept]);
+    const preparedHandle = fingerprintId("mcph", `${proposalKey}:${proposalHash}`);
     await kv.set(KV.extractionOperationReceipt(receiptKey), receiptKey, {
       ...receiptIdentity,
       key: receiptKey,
@@ -262,13 +417,13 @@ describe("full extraction REST wrappers", () => {
     await kv.set(KV.memoryConsolidationProposal(proposalKey), proposalKey, {
       ...identity,
       key: proposalKey,
-      handle: "mcph-1",
-      proposalHash: "proposal-1",
+      handle: preparedHandle,
+      proposalHash,
       status: "prepared",
       preparedAt: "2026-07-24T00:00:01.000Z",
-      concept: "windows",
-      sourceObservationIds: ["obs-1"],
-      parsed: {},
+      concept,
+      sourceObservationIds,
+      parsed,
       totalObservations: 1,
       promptChars: 42,
     });
@@ -278,12 +433,27 @@ describe("full extraction REST wrappers", () => {
       headers: {},
       body: { ...identity, concept: "windows", sourceObservationIds: ["obs-1"] },
     });
+    const recovered = await sdk.getFunction("api::full-memory-consolidate-window-prepare")({
+      headers: {},
+      body: {
+        ...identity,
+        concept: "windows",
+        sourceObservationIds: ["obs-1"],
+        requireExistingReceipt: true,
+      },
+    });
 
     expect(response.status_code).toBe(200);
     expect(response.body).toMatchObject({
       status: "prepared",
-      preparedHandle: "mcph-1",
-      proposalHash: "proposal-1",
+      preparedHandle,
+      proposalHash,
+    });
+    expect(recovered.status_code).toBe(200);
+    expect(recovered.body).toMatchObject({
+      status: "prepared",
+      preparedHandle,
+      proposalHash,
     });
     expect(sdk.trigger).not.toHaveBeenCalled();
     expect(await kv.get(KV.extractionOperationReceipt(receiptKey), receiptKey)).toMatchObject({
@@ -442,6 +612,70 @@ describe("full extraction REST wrappers", () => {
       body: { success: true, status: "succeeded", memoryIds: ["mem-1"] },
     });
     expect(sdk.trigger).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    {
+      api: "api::full-memory-consolidate-window-commit",
+      stage: "memory_consolidate",
+    },
+    {
+      api: "api::full-skill-extract-commit",
+      stage: "skill_extract",
+    },
+  ])("does not create a missing recovered $stage commit receipt", async ({ api, stage }) => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    const prepareRunId = `${stage}-prepare`;
+    const unitId = `${stage}-unit`;
+    const prepareInputHash = `${stage}-prepare-input`;
+    const preparedHandle = `${stage}-handle`;
+    const proposalHash = `${stage}-proposal`;
+    const inputHash = stableHash({
+      prepareRunId,
+      unitId,
+      prepareInputHash,
+      preparedHandle,
+      proposalHash,
+    });
+
+    const response = await sdk.getFunction(api)({
+      headers: {},
+      body: {
+        runId: `${stage}-commit`,
+        stage,
+        unitId,
+        inputHash,
+        prepareRunId,
+        prepareInputHash,
+        preparedHandle,
+        proposalHash,
+        requireExistingReceipt: true,
+      },
+    });
+
+    expect(response.status_code).toBe(200);
+    expect(response.body).toMatchObject({
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+      operationReceiptAbsence: {
+        schema: "extraction-operation-receipt-absence/v1",
+        key: buildExtractionOperationKey({
+          runId: `${stage}-commit`,
+          stage,
+          unitId,
+        }),
+        runId: `${stage}-commit`,
+        stage,
+        unitId,
+        inputHash,
+        runnerInputHash: inputHash,
+      },
+    });
+    expect(sdk.trigger).not.toHaveBeenCalled();
   });
 
   it("forwards a v2 summary attempt and exact operation identity", async () => {
@@ -897,6 +1131,113 @@ describe("full extraction REST wrappers", () => {
     expect(sdk.trigger).toHaveBeenCalledTimes(1);
   });
 
+  it("returns an exact lesson receipt-absence proof through the HTTP transport", async () => {
+    const operationReceiptAbsence = {
+      schema: "extraction-operation-receipt-absence/v1",
+      key: `xop_${"a".repeat(32)}`,
+      runId: "attempt-absence",
+      stage: "lessons",
+      unitId: "session-1",
+      inputHash: "b".repeat(64),
+      runnerInputHash: "c".repeat(64),
+      observedAt: "2026-07-30T00:00:00.000Z",
+    };
+    const sdk = mockSdk(async () => ({
+      success: false,
+      status: "failed",
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+      operationReceiptAbsence,
+    }));
+    const kv = mockKV();
+    const startedAt = "2026-07-22T00:00:00.000Z";
+    const inputHash = sessionInputHash("session-1", startedAt);
+    await kv.set(KV.sessions, "session-1", {
+      id: "session-1",
+      startedAt,
+    });
+    registerApiTriggers(sdk as never, kv as never, "");
+
+    const response = await sdk.getFunction("api::lesson-extract")({
+      headers: {},
+      body: {
+        sessionIds: ["session-1"],
+        attemptId: "attempt-absence",
+        inputHash,
+        requireExistingReceipt: true,
+      },
+    });
+
+    expect(response).toEqual({
+      status_code: 200,
+      body: {
+        success: false,
+        status: "failed",
+        failure: {
+          class: "transient_runtime",
+          cause: "extraction_operation_reconciliation_required",
+        },
+        operationReceiptAbsence,
+      },
+    });
+  });
+
+  it("returns a running lesson receipt through the recovered HTTP query", async () => {
+    const startedAt = "2026-07-30T00:00:00.000Z";
+    const operationReceipt = {
+      key: `xop_${"a".repeat(32)}`,
+      version: 1,
+      status: "running",
+      runId: "attempt-running",
+      stage: "lessons",
+      unitId: "session-1",
+      inputHash: "b".repeat(64),
+      runnerInputHash: "c".repeat(64),
+      startedAt,
+    };
+    const sdk = mockSdk(async () => ({
+      success: false,
+      status: "failed",
+      failure: {
+        class: "transient_runtime",
+        cause: "extraction_operation_reconciliation_required",
+      },
+      operationReceipt,
+    }));
+    const kv = mockKV();
+    const sessionStartedAt = "2026-07-22T00:00:00.000Z";
+    await kv.set(KV.sessions, "session-1", {
+      id: "session-1",
+      startedAt: sessionStartedAt,
+    });
+    registerApiTriggers(sdk as never, kv as never, "");
+
+    const response = await sdk.getFunction("api::lesson-extract")({
+      headers: {},
+      body: {
+        sessionIds: ["session-1"],
+        attemptId: "attempt-running",
+        inputHash: sessionInputHash("session-1", sessionStartedAt),
+        requireExistingReceipt: true,
+      },
+    });
+
+    expect(response).toEqual({
+      status_code: 200,
+      body: {
+        success: false,
+        status: "failed",
+        failure: {
+          class: "transient_runtime",
+          cause: "extraction_operation_reconciliation_required",
+        },
+        operationReceipt,
+      },
+    });
+  });
+
   it("allows only structured summary failure diagnostics through the REST boundary", async () => {
     const sdk = mockSdk(async () => ({
       success: false,
@@ -1068,6 +1409,8 @@ describe("full extraction REST wrappers", () => {
           }
           reduceRequests.push(payload);
           if (reduceFailed) {
+            const attemptId = payload.attemptId as string;
+            const operationUnitId = payload.operationUnitId as string;
             return {
               success: false,
               status: "failed",
@@ -1094,7 +1437,27 @@ describe("full extraction REST wrappers", () => {
                       },
                     },
                   }
-                : {}),
+                : {
+                    operationReceipt: {
+                      key: `xop_${stableV2Hash([
+                        attemptId,
+                        "summary",
+                        operationUnitId,
+                      ]).slice(0, 32)}`,
+                      version: 1,
+                      status: "running",
+                      runId: attemptId,
+                      stage: "summary",
+                      unitId: operationUnitId,
+                      inputHash: stableV2Hash({
+                        attemptId,
+                        operationUnitId,
+                        phase: "final_result_persistence",
+                      }),
+                      runnerInputHash: payload.inputHash,
+                      startedAt: "2026-07-30T00:00:00.000Z",
+                    },
+                  }),
             };
           }
           const attemptId = payload.attemptId as string;
@@ -1118,7 +1481,7 @@ describe("full extraction REST wrappers", () => {
               kind: "committed",
               receiptKey: `receipt-${attemptId}`,
               receiptVersion: 1,
-              resultRef: `summary-resumable-runs:${resumableRunId}`,
+              resultRef: `mem:summary-resumable:runs:${resumableRunId}`,
               effectHash: stableV2Hash({
                 title: summary.title,
                 narrative: "",
@@ -1281,11 +1644,12 @@ describe("full extraction REST wrappers", () => {
           runId: "formal-run",
           stage: "semantic_rollup",
           unitId: "w0001",
-          inputHash: "input-1",
+          inputHash: "a".repeat(64),
           windowId: "w0001",
           mark: "full",
           kind: "window",
           sessionIds: ["ses-1"],
+          sourceSummaryHashes: { "ses-1": "b".repeat(64) },
         },
         functionId: "mem::semantic-rollup",
       },
@@ -1340,14 +1704,86 @@ describe("full extraction REST wrappers", () => {
       sdk.trigger.mockClear();
       const handler = sdk.getFunction(entry.api);
       const first = await handler({ headers: {}, body: entry.body });
-      const replay = await handler({ headers: {}, body: entry.body });
+      const domainReverification = new Set([
+        "semantic_rollup",
+        "crystal",
+        "consolidation_procedural",
+        "reflect_insight",
+      ]).has(entry.body.stage);
+      if (domainReverification && first.status_code === 200) {
+        const operationReceipt = first.body.operationReceipt as {
+          key: string;
+          inputHash: string;
+        };
+        const scope = KV.extractionOperationReceipt(operationReceipt.key);
+        const stored = await kv.get<Record<string, unknown>>(scope, operationReceipt.key);
+        const identity = {
+          runId: entry.body.runId,
+          unitId: entry.body.unitId,
+          inputHash: operationReceipt.inputHash,
+        };
+        const stageRecovery = entry.body.stage === "semantic_rollup"
+          ? {
+            semanticRecovery: {
+              schema: "semantic-rollup-recovery/v1",
+              phase: "committed",
+              identity: {
+                runId: identity.runId,
+                unitId: identity.unitId,
+                receiptInputHash: identity.inputHash,
+              },
+            },
+          }
+          : entry.body.stage === "crystal"
+            ? {
+              crystalRecovery: {
+                schema: "crystal-recovery/v1",
+                phase: "committed",
+                identity,
+              },
+            }
+            : entry.body.stage === "consolidation_procedural"
+              ? {
+                proceduralRecovery: {
+                  schema: "consolidation-procedural-recovery/v1",
+                  phase: "committed",
+                  identity,
+                },
+              }
+              : {
+                reflectRecovery: {
+                  schema: "reflect-insight-recovery/v1",
+                  phase: "committed",
+                  identity,
+                },
+              };
+        await kv.set(scope, operationReceipt.key, { ...stored, ...stageRecovery });
+      }
+      const replay = await handler({
+        headers: {},
+        body: domainReverification
+          ? { ...entry.body, requireExistingReceipt: true }
+          : entry.body,
+      });
 
       expect(first.status_code).toBe(200);
       expect(replay.status_code).toBe(200);
-      expect(sdk.trigger).toHaveBeenCalledTimes(1);
+      expect(sdk.trigger).toHaveBeenCalledTimes(domainReverification ? 2 : 1);
       expect(sdk.trigger).toHaveBeenCalledWith(expect.objectContaining({
         function_id: entry.functionId,
       }));
+      expect(first.body).toMatchObject({
+        operationReceipt: {
+          key: expect.stringMatching(/^xop_[0-9a-f]{32}$/),
+          version: 1,
+          status: "succeeded",
+          runId: entry.body.runId,
+          stage: entry.body.stage,
+          unitId: entry.body.unitId,
+          inputHash: expect.any(String),
+          runnerInputHash: entry.body.inputHash,
+        },
+      });
       expect(replay.body).toEqual(first.body);
     }
   });
@@ -1405,6 +1841,26 @@ describe("full extraction REST wrappers", () => {
         identity,
         sessionId: "ses-1",
         model: "skill-model",
+        operationReceiptManaged: true,
+      },
+    });
+
+    const recoveredPrepare = await sdk.getFunction("api::full-skill-extract-prepare")({
+      headers: {},
+      body: {
+        ...identity,
+        sessionId: "ses-1",
+        requireExistingReceipt: true,
+      },
+    });
+    expect(recoveredPrepare.status_code).toBe(200);
+    expect(sdk.trigger).toHaveBeenLastCalledWith({
+      function_id: "mem::full-skill-extract-prepare",
+      payload: {
+        identity,
+        sessionId: "ses-1",
+        operationReceiptManaged: true,
+        requireExistingReceipt: true,
       },
     });
 
@@ -1525,9 +1981,22 @@ describe("full extraction REST wrappers", () => {
       const response = await handler({ headers: {}, body: entry.body });
 
       expect(response.status_code).toBe(200);
+      const expectsRecoveryIdentity = [
+        "api::full-consolidation-procedural-window",
+        "api::full-reflect-insight-window",
+      ].includes(entry.api);
       expect(sdk.trigger).toHaveBeenCalledWith({
         function_id: entry.function_id,
-        payload: entry.payload,
+        payload: expectsRecoveryIdentity
+          ? expect.objectContaining({
+              ...entry.payload,
+              recoveryIdentity: expect.objectContaining({
+                runId: "formal-run",
+                unitId: (entry.body as Record<string, unknown>).unitId,
+                inputHash: expect.stringMatching(/^[0-9a-f]{64}$/),
+              }),
+            })
+          : entry.payload,
       });
     }
   });
@@ -1599,6 +2068,9 @@ describe("full extraction REST wrappers", () => {
         groupId: "crystal-group:1:repo",
         actionIds: ["action-1"],
         actionUpdatedAts: ["2026-07-24T00:00:00.000Z"],
+        runId: "crystal-attempt",
+        unitId: "crystal-group:1:repo",
+        inputHash: expect.stringMatching(/^[0-9a-f]{64}$/),
       },
     });
   });

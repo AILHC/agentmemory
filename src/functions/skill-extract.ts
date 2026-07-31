@@ -17,6 +17,7 @@ import { logger } from "../logger.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import {
   completeModelOperationFromVerifiedResult,
+  projectExtractionOperationReceiptAbsence,
   withExtractionOperationReceipt,
 } from "./extraction-operation-receipts.js";
 import { withOutputLanguagePolicy } from "../prompts/output-language.js";
@@ -139,12 +140,14 @@ interface SkillExtractOptions {
   operationIdentity?: ExtractionOperationIdentity;
   operationReceiptManaged?: boolean;
   requireExistingReceipt?: boolean;
+  expectedReceiptInputHash?: string;
 }
 
 type ParsedSkill = NonNullable<ReturnType<typeof parseSkillXml>>;
 const SKILL_COMMIT_LOCK_KEY = "skill-extract-commit";
 
 function stableStringify(value: unknown): string {
+  if (value === undefined) return "null";
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableStringify(item)).join(",")}]`;
@@ -159,6 +162,68 @@ function stableStringify(value: unknown): string {
 
 function stableHash(value: unknown): string {
   return createHash("sha256").update(stableStringify(value)).digest("hex");
+}
+
+function skillProposalHash(options: {
+  parsed: ParsedSkill | null;
+  sessionId: string;
+  concepts: string[];
+  sourceObservationIds: string[];
+}): string {
+  return fingerprintId("skh", stableStringify([
+    options.parsed,
+    options.sessionId,
+    options.concepts,
+    options.sourceObservationIds,
+  ]));
+}
+
+function skillStableEffect(skill: ProceduralMemory): Record<string, unknown> {
+  return {
+    id: skill.id,
+    name: skill.name,
+    triggerCondition: skill.triggerCondition,
+    steps: skill.steps,
+    expectedOutcome: skill.expectedOutcome,
+    tags: skill.tags,
+    concepts: skill.concepts,
+    sourceObservationIds: skill.sourceObservationIds,
+    createdAt: skill.createdAt,
+  };
+}
+
+function isVerifiableSkill(value: unknown): value is ProceduralMemory {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const skill = value as Partial<ProceduralMemory>;
+  return typeof skill.id === "string"
+    && typeof skill.name === "string"
+    && typeof skill.triggerCondition === "string"
+    && Array.isArray(skill.steps)
+    && skill.steps.every((step) => typeof step === "string")
+    && typeof skill.expectedOutcome === "string"
+    && Array.isArray(skill.tags)
+    && skill.tags.every((tag) => typeof tag === "string")
+    && Array.isArray(skill.concepts)
+    && skill.concepts.every((concept) => typeof concept === "string")
+    && Array.isArray(skill.sourceSessionIds)
+    && skill.sourceSessionIds.every((sessionId) => typeof sessionId === "string")
+    && Array.isArray(skill.sourceObservationIds)
+    && skill.sourceObservationIds.every((observationId) => typeof observationId === "string")
+    && typeof skill.createdAt === "string";
+}
+
+function skillIdentityId(skill: Pick<
+  ProceduralMemory,
+  "name" | "triggerCondition" | "steps"
+>): string {
+  return fingerprintId(
+    "skill",
+    JSON.stringify({
+      title: skill.name.toLowerCase(),
+      trigger: skill.triggerCondition.toLowerCase(),
+      steps: skill.steps.map((step) => step.toLowerCase().trim()),
+    }),
+  );
 }
 
 function skillProposalKey(identity: ExtractionOperationIdentity): string {
@@ -182,6 +247,102 @@ function skillProposalResponse(proposal: SkillExtractionProposal): Record<string
   };
 }
 
+function committedSkillFailure(cause: string): Record<string, unknown> {
+  return {
+    success: false,
+    status: "failed",
+    failure: { class: "hard", cause },
+  };
+}
+
+function sameJsonValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function verifyCommittedSkillProposal(
+  kv: StateKV,
+  proposal: SkillExtractionProposal,
+): Promise<Record<string, unknown> | null> {
+  if (!proposal.parsed) {
+    return (
+      !proposal.commitIntent
+      && proposal.response?.status === "skipped"
+      && proposal.response.extracted === false
+      && sameJsonValue(proposal.response.proceduralMemoryIds, [])
+    )
+      ? null
+      : committedSkillFailure("skill_extract_committed_effect_conflict");
+  }
+  const intent = proposal.commitIntent;
+  const response = proposal.response;
+  if (!intent || !response) {
+    return committedSkillFailure("skill_extract_committed_effect_missing");
+  }
+  if (
+    typeof intent.stableResultHash !== "string"
+    || !/^[0-9a-f]{64}$/.test(intent.stableResultHash)
+  ) {
+    return committedSkillFailure("skill_extract_committed_effect_missing");
+  }
+  const [skill, audit] = await Promise.all([
+    kv.get<ProceduralMemory>(KV.procedural, intent.resultId),
+    kv.get<AuditEntry>(KV.audit, intent.auditId),
+  ]);
+  if (!skill || !audit) {
+    return committedSkillFailure("skill_extract_committed_effect_missing");
+  }
+  const auditDetails = audit.details as Record<string, unknown> | undefined;
+  const responseSkill = response.skill;
+  if (!isVerifiableSkill(skill) || !isVerifiableSkill(responseSkill)) {
+    return committedSkillFailure("skill_extract_committed_effect_conflict");
+  }
+  const effectMatches = (
+    skill.id === intent.resultId
+    && skillIdentityId(skill) === intent.resultId
+    && stableHash(skillStableEffect(skill)) === intent.stableResultHash
+    && skill.sourceSessionIds.includes(proposal.sessionId)
+    && responseSkill?.id === intent.resultId
+    && stableHash(skillStableEffect(responseSkill)) === intent.stableResultHash
+    && responseSkill.sourceSessionIds.includes(proposal.sessionId)
+    && audit.id === intent.auditId
+    && audit.timestamp === intent.createdAt
+    && audit.operation === "skill_extract"
+    && audit.functionId === "mem::full-skill-extract-commit"
+    && sameJsonValue(audit.targetIds, [intent.resultId])
+    && auditDetails?.skillId === intent.resultId
+    && auditDetails?.sessionId === proposal.sessionId
+    && auditDetails?.reinforced === response.reinforced
+    && typeof auditDetails?.duplicateSession === "boolean"
+    && response.success === true
+    && response.status === "succeeded"
+    && response.extracted === true
+    && sameJsonValue(response.proceduralMemoryIds, [intent.resultId])
+  );
+  return effectMatches
+    ? null
+    : committedSkillFailure("skill_extract_committed_effect_conflict");
+}
+
+function skillDomainEffectEvidence(
+  proposal: SkillExtractionProposal,
+): Record<string, unknown> {
+  const intent = proposal.commitIntent!;
+  return {
+    schema: "skill-extract-domain-effect/v1",
+    proposalHash: proposal.proposalHash,
+    resultId: intent.resultId,
+    auditId: intent.auditId,
+    effectHash: stableHash([
+      proposal.key,
+      proposal.proposalHash,
+      intent.resultId,
+      intent.auditId,
+      intent.createdAt,
+      intent.stableResultHash,
+    ]),
+  };
+}
+
 async function storeSkillProposal(options: {
   kv: StateKV;
   identity: ExtractionOperationIdentity;
@@ -193,12 +354,7 @@ async function storeSkillProposal(options: {
   responseMetadata: Record<string, unknown>;
 }): Promise<Record<string, unknown>> {
   const key = skillProposalKey(options.identity);
-  const proposalHash = fingerprintId("skh", JSON.stringify([
-    options.parsed,
-    options.sessionId,
-    options.concepts,
-    options.sourceObservationIds,
-  ]));
+  const proposalHash = skillProposalHash(options);
   const proposal: SkillExtractionProposal = {
     ...options.identity,
     key,
@@ -228,7 +384,7 @@ async function storeSkillProposal(options: {
   return skillProposalResponse(proposal);
 }
 
-async function findSkillPreparationResult(
+export async function findSkillPreparationResult(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
 ): Promise<Record<string, unknown> | null> {
@@ -243,6 +399,17 @@ async function findSkillPreparationResult(
       status: "failed",
       failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
     };
+  }
+  const expectedHash = skillProposalHash(proposal);
+  if (
+    proposal.key !== skillProposalKey(identity)
+    || proposal.runId !== identity.runId
+    || proposal.stage !== identity.stage
+    || proposal.unitId !== identity.unitId
+    || proposal.proposalHash !== expectedHash
+    || proposal.handle !== fingerprintId("skph", `${proposal.key}:${expectedHash}`)
+  ) {
+    return committedSkillFailure("proposal_identity_conflict");
   }
   return skillProposalResponse(proposal);
 }
@@ -455,7 +622,12 @@ export async function runSkillExtract(options: SkillExtractOptions): Promise<Rec
     options.kv,
     verifiedIdentity,
     execute,
-    { requireExisting: options.requireExistingReceipt === true },
+    {
+      requireExisting: options.requireExistingReceipt === true,
+      ...(options.expectedReceiptInputHash
+        ? { expectedInputHash: options.expectedReceiptInputHash }
+        : {}),
+    },
   );
   if (
     operation.failure?.cause === "extraction_operation_reconciliation_required"
@@ -466,11 +638,21 @@ export async function runSkillExtract(options: SkillExtractOptions): Promise<Rec
         options.kv,
         verifiedIdentity,
         persisted,
+        { allowMissing: true },
       );
     }
   }
   if (operation.failure) {
-    return { success: false, status: "failed", failure: operation.failure };
+    const operationReceiptAbsence = projectExtractionOperationReceiptAbsence(
+      operation.receiptAbsence,
+      options.operationIdentity!.inputHash,
+    );
+    return {
+      success: false,
+      status: "failed",
+      failure: operation.failure,
+      ...(operationReceiptAbsence ? { operationReceiptAbsence } : {}),
+    };
   }
   return operation.response ?? {
     success: false,
@@ -494,9 +676,15 @@ export async function commitSkillExtractionProposal(options: {
     if (!proposal) {
       return { success: false, status: "failed", failure: { class: "hard", cause: "proposal_not_found" } };
     }
+    const expectedProposalHash = skillProposalHash(proposal);
     if (
-      proposal.inputHash !== options.identity.inputHash
+      proposal.key !== key
+      || proposal.runId !== options.identity.runId
+      || proposal.unitId !== options.identity.unitId
+      || proposal.inputHash !== options.identity.inputHash
       || proposal.handle !== options.preparedHandle
+      || proposal.proposalHash !== expectedProposalHash
+      || proposal.handle !== fingerprintId("skph", `${key}:${expectedProposalHash}`)
       || (
         options.proposalHash !== undefined
         && proposal.proposalHash !== options.proposalHash
@@ -509,8 +697,15 @@ export async function commitSkillExtractionProposal(options: {
         failure: { class: "hard", cause: "proposal_identity_conflict" },
       };
     }
-    if (proposal.status === "committed" && proposal.response) {
-      return skillProposalResponse(proposal);
+    if (proposal.status === "committed") {
+      const verificationFailure = await verifyCommittedSkillProposal(options.kv, proposal);
+      if (verificationFailure) return verificationFailure;
+      return proposal.parsed
+        ? {
+          ...skillProposalResponse(proposal),
+          domainEffectEvidence: skillDomainEffectEvidence(proposal),
+        }
+        : skillProposalResponse(proposal);
     }
     if (!proposal.parsed) {
       return {
@@ -539,6 +734,9 @@ export async function commitSkillExtractionProposal(options: {
 
     const intent = proposal.commitIntent;
     const existing = await options.kv.get<ProceduralMemory>(KV.procedural, intent.resultId).catch(() => null);
+    if (existing && !isVerifiableSkill(existing)) {
+      return committedSkillFailure("skill_extract_committed_effect_conflict");
+    }
     const alreadyReinforced = existing?.sourceSessionIds.includes(proposal.sessionId) ?? false;
     const skill: ProceduralMemory = existing
       ? {
@@ -565,6 +763,16 @@ export async function commitSkillExtractionProposal(options: {
           createdAt: intent.createdAt,
           updatedAt: intent.createdAt,
         };
+    if (skillIdentityId(skill) !== intent.resultId) {
+      return committedSkillFailure("skill_extract_committed_effect_conflict");
+    }
+    const stableResultHash = stableHash(skillStableEffect(skill));
+    if (intent.stableResultHash === undefined) {
+      intent.stableResultHash = stableResultHash;
+      await options.kv.set(KV.skillExtractionProposal(key), key, proposal);
+    } else if (intent.stableResultHash !== stableResultHash) {
+      return committedSkillFailure("skill_extract_committed_effect_conflict");
+    }
     await options.kv.set(KV.procedural, skill.id, skill);
     const audit: AuditEntry = {
       id: intent.auditId,
@@ -593,7 +801,11 @@ export async function commitSkillExtractionProposal(options: {
       parseFailures: 0,
     };
     await options.kv.set(KV.skillExtractionProposal(key), key, proposal);
-    return skillProposalResponse(proposal);
+    return await verifyCommittedSkillProposal(options.kv, proposal)
+      ?? {
+        ...skillProposalResponse(proposal),
+        domainEffectEvidence: skillDomainEffectEvidence(proposal),
+      };
   });
 }
 
@@ -615,6 +827,7 @@ export function registerSkillExtractFunctions(
       model?: string;
       operationReceiptManaged?: boolean;
       requireExistingReceipt?: boolean;
+      expectedReceiptInputHash?: string;
     }) => withKeyedLock(
       `skill-extract-prepare:${skillProposalKey(data.identity)}`,
       () => runSkillExtract({ kv, provider, ...data, operationIdentity: data.identity }),

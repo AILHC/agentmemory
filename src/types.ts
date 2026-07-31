@@ -221,7 +221,9 @@ export interface ExtractionOperationReceipt<T = unknown>
     id: string;
     at: string;
     resultStatus: "absent";
-    resumableRunId: string;
+    proofKind: "summary_resumable_run" | "protocol_state";
+    phase: "execute" | "prepare" | "commit";
+    resumableRunId?: string;
   };
   retry?: {
     epoch: number;
@@ -298,6 +300,7 @@ export interface SkillExtractionProposal extends ExtractionOperationIdentity {
     resultId: string;
     auditId: string;
     createdAt: string;
+    stableResultHash?: string;
   };
   response?: {
     success: true;
