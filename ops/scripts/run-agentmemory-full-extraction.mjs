@@ -1129,6 +1129,8 @@ const HELP_TEXT = [
   '--reflect-insight-model <model>          本次 run 的 reflect_insight 阶段模型显式覆盖。',
   '--default-stage-model <model>            本次 run 的阶段模型默认显式覆盖；stage-specific CLI 优先。',
   '--max-units-per-resume <n>               v2 受控恢复本次最多推进的未决单元数；不改变业务配置。',
+  '--pending-policy <wait|exit>              v2 遇到安全 pending 时保持写锁轮询或返回 75；默认 wait。',
+  '--pending-poll-ms <n>                    v2 pending 轮询间隔毫秒数；默认 30000。',
   '--reset-drifted-units                    resume 时重置漂移单元。',
   '--run-state-format <v1|v2>               状态格式；默认 v2，旧 run 恢复时可显式使用 v1。',
   '--dry-run                                只盘点和写计划状态，不调用提炼写接口。',
@@ -1167,6 +1169,8 @@ export function parseArgs(argv) {
     reflectInsightModel: '',
     defaultStageModel: '',
     maxUnitsPerResume: null,
+    pendingPolicy: 'wait',
+    pendingPollMs: 30_000,
     resetDriftedUnits: false,
     runStateFormat: 'v2',
     dryRun: false,
@@ -1276,6 +1280,12 @@ export function parseArgs(argv) {
     } else if (arg === '--max-units-per-resume') {
       result.maxUnitsPerResume = requirePositiveSafeInteger(argv, i, arg);
       i += 1;
+    } else if (arg === '--pending-policy') {
+      result.pendingPolicy = requireValue(argv, i, arg);
+      i += 1;
+    } else if (arg === '--pending-poll-ms') {
+      result.pendingPollMs = requirePositiveSafeInteger(argv, i, arg);
+      i += 1;
     } else if (arg === '--reset-drifted-units') {
       result.resetDriftedUnits = true;
     } else if (arg === '--run-state-format') {
@@ -1357,6 +1367,12 @@ export function parseArgs(argv) {
     && (result.runStateFormat !== 'v2' || !result.resume || result.dryRun)
   ) {
     throw new Error('--max-units-per-resume 仅允许用于非 dry-run 的 v2 --resume');
+  }
+  if (!['wait', 'exit'].includes(result.pendingPolicy)) {
+    throw new Error('--pending-policy 必须是 wait 或 exit');
+  }
+  if (!Number.isSafeInteger(result.pendingPollMs) || result.pendingPollMs < 1) {
+    throw new Error('--pending-poll-ms 必须是安全正整数');
   }
   return result;
 }
@@ -5568,27 +5584,30 @@ function createV2ExecutionBoundary({ limit, drainRequestProbe }) {
   let processed = 0;
   let last = null;
   let pause = null;
+  const pollDrain = async ({ stage, unitId }) => {
+    const drainRequest = await drainRequestProbe?.();
+    if (!drainRequest) return false;
+    pause = {
+      reasonCode: 'operator_drain_requested',
+      stage,
+      lastUnitId: last?.unitId || null,
+      nextUnitId: unitId,
+      processedCount: processed,
+      requestedAt: drainRequest.requestedAt,
+    };
+    return true;
+  };
   return {
     limit,
     async claim({ stage, unitId }) {
-      const drainRequest = await drainRequestProbe?.();
-      if (drainRequest) {
-        pause = {
-          reasonCode: 'operator_drain_requested',
-          stage,
-          lastUnitId: last?.unitId || null,
-          nextUnitId: unitId,
-          processedCount: processed,
-          requestedAt: drainRequest.requestedAt,
-        };
-        return false;
-      }
+      if (await pollDrain({ stage, unitId })) return false;
       if (remaining !== null && remaining <= 0) return false;
       if (remaining !== null) remaining -= 1;
       processed += 1;
       last = { stage, unitId };
       return true;
     },
+    pollDrain,
     reached() {
       if (pause) return true;
       if (limit !== null && processed > 0 && remaining === 0) {
@@ -5619,6 +5638,7 @@ async function runV2JournalSingleStage({
   planOnly,
   dependencyStates = new Map(),
   executionBoundary = null,
+  inProcessAcceptedUnitIds = null,
 }) {
   const opened = control.some((event) => event.type === 'stage_opened' && event.payload?.stage === stage);
   if (!opened) await durable('control', 'stage_opened', { stage });
@@ -5640,6 +5660,7 @@ async function runV2JournalSingleStage({
     dependencyStates,
     ...adapter,
     executionBoundary,
+    inProcessAcceptedUnitIds,
   });
   const recoveryProjection = reduceRecoveryJournal(await journal.readStage(stage)).run;
   let statusEntry;
@@ -5695,6 +5716,7 @@ async function runV2JournalTwoPhaseStage({
   adapter,
   planOnly,
   executionBoundary = null,
+  inProcessAcceptedUnitIds = null,
 }) {
   const opened = control.some((event) => event.type === 'stage_opened' && event.payload?.stage === stage);
   if (!opened) await durable('control', 'stage_opened', { stage });
@@ -5715,6 +5737,7 @@ async function runV2JournalTwoPhaseStage({
     stage,
     ...adapter,
     executionBoundary,
+    inProcessAcceptedUnitIds,
   });
   const latestEvents = await journal.readStage(stage);
   const hasRecoveryProjection = latestEvents.some((event) => (
@@ -6971,167 +6994,242 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     }
     if (await ensureV2CompletedStatus({ journal, fsApi, runId, control })) return 0;
 
-    const summaryResult = await runV2JournalSingleStage({
-      stage: 'summary',
-      control,
-      journal,
-      durable,
-      plan: buildV2SummaryPlan(sessions, baseUrl, options),
-      adapter: buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote }),
-      planOnly: options.dryRun,
-      executionBoundary,
-    });
-    control = summaryResult.control;
-    if (summaryResult.status === 'paused') {
-      throw new V2ExecutionPauseReached();
-    }
-    if (summaryResult.status === 'blocked') {
-      return 1;
-    }
-    const summaryDependencyStates = recoveryDependencyStates(
-      'summary',
-      await journal.readStage('summary'),
-    );
-    const lessonsResult = await runV2JournalSingleStage({
-      stage: 'lessons',
-      control,
-      journal,
-      durable,
-      plan: buildV2LessonsPlan(sessions, baseUrl, options),
-      adapter: buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote }),
-      planOnly: options.dryRun,
-      dependencyStates: summaryDependencyStates,
-      executionBoundary,
-    });
-    control = lessonsResult.control;
-    if (lessonsResult.status === 'paused') {
-      throw new V2ExecutionPauseReached();
-    }
-    const earlyStageStatuses = [summaryResult.status, lessonsResult.status];
-    await journal.writeStatus({
-      status: earlyStageStatuses.includes('blocked')
-        ? 'blocked'
-        : earlyStageStatuses.includes('attention_required')
-          ? 'attention_required'
-          : 'running',
-      current_stage: !['completed', 'planned'].includes(lessonsResult.status)
-        ? 'lessons'
-        : !['completed', 'planned'].includes(summaryResult.status)
-          ? 'summary'
-          : null,
-      summary: summaryResult.statusEntry,
-      lessons: lessonsResult.statusEntry,
-    });
-    if (lessonsResult.status === 'blocked') {
-      return 1;
-    }
-    if (dependencies.v2RemainingStages === false) {
-      if (earlyStageStatuses.includes('attention_required')) return 1;
-      if (earlyStageStatuses.includes('pending')) return 75;
-      if (earlyStageStatuses.some((status) => !['completed', 'planned'].includes(status))) {
+    const pendingWait = dependencies.v2PendingWait || sleep;
+    const inProcessAcceptedUnitIdsByStage = new Map();
+    const acceptedUnitIdsForStage = (stage) => {
+      if (!inProcessAcceptedUnitIdsByStage.has(stage)) {
+        inProcessAcceptedUnitIdsByStage.set(stage, new Set());
+      }
+      return inProcessAcceptedUnitIdsByStage.get(stage);
+    };
+    const pendingCanWait = async (stages) => {
+      let hasContinuableWork = false;
+      let nextUnit = null;
+      for (const stage of stages) {
+        const stagePath = journal.stagePath(stage);
+        const exists = await fsApi.access(stagePath).then(
+          () => true,
+          (error) => error?.code === 'ENOENT' ? false : Promise.reject(error),
+        );
+        if (!exists) continue;
+        const reduced = reduceRecoveryJournal(await journal.readStage(stage));
+        const projection = reduced.run.projection;
+        if (
+          projection.reconciling > 0
+          || projection.isolated > 0
+          || projection.dependency_blocked > 0
+          || projection.system_blocked > 0
+        ) return { canWait: false, nextUnit: null };
+        if (projection.runnable > 0 || projection.running > 0 || projection.retry_wait > 0) {
+          hasContinuableWork = true;
+          const candidate = [...reduced.units.values()].find((unit) => (
+            !unit.split
+            && !unit.terminal
+            && !unit.blocked
+            && ['planned', 'running', 'retry_wait'].includes(unit.recovery.state)
+          ));
+          if (!nextUnit && candidate) nextUnit = { stage, unitId: candidate.unit_id };
+        }
+      }
+      return { canWait: hasContinuableWork, nextUnit };
+    };
+    while (true) {
+      const summaryResult = await runV2JournalSingleStage({
+        stage: 'summary',
+        control,
+        journal,
+        durable,
+        plan: buildV2SummaryPlan(sessions, baseUrl, options),
+        adapter: buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote }),
+        planOnly: options.dryRun,
+        executionBoundary,
+        inProcessAcceptedUnitIds: acceptedUnitIdsForStage('summary'),
+      });
+      control = summaryResult.control;
+      if (summaryResult.status === 'paused') {
+        throw new V2ExecutionPauseReached();
+      }
+      if (summaryResult.status === 'blocked') {
         return 1;
+      }
+      const summaryDependencyStates = recoveryDependencyStates(
+        'summary',
+        await journal.readStage('summary'),
+      );
+      const lessonsResult = await runV2JournalSingleStage({
+        stage: 'lessons',
+        control,
+        journal,
+        durable,
+        plan: buildV2LessonsPlan(sessions, baseUrl, options),
+        adapter: buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote }),
+        planOnly: options.dryRun,
+        dependencyStates: summaryDependencyStates,
+        executionBoundary,
+        inProcessAcceptedUnitIds: acceptedUnitIdsForStage('lessons'),
+      });
+      control = lessonsResult.control;
+      if (lessonsResult.status === 'paused') {
+        throw new V2ExecutionPauseReached();
+      }
+      const earlyStageStatuses = [summaryResult.status, lessonsResult.status];
+      await journal.writeStatus({
+        status: earlyStageStatuses.includes('blocked')
+          ? 'blocked'
+          : earlyStageStatuses.includes('attention_required')
+            ? 'attention_required'
+            : 'running',
+        current_stage: !['completed', 'planned'].includes(lessonsResult.status)
+          ? 'lessons'
+          : !['completed', 'planned'].includes(summaryResult.status)
+            ? 'summary'
+            : null,
+        summary: summaryResult.statusEntry,
+        lessons: lessonsResult.statusEntry,
+      });
+      if (lessonsResult.status === 'blocked') {
+        return 1;
+      }
+      if (dependencies.v2RemainingStages === false) {
+        if (earlyStageStatuses.includes('attention_required')) return 1;
+        if (earlyStageStatuses.includes('pending')) {
+          const pendingState = await pendingCanWait(['summary', 'lessons']);
+          if (
+            pendingState.nextUnit
+            && await executionBoundary?.pollDrain(pendingState.nextUnit)
+          ) throw new V2ExecutionPauseReached();
+          if (
+            options.pendingPolicy === 'exit'
+            || !pendingState.canWait
+          ) return 75;
+          logProgress('v2', 'pending_wait', {
+            stages: ['summary', 'lessons'],
+            poll_ms: options.pendingPollMs,
+          });
+          await pendingWait(options.pendingPollMs, { signal: options.signal });
+          continue;
+        }
+        if (earlyStageStatuses.some((status) => !['completed', 'planned'].includes(status))) {
+          return 1;
+        }
+        return 0;
+      }
+      const request = (endpoint, body) => requestJson(
+        baseUrl,
+        secret,
+        'POST',
+        endpoint,
+        body,
+        requestOptions(options),
+      );
+      const runRemaining = typeof dependencies.v2RemainingStages === 'function'
+        ? dependencies.v2RemainingStages
+        : runV2RemainingStages;
+      const remainingResult = await runRemaining({
+        options,
+        runId,
+        config,
+        configHash,
+        inventoryHash,
+        request,
+        stableHash,
+        loadSelectedSessions: async () => {
+          const latest = await loadSessions(baseUrl, secret, options.agentId, options);
+          const latestSelection = selectFullExtractionSessions(latest, excludedSessionIds).sessions;
+          if (!frozenSummary) return latestSelection;
+          return resolveV2FrozenSummaryInventory({
+            options,
+            started,
+            sessions: latestSelection,
+            events: summaryEvents,
+            baseUrl,
+          }).sessions;
+        },
+        eligibleStages: {
+          semantic_rollup: ['completed', 'planned'].includes(summaryResult.status),
+          skill_extract: ['completed', 'planned'].includes(summaryResult.status),
+          reflect_insight: (
+            ['completed', 'planned'].includes(summaryResult.status)
+            && ['completed', 'planned'].includes(lessonsResult.status)
+          ),
+        },
+        runSingleStage: async ({ stage, plan, adapter }) => {
+          const result = await runV2JournalSingleStage({
+            stage,
+            control,
+            journal,
+            durable,
+            plan,
+            adapter,
+            planOnly: options.dryRun,
+            executionBoundary,
+            inProcessAcceptedUnitIds: acceptedUnitIdsForStage(stage),
+          });
+          control = result.control;
+          if (result.status === 'paused') {
+            throw new V2ExecutionPauseReached();
+          }
+          return result;
+        },
+        runTwoPhaseStage: async ({ stage, plan, adapter }) => {
+          const result = await runV2JournalTwoPhaseStage({
+            stage,
+            control,
+            journal,
+            durable,
+            plan,
+            adapter,
+            planOnly: options.dryRun,
+            executionBoundary,
+            inProcessAcceptedUnitIds: acceptedUnitIdsForStage(stage),
+          });
+          control = result.control;
+          if (result.status === 'paused') {
+            throw new V2ExecutionPauseReached();
+          }
+          return result;
+        },
+      });
+      const finalStageStatuses = [...earlyStageStatuses, remainingResult.status];
+      if (finalStageStatuses.includes('blocked')) {
+        return 1;
+      }
+      if (finalStageStatuses.includes('attention_required')) {
+        return 1;
+      }
+      if (finalStageStatuses.includes('pending')) {
+        const pendingState = await pendingCanWait(EFFECT_STATE_RECOVERY_STAGES);
+        if (
+          pendingState.nextUnit
+          && await executionBoundary?.pollDrain(pendingState.nextUnit)
+        ) throw new V2ExecutionPauseReached();
+        if (
+          options.pendingPolicy === 'exit'
+          || !pendingState.canWait
+        ) return 75;
+        logProgress('v2', 'pending_wait', {
+          stages: EFFECT_STATE_RECOVERY_STAGES,
+          poll_ms: options.pendingPollMs,
+        });
+        await pendingWait(options.pendingPollMs, { signal: options.signal });
+        continue;
+      }
+      if (finalStageStatuses.some((status) => !['completed', 'planned'].includes(status))) {
+        return 1;
+      }
+      if (!options.dryRun && !control.some((event) => event.type === 'run_completed')) {
+        await durable('control', 'run_completed', {
+          run_id: runId,
+          stage_count: 8,
+        });
+        await journal.writeStatus({
+          status: 'completed',
+          current_stage: null,
+          stage_count: 8,
+        });
       }
       return 0;
     }
-    const request = (endpoint, body) => requestJson(
-      baseUrl,
-      secret,
-      'POST',
-      endpoint,
-      body,
-      requestOptions(options),
-    );
-    const runRemaining = typeof dependencies.v2RemainingStages === 'function'
-      ? dependencies.v2RemainingStages
-      : runV2RemainingStages;
-    const remainingResult = await runRemaining({
-      options,
-      runId,
-      config,
-      configHash,
-      inventoryHash,
-      request,
-      stableHash,
-      loadSelectedSessions: async () => {
-        const latest = await loadSessions(baseUrl, secret, options.agentId, options);
-        const latestSelection = selectFullExtractionSessions(latest, excludedSessionIds).sessions;
-        if (!frozenSummary) return latestSelection;
-        return resolveV2FrozenSummaryInventory({
-          options,
-          started,
-          sessions: latestSelection,
-          events: summaryEvents,
-          baseUrl,
-        }).sessions;
-      },
-      eligibleStages: {
-        semantic_rollup: ['completed', 'planned'].includes(summaryResult.status),
-        skill_extract: ['completed', 'planned'].includes(summaryResult.status),
-        reflect_insight: (
-          ['completed', 'planned'].includes(summaryResult.status)
-          && ['completed', 'planned'].includes(lessonsResult.status)
-        ),
-      },
-      runSingleStage: async ({ stage, plan, adapter }) => {
-        const result = await runV2JournalSingleStage({
-          stage,
-          control,
-          journal,
-          durable,
-          plan,
-          adapter,
-          planOnly: options.dryRun,
-          executionBoundary,
-        });
-        control = result.control;
-        if (result.status === 'paused') {
-          throw new V2ExecutionPauseReached();
-        }
-        return result;
-      },
-      runTwoPhaseStage: async ({ stage, plan, adapter }) => {
-        const result = await runV2JournalTwoPhaseStage({
-          stage,
-          control,
-          journal,
-          durable,
-          plan,
-          adapter,
-          planOnly: options.dryRun,
-          executionBoundary,
-        });
-        control = result.control;
-        if (result.status === 'paused') {
-          throw new V2ExecutionPauseReached();
-        }
-        return result;
-      },
-    });
-    const finalStageStatuses = [...earlyStageStatuses, remainingResult.status];
-    if (finalStageStatuses.includes('blocked')) {
-      return 1;
-    }
-    if (finalStageStatuses.includes('attention_required')) {
-      return 1;
-    }
-    if (finalStageStatuses.includes('pending')) {
-      return 75;
-    }
-    if (finalStageStatuses.some((status) => !['completed', 'planned'].includes(status))) {
-      return 1;
-    }
-    if (!options.dryRun && !control.some((event) => event.type === 'run_completed')) {
-      await durable('control', 'run_completed', {
-        run_id: runId,
-        stage_count: 8,
-      });
-      await journal.writeStatus({
-        status: 'completed',
-        current_stage: null,
-        stage_count: 8,
-      });
-    }
-    return 0;
   } catch (error) {
     if (!(error instanceof V2ExecutionPauseReached)) throw error;
     const pause = executionBoundary?.pause();

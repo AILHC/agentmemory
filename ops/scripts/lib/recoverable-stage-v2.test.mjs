@@ -1883,11 +1883,12 @@ test('single-phase re-verifies a recorded terminal before completing the stage',
     },
   );
   let verificationCalls = 0;
-
-  assert.deepEqual(await runSinglePhaseStage({
-    events: harness.events,
+  const recoveryEvents = [...harness.events];
+  const inProcessAcceptedUnitIds = new Set();
+  const invoke = (targetHarness, acceptedUnitIds) => runSinglePhaseStage({
+    events: targetHarness.events,
     plan,
-    append: harness.append,
+    append: targetHarness.append,
     attemptIdForUnit: () => 'must-not-run',
     verifyRecoveredTerminal: async () => {
       verificationCalls += 1;
@@ -1895,9 +1896,26 @@ test('single-phase re-verifies a recorded terminal before completing the stage',
     },
     execute: async () => assert.fail('recorded terminal must not execute'),
     record: async () => assert.fail('recorded terminal must not record twice'),
-  }), { status: 'completed', acceptedCount: 1 });
+    inProcessAcceptedUnitIds: acceptedUnitIds,
+  });
+
+  assert.deepEqual(await invoke(harness, inProcessAcceptedUnitIds), {
+    status: 'completed',
+    acceptedCount: 1,
+  });
   assert.equal(verificationCalls, 1);
+  assert.equal(inProcessAcceptedUnitIds.has('unit-1'), true);
   assert.equal(harness.events.at(-1).type, 'stage_completed');
+
+  const sameProcessHarness = makeHarness();
+  sameProcessHarness.events.push(...recoveryEvents);
+  await invoke(sameProcessHarness, inProcessAcceptedUnitIds);
+  assert.equal(verificationCalls, 1);
+
+  const newProcessHarness = makeHarness();
+  newProcessHarness.events.push(...recoveryEvents);
+  await invoke(newProcessHarness, new Set());
+  assert.equal(verificationCalls, 2);
 });
 
 test('single-phase blocks completion when a recorded terminal cannot be re-verified', async () => {
@@ -2703,11 +2721,12 @@ test('two-phase re-verifies a recorded commit terminal before completing the sta
     },
   );
   let verificationCalls = 0;
-
-  assert.deepEqual(await runTwoPhaseStage({
-    events: harness.events,
+  const recoveryEvents = [...harness.events];
+  const inProcessAcceptedUnitIds = new Set();
+  const invoke = (targetHarness, acceptedUnitIds) => runTwoPhaseStage({
+    events: targetHarness.events,
     plan,
-    append: harness.append,
+    append: targetHarness.append,
     prepareAttemptIdForUnit: () => 'must-not-prepare',
     commitAttemptIdForUnit: () => 'must-not-commit',
     prepare: async () => assert.fail('recorded terminal must not prepare'),
@@ -2717,9 +2736,26 @@ test('two-phase re-verifies a recorded commit terminal before completing the sta
       return committedVerificationCandidate('recorded-two-phase');
     },
     record: async () => assert.fail('recorded terminal must not record twice'),
-  }), { status: 'completed', acceptedCount: 1 });
+    inProcessAcceptedUnitIds: acceptedUnitIds,
+  });
+
+  assert.deepEqual(await invoke(harness, inProcessAcceptedUnitIds), {
+    status: 'completed',
+    acceptedCount: 1,
+  });
   assert.equal(verificationCalls, 1);
+  assert.equal(inProcessAcceptedUnitIds.has('unit-1'), true);
   assert.equal(harness.events.at(-1).type, 'stage_completed');
+
+  const sameProcessHarness = makeHarness();
+  sameProcessHarness.events.push(...recoveryEvents);
+  await invoke(sameProcessHarness, inProcessAcceptedUnitIds);
+  assert.equal(verificationCalls, 1);
+
+  const newProcessHarness = makeHarness();
+  newProcessHarness.events.push(...recoveryEvents);
+  await invoke(newProcessHarness, new Set());
+  assert.equal(verificationCalls, 2);
 });
 
 test('two-phase prepare can finish directly without entering commit', async () => {

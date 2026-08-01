@@ -1025,6 +1025,7 @@ export async function runSinglePhaseStage({
   stage = 'stage',
   dependencyStates = new Map(),
   executionBoundary = null,
+  inProcessAcceptedUnitIds = null,
 }) {
   const events = [...initialEvents];
   let state = await ensurePlan({ events, plan, planMetadata, append, mode: 'single' });
@@ -1041,6 +1042,11 @@ export async function runSinglePhaseStage({
     let unit = state.units.get(plannedUnit.unit_id);
     let retryAttemptStartedNow = false;
     if (unit.split) continue;
+    if (
+      unit.recorded
+      && ACCEPTED_TERMINALS.has(unit.terminal)
+      && inProcessAcceptedUnitIds?.has(unit.unit_id)
+    ) continue;
     if (
       unit.retry_scheduled
       && Date.parse(unit.retry_scheduled.retry_at) > now().getTime()
@@ -1565,6 +1571,9 @@ export async function runSinglePhaseStage({
       unit = { ...unit, recorded: true };
       state.units.set(unit.unit_id, unit);
     }
+    if (unit.recorded && ACCEPTED_TERMINALS.has(unit.terminal)) {
+      inProcessAcceptedUnitIds?.add(unit.unit_id);
+    }
   }
 
   state = validateStageEvents(events, 'single');
@@ -1640,6 +1649,7 @@ export async function runTwoPhaseStage({
   recoverPrepare = false,
   recoverCommit = false,
   executionBoundary = null,
+  inProcessAcceptedUnitIds = null,
 }) {
   const events = [...initialEvents];
   let state = await ensurePlan({ events, plan, planMetadata, append, mode: 'two_phase' });
@@ -1656,6 +1666,11 @@ export async function runTwoPhaseStage({
     let unit = state.units.get(plannedUnit.unit_id);
     const recoveredAcceptedTerminal = ACCEPTED_TERMINALS.has(unit.terminal);
     if (unit.split) continue;
+    if (
+      unit.recorded
+      && recoveredAcceptedTerminal
+      && inProcessAcceptedUnitIds?.has(unit.unit_id)
+    ) continue;
     if (unit.blocked || unit.terminal === 'failed') continue;
     const dependencies = (unit.depends_on || []).map((dependency) => (
       dependencySnapshot({
@@ -2183,6 +2198,9 @@ export async function runTwoPhaseStage({
       });
       unit = { ...unit, recorded: true };
       state.units.set(unit.unit_id, unit);
+    }
+    if (unit.recorded && ACCEPTED_TERMINALS.has(unit.terminal)) {
+      inProcessAcceptedUnitIds?.add(unit.unit_id);
     }
   }
 

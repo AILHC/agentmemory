@@ -23,6 +23,9 @@ import {
 function mainForEarlyStages(argv, dependencies = {}) {
   return mainForTest(argv, {
     v2RuntimeCheck: async () => ({ summarizeChunkConcurrency: 1 }),
+    v2PendingWait: async () => {
+      throw new Error('unexpected_v2_pending_wait');
+    },
     ...dependencies,
     v2RemainingStages: false,
   });
@@ -171,10 +174,23 @@ test('v2 controlled resume processes one unresolved unit and records a durable p
       '--resume',
       '--max-units-per-resume', '1',
     ]);
+    const pendingOptions = parseArgs([
+      ...argv,
+      '--pending-policy', 'exit',
+      '--pending-poll-ms', '17',
+    ]);
     assert.deepEqual(
       buildConfigFromOptions(controlledOptions),
       buildConfigFromOptions(regularOptions),
     );
+    assert.deepEqual(
+      buildConfigFromOptions(pendingOptions),
+      buildConfigFromOptions(regularOptions),
+    );
+    assert.equal(regularOptions.pendingPolicy, 'wait');
+    assert.equal(regularOptions.pendingPollMs, 30_000);
+    assert.equal(pendingOptions.pendingPolicy, 'exit');
+    assert.equal(pendingOptions.pendingPollMs, 17);
     assert.throws(
       () => parseArgs([...argv, '--max-units-per-resume', '1']),
       /仅允许用于非 dry-run 的 v2 --resume/,
@@ -185,6 +201,14 @@ test('v2 controlled resume processes one unresolved unit and records a durable p
         /必须是(?:安全)?正整数/,
       );
     }
+    assert.throws(
+      () => parseArgs([...argv, '--pending-policy', 'forever']),
+      /必须是 wait 或 exit/,
+    );
+    assert.throws(
+      () => parseArgs([...argv, '--pending-poll-ms', '0']),
+      /必须是(?:安全)?正整数/,
+    );
 
     let summaryDispatches = 0;
     let lessonDispatches = 0;
@@ -1065,6 +1089,7 @@ test('v2 summary keeps an uncontracted 5xx pending and re-verifies the same rece
         '--state-dir', stateDir,
         '--run-id', 'summary-uncontracted-5xx',
         '--run-state-format', 'v2',
+        '--pending-policy', 'exit',
       ];
       const firstCode = await mainForEarlyStages(argv, {
         v2SummaryRemote: {
@@ -1121,6 +1146,251 @@ test('v2 summary keeps an uncontracted 5xx pending and re-verifies the same rece
   }
 });
 
+test('v2 keeps writer ownership and repolls pending lessons until completion by default', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-pending-repoll-'));
+  context.after(async () => {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  await withServer((_request, response) => {
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      success: true,
+      sessions: [
+        { id: 's1', startedAt: '2026-07-22T00:00:00.000Z' },
+        { id: 's2', startedAt: '2026-07-22T00:01:00.000Z' },
+      ],
+    }));
+  }, async (baseUrl) => {
+    const runId = 'pending-repoll-default';
+    const runRoot = path.join(stateDir, `${runId}.v2`);
+    let summaryCalls = 0;
+    const lessonCalls = [];
+    let secondLessonCalls = 0;
+    let waits = 0;
+    const code = await mainForEarlyStages([
+      '--base-url', baseUrl,
+      '--state-dir', stateDir,
+      '--run-id', runId,
+      '--run-state-format', 'v2',
+    ], {
+      v2SummaryRemote: {
+        advance: async (request) => {
+          summaryCalls += 1;
+          return successfulSummaryResponse(request);
+        },
+        record: async () => {},
+      },
+      v2LessonsRemote: {
+        start: async (request) => {
+          lessonCalls.push(request.sessionId);
+          if (request.sessionId === 's1') {
+            return committedLessonResponse('lesson-s1');
+          }
+          secondLessonCalls += 1;
+          if (secondLessonCalls === 1) {
+            assert.equal(request.requireExistingReceipt, false);
+            return {
+              ok: true,
+              data: { runs: [{ id: 'lesson-running', status: 'running' }] },
+            };
+          }
+          assert.equal(request.requireExistingReceipt, true);
+          return committedLessonResponse('lesson-recovered');
+        },
+        record: async () => {},
+      },
+      v2PendingWait: async () => {
+        waits += 1;
+        assert.equal(
+          await fs.access(path.join(runRoot, 'writer.lock.json')).then(() => true, () => false),
+          true,
+        );
+      },
+    });
+
+    assert.equal(code, 0);
+    assert.equal(summaryCalls, 2);
+    assert.deepEqual(lessonCalls, ['s1', 's2', 's2']);
+    assert.equal(waits, 1);
+    assert.equal(
+      await fs.access(path.join(runRoot, 'writer.lock.json')).then(() => true, () => false),
+      false,
+    );
+    const lessonEvents = (await fs.readFile(
+      path.join(runRoot, 'lessons.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(lessonEvents.at(-1).type, 'stage_completed');
+  });
+});
+
+test('v2 pending wait preserves operator drain without redispatching the active operation', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-pending-drain-'));
+  context.after(async () => {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  await withServer((_request, response) => {
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      success: true,
+      sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+    }));
+  }, async (baseUrl) => {
+    const runId = 'pending-wait-drain';
+    const runRoot = path.join(stateDir, `${runId}.v2`);
+    let lessonCalls = 0;
+    const code = await mainForEarlyStages([
+      '--base-url', baseUrl,
+      '--state-dir', stateDir,
+      '--run-id', runId,
+      '--run-state-format', 'v2',
+    ], {
+      v2SummaryRemote: {
+        advance: async (request) => successfulSummaryResponse(request),
+        record: async () => {},
+      },
+      v2LessonsRemote: {
+        start: async () => {
+          lessonCalls += 1;
+          return {
+            ok: true,
+            data: { runs: [{ id: 'lesson-running', status: 'running' }] },
+          };
+        },
+        record: async () => assert.fail('pending operation must not be recorded'),
+      },
+      v2PendingWait: async () => {
+        const lock = JSON.parse(await fs.readFile(
+          path.join(runRoot, 'writer.lock.json'),
+          'utf8',
+        ));
+        await fs.writeFile(
+          path.join(runRoot, 'drain-request.json'),
+          `${JSON.stringify({
+            format: 'agentmemory-full-extraction-drain-request/v2',
+            schema_version: 2,
+            run_id: runId,
+            owner_id: lock.owner_id,
+            requested_at: new Date().toISOString(),
+          })}\n`,
+          'utf8',
+        );
+      },
+    });
+
+    assert.equal(code, 75);
+    assert.equal(lessonCalls, 1);
+    const control = (await fs.readFile(
+      path.join(runRoot, 'control.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(control.at(-1).type, 'run_paused');
+    assert.equal(control.at(-1).payload.reason_code, 'operator_drain_requested');
+    assert.equal(
+      await fs.access(path.join(runRoot, 'writer.lock.json')).then(() => true, () => false),
+      false,
+    );
+  });
+});
+
+test('v2 pending wait observes operator drain while every unit is in future retry wait', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-retry-wait-drain-'));
+  context.after(async () => {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  await withServer((_request, response) => {
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      success: true,
+      sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+    }));
+  }, async (baseUrl) => {
+    const runId = 'retry-wait-drain';
+    const runRoot = path.join(stateDir, `${runId}.v2`);
+    let summaryCalls = 0;
+    const code = await mainForEarlyStages([
+      '--base-url', baseUrl,
+      '--state-dir', stateDir,
+      '--run-id', runId,
+      '--run-state-format', 'v2',
+    ], {
+      v2SummaryRemote: {
+        advance: async ({ operationUnitId }) => {
+          summaryCalls += 1;
+          return {
+            ok: true,
+            data: {
+              status: 'preflight_unavailable',
+              error: 'preflight_unavailable',
+              operationUnitId,
+              recoveryEvidence: {
+                kind: 'no_effect',
+                observation: 'execution_error',
+                reasonCode: 'preflight_unavailable',
+                retryHint: { notBefore: '2099-07-30T00:00:00.000Z' },
+                proof: {
+                  kind: 'receipt_before_formal_effect',
+                  receiptKey: 'receipt-1',
+                  receiptVersion: 1,
+                  phase: 'preflight',
+                  commitPlanAbsent: true,
+                },
+              },
+            },
+          };
+        },
+        record: async () => assert.fail('retry-wait unit must not be recorded'),
+      },
+      v2LessonsRemote: {
+        start: async () => assert.fail('lessons must remain dependency blocked'),
+        record: async () => {},
+      },
+      v2PendingWait: async () => {
+        const lock = JSON.parse(await fs.readFile(
+          path.join(runRoot, 'writer.lock.json'),
+          'utf8',
+        ));
+        await fs.writeFile(
+          path.join(runRoot, 'drain-request.json'),
+          `${JSON.stringify({
+            format: 'agentmemory-full-extraction-drain-request/v2',
+            schema_version: 2,
+            run_id: runId,
+            owner_id: lock.owner_id,
+            requested_at: new Date().toISOString(),
+          })}\n`,
+          'utf8',
+        );
+      },
+    });
+
+    assert.equal(code, 75);
+    assert.equal(summaryCalls, 1);
+    const control = (await fs.readFile(
+      path.join(runRoot, 'control.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(control.at(-1).type, 'run_paused');
+    assert.equal(control.at(-1).payload.reason_code, 'operator_drain_requested');
+    assert.equal(control.at(-1).payload.stage, 'summary');
+  });
+});
+
 test('v2 Summary routes structured domain and unknown outcomes through recovery evidence', async (context) => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
@@ -1174,6 +1444,7 @@ test('v2 Summary routes structured domain and unknown outcomes through recovery 
               '--state-dir', stateDir,
               '--run-id', `summary-contract-${scenario.name}`,
               '--run-state-format', 'v2',
+              '--pending-policy', 'exit',
             ];
             const summaryRemote = {
               advance: async ({ attemptId, operationUnitId }) => ({
@@ -1927,7 +2198,11 @@ test('v2 summary authorized retry preserves recoverable receipt boundaries', asy
             };
 
             for (const expectedCode of scenario.expectedCodes) {
-              const code = await mainForEarlyStages([...prepared.argv, '--resume'], {
+              const code = await mainForEarlyStages([
+                ...prepared.argv,
+                '--resume',
+                '--pending-policy', 'exit',
+              ], {
                 v2SummaryRemote: summaryRemote,
                 v2LessonsRemote: prepared.lessonsRemote,
               });
@@ -3236,6 +3511,7 @@ test('v2 lessons keeps safe transient failures pending but seals deterministic f
         '--state-dir', stateDir,
         '--run-id', 'lessons-transient',
         '--run-state-format', 'v2',
+        '--pending-policy', 'exit',
       ], {
         v2SummaryRemote: summaryRemote,
         v2LessonsRemote: {
