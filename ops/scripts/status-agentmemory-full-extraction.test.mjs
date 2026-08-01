@@ -129,6 +129,48 @@ test('v2 journal 在阶段执行中发布有界进度和存活 lock', async (con
   );
 });
 
+test('v2 journal 在现代 PowerShell 下按 UTC 即时值判断新鲜度', async (context) => {
+  const pwsh = spawnSync('pwsh', ['-NoProfile', '-Command', 'exit 0'], {
+    encoding: 'utf8',
+    windowsHide: true,
+  });
+  if (pwsh.status !== 0) {
+    context.skip('pwsh 不可用');
+    return;
+  }
+
+  const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-fresh-'));
+  context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
+  const runId = 'v2-fresh';
+  const runRoot = path.join(runtimeRoot, 'extraction-runs', `${runId}.v2`);
+  const progressAt = new Date(Date.now() - 1000).toISOString();
+  await writeJournal(path.join(runRoot, 'control.jsonl'), [
+    event(0, 'run_started', { run_id: runId }, progressAt),
+    event(1, 'stage_opened', { stage: 'summary' }, progressAt),
+  ]);
+  await writeJournal(path.join(runRoot, 'summary.jsonl'), [
+    event(0, 'unit_planned', { unit_id: 'session-a' }, progressAt),
+    event(1, 'stage_plan_completed', {}, progressAt),
+    event(2, 'unit_started', { unit_id: 'session-a' }, progressAt),
+  ]);
+
+  const result = runStatusWithShell('pwsh', runtimeRoot, runId, 'summary');
+  const fields = Object.fromEntries(
+    result.stdout
+      .split(/\r?\n/u)
+      .filter((line) => line.includes('='))
+      .map((line) => {
+        const separator = line.indexOf('=');
+        return [line.slice(0, separator), line.slice(separator + 1)];
+      }),
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(fields.status_journal_stale, 'false', result.stdout);
+  assert.ok(Number(fields.status_journal_age_seconds) < 60, result.stdout);
+  assert.equal(fields.snapshot_at, progressAt, result.stdout);
+});
+
 test('v2 required stages 完成后使用阶段性完成判据', async (context) => {
   const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-complete-'));
   context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));

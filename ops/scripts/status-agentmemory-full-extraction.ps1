@@ -404,7 +404,13 @@ if (Test-Path -LiteralPath $v2Root -PathType Container) {
   if ($LASTEXITCODE -ne 0) {
     throw 'safe recovery status projection failed'
   }
-  $projection = ($rawProjection -join [Environment]::NewLine) | ConvertFrom-Json
+  $projectionJson = $rawProjection -join [Environment]::NewLine
+  $supportsDateKind = (Get-Command ConvertFrom-Json).Parameters.ContainsKey('DateKind')
+  $projection = if ($supportsDateKind) {
+    ConvertFrom-Json -InputObject $projectionJson -DateKind String
+  } else {
+    ConvertFrom-Json -InputObject $projectionJson
+  }
   $lockPath = Join-Path $v2Root 'writer.lock.json'
   $lockPresent = Test-Path -LiteralPath $lockPath -PathType Leaf
   $lockPidAlive = $false
@@ -417,12 +423,20 @@ if (Test-Path -LiteralPath $v2Root -PathType Container) {
       Get-Process -Id ([int]$lock.pid) -ErrorAction SilentlyContinue
     )
   }
-  $journalAgeSeconds = if ($null -eq $projection.last_progress_at) { 0 } else {
+  $lastProgressAt = if ($null -eq $projection.last_progress_at) {
+    $null
+  } else {
+    [string]$projection.last_progress_at
+  }
+  $journalAgeSeconds = if ($null -eq $lastProgressAt) { 0 } else {
     [Math]::Max(
       0,
       [Math]::Floor(
-        ((Get-Date).ToUniversalTime() -
-          [DateTime]::Parse([string]$projection.last_progress_at).ToUniversalTime()).TotalSeconds
+        ([DateTimeOffset]::UtcNow -
+          [DateTimeOffset]::Parse(
+            $lastProgressAt,
+            [Globalization.CultureInfo]::InvariantCulture
+          ).ToUniversalTime()).TotalSeconds
       )
     )
   }
@@ -440,7 +454,7 @@ if (Test-Path -LiteralPath $v2Root -PathType Container) {
   ) | Select-Object -Last 1
   Write-Output "current_stage=$(if ($null -eq $currentStage) { '' } else { $currentStage.stage })"
   Write-Output 'scheduler_epoch='
-  Write-Output "snapshot_at=$($projection.last_progress_at)"
+  Write-Output "snapshot_at=$lastProgressAt"
   Write-Output "next_retry_at=$($projection.next_retry_at)"
   Write-Output "completion_mode=$(if ([string]::IsNullOrWhiteSpace($RequiredStages)) { 'full_run' } else { 'required_stages' })"
   Write-Output "required_stages=$RequiredStages"
