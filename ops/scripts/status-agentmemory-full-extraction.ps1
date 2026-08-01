@@ -443,6 +443,7 @@ if (Test-Path -LiteralPath $v2Root -PathType Container) {
   Write-Output "run_id=$RunId"
   Write-Output 'source=v2_journal'
   Write-Output "run_status=$($projection.run_status)"
+  Write-Output "pause_reason_code=$($projection.pause_reason_code)"
   Write-Output "recovery_contract_version=$($projection.recovery_contract_version)"
   Write-Output 'status_manifest_stale=false'
   Write-Output "status_journal_stale=$(($journalAgeSeconds -gt $StatusStaleAfterSeconds).ToString().ToLowerInvariant())"

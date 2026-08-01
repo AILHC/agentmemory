@@ -117,6 +117,9 @@ export function projectSafeRecoveryStatus({
   return {
     run_id: runId,
     run_status: status,
+    pause_reason_code: controlLifecycle.state === 'paused'
+      ? controlLifecycle.pause.payload.reason_code
+      : null,
     recovery_contract_version: contractVersions.size === 1
       ? [...contractVersions][0]
       : contractVersions.size === 0

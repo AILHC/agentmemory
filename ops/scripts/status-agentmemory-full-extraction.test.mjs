@@ -129,6 +129,35 @@ test('v2 journal 在阶段执行中发布有界进度和存活 lock', async (con
   );
 });
 
+test('v2 journal 公开受控排空的非敏感暂停原因', async (context) => {
+  const runtimeRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-status-drained-'));
+  context.after(() => fs.rm(runtimeRoot, { recursive: true, force: true }));
+  const runId = 'v2-drained';
+  const runRoot = path.join(runtimeRoot, 'extraction-runs', `${runId}.v2`);
+  await writeJournal(path.join(runRoot, 'control.jsonl'), [
+    event(0, 'run_started', { run_id: runId }),
+    event(1, 'run_paused', {
+      run_id: runId,
+      reason_code: 'operator_drain_requested',
+      stage: 'summary',
+      next_unit_id: 'session-a',
+      processed_unit_count: 0,
+      requested_at: '2026-08-01T00:00:00.000Z',
+    }),
+  ]);
+  await writeJournal(path.join(runRoot, 'summary.jsonl'), [
+    event(0, 'unit_planned', { unit_id: 'session-a' }),
+    event(1, 'stage_plan_completed', {}),
+  ]);
+
+  const result = runStatus(runtimeRoot, runId, 'summary');
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /run_status=paused/);
+  assert.match(result.stdout, /pause_reason_code=operator_drain_requested/);
+  assert.match(result.stdout, /lock_present=false/);
+});
+
 test('v2 journal 在现代 PowerShell 下按 UTC 即时值判断新鲜度', async (context) => {
   const pwsh = spawnSync('pwsh', ['-NoProfile', '-Command', 'exit 0'], {
     encoding: 'utf8',

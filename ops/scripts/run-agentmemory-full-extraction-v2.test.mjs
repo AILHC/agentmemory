@@ -340,6 +340,168 @@ test('v2 controlled resume processes one unresolved unit and records a durable p
   });
 });
 
+test('v2 operator drain finishes the current unit and pauses before the next dispatch', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-operator-drain-'));
+  context.after(async () => {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  await withServer((request, response) => {
+    assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      success: true,
+      sessions: [
+        { id: 's1', startedAt: '2026-07-22T00:00:00.000Z' },
+        { id: 's2', startedAt: '2026-07-22T00:01:00.000Z' },
+      ],
+    }));
+  }, async (baseUrl) => {
+    const runId = 'operator-drain';
+    const runRoot = path.join(stateDir, `${runId}.v2`);
+    const argv = [
+      '--base-url', baseUrl,
+      '--state-dir', stateDir,
+      '--run-id', runId,
+      '--run-state-format', 'v2',
+    ];
+    assert.equal(await mainForEarlyStages([...argv, '--dry-run']), 0);
+
+    let summaryDispatches = 0;
+    let requestedAt = null;
+    const exitCode = await mainForEarlyStages([...argv, '--resume'], {
+      v2SummaryRemote: {
+        advance: async (request) => {
+          summaryDispatches += 1;
+          const lock = JSON.parse(await fs.readFile(
+            path.join(runRoot, 'writer.lock.json'),
+            'utf8',
+          ));
+          requestedAt = new Date().toISOString();
+          await fs.writeFile(
+            path.join(runRoot, 'drain-request.json'),
+            `${JSON.stringify({
+              format: 'agentmemory-full-extraction-drain-request/v2',
+              schema_version: 2,
+              run_id: runId,
+              owner_id: lock.owner_id,
+              requested_at: requestedAt,
+            })}\n`,
+            'utf8',
+          );
+          return successfulSummaryResponse(request, 'drained summary');
+        },
+        record: async () => {},
+      },
+      v2LessonsRemote: {
+        start: async () => assert.fail('lessons must remain undispatched'),
+        record: async () => {},
+      },
+    });
+
+    assert.equal(exitCode, 75);
+    assert.equal(summaryDispatches, 1);
+    const readJournal = async (name) => (await fs.readFile(
+      path.join(runRoot, `${name}.jsonl`),
+      'utf8',
+    )).trim().split('\n').filter(Boolean).map(JSON.parse);
+    const control = await readJournal('control');
+    const summary = await readJournal('summary');
+    assert.equal(summary.filter((event) => event.type === 'unit_recorded').length, 1);
+    assert.equal(summary.some((event) => event.type === 'stage_completed'), false);
+    assert.deepEqual(control.at(-1).payload, {
+      run_id: runId,
+      reason_code: 'operator_drain_requested',
+      stage: 'summary',
+      last_unit_id: 's1',
+      next_unit_id: 's2',
+      processed_unit_count: 1,
+      requested_at: requestedAt,
+    });
+    const status = JSON.parse(await fs.readFile(path.join(runRoot, 'status.json'), 'utf8'));
+    assert.equal(status.status, 'paused');
+    assert.equal(status.pause_reason_code, 'operator_drain_requested');
+    assert.equal(status.next_unit_id, 's2');
+    await assert.rejects(
+      fs.access(path.join(runRoot, 'writer.lock.json')),
+      (error) => error?.code === 'ENOENT',
+    );
+    await fs.access(path.join(runRoot, 'drain-request.json'));
+  });
+});
+
+test('v2 operator drain rejects a request bound to another lock owner', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-drain-owner-'));
+  context.after(async () => {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
+
+  await withServer((request, response) => {
+    assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      success: true,
+      sessions: [
+        { id: 's1', startedAt: '2026-07-22T00:00:00.000Z' },
+        { id: 's2', startedAt: '2026-07-22T00:01:00.000Z' },
+      ],
+    }));
+  }, async (baseUrl) => {
+    const runId = 'drain-owner-mismatch';
+    const runRoot = path.join(stateDir, `${runId}.v2`);
+    const argv = [
+      '--base-url', baseUrl,
+      '--state-dir', stateDir,
+      '--run-id', runId,
+      '--run-state-format', 'v2',
+    ];
+    assert.equal(await mainForEarlyStages([...argv, '--dry-run']), 0);
+
+    await assert.rejects(
+      () => mainForEarlyStages([...argv, '--resume'], {
+        v2SummaryRemote: {
+          advance: async (request) => {
+            await fs.writeFile(
+              path.join(runRoot, 'drain-request.json'),
+              `${JSON.stringify({
+                format: 'agentmemory-full-extraction-drain-request/v2',
+                schema_version: 2,
+                run_id: runId,
+                owner_id: 'different-owner',
+                requested_at: new Date().toISOString(),
+              })}\n`,
+              'utf8',
+            );
+            return successfulSummaryResponse(request, 'owner mismatch');
+          },
+          record: async () => {},
+        },
+        v2LessonsRemote: {
+          start: async () => assert.fail('lessons must remain undispatched'),
+          record: async () => {},
+        },
+      }),
+      /v2_drain_request_owner_mismatch/,
+    );
+    const control = (await fs.readFile(path.join(runRoot, 'control.jsonl'), 'utf8'))
+      .trim().split('\n').filter(Boolean).map(JSON.parse);
+    assert.equal(control.some((event) => event.type === 'run_paused'), false);
+    await assert.rejects(
+      fs.access(path.join(runRoot, 'writer.lock.json')),
+      (error) => error?.code === 'ENOENT',
+    );
+    await fs.access(path.join(runRoot, 'drain-request.json'));
+  });
+});
+
 test('new runner refuses business APIs while a fenced migration is incomplete', async (context) => {
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-fenced-runner-'));
   context.after(() => fs.rm(stateDir, { recursive: true, force: true }));

@@ -5514,28 +5514,95 @@ function markStageItemIsolated(state, stage, item, outcome) {
   applyFailureState(target, failure);
 }
 
-class V2ResumeUnitLimitReached extends Error {
+class V2ExecutionPauseReached extends Error {
   constructor() {
-    super('v2_resume_unit_limit_reached');
-    this.name = 'V2ResumeUnitLimitReached';
+    super('v2_execution_pause_reached');
+    this.name = 'V2ExecutionPauseReached';
   }
 }
 
-function createV2ResumeExecutionBoundary(limit) {
-  if (limit === null) return null;
+function createV2DrainRequestProbe({ journal, fsApi, now = () => Date.now() }) {
+  const requestPath = path.join(journal.rootDir, 'drain-request.json');
+  return async () => {
+    const raw = await fsApi.readFile(requestPath, 'utf8').catch((error) => {
+      if (error?.code === 'ENOENT') return null;
+      throw error;
+    });
+    if (raw === null) return null;
+    let request;
+    try {
+      request = JSON.parse(raw);
+    } catch {
+      throw new Error('v2_drain_request_invalid');
+    }
+    if (
+      request?.format !== 'agentmemory-full-extraction-drain-request/v2'
+      || request?.schema_version !== 2
+      || request?.run_id !== journal.runId
+      || typeof request?.owner_id !== 'string'
+      || !request.owner_id
+      || typeof request?.requested_at !== 'string'
+    ) {
+      throw new Error('v2_drain_request_invalid');
+    }
+    if (request.owner_id !== journal.lock?.owner_id) {
+      throw new Error('v2_drain_request_owner_mismatch');
+    }
+    const requestedAt = Date.parse(request.requested_at);
+    const lockCreatedAt = Date.parse(journal.lock?.created_at || '');
+    if (
+      !Number.isFinite(requestedAt)
+      || !Number.isFinite(lockCreatedAt)
+      || requestedAt < lockCreatedAt
+      || requestedAt > now() + 60_000
+    ) {
+      throw new Error('v2_drain_request_time_invalid');
+    }
+    return { requestedAt: request.requested_at };
+  };
+}
+
+function createV2ExecutionBoundary({ limit, drainRequestProbe }) {
+  if (limit === null && typeof drainRequestProbe !== 'function') return null;
   let remaining = limit;
   let processed = 0;
   let last = null;
+  let pause = null;
   return {
     limit,
-    claim({ stage, unitId }) {
-      if (remaining <= 0) return false;
-      remaining -= 1;
+    async claim({ stage, unitId }) {
+      const drainRequest = await drainRequestProbe?.();
+      if (drainRequest) {
+        pause = {
+          reasonCode: 'operator_drain_requested',
+          stage,
+          lastUnitId: last?.unitId || null,
+          nextUnitId: unitId,
+          processedCount: processed,
+          requestedAt: drainRequest.requestedAt,
+        };
+        return false;
+      }
+      if (remaining !== null && remaining <= 0) return false;
+      if (remaining !== null) remaining -= 1;
       processed += 1;
       last = { stage, unitId };
       return true;
     },
-    reached: () => processed > 0 && remaining === 0,
+    reached() {
+      if (pause) return true;
+      if (limit !== null && processed > 0 && remaining === 0) {
+        pause = {
+          reasonCode: 'resume_unit_limit_reached',
+          stage: last.stage,
+          lastUnitId: last.unitId,
+          processedCount: processed,
+        };
+        return true;
+      }
+      return false;
+    },
+    pause: () => pause,
     processedCount: () => processed,
     lastUnitId: () => last?.unitId || null,
     lastStage: () => last?.stage || null,
@@ -6668,7 +6735,7 @@ async function repairV2ResumedStatusCache({ journal, fsApi, control, controlLife
 async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
   const baseUrl = normalizeBaseUrl(options.baseUrl);
   const fsApi = dependencies.fsApi || fs;
-  const executionBoundary = createV2ResumeExecutionBoundary(options.maxUnitsPerResume);
+  let executionBoundary = null;
   const journal = new RunStateJournalV2({
     rootDir: path.join(options.stateDir, `${runId}.v2`),
     runId,
@@ -6698,6 +6765,10 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     const verifiedTakeover = dependencies.v2VerifiedTakeover
       || (options.resume ? async ({ owner }) => owner.run_id === runId : null);
     await journal.acquireLock({ takeover: verifiedTakeover });
+    executionBoundary = createV2ExecutionBoundary({
+      limit: options.maxUnitsPerResume,
+      drainRequestProbe: createV2DrainRequestProbe({ journal, fsApi }),
+    });
     let control = await journal.open();
     let controlLifecycle = reduceRunControlLifecycle(control);
     const migrationGates = [];
@@ -6912,7 +6983,7 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     });
     control = summaryResult.control;
     if (summaryResult.status === 'paused') {
-      throw new V2ResumeUnitLimitReached();
+      throw new V2ExecutionPauseReached();
     }
     if (summaryResult.status === 'blocked') {
       return 1;
@@ -6934,7 +7005,7 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     });
     control = lessonsResult.control;
     if (lessonsResult.status === 'paused') {
-      throw new V2ResumeUnitLimitReached();
+      throw new V2ExecutionPauseReached();
     }
     const earlyStageStatuses = [summaryResult.status, lessonsResult.status];
     await journal.writeStatus({
@@ -7014,7 +7085,7 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
         });
         control = result.control;
         if (result.status === 'paused') {
-          throw new V2ResumeUnitLimitReached();
+          throw new V2ExecutionPauseReached();
         }
         return result;
       },
@@ -7031,7 +7102,7 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
         });
         control = result.control;
         if (result.status === 'paused') {
-          throw new V2ResumeUnitLimitReached();
+          throw new V2ExecutionPauseReached();
         }
         return result;
       },
@@ -7062,32 +7133,54 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     }
     return 0;
   } catch (error) {
-    if (!(error instanceof V2ResumeUnitLimitReached)) throw error;
-    const stage = executionBoundary?.lastStage();
-    const unitId = executionBoundary?.lastUnitId();
-    const processedCount = executionBoundary?.processedCount() || 0;
-    if (!stage || !unitId || processedCount < 1) {
-      throw new Error('v2_resume_unit_limit_state_invalid');
-    }
-    const recoveryProjection = reduceRecoveryJournal(await journal.readStage(stage)).run;
-    await durable('control', 'run_paused', {
-      run_id: runId,
-      reason_code: 'resume_unit_limit_reached',
-      stage,
-      unit_id: unitId,
-      processed_unit_count: processedCount,
-      max_units_per_resume: executionBoundary.limit,
-    });
+    if (!(error instanceof V2ExecutionPauseReached)) throw error;
+    const pause = executionBoundary?.pause();
+    if (!pause?.stage || !pause?.reasonCode) throw new Error('v2_execution_pause_state_invalid');
+    const processedCount = pause.processedCount;
+    const operatorDrain = pause.reasonCode === 'operator_drain_requested';
+    const pausePayload = operatorDrain
+      ? {
+          run_id: runId,
+          reason_code: pause.reasonCode,
+          stage: pause.stage,
+          ...(pause.lastUnitId ? { last_unit_id: pause.lastUnitId } : {}),
+          next_unit_id: pause.nextUnitId,
+          processed_unit_count: processedCount,
+          requested_at: pause.requestedAt,
+        }
+      : {
+          run_id: runId,
+          reason_code: pause.reasonCode,
+          stage: pause.stage,
+          unit_id: pause.lastUnitId,
+          processed_unit_count: processedCount,
+          max_units_per_resume: executionBoundary.limit,
+        };
+    if (
+      !Number.isSafeInteger(processedCount)
+      || processedCount < (operatorDrain ? 0 : 1)
+      || (!operatorDrain && !pause.lastUnitId)
+      || (operatorDrain && (!pause.nextUnitId || !pause.requestedAt))
+    ) throw new Error('v2_execution_pause_state_invalid');
+    const recoveryProjection = reduceRecoveryJournal(await journal.readStage(pause.stage)).run;
+    await durable('control', 'run_paused', pausePayload);
     reduceRunControlLifecycle(await journal.readControl());
     await journal.writeStatus({
       status: 'paused',
-      current_stage: stage,
-      pause_reason_code: 'resume_unit_limit_reached',
+      current_stage: pause.stage,
+      pause_reason_code: pause.reasonCode,
       processed_units_this_invocation: processedCount,
-      max_units_per_resume: executionBoundary.limit,
-      [stage]: {
+      ...(operatorDrain
+        ? { next_unit_id: pause.nextUnitId }
+        : { max_units_per_resume: executionBoundary.limit }),
+      [pause.stage]: {
         status: 'paused',
-        unit_id: unitId,
+        ...(operatorDrain
+          ? {
+              ...(pause.lastUnitId ? { last_unit_id: pause.lastUnitId } : {}),
+              next_unit_id: pause.nextUnitId,
+            }
+          : { unit_id: pause.lastUnitId }),
         recovery_policy_version: RECOVERY_POLICY_VERSION,
         recovery: recoveryProjection.projection,
         acceptance_ready: recoveryProjection.acceptance_ready,

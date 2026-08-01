@@ -295,6 +295,7 @@ test('the latest control event distinguishes an operator pause from a resumed ru
     requiredStages: ['summary'],
   });
   assert.equal(paused.run_status, 'paused');
+  assert.equal(paused.pause_reason_code, 'resume_unit_limit_reached');
 
   const resumed = projectSafeRecoveryStatus({
     runId: 'paused-run',
@@ -306,4 +307,32 @@ test('the latest control event distinguishes an operator pause from a resumed ru
     requiredStages: ['summary'],
   });
   assert.equal(resumed.run_status, 'running');
+  assert.equal(resumed.pause_reason_code, null);
+});
+
+test('an operator drain pause can record zero processed units', () => {
+  const status = projectSafeRecoveryStatus({
+    runId: 'operator-drain',
+    controlEvents: [
+      event(0, 'run_started', { run_id: 'operator-drain' }),
+      event(1, 'run_paused', {
+        run_id: 'operator-drain',
+        reason_code: 'operator_drain_requested',
+        stage: 'summary',
+        next_unit_id: 'summary-a',
+        processed_unit_count: 0,
+        requested_at: '2026-08-01T00:00:00.000Z',
+      }),
+    ],
+    stageEvents: {
+      summary: [
+        event(0, 'unit_planned', { unit_id: 'summary-a' }),
+        event(1, 'stage_plan_completed', { unit_count: 1 }),
+      ],
+    },
+    requiredStages: ['summary'],
+  });
+
+  assert.equal(status.run_status, 'paused');
+  assert.equal(status.pause_reason_code, 'operator_drain_requested');
 });

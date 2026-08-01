@@ -37,19 +37,37 @@ export function reduceRunControlLifecycle(events) {
       continue;
     }
     if (event.type === 'run_paused') {
-      if (
-        state !== 'running'
-        || payload.run_id !== runId
-        || typeof payload.reason_code !== 'string'
-        || !payload.reason_code
-        || !STAGE_NAME.test(String(payload.stage || ''))
-        || typeof payload.unit_id !== 'string'
-        || !payload.unit_id
-        || !Number.isSafeInteger(payload.processed_unit_count)
-        || payload.processed_unit_count < 1
-        || !Number.isSafeInteger(payload.max_units_per_resume)
-        || payload.max_units_per_resume < payload.processed_unit_count
-      ) {
+      const commonPauseValid = (
+        state === 'running'
+        && payload.run_id === runId
+        && typeof payload.reason_code === 'string'
+        && payload.reason_code
+        && STAGE_NAME.test(String(payload.stage || ''))
+      );
+      const processedCount = payload.processed_unit_count;
+      const operatorDrainValid = (
+        payload.reason_code === 'operator_drain_requested'
+        && Number.isSafeInteger(processedCount)
+        && processedCount >= 0
+        && typeof payload.next_unit_id === 'string'
+        && payload.next_unit_id
+        && Number.isFinite(Date.parse(payload.requested_at || ''))
+        && (
+          processedCount === 0
+            ? payload.last_unit_id === undefined
+            : typeof payload.last_unit_id === 'string' && payload.last_unit_id
+        )
+      );
+      const unitLimitValid = (
+        payload.reason_code !== 'operator_drain_requested'
+        && typeof payload.unit_id === 'string'
+        && payload.unit_id
+        && Number.isSafeInteger(processedCount)
+        && processedCount >= 1
+        && Number.isSafeInteger(payload.max_units_per_resume)
+        && payload.max_units_per_resume >= processedCount
+      );
+      if (!commonPauseValid || (!operatorDrainValid && !unitLimitValid)) {
         controlTransitionError(event, 'run_paused');
       }
       pause = { seq: event.seq, payload };

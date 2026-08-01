@@ -1089,7 +1089,7 @@ export async function runSinglePhaseStage({
     if (
       !unit.recorded
       && executionBoundary
-      && !executionBoundary.claim({ stage, unitId: unit.unit_id })
+      && !(await executionBoundary.claim({ stage, unitId: unit.unit_id }))
     ) {
       break;
     }
@@ -1692,7 +1692,7 @@ export async function runTwoPhaseStage({
     if (
       !unit.recorded
       && executionBoundary
-      && !executionBoundary.claim({ stage, unitId: unit.unit_id })
+      && !(await executionBoundary.claim({ stage, unitId: unit.unit_id }))
     ) {
       break;
     }
