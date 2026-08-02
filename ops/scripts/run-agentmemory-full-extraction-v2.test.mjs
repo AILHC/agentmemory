@@ -3346,6 +3346,53 @@ test('v2 resume freezes a completed summary plan and ignores appended live sessi
   }
 });
 
+test('v2 resume reconstructs a fully adopted frozen inventory from an empty summary plan', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-frozen-baseline-'));
+  let sessions = [{ id: 'adopted', startedAt: '2026-07-23T00:00:00.000Z' }];
+  const baselineDependencies = {
+    v2BaselineRunInspection: async () => ({ baselineId: 'baseline-1', retired: false }),
+    v2BaselinePartition: async ({ sessions: inputSessions }) => (
+      inputSessions.filter((session) => session.id !== 'adopted')
+    ),
+  };
+  try {
+    await withServer((_request, response) => {
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({ success: true, sessions }));
+    }, async (baseUrl) => {
+      const argv = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-id', 'frozen-baseline',
+        '--run-state-format', 'v2',
+      ];
+      assert.equal(await mainForEarlyStages([...argv, '--dry-run'], baselineDependencies), 0);
+
+      sessions = [
+        ...sessions,
+        { id: 'added', startedAt: '2026-07-25T00:00:00.000Z' },
+      ];
+      assert.equal(await mainForEarlyStages([...argv, '--resume'], baselineDependencies), 0);
+    });
+
+    for (const stage of ['summary', 'lessons']) {
+      const events = (await fs.readFile(
+        path.join(stateDir, 'frozen-baseline.v2', `${stage}.jsonl`),
+        'utf8',
+      )).trim().split('\n').map(JSON.parse);
+      assert.deepEqual(
+        events.filter((event) => event.type === 'unit_planned'),
+        [],
+      );
+    }
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
 test('v2 frozen resume hard-stops when an original live session is missing or changed', async (context) => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';

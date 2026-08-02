@@ -5872,6 +5872,7 @@ export function resolveV2FrozenSummaryInventory({
   options,
   started,
   sessions,
+  eligibleSummarySessions = sessions,
   events,
   baseUrl,
 }) {
@@ -5902,7 +5903,7 @@ export function resolveV2FrozenSummaryInventory({
     throw new Error('v2_frozen_plan_invalid');
   }
 
-  const livePlan = buildV2SummaryPlan(sessions, baseUrl, options);
+  const livePlan = buildV2SummaryPlan(eligibleSummarySessions, baseUrl, options);
   const livePlanById = new Map(livePlan.map((unit) => [unit.unit_id, unit]));
   const liveSessionById = new Map(sessions.map((session) => [session.id, session]));
   for (const unit of plan) {
@@ -5918,7 +5919,11 @@ export function resolveV2FrozenSummaryInventory({
     }
   }
 
-  const frozenSessions = plan.map((unit) => liveSessionById.get(unit.unit_id));
+  const eligibleSummaryIds = new Set(eligibleSummarySessions.map((session) => session.id));
+  const frozenOpenIds = new Set(plan.map((unit) => unit.unit_id));
+  const frozenSessions = sessions.filter((session) => (
+    !eligibleSummaryIds.has(session.id) || frozenOpenIds.has(session.id)
+  ));
   const inventoryHash = computeInventoryHash(frozenSessions, options.agentId);
   if (started.payload?.inventory_hash !== inventoryHash) {
     throw new Error('v2_frozen_plan_inventory_drifted');
@@ -7006,6 +7011,16 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     };
     if (activeBaselineId) config.adopted_baseline_id = activeBaselineId;
     const configHash = stableHash(config);
+    const partitionSessions = dependencies.v2BaselinePartition
+      || (dependencies.v2RuntimeCheck
+        ? async ({ sessions: inputSessions }) => inputSessions
+        : (input) => partitionRunnerSessions({
+          ...input,
+          baseUrl,
+          secret,
+          expectedBaselineId: activeBaselineId,
+          options,
+        }));
     const started = control.find((event) => event.type === 'run_started');
     if (started) {
       if (
@@ -7027,10 +7042,18 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     const summaryEvents = started && options.resume
       ? await journal.readStage('summary')
       : [];
+    const eligibleSummarySessions = started && options.resume && activeBaselineId
+      ? await partitionSessions({
+        stage: 'summary',
+        stageContractVersion: 'summary/v1',
+        sessions,
+      })
+      : sessions;
     const frozenSummary = resolveV2FrozenSummaryInventory({
       options,
       started,
       sessions,
+      eligibleSummarySessions,
       events: summaryEvents,
       baseUrl,
     });
@@ -7040,16 +7063,6 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     if (started && started.payload?.inventory_hash !== inventoryHash) {
       throw new Error('v2_run_input_drifted: 请创建新的 run_id');
     }
-    const partitionSessions = dependencies.v2BaselinePartition
-      || (dependencies.v2RuntimeCheck
-        ? async ({ sessions: inputSessions }) => inputSessions
-        : (input) => partitionRunnerSessions({
-          ...input,
-          baseUrl,
-          secret,
-          expectedBaselineId: activeBaselineId,
-          options,
-        }));
     const [summarySessions, lessonSessions] = await Promise.all([
       partitionSessions({
         stage: 'summary',
