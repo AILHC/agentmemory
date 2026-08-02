@@ -1,7 +1,7 @@
 import {
-  RECOVERY_POLICY_HASH,
   RECOVERY_POLICY_VERSION,
   decideRecovery,
+  isRecoveryPolicyReadCompatible,
   recoveryValueHash,
 } from './recovery-policy-v1.mjs';
 import {
@@ -255,7 +255,10 @@ function applyGenericEvent(event, unit, run, units) {
       || (
         normalizationBound
         && (
-          payload.policy_hash !== RECOVERY_POLICY_HASH
+          !isRecoveryPolicyReadCompatible(
+            payload.policy_version,
+            payload.policy_hash,
+          )
           || !/^[0-9a-f]{64}$/.test(String(normalization?.candidate_evidence_hash || ''))
           || !/^[0-9a-f]{64}$/.test(String(normalization?.snapshot_hash || ''))
           || normalization?.normalized_evidence_hash !== recoveryValueHash(payload.evidence)

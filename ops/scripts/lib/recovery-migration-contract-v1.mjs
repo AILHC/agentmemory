@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import {
-  RECOVERY_POLICY_HASH,
   RECOVERY_POLICY_VERSION,
+  isRecoveryPolicyReadCompatible,
 } from './recovery-policy-v1.mjs';
 
 export const RECOVERY_MIGRATION_SCHEMA_VERSION = 1;
@@ -56,10 +56,13 @@ export function validateRecoveryMigrationManifest(manifest, fenceSeq = null) {
     || !CONTRACT_VERSION.test(String(manifest.original_contract_version || ''))
     || manifest.target_contract_version !== RECOVERY_POLICY_VERSION
     || manifest.recovery_contract_version !== RECOVERY_POLICY_VERSION
-    || manifest.recovery_policy_hash !== RECOVERY_POLICY_HASH
     || !CONTRACT_VERSION.test(String(manifest.original_policy_version || ''))
     || manifest.target_policy_version !== RECOVERY_POLICY_VERSION
-    || manifest.new_policy_hash !== RECOVERY_POLICY_HASH
+    || manifest.recovery_policy_hash !== manifest.new_policy_hash
+    || !isRecoveryPolicyReadCompatible(
+      manifest.target_policy_version,
+      manifest.recovery_policy_hash,
+    )
     || manifest.tool_version !== RECOVERY_MIGRATION_TOOL_VERSION
     || !Number.isSafeInteger(manifest.journal_seq)
     || manifest.journal_seq < -1

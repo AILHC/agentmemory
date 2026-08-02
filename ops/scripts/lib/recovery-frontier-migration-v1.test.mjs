@@ -23,6 +23,7 @@ import {
 } from './recoverable-stage-v2.mjs';
 import {
   RECOVERY_POLICY_HASH,
+  RECOVERY_POLICY_READ_COMPATIBLE_HASHES,
   RECOVERY_POLICY_VERSION,
   decideRecovery,
 } from './recovery-policy-v1.mjs';
@@ -1835,6 +1836,14 @@ test('manifest validation rejects target-contract and completion-count tampering
   assert.throws(
     () => validateRecoveryMigrationManifest(future),
     /recovery_migration_manifest_invalid/,
+  );
+
+  const historicalRebound = structuredClone(manifest);
+  historicalRebound.recovery_policy_hash = RECOVERY_POLICY_READ_COMPATIBLE_HASHES[0];
+  historicalRebound.new_policy_hash = RECOVERY_POLICY_READ_COMPATIBLE_HASHES[0];
+  assert.throws(
+    () => validateRecoveryMigrationManifest(historicalRebound),
+    /recovery_migration_manifest_hash_mismatch/,
   );
 
   const countTampered = structuredClone(manifest);

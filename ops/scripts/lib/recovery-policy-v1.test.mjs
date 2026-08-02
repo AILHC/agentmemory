@@ -3,8 +3,10 @@ import test from 'node:test';
 import {
   RECOVERY_POLICY_DESCRIPTOR,
   RECOVERY_POLICY_HASH,
+  RECOVERY_POLICY_READ_COMPATIBLE_HASHES,
   RECOVERY_POLICY_VERSION,
   decideRecovery,
+  isRecoveryPolicyReadCompatible,
   normalizeOperationEvidence,
   recoveryPolicyHash,
   recoveryValueHash,
@@ -12,6 +14,31 @@ import {
 } from './recovery-policy-v1.mjs';
 
 const HASH = 'a'.repeat(64);
+const HISTORICAL_POLICY_HASH =
+  '3205f7a61c8e576689d9a478cd3e1aae4de16d84e930f50dfbd06ac7907c2e7f';
+
+test('published compatible v1 policy hashes remain readable', () => {
+  assert.deepEqual(
+    RECOVERY_POLICY_READ_COMPATIBLE_HASHES,
+    [HISTORICAL_POLICY_HASH, RECOVERY_POLICY_HASH],
+  );
+  assert.equal(
+    isRecoveryPolicyReadCompatible(RECOVERY_POLICY_VERSION, HISTORICAL_POLICY_HASH),
+    true,
+  );
+  assert.equal(
+    isRecoveryPolicyReadCompatible(RECOVERY_POLICY_VERSION, RECOVERY_POLICY_HASH),
+    true,
+  );
+  assert.equal(
+    isRecoveryPolicyReadCompatible(RECOVERY_POLICY_VERSION, 'f'.repeat(64)),
+    false,
+  );
+  assert.equal(
+    isRecoveryPolicyReadCompatible('effect-state-recovery/v2', HISTORICAL_POLICY_HASH),
+    false,
+  );
+});
 
 function noEffect(proof, observation = 'execution_error', reasonCode = 'provider_unavailable') {
   return { kind: 'no_effect', observation, reasonCode, proof };

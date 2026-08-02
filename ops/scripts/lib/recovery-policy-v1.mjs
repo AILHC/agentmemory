@@ -92,6 +92,20 @@ export function recoveryPolicyHash(descriptor) {
 
 export const RECOVERY_POLICY_HASH = recoveryPolicyHash(RECOVERY_POLICY_DESCRIPTOR);
 
+// Published journals bind to exact hashes. Keep only policy variants whose
+// recorded decisions remain readable under the current v1 reducer.
+export const RECOVERY_POLICY_READ_COMPATIBLE_HASHES = Object.freeze([
+  '3205f7a61c8e576689d9a478cd3e1aae4de16d84e930f50dfbd06ac7907c2e7f',
+  RECOVERY_POLICY_HASH,
+]);
+
+export function isRecoveryPolicyReadCompatible(version, policyHash) {
+  return (
+    version === RECOVERY_POLICY_VERSION
+    && RECOVERY_POLICY_READ_COMPATIBLE_HASHES.includes(policyHash)
+  );
+}
+
 const SYSTEM_FAULT_CODES = new Set(RECOVERY_SYSTEM_FAULT_CODES);
 const NO_EFFECT_OBSERVATIONS = new Set([
   'execution_error',

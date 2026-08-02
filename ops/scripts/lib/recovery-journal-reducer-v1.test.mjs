@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  RECOVERY_POLICY_READ_COMPATIBLE_HASHES,
   RECOVERY_POLICY_VERSION,
   decideRecovery,
   resolveOperationRecovery,
@@ -246,6 +247,15 @@ test('reducer rejects altered decisions and unknown event structures', () => {
     normalization: recovery.normalization,
   });
   assert.doesNotThrow(() => reduceRecoveryJournal([...prefix, bound]));
+  const historical = structuredClone(bound);
+  historical.payload.policy_hash = RECOVERY_POLICY_READ_COMPATIBLE_HASHES[0];
+  assert.doesNotThrow(() => reduceRecoveryJournal([...prefix, historical]));
+  const unknownPolicy = structuredClone(bound);
+  unknownPolicy.payload.policy_hash = 'f'.repeat(64);
+  assert.throws(
+    () => reduceRecoveryJournal([...prefix, unknownPolicy]),
+    /recovery_journal_decision_invalid/,
+  );
   bound.payload.normalization.normalized_evidence_hash = 'f'.repeat(64);
   assert.throws(
     () => reduceRecoveryJournal([...prefix, bound]),
