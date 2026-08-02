@@ -8,6 +8,17 @@ import {
 } from './lib/recovery-policy-v1.mjs';
 
 const MANIFEST_NAME = 'DEPLOYMENT.json';
+const EXTRACTION_MODEL_CONTRACTS_PATH = 'scripts/extraction-model-contracts-v1.json';
+const EXTRACTION_STAGES = [
+  'summary',
+  'lessons',
+  'memory_consolidate',
+  'semantic_rollup',
+  'skill_extract',
+  'crystal',
+  'consolidation_procedural',
+  'reflect_insight',
+];
 const ALLOWED_TOP_LEVEL = new Set([
   'dist',
   'node_modules',
@@ -30,6 +41,7 @@ const KEY_FILE_PATHS = [
   'dist/worker-supervisor.mjs',
   'scripts/_agentmemory-local-common.ps1',
   'scripts/agentmemory-deployment-manifest.mjs',
+  EXTRACTION_MODEL_CONTRACTS_PATH,
   'scripts/doctor-agentmemory-console.ps1',
   'scripts/doctor-agentmemory.ps1',
   'scripts/create-agentmemory-recovery-evidence-snapshot.mjs',
@@ -39,6 +51,7 @@ const KEY_FILE_PATHS = [
   'scripts/lib/effect-state-recovery-stage-catalog-v1.mjs',
   'scripts/lib/full-extraction-stage-adapters-v2.mjs',
   'scripts/lib/iii-state-read-only-adapter-v1.mjs',
+  'scripts/lib/incremental-extraction-status-v1.mjs',
   'scripts/lib/legacy-lesson-safe-facts-collector-v1.mjs',
   'scripts/lib/lesson-recovery-adapter-v1.mjs',
   'scripts/lib/offline-statekv-snapshot-v1.mjs',
@@ -57,6 +70,8 @@ const KEY_FILE_PATHS = [
   'scripts/lib/summary-recovery-adapter-v1.mjs',
   'scripts/lib/v2-release-gate.mjs',
   'scripts/run-agentmemory-full-extraction.mjs',
+  'scripts/preview-agentmemory-adopted-baseline.mjs',
+  'scripts/apply-agentmemory-adopted-baseline.mjs',
   'scripts/project-agentmemory-recovery-status.mjs',
   'scripts/migrate-agentmemory-recovery-frontier.mjs',
   'scripts/start-agentmemory-console.ps1',
@@ -154,6 +169,59 @@ async function readPackageVersion(root) {
   return packageJson.version;
 }
 
+function hasExactKeys(value, expected) {
+  return value
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+}
+
+export function validateExtractionModelContracts(value) {
+  if (
+    !hasExactKeys(value, [
+      'schema_version',
+      'compatibility_basis',
+      'audit_only_fields',
+      'output_language',
+      'stages',
+    ])
+    || value.schema_version !== 1
+    || value.compatibility_basis !== 'compatible_with_only'
+    || JSON.stringify(value.audit_only_fields) !== JSON.stringify(['model', 'prompt_hash'])
+    || !['default', 'zh-CN'].includes(value.output_language)
+    || !Array.isArray(value.stages)
+    || JSON.stringify(value.stages.map((entry) => entry?.stage))
+      !== JSON.stringify(EXTRACTION_STAGES)
+  ) throw new Error('extraction model contracts manifest is invalid');
+  for (const entry of value.stages) {
+    if (
+      !hasExactKeys(entry, ['stage', 'compatible_with', 'model', 'prompt_hash'])
+      || !Array.isArray(entry.compatible_with)
+      || entry.compatible_with.length === 0
+      || entry.compatible_with.some((version) => typeof version !== 'string' || !version)
+      || new Set(entry.compatible_with).size !== entry.compatible_with.length
+      || JSON.stringify(entry.compatible_with)
+        !== JSON.stringify([...entry.compatible_with].sort((left, right) => left.localeCompare(right, 'en')))
+      || typeof entry.model !== 'string'
+      || !entry.model.trim()
+      || !/^[0-9a-f]{64}$/.test(entry.prompt_hash || '')
+      || /^0{64}$/.test(entry.prompt_hash)
+    ) throw new Error(`extraction model contract entry is invalid: ${String(entry?.stage || '?')}`);
+  }
+  return value;
+}
+
+async function readExtractionModelContracts(root) {
+  const target = path.join(root, ...EXTRACTION_MODEL_CONTRACTS_PATH.split('/'));
+  return validateExtractionModelContracts(JSON.parse(await fs.readFile(target, 'utf8')));
+}
+
+export function deploymentStageContractCompatible(contracts, stage, contractVersion) {
+  const valid = validateExtractionModelContracts(contracts);
+  const entry = valid.stages.find((candidate) => candidate.stage === stage);
+  return Boolean(entry?.compatible_with.includes(contractVersion));
+}
+
 function summarizeFiles(files) {
   const hash = createHash('sha256');
   let byteCount = 0;
@@ -188,7 +256,7 @@ export async function createDeploymentManifest({
     return entry;
   });
   const manifest = {
-    schemaVersion: 3,
+    schemaVersion: 4,
     sourceCommit: sourceCommit.toLowerCase(),
     packageVersion: await readPackageVersion(root),
     builtAt,
@@ -197,6 +265,7 @@ export async function createDeploymentManifest({
       maxVersion: RECOVERY_POLICY_VERSION,
       policyHash: RECOVERY_POLICY_HASH,
     },
+    extractionModelContracts: await readExtractionModelContracts(root),
     content: summarizeFiles(files),
     keyFiles,
   };
@@ -211,7 +280,7 @@ export async function createDeploymentManifest({
 }
 
 function assertManifestShape(manifest) {
-  if (!manifest || manifest.schemaVersion !== 3) {
+  if (!manifest || manifest.schemaVersion !== 4) {
     throw new Error('unsupported DEPLOYMENT.json schemaVersion');
   }
   assertCommit('sourceCommit', manifest.sourceCommit);
@@ -236,6 +305,7 @@ function assertManifestShape(manifest) {
   ) {
     throw new Error('DEPLOYMENT.json recovery contract range is incompatible');
   }
+  validateExtractionModelContracts(manifest.extractionModelContracts);
 }
 
 export async function verifyDeploymentManifest(rootPath) {
@@ -260,6 +330,7 @@ export async function verifyDeploymentManifest(rootPath) {
     packageVersion: manifest.packageVersion,
     builtAt: manifest.builtAt,
     recoveryContract: manifest.recoveryContract,
+    extractionModelContracts: manifest.extractionModelContracts,
     fileCount: manifest.content.fileCount,
     byteCount: manifest.content.byteCount,
     contentSha256: manifest.content.sha256,

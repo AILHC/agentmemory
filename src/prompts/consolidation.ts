@@ -44,13 +44,36 @@ Output format (XML):
 Rules:
 - Only extract procedures observed 2+ times
 - Steps should be concrete and actionable
-- Trigger condition should be specific enough to match automatically`;
+- Trigger condition should be specific enough to match automatically
+- Existing procedures are context only; reinforce or merge one only when the new patterns support it
+- If the new patterns support no reusable procedure, return exactly <procedures></procedures>`;
 
 export function buildProceduralExtractionPrompt(
   patterns: Array<{ content: string; frequency: number }>,
+  historicalProcedures: Array<{
+    name: string;
+    triggerCondition: string;
+    steps: string[];
+  }> = [],
 ): string {
   const items = patterns
     .map((p, i) => `[Pattern ${i + 1}] (seen ${p.frequency}x)\n${p.content}`)
     .join("\n\n");
-  return `Extract reusable procedures from these recurring patterns:\n\n${items}`;
+  const history = historicalProcedures.length > 0
+    ? historicalProcedures.map((procedure, index) => [
+        `[Existing procedure ${index + 1}] ${procedure.name}`,
+        `Trigger: ${procedure.triggerCondition}`,
+        ...procedure.steps.map((step) => `- ${step}`),
+      ].join("\n")).join("\n\n")
+    : "(none)";
+  return [
+    "Extract reusable procedures supported by the new recurring patterns.",
+    "New patterns are evidence. Existing procedures are historical context only.",
+    "",
+    "New recurring patterns:",
+    items,
+    "",
+    "Existing procedures (context only):",
+    history,
+  ].join("\n");
 }

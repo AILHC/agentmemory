@@ -6,6 +6,7 @@ const STAGES = new Map([
     resultRef: 'memories',
     commitFunction: 'mem::full-memory-consolidate-window-commit',
     domainEffectSchema: 'memory-consolidate-domain-effect/v1',
+    noEffectSchema: 'memory-consolidate-no-effect/v1',
     noEffect: (response) => response?.status === 'skipped' && response?.consolidated === 0,
     noEffectReason: 'insufficient_observations',
   }],
@@ -284,6 +285,78 @@ function receiptBoundCommittedFacts({
   };
 }
 
+function receiptBoundCommittedNoEffectFacts({
+  stage,
+  stageSpec,
+  unit,
+  attemptId,
+  facts,
+  response,
+}) {
+  const receipt = facts.receipt || response?.operationReceipt;
+  const commitContext = facts.commitContext;
+  const noEffect = valueAt(response, 'noEffectEvidence', 'no_effect_evidence');
+  const resultIds = strings(valueAt(
+    response,
+    stageSpec.resultField,
+    stageSpec.resultField.replace(/[A-Z]/g, (letter) => `_${letter.toLowerCase()}`),
+  ));
+  if (
+    !stageSpec.noEffectSchema
+    || response?.success !== true
+    || response?.status !== 'skipped'
+    || response?.consolidated !== 0
+    || !resultIds
+    || resultIds.length !== 0
+    || !receiptIdentityMatches(receipt, {
+      stage,
+      attemptId,
+      unitId: unit.unit_id,
+      inputHash: unit.input_hash,
+    })
+    || receipt.status !== 'succeeded'
+    || !nonEmpty(commitContext?.preparedHandle)
+    || !nonEmpty(commitContext?.proposalHash)
+    || !nonEmpty(commitContext?.prepareAttemptId)
+    || !nonEmpty(commitContext?.prepareInputHash)
+    || unit.input_hash !== commitInputHash(unit.unit_id, commitContext)
+    || !noEffect
+    || Object.keys(noEffect).sort().join(',') !== 'proofHash,proposalHash,reasonCode,schema'
+    || noEffect.schema !== stageSpec.noEffectSchema
+    || noEffect.proposalHash !== commitContext.proposalHash
+    || noEffect.reasonCode !== 'no_durable_memory'
+    || !/^[0-9a-f]{64}$/.test(noEffect.proofHash)
+  ) return null;
+  return {
+    candidateEvidence: {
+      kind: 'no_effect',
+      observation: 'business_empty',
+      reasonCode: noEffect.reasonCode,
+      proof: {
+        kind: 'committed_structured_no_effect',
+        receiptKey: receipt.key,
+        receiptVersion: receipt.version,
+        schema: noEffect.schema,
+        proposalHash: noEffect.proposalHash,
+        reasonCode: noEffect.reasonCode,
+        proofHash: noEffect.proofHash,
+      },
+    },
+    snapshot: {
+      receipt: {
+        key: receipt.key,
+        version: receipt.version,
+        status: receipt.status,
+      },
+      commit: {
+        ...commitContext,
+        resultIds,
+      },
+      committedNoEffect: { ...noEffect },
+    },
+  };
+}
+
 function receiptBoundCommittingFacts({
   stage,
   unit,
@@ -431,6 +504,15 @@ export function adaptSafeStageOperationEvidence({
     response,
   });
   if (receiptBoundCommitted) return receiptBoundCommitted;
+  const receiptBoundCommittedNoEffect = receiptBoundCommittedNoEffectFacts({
+    stage,
+    stageSpec,
+    unit,
+    attemptId,
+    facts: collected,
+    response,
+  });
+  if (receiptBoundCommittedNoEffect) return receiptBoundCommittedNoEffect;
   const noEffect = noEffectFacts({
     stage,
     stageSpec,

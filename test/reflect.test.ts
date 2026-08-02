@@ -4,7 +4,14 @@ vi.mock("../src/logger.js", () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import { registerReflectFunctions, runReflectInsightWindow } from "../src/functions/reflect.js";
+import {
+  REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+  enqueueReflectInsightBacklog,
+  planReflectInsightWindows,
+  reconcileReflectInsightContribution,
+  registerReflectFunctions,
+  runReflectInsightWindow,
+} from "../src/functions/reflect.js";
 import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
 import { fingerprintId, KV } from "../src/state/schema.js";
 import type {
@@ -131,6 +138,91 @@ Security requires layered protection: input validation, safe APIs, and deny-list
 Focus test effort on system boundaries where trust transitions occur.
 </insight>
 </insights>`;
+
+type PlannedReflectWindow = {
+  windowId: string;
+  semanticMemoryIds: string[];
+  lessonIds: string[];
+  crystalIds: string[];
+  stageContractVersion: string;
+  sourceVersionKeys: string[];
+};
+
+async function seedIncrementalReflectSources(
+  kv: ReturnType<typeof mockKV>,
+  suffix: string,
+  count = 3,
+): Promise<{
+  semanticMemoryId: string;
+  lessonId: string;
+  crystalId: string;
+  window?: PlannedReflectWindow;
+}> {
+  const semanticMemoryId = `sem_incremental_${suffix}`;
+  const lessonId = `lsn_incremental_${suffix}`;
+  const crystalId = `crys_incremental_${suffix}`;
+  await kv.set(KV.semantic, semanticMemoryId, makeSemantic(
+    `Security boundary evidence ${suffix}`,
+    semanticMemoryId,
+  ));
+  await kv.set(KV.lessons, lessonId, {
+    ...makeLesson(`Validate security boundaries ${suffix}`, ["security", "boundaries"]),
+    id: lessonId,
+  });
+  await kv.set(KV.crystals, crystalId, {
+    ...makeCrystal(`Completed boundary validation ${suffix}`, ["security"]),
+    id: crystalId,
+  });
+  await enqueueReflectInsightBacklog({
+    kv: kv as never,
+    semanticMemoryIds: count >= 1 ? [semanticMemoryId] : [],
+    lessonIds: count >= 2 ? [lessonId] : [],
+    crystalIds: count >= 3 ? [crystalId] : [],
+  });
+  const plan = await planReflectInsightWindows({ kv: kv as never, useGraph: false }) as {
+    windows: PlannedReflectWindow[];
+  };
+  return { semanticMemoryId, lessonId, crystalId, window: plan.windows[0] };
+}
+
+async function createReflectOperationReceipt(
+  kv: ReturnType<typeof mockKV>,
+  identity: { runId: string; unitId: string; inputHash: string },
+): Promise<string> {
+  const key = buildExtractionOperationKey({ ...identity, stage: "reflect_insight" });
+  await kv.set(KV.extractionOperationReceipt(key), key, {
+    ...identity,
+    stage: "reflect_insight",
+    key,
+    version: 1,
+    status: "running",
+    startedAt: "2026-08-02T00:00:00.000Z",
+  });
+  return key;
+}
+
+async function finalizeReflectContribution(options: {
+  kv: ReturnType<typeof mockKV>;
+  identity: { runId: string; unitId: string; inputHash: string };
+  sourceVersionKeys: string[];
+  response: Record<string, unknown>;
+}): Promise<Record<string, unknown>> {
+  const key = buildExtractionOperationKey({ ...options.identity, stage: "reflect_insight" });
+  const scope = KV.extractionOperationReceipt(key);
+  const receipt = await options.kv.get<Record<string, unknown>>(scope, key);
+  await options.kv.set(scope, key, {
+    ...receipt,
+    status: "succeeded",
+    completedAt: "2026-08-02T00:01:00.000Z",
+    response: options.response,
+  });
+  return reconcileReflectInsightContribution({
+    kv: options.kv as never,
+    identity: { ...options.identity, stage: "reflect_insight" },
+    sourceVersionKeys: options.sourceVersionKeys,
+    operationReceiptRef: { scope, key },
+  });
+}
 
 describe("Reflect", () => {
   let sdk: ReturnType<typeof mockSdk>;
@@ -865,5 +957,319 @@ describe("Reflect", () => {
       error: "reflect_insight_source_mutation_conflict",
     });
     expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  describe("incremental reflect insight contract", () => {
+    it("plans only explicit backlog sources and keeps fewer than three pending", async () => {
+      const sources = await seedIncrementalReflectSources(kv, "planner", 0);
+      await kv.set(KV.insights, "ins_historical", {
+        id: "ins_historical",
+        title: "Historical insight",
+        content: "This historical insight must not become an upstream source.",
+        confidence: 0.8,
+        reinforcements: 0,
+        sourceConceptCluster: ["history"],
+        sourceMemoryIds: [],
+        sourceLessonIds: [],
+        sourceCrystalIds: [],
+        tags: ["history"],
+        createdAt: "2026-08-01T00:00:00.000Z",
+        updatedAt: "2026-08-01T00:00:00.000Z",
+        decayRate: 0.05,
+      });
+
+      expect(await planReflectInsightWindows({ kv: kv as never, useGraph: false }))
+        .toMatchObject({ windows: [], totalItems: 0 });
+
+      await enqueueReflectInsightBacklog({
+        kv: kv as never,
+        semanticMemoryIds: [sources.semanticMemoryId],
+        lessonIds: [sources.lessonId],
+      });
+      expect(await planReflectInsightWindows({ kv: kv as never, useGraph: false }))
+        .toMatchObject({
+          windows: [],
+          totalItems: 2,
+          reason: "fewer than 3 unconsumed supporting items",
+        });
+      expect(await kv.list(KV.reflectInsightBacklog)).toHaveLength(2);
+      expect(provider.summarize).not.toHaveBeenCalled();
+
+      await enqueueReflectInsightBacklog({
+        kv: kv as never,
+        crystalIds: [sources.crystalId],
+      });
+      const ready = await planReflectInsightWindows({ kv: kv as never, useGraph: false }) as {
+        windows: PlannedReflectWindow[];
+      };
+      expect(ready.windows).toHaveLength(1);
+      expect(ready.windows[0]).toMatchObject({
+        semanticMemoryIds: [sources.semanticMemoryId],
+        lessonIds: [sources.lessonId],
+        crystalIds: [sources.crystalId],
+        stageContractVersion: REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+      });
+      expect(ready.windows[0].sourceVersionKeys).toHaveLength(3);
+    });
+
+    it("uses historical insights only as context and terminally consumes exact sources", async () => {
+      const { window } = await seedIncrementalReflectSources(kv, "success");
+      expect(window).toBeDefined();
+      const historical: Insight = {
+        id: "ins_incremental_history",
+        title: "Historical Boundary Evidence",
+        content: "Security boundary evidence requires durable provenance.",
+        confidence: 0.82,
+        reinforcements: 2,
+        sourceConceptCluster: ["security"],
+        sourceMemoryIds: ["sem_old"],
+        sourceLessonIds: [],
+        sourceCrystalIds: [],
+        tags: ["security"],
+        createdAt: "2026-08-01T00:00:00.000Z",
+        updatedAt: "2026-08-01T00:00:00.000Z",
+        decayRate: 0.05,
+      };
+      await kv.set(KV.insights, historical.id, historical);
+      const identity = {
+        runId: "reflect-incremental-success",
+        unitId: window!.windowId,
+        inputHash: "1".repeat(64),
+      };
+      await createReflectOperationReceipt(kv, identity);
+      const input = {
+        kv: kv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: window!.semanticMemoryIds,
+        lessonIds: window!.lessonIds,
+        crystalIds: window!.crystalIds,
+        stageContractVersion: REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+        sourceVersionKeys: window!.sourceVersionKeys,
+        recoveryIdentity: identity,
+      };
+
+      const first = await runReflectInsightWindow(input);
+      expect(first).toMatchObject({ success: true, status: "succeeded" });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect(provider.summarize.mock.calls[0][1]).toContain(historical.title);
+      expect(provider.summarize.mock.calls[0][1]).toContain(historical.content);
+      expect(await kv.get(KV.insights, historical.id)).toEqual(historical);
+
+      const reconciled = await finalizeReflectContribution({
+        kv,
+        identity,
+        sourceVersionKeys: window!.sourceVersionKeys,
+        response: first,
+      });
+      expect(reconciled).toMatchObject({ success: true, status: "succeeded" });
+      expect(await kv.list(KV.reflectInsightBacklog)).toEqual([]);
+      expect(await planReflectInsightWindows({ kv: kv as never, useGraph: false }))
+        .toMatchObject({ windows: [], totalItems: 0 });
+      const contributionScope = KV.extractionContributionRecords(
+        "reflect_insight",
+        REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+      );
+      expect(await kv.list<{ state: string }>(contributionScope)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ state: "committed" }),
+          expect.objectContaining({ state: "committed" }),
+          expect.objectContaining({ state: "committed" }),
+        ]),
+      );
+
+      expect(await runReflectInsightWindow(input)).toMatchObject({
+        success: true,
+        insightIds: first.insightIds,
+      });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+
+      const createdInsightId = (first.insightIds as string[])[0];
+      const created = await kv.get<Insight>(KV.insights, createdInsightId);
+      await kv.set(KV.insights, createdInsightId, { ...created!, content: "tampered" });
+      expect(await runReflectInsightWindow(input)).toMatchObject({
+        success: false,
+        error: "reflect_insight_source_mutation_conflict",
+        failure: { class: "hard", cause: "reflect_insight_source_mutation_conflict" },
+      });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+    });
+
+    it("commits a strict empty response as terminal no-effect", async () => {
+      provider.summarize.mockResolvedValueOnce("<insights></insights>");
+      const { window } = await seedIncrementalReflectSources(kv, "empty");
+      const identity = {
+        runId: "reflect-incremental-empty",
+        unitId: window!.windowId,
+        inputHash: "2".repeat(64),
+      };
+      await createReflectOperationReceipt(kv, identity);
+      const result = await runReflectInsightWindow({
+        kv: kv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: window!.semanticMemoryIds,
+        lessonIds: window!.lessonIds,
+        crystalIds: window!.crystalIds,
+        stageContractVersion: REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+        sourceVersionKeys: window!.sourceVersionKeys,
+        recoveryIdentity: identity,
+      });
+
+      expect(result).toMatchObject({
+        success: true,
+        status: "skipped",
+        insightIds: [],
+        reflectRecoveryEvidence: {
+          kind: "no_effect",
+          reasonCode: "no_novel_insight",
+          proof: { schema: "reflect-insight-no-effect/v1" },
+        },
+      });
+      expect(await finalizeReflectContribution({
+        kv,
+        identity,
+        sourceVersionKeys: window!.sourceVersionKeys,
+        response: result,
+      })).toMatchObject({ success: true, status: "skipped" });
+      expect(await kv.list(KV.insights)).toEqual([]);
+      expect(await kv.list<{ state: string }>(KV.extractionContributionRecords(
+        "reflect_insight",
+        REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+      ))).toEqual(expect.arrayContaining([
+        expect.objectContaining({ state: "no_effect" }),
+        expect.objectContaining({ state: "no_effect" }),
+        expect.objectContaining({ state: "no_effect" }),
+      ]));
+      expect(await planReflectInsightWindows({ kv: kv as never, useGraph: false }))
+        .toMatchObject({ windows: [], totalItems: 0 });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+    });
+
+    it("recovers a persisted formal response without another provider call", async () => {
+      const { window } = await seedIncrementalReflectSources(kv, "recovery");
+      const identity = {
+        runId: "reflect-incremental-recovery",
+        unitId: window!.windowId,
+        inputHash: "3".repeat(64),
+      };
+      const key = await createReflectOperationReceipt(kv, identity);
+      let loseStagedResponse = true;
+      const flakyKv = {
+        ...kv,
+        set: async <T>(scope: string, itemKey: string, data: T): Promise<T> => {
+          const stored = await kv.set(scope, itemKey, data);
+          const recovery = (data as { reflectRecovery?: { phase?: string } }).reflectRecovery;
+          if (loseStagedResponse && scope === KV.extractionOperationReceipt(key)
+            && recovery?.phase === "staged") {
+            loseStagedResponse = false;
+            throw new Error("staged response lost");
+          }
+          return stored;
+        },
+      };
+      const baseInput = {
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: window!.semanticMemoryIds,
+        lessonIds: window!.lessonIds,
+        crystalIds: window!.crystalIds,
+        stageContractVersion: REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+        sourceVersionKeys: window!.sourceVersionKeys,
+        recoveryIdentity: identity,
+      };
+
+      expect(await runReflectInsightWindow({ ...baseInput, kv: flakyKv as never }))
+        .toMatchObject({ success: false, error: "staged response lost" });
+      const resumed = await runReflectInsightWindow({ ...baseInput, kv: kv as never });
+      expect(resumed).toMatchObject({ success: true, status: "succeeded" });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect(await finalizeReflectContribution({
+        kv,
+        identity,
+        sourceVersionKeys: window!.sourceVersionKeys,
+        response: resumed,
+      })).toMatchObject({ success: true, status: "succeeded" });
+    });
+
+    it("keeps malformed output retryable without consuming the backlog", async () => {
+      provider.summarize.mockResolvedValueOnce("not structured output");
+      const { window } = await seedIncrementalReflectSources(kv, "malformed");
+      const identity = {
+        runId: "reflect-incremental-malformed",
+        unitId: window!.windowId,
+        inputHash: "4".repeat(64),
+      };
+      await createReflectOperationReceipt(kv, identity);
+      const result = await runReflectInsightWindow({
+        kv: kv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: window!.semanticMemoryIds,
+        lessonIds: window!.lessonIds,
+        crystalIds: window!.crystalIds,
+        stageContractVersion: REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+        sourceVersionKeys: window!.sourceVersionKeys,
+        recoveryIdentity: identity,
+      });
+
+      expect(result).toMatchObject({
+        success: false,
+        error: "reflect_insight_response_parse_failure",
+        failure: { class: "unit", cause: "reflect_insight_response_parse_failure" },
+      });
+      const replanned = await planReflectInsightWindows({ kv: kv as never, useGraph: false }) as {
+        windows: PlannedReflectWindow[];
+      };
+      expect(replanned.windows).toHaveLength(1);
+      expect(replanned.windows[0].sourceVersionKeys).toEqual(window!.sourceVersionKeys);
+      expect(await kv.list<{ state: string }>(KV.extractionContributionRecords(
+        "reflect_insight",
+        REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+      ))).not.toEqual(expect.arrayContaining([expect.objectContaining({ state: "claimed" })]));
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+    });
+
+    it("rebuilds the pending window when an upstream source drifts before commit", async () => {
+      const seeded = await seedIncrementalReflectSources(kv, "drift");
+      const originalKeys = [...seeded.window!.sourceVersionKeys];
+      const identity = {
+        runId: "reflect-incremental-drift",
+        unitId: seeded.window!.windowId,
+        inputHash: "5".repeat(64),
+      };
+      await createReflectOperationReceipt(kv, identity);
+      provider.summarize.mockImplementationOnce(async () => {
+        const semantic = await kv.get<SemanticMemory>(KV.semantic, seeded.semanticMemoryId);
+        await kv.set(KV.semantic, seeded.semanticMemoryId, {
+          ...semantic!,
+          fact: `${semantic!.fact} corrected`,
+          updatedAt: "2026-08-02T00:00:30.000Z",
+        });
+        return XML_RESPONSE;
+      });
+
+      const result = await runReflectInsightWindow({
+        kv: kv as never,
+        provider: provider as never,
+        useGraph: false,
+        semanticMemoryIds: seeded.window!.semanticMemoryIds,
+        lessonIds: seeded.window!.lessonIds,
+        crystalIds: seeded.window!.crystalIds,
+        stageContractVersion: REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+        sourceVersionKeys: originalKeys,
+        recoveryIdentity: identity,
+      });
+      expect(result).toMatchObject({
+        success: false,
+        failure: { class: "hard", cause: "reflect_insight_source_drifted_before_commit" },
+      });
+      const replanned = await planReflectInsightWindows({ kv: kv as never, useGraph: false }) as {
+        windows: PlannedReflectWindow[];
+      };
+      expect(replanned.windows).toHaveLength(1);
+      expect(replanned.windows[0].sourceVersionKeys).not.toEqual(originalKeys);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+    });
   });
 });

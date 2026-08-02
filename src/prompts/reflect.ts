@@ -14,6 +14,8 @@ Rules:
 - Content should be the actual observation (1-3 sentences)
 - Prefer actionable insights over abstract summaries
 - Skip insights that merely restate a single source item
+- Existing insights are historical context only; do not treat them as new supporting items
+- If the new supporting items yield no novel or supportable insight, return exactly <insights></insights>
 - Always emit confidence attribute before title attribute`;
 
 export const REFLECT_OUTPUT_CONTRACT = {
@@ -29,7 +31,12 @@ export function buildReflectPrompt(cluster: {
   facts: Array<{ fact: string; confidence: number }>;
   lessons: Array<{ content: string; confidence: number }>;
   crystalNarratives: string[];
-}): string {
+}, existingInsights: Array<{
+  title: string;
+  content: string;
+  confidence: number;
+  reinforcements: number;
+}> = []): string {
   const sections: string[] = [];
 
   sections.push(`## Concept Cluster: ${cluster.concepts.join(", ")}`);
@@ -59,5 +66,13 @@ export function buildReflectPrompt(cluster: {
     );
   }
 
-  return `Synthesize higher-order insights from this cluster of related memories:\n\n${sections.join("\n")}`;
+  if (existingInsights.length > 0) {
+    sections.push(
+      "\n## Existing Insights (historical context only)",
+      ...existingInsights.map((insight) =>
+        `- [confidence=${insight.confidence}; reinforcements=${insight.reinforcements}] ${insight.title}: ${insight.content}`),
+    );
+  }
+
+  return `Synthesize higher-order insights from the new supporting items below. Existing insights may guide merge or reinforcement decisions, but are not new evidence:\n\n${sections.join("\n")}`;
 }

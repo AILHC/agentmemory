@@ -12,6 +12,11 @@ const modulePath = path.resolve(
   'agentmemory-deployment-manifest.mjs',
 );
 const manifestModule = await import(pathToFileURL(modulePath));
+const extractionModelContractsPath = path.resolve(
+  'ops',
+  'scripts',
+  'extraction-model-contracts-v1.json',
+);
 const commonScript = path.resolve(
   'ops',
   'scripts',
@@ -37,6 +42,7 @@ async function createFixture(context) {
     fs.writeFile(path.join(root, 'scripts', 'start.ps1'), "Write-Output 'start'\n"),
     fs.writeFile(path.join(root, 'scripts', '_agentmemory-local-common.ps1'), 'function Common-Fixture {}\n'),
     fs.writeFile(path.join(root, 'scripts', 'agentmemory-deployment-manifest.mjs'), 'export {};\n'),
+    fs.copyFile(extractionModelContractsPath, path.join(root, 'scripts', 'extraction-model-contracts-v1.json')),
     fs.writeFile(path.join(root, 'scripts', 'doctor-agentmemory-console.ps1'), "Write-Output 'doctor'\n"),
     fs.writeFile(path.join(root, 'scripts', 'doctor-agentmemory.ps1'), "Write-Output 'service doctor'\n"),
     fs.writeFile(path.join(root, 'scripts', 'create-agentmemory-recovery-evidence-snapshot.mjs'), 'export {};\n'),
@@ -46,6 +52,7 @@ async function createFixture(context) {
     fs.writeFile(path.join(root, 'scripts', 'lib', 'effect-state-recovery-stage-catalog-v1.mjs'), 'export {};\n'),
     fs.writeFile(path.join(root, 'scripts', 'lib', 'full-extraction-stage-adapters-v2.mjs'), 'export {};\n'),
     fs.writeFile(path.join(root, 'scripts', 'lib', 'iii-state-read-only-adapter-v1.mjs'), 'export {};\n'),
+    fs.writeFile(path.join(root, 'scripts', 'lib', 'incremental-extraction-status-v1.mjs'), 'export {};\n'),
     fs.writeFile(path.join(root, 'scripts', 'lib', 'legacy-lesson-safe-facts-collector-v1.mjs'), 'export {};\n'),
     fs.writeFile(path.join(root, 'scripts', 'lib', 'lesson-recovery-adapter-v1.mjs'), 'export {};\n'),
     fs.writeFile(path.join(root, 'scripts', 'lib', 'offline-statekv-snapshot-v1.mjs'), 'export {};\n'),
@@ -64,6 +71,8 @@ async function createFixture(context) {
     fs.writeFile(path.join(root, 'scripts', 'lib', 'summary-recovery-adapter-v1.mjs'), 'export {};\n'),
     fs.writeFile(path.join(root, 'scripts', 'lib', 'v2-release-gate.mjs'), 'export {};\n'),
     fs.writeFile(path.join(root, 'scripts', 'run-agentmemory-full-extraction.mjs'), 'export {};\n'),
+    fs.writeFile(path.join(root, 'scripts', 'preview-agentmemory-adopted-baseline.mjs'), 'export {};\n'),
+    fs.writeFile(path.join(root, 'scripts', 'apply-agentmemory-adopted-baseline.mjs'), 'export {};\n'),
     fs.writeFile(path.join(root, 'scripts', 'migrate-agentmemory-recovery-frontier.mjs'), 'export {};\n'),
     fs.writeFile(path.join(root, 'scripts', 'project-agentmemory-recovery-status.mjs'), 'export {};\n'),
     fs.writeFile(path.join(root, 'scripts', 'start-agentmemory-console.ps1'), "Write-Output 'start console'\n"),
@@ -103,7 +112,7 @@ test('生成清单后可以验证完整 current，且清单不哈希自身', asy
     builtAt: '2026-07-18T00:00:00.000Z',
   });
 
-  assert.equal(manifest.schemaVersion, 3);
+  assert.equal(manifest.schemaVersion, 4);
   assert.equal(manifest.sourceCommit, SOURCE_COMMIT);
   assert.equal(manifest.packageVersion, '0.9.27');
   assert.equal(
@@ -111,6 +120,15 @@ test('生成清单后可以验证完整 current，且清单不哈希自身', asy
     manifest.recoveryContract.maxVersion,
   );
   assert.match(manifest.recoveryContract.policyHash, /^[0-9a-f]{64}$/);
+  assert.equal(manifest.extractionModelContracts.stages.length, 8);
+  assert.equal(
+    manifestModule.deploymentStageContractCompatible(
+      manifest.extractionModelContracts,
+      'summary',
+      'summary/v1',
+    ),
+    true,
+  );
   assert.equal(manifest.content.fileCount > 0, true);
   assert.match(manifest.content.sha256, /^[0-9a-f]{64}$/);
   assert.deepEqual(
@@ -120,6 +138,7 @@ test('生成清单后可以验证完整 current，且清单不哈希自身', asy
       'dist/worker-supervisor.mjs',
       'scripts/_agentmemory-local-common.ps1',
       'scripts/agentmemory-deployment-manifest.mjs',
+      'scripts/extraction-model-contracts-v1.json',
       'scripts/doctor-agentmemory-console.ps1',
       'scripts/doctor-agentmemory.ps1',
       'scripts/create-agentmemory-recovery-evidence-snapshot.mjs',
@@ -129,6 +148,7 @@ test('生成清单后可以验证完整 current，且清单不哈希自身', asy
       'scripts/lib/effect-state-recovery-stage-catalog-v1.mjs',
       'scripts/lib/full-extraction-stage-adapters-v2.mjs',
       'scripts/lib/iii-state-read-only-adapter-v1.mjs',
+      'scripts/lib/incremental-extraction-status-v1.mjs',
       'scripts/lib/legacy-lesson-safe-facts-collector-v1.mjs',
       'scripts/lib/lesson-recovery-adapter-v1.mjs',
       'scripts/lib/offline-statekv-snapshot-v1.mjs',
@@ -147,6 +167,8 @@ test('生成清单后可以验证完整 current，且清单不哈希自身', asy
       'scripts/lib/summary-recovery-adapter-v1.mjs',
       'scripts/lib/v2-release-gate.mjs',
       'scripts/run-agentmemory-full-extraction.mjs',
+      'scripts/preview-agentmemory-adopted-baseline.mjs',
+      'scripts/apply-agentmemory-adopted-baseline.mjs',
       'scripts/project-agentmemory-recovery-status.mjs',
       'scripts/migrate-agentmemory-recovery-frontier.mjs',
       'scripts/start-agentmemory-console.ps1',
@@ -161,6 +183,22 @@ test('生成清单后可以验证完整 current，且清单不哈希自身', asy
   const result = await manifestModule.verifyDeploymentManifest(root);
   assert.equal(result.ok, true);
   assert.equal(result.fileCount, manifest.content.fileCount);
+  assert.deepEqual(result.extractionModelContracts, manifest.extractionModelContracts);
+});
+
+test('模型和提示词哈希只用于审计，compatible_with 单独决定合同兼容性', async () => {
+  const contracts = JSON.parse(await fs.readFile(extractionModelContractsPath, 'utf8'));
+  const changedAudit = structuredClone(contracts);
+  changedAudit.stages[0].model = 'gpt-5.6-luna-audit-change';
+  changedAudit.stages[0].prompt_hash = 'f'.repeat(64);
+  assert.equal(
+    manifestModule.deploymentStageContractCompatible(changedAudit, 'summary', 'summary/v1'),
+    true,
+  );
+  assert.equal(
+    manifestModule.deploymentStageContractCompatible(changedAudit, 'summary', 'summary/v2'),
+    false,
+  );
 });
 
 test('文件修改、缺失和额外顶层文件都会使验证失败', async (context) => {

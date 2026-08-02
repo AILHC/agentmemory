@@ -1807,6 +1807,17 @@ export async function runTwoPhaseStage({
           await appendAndTrack(events, append, 'run_blocked', actionPayload);
           return { status: 'blocked', unitId: unit.unit_id, detail: actionPayload };
         }
+        if (recovery.decision.action === 'isolate') {
+          await appendAndTrack(events, append, 'unit_isolated', actionPayload);
+          unit = {
+            ...unit,
+            terminal: 'failed',
+            terminal_payload: actionPayload,
+            recovery_state: 'isolated',
+          };
+          state.units.set(unit.unit_id, unit);
+          continue;
+        }
         throw new Error(`v2_prepare_recovery_action_invalid:${recovery.decision.action}`);
       }
       if (result.status === 'pending') {

@@ -66,6 +66,7 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 360000;
 const DEFAULT_LESSON_TIMEOUT_MS = 360000;
 const DEFAULT_STAGE_CHAR_BUDGET = 64000;
 const SUMMARY_RESUMABLE_PATH = '/agentmemory/summarize/resumable';
+const EXTRACTION_BASELINE_PATH = '/agentmemory/full/extraction-baseline';
 const SUMMARY_SESSION_POLL_ATTEMPTS = 5;
 const SUMMARY_ADVANCE_MIN_CALL_LIMIT = 20;
 const SUMMARY_ADVANCE_MAX_CALL_LIMIT = 10000;
@@ -1758,6 +1759,73 @@ export async function requestJson(baseUrl, secret, method, apiPath, body, option
   else if (parsed?.success === false) result.error = compactStateError(parsed?.error, 'application reported success=false');
   Object.defineProperty(result, 'data', { value: parsed, enumerable: false });
   return result;
+}
+
+async function inspectRunnerAdoptedBaseline({ baseUrl, secret, runId, options }) {
+  const result = await requestJson(
+    baseUrl,
+    secret,
+    'POST',
+    EXTRACTION_BASELINE_PATH,
+    { action: 'inspect_run', runId },
+    requestOptions(options),
+  );
+  if (result.status_code === 404) return { baselineId: null, retired: false };
+  if (!result.ok) throw new Error(result.error || 'v2_adopted_baseline_inspection_failed');
+  return {
+    baselineId: typeof result.data?.baselineId === 'string' ? result.data.baselineId : null,
+    retired: result.data?.retired === true,
+  };
+}
+
+export async function partitionRunnerSessions({
+  baseUrl,
+  secret,
+  stage,
+  stageContractVersion,
+  sessions,
+  expectedBaselineId,
+  options,
+}) {
+  if (sessions.length === 0) return [];
+  const result = await requestJson(
+    baseUrl,
+    secret,
+    'POST',
+    EXTRACTION_BASELINE_PATH,
+    {
+      action: 'partition_sessions',
+      stage,
+      stageContractVersion,
+      sessionIds: sessions.map((session) => session.id),
+    },
+    requestOptions(options),
+  );
+  if (result.status_code === 404) return sessions;
+  if (!result.ok) throw new Error(result.error || 'v2_adopted_baseline_partition_failed');
+  const baselineId = typeof result.data?.baselineId === 'string' ? result.data.baselineId : null;
+  const openSessionIds = result.data?.openSessionIds;
+  const adoptedSessionIds = result.data?.adoptedSessionIds;
+  if (
+    baselineId !== expectedBaselineId
+    || !Array.isArray(openSessionIds)
+    || !Array.isArray(adoptedSessionIds)
+  ) {
+    throw new Error('v2_adopted_baseline_changed');
+  }
+  const openIds = new Set(openSessionIds);
+  const adoptedIds = new Set(adoptedSessionIds);
+  const inputIds = new Set(sessions.map((session) => session.id));
+  const partitionIds = new Set([...openIds, ...adoptedIds]);
+  if (
+    openIds.size !== openSessionIds.length
+    || adoptedIds.size !== adoptedSessionIds.length
+    || [...openIds].some((sessionId) => typeof sessionId !== 'string' || adoptedIds.has(sessionId))
+    || [...adoptedIds].some((sessionId) => typeof sessionId !== 'string')
+    || partitionIds.size !== inputIds.size
+    || [...partitionIds].some((sessionId) => !inputIds.has(sessionId))
+  ) throw new Error('v2_adopted_baseline_partition_invalid');
+  return sessions.filter((session) => openIds.has(session.id));
 }
 
 function requestOptions(options = {}) {
@@ -6757,6 +6825,7 @@ async function repairV2ResumedStatusCache({ journal, fsApi, control, controlLife
 
 async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
   const baseUrl = normalizeBaseUrl(options.baseUrl);
+  const secret = requireSecret();
   const fsApi = dependencies.fsApi || fs;
   let executionBoundary = null;
   const journal = new RunStateJournalV2({
@@ -6785,6 +6854,17 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       if (exists) throw new Error('v2_v1_state_collision: 该 run_id 已有 v1 状态或锁');
     }
     await assertV1ReleaseGate(options.stateDir, { fsApi });
+    const baselineInspection = dependencies.v2BaselineRunInspection
+      ? await dependencies.v2BaselineRunInspection({ baseUrl, secret, runId, options })
+      : dependencies.v2RuntimeCheck
+        ? { baselineId: null, retired: false }
+        : await inspectRunnerAdoptedBaseline({ baseUrl, secret, runId, options });
+    if (baselineInspection?.retired === true) {
+      throw new Error(`v2_run_retired_by_adopted_baseline:${baselineInspection.baselineId || 'unknown'}`);
+    }
+    const activeBaselineId = typeof baselineInspection?.baselineId === 'string'
+      ? baselineInspection.baselineId
+      : null;
     const verifiedTakeover = dependencies.v2VerifiedTakeover
       || (options.resume ? async ({ owner }) => owner.run_id === runId : null);
     await journal.acquireLock({ takeover: verifiedTakeover });
@@ -6823,7 +6903,6 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       control,
       controlLifecycle,
     });
-    const secret = requireSecret();
   if (options.doctorScript) {
     await runDoctorGate(path.resolve(options.doctorScript), options.doctorOk);
   }
@@ -6925,6 +7004,7 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
       base_url: baseUrl,
       mark: options.mark,
     };
+    if (activeBaselineId) config.adopted_baseline_id = activeBaselineId;
     const configHash = stableHash(config);
     const started = control.find((event) => event.type === 'run_started');
     if (started) {
@@ -6960,6 +7040,28 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
     if (started && started.payload?.inventory_hash !== inventoryHash) {
       throw new Error('v2_run_input_drifted: 请创建新的 run_id');
     }
+    const partitionSessions = dependencies.v2BaselinePartition
+      || (dependencies.v2RuntimeCheck
+        ? async ({ sessions: inputSessions }) => inputSessions
+        : (input) => partitionRunnerSessions({
+          ...input,
+          baseUrl,
+          secret,
+          expectedBaselineId: activeBaselineId,
+          options,
+        }));
+    const [summarySessions, lessonSessions] = await Promise.all([
+      partitionSessions({
+        stage: 'summary',
+        stageContractVersion: 'summary/v1',
+        sessions,
+      }),
+      partitionSessions({
+        stage: 'lessons',
+        stageContractVersion: 'lessons/v1',
+        sessions,
+      }),
+    ]);
     if (!started) {
       await durable('control', 'run_started', {
         run_id: runId,
@@ -7039,7 +7141,7 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
         control,
         journal,
         durable,
-        plan: buildV2SummaryPlan(sessions, baseUrl, options),
+        plan: buildV2SummaryPlan(summarySessions, baseUrl, options),
         adapter: buildV2SummaryAdapter({ baseUrl, secret, options, runId, summaryRemote }),
         planOnly: options.dryRun,
         executionBoundary,
@@ -7061,7 +7163,7 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
         control,
         journal,
         durable,
-        plan: buildV2LessonsPlan(sessions, baseUrl, options),
+        plan: buildV2LessonsPlan(lessonSessions, baseUrl, options),
         adapter: buildV2LessonsAdapter({ baseUrl, secret, options, runId, lessonsRemote }),
         planOnly: options.dryRun,
         dependencyStates: summaryDependencyStates,
@@ -7144,6 +7246,19 @@ async function runV2SummaryLifecycle({ options, runId, dependencies = {} }) {
             events: summaryEvents,
             baseUrl,
           }).sessions;
+        },
+        loadSelectedSessionsForStage: async (stage, inputSessions) => {
+          const stageContractVersion = {
+            memory_consolidate: 'memory_consolidate/v1',
+            semantic_rollup: 'semantic-rollup/v1',
+            skill_extract: 'skill_extract/v1',
+          }[stage];
+          if (!stageContractVersion) throw new Error(`v2_adopted_baseline_stage_invalid:${stage}`);
+          return partitionSessions({
+            stage,
+            stageContractVersion,
+            sessions: inputSessions,
+          });
         },
         eligibleStages: {
           semantic_rollup: ['completed', 'planned'].includes(summaryResult.status),

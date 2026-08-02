@@ -482,18 +482,67 @@ function singleAdapter({
       completeOperation,
       resolveOutcome,
     }) => {
-      if (unit.skip_reason) {
-        return { status: 'skipped', payload: { reason: unit.skip_reason, result_ids: [] } };
-      }
       const recoveryEnabled = Boolean(
         adaptRecoveryEvidence
         && startOperation
         && completeOperation
         && resolveOutcome,
       );
+      if (unit.block_reason) {
+        return {
+          status: 'blocked',
+          reason: unit.block_reason,
+          payload: { error: unit.block_reason },
+        };
+      }
+      if (unit.skip_reason) {
+        return { status: 'skipped', payload: { reason: unit.skip_reason, result_ids: [] } };
+      }
       const operationId = activeOperation?.operation_id
         || completedOperations.at(-1)?.operation_id
         || unit.unit_id;
+      if (unit.isolate_reason) {
+        if (!recoveryEnabled) {
+          return {
+            status: 'failed',
+            payload: { error: unit.isolate_reason },
+          };
+        }
+        if (!activeOperation) await startOperation({ operationId });
+        const recovery = await resolveOutcome({
+          operationId,
+          candidateEvidence: {
+            kind: 'no_effect',
+            observation: 'business_rejected',
+            reasonCode: 'source_correction_requires_migration',
+            proof: { kind: 'request_not_dispatched', attemptId, journalSeq: 0 },
+          },
+          snapshot: {
+            requestDispatch: {
+              state: 'not_dispatched', persisted: true, attemptId, journalSeq: 0,
+            },
+            receipt: { formalEffect: false },
+          },
+        });
+        const terminalResult = {
+          status: 'failed',
+          payload: { error: unit.isolate_reason },
+        };
+        if (recovery.decision.action === 'isolate') {
+          await completeOperation({
+            operationId,
+            status: 'failed',
+            terminal_result: terminalResult,
+          });
+          return { ...terminalResult, recovery };
+        }
+        return blockedFromRecovery(
+          recovery,
+          `${stage}_recovery_contract_invalid`,
+          { data: terminalResult.payload },
+          receiptExpectation({ unit, attemptId }),
+        );
+      }
       const completedTerminal = completedOperations.at(-1)?.terminal_result;
       if (recoveryEnabled && completedTerminal) {
         const result = await invoke({
@@ -748,6 +797,40 @@ function twoPhaseAdapter({
             }),
           };
         }
+        if (terminal?.status === 'skipped' && prepared && commitAttemptId) {
+          const inputHash = commitInputHash({ unit, prepared });
+          const result = await request(
+            commitEndpoint,
+            buildFormalBody({
+              stage,
+              unit,
+              attemptId: commitAttemptId,
+              inputHash,
+              payload: {
+                prepareRunId: prepared.attempt_id,
+                prepareInputHash: prepared.prepare_input_hash,
+                preparedHandle: prepared.prepared_handle,
+                proposalHash: prepared.proposal_hash,
+                requireExistingReceipt: true,
+              },
+            }),
+          );
+          const classified = classifyIdempotentCommitResponse(result, resultFields);
+          return {
+            recoveryCandidate: commitRecoveryFacts({
+              unit,
+              attemptId: commitAttemptId,
+              prepared,
+              result: terminalMatches(classified, terminal)
+                ? result
+                : {
+                    ok: false,
+                    data: { error: `${stage}_recovered_terminal_unverified` },
+                  },
+              inputHash,
+            }),
+          };
+        }
         if (terminal?.status === 'skipped' && prepareAttemptId) {
           const result = await request(
             prepareEndpoint,
@@ -809,6 +892,30 @@ function twoPhaseAdapter({
       proposal_hash: prepared.proposal_hash,
     }),
     prepare: async ({ unit, attemptId, recovered }) => {
+      if (unit.block_reason) {
+        return { status: 'blocked', reason: unit.block_reason, payload: { error: unit.block_reason } };
+      }
+      if (unit.isolate_reason) {
+        return {
+          status: 'failed',
+          reason: unit.isolate_reason,
+          payload: { error: unit.isolate_reason },
+          recoveryCandidate: {
+            candidateEvidence: {
+              kind: 'no_effect',
+              observation: 'business_rejected',
+              reasonCode: 'source_correction_requires_migration',
+              proof: { kind: 'request_not_dispatched', attemptId, journalSeq: 0 },
+            },
+            snapshot: {
+              requestDispatch: {
+                state: 'not_dispatched', persisted: true, attemptId, journalSeq: 0,
+              },
+              receipt: { formalEffect: false },
+            },
+          },
+        };
+      }
       if (unit.skip_reason) {
         return { status: 'skipped', payload: { reason: unit.skip_reason, result_ids: [] } };
       }
@@ -958,7 +1065,10 @@ function twoPhaseAdapter({
           response,
           receiptExpectation({ unit, attemptId, runnerInputHash: inputHash }),
         );
-        return recovery.decision.action === 'replay'
+        return (
+          recovery.decision.action === 'replay'
+          || recovery.decision.action === 'skipped'
+        )
           ? {
               ...completedTerminal,
               recovery,
@@ -1007,6 +1117,21 @@ function twoPhaseAdapter({
         await completeOperation({
           operationId,
           status: 'succeeded',
+          terminal_result: terminalResult,
+        });
+        return {
+          ...terminalResult,
+          recovery,
+        };
+      }
+      if (recovery.decision.action === 'skipped' && classified.status === 'skipped') {
+        const terminalResult = {
+          status: 'skipped',
+          payload: classified.payload,
+        };
+        await completeOperation({
+          operationId,
+          status: 'skipped',
           terminal_result: terminalResult,
         });
         return {
@@ -1076,14 +1201,82 @@ function estimateSummaryChars(summary) {
   ].join('\n').length + 200;
 }
 
-function semanticPlan(sessions, config, stableHash) {
-  const entries = sessions
+function semanticEntries(sessions, stableHash) {
+  return sessions
     .filter((session) => usableSummary(session.summary))
     .map((session) => ({
       session_id: session.id,
       summary_hash: stableHash(summaryFields(session.summary)),
       estimated_chars: estimateSummaryChars(session.summary),
     }));
+}
+
+async function semanticEligibleEntries(entries, request, stableHash) {
+  const eligible = [];
+  for (let offset = 0; offset < entries.length; offset += 100) {
+    const page = entries.slice(offset, offset + 100);
+    const sessionIds = page.map((entry) => entry.session_id);
+    const sourceSummaryHashes = Object.fromEntries(
+      page.map((entry) => [entry.session_id, entry.summary_hash]),
+    );
+    const response = await request('/agentmemory/full/semantic-rollup-eligibility', {
+      sessionIds,
+      sourceSummaryHashes,
+    });
+    const data = responseData(response);
+    if (response?.ok === false || data?.success === false) {
+      const reason = failureCause(response) || 'semantic_rollup_eligibility_failed';
+      const blockedSourceIds = firstArray(data, ['blockedSessionIds', 'blocked_session_ids']);
+      return {
+        blockedUnit: {
+          unit_id: `eligibility-${stableHash([reason, blockedSourceIds]).slice(0, 12)}`,
+          source_ids: blockedSourceIds,
+          source_session_ids: blockedSourceIds,
+          source_summary_hashes: Object.fromEntries(
+            page
+              .filter((entry) => blockedSourceIds.includes(entry.session_id))
+              .map((entry) => [entry.session_id, entry.summary_hash]),
+          ),
+          input_hash: stableHash({ reason, blockedSourceIds }),
+          block_reason: reason,
+        },
+      };
+    }
+    const eligibleIds = firstArray(data, ['eligibleSessionIds', 'eligible_session_ids']);
+    const terminalIds = firstArray(data, ['terminalSessionIds', 'terminal_session_ids']);
+    const pageIds = new Set(sessionIds);
+    const partition = [...eligibleIds, ...terminalIds];
+    if (
+      partition.length !== sessionIds.length
+      || new Set(partition).size !== partition.length
+      || partition.some((sessionId) => !pageIds.has(sessionId))
+    ) {
+      const reason = 'semantic_rollup_eligibility_response_invalid';
+      return {
+        blockedUnit: {
+          unit_id: `eligibility-${stableHash([reason, sessionIds]).slice(0, 12)}`,
+          source_ids: sessionIds,
+          source_session_ids: sessionIds,
+          source_summary_hashes: sourceSummaryHashes,
+          input_hash: stableHash({ reason, sessionIds, sourceSummaryHashes }),
+          block_reason: reason,
+        },
+      };
+    }
+    const eligibleSet = new Set(eligibleIds);
+    eligible.push(...page.filter((entry) => eligibleSet.has(entry.session_id)));
+  }
+  return { entries: eligible };
+}
+
+async function semanticPlan({ sessions, config, stableHash, request }) {
+  const eligibility = await semanticEligibleEntries(
+    semanticEntries(sessions, stableHash),
+    request,
+    stableHash,
+  );
+  if (eligibility.blockedUnit) return [eligibility.blockedUnit];
+  const entries = eligibility.entries;
   const windows = [];
   let current = [];
   let currentChars = 0;
@@ -1154,6 +1347,10 @@ function splitMemoryUnit(unit, stableHash) {
   if (sourceIds.length <= 1) return [];
   const mid = Math.ceil(sourceIds.length / 2);
   const sessionIds = unit.observationSessionIds || unit.observation_session_ids;
+  const sourceVersionKeys = firstArray(unit, ['sourceVersionKeys', 'source_version_keys']);
+  const sourceVersionKeyById = sourceVersionKeys.length === sourceIds.length
+    ? Object.fromEntries(sourceIds.map((id, index) => [id, sourceVersionKeys[index]]))
+    : null;
   return [sourceIds.slice(0, mid), sourceIds.slice(mid)].map((ids, index) => {
     const unitId = `${unit.unit_id}${String.fromCharCode(97 + index)}`;
     const observationSessionIds = sessionIds && typeof sessionIds === 'object'
@@ -1170,6 +1367,12 @@ function splitMemoryUnit(unit, stableHash) {
       sourceObservationIds: ids,
       observationIds: ids,
       source_count: ids.length,
+      ...(unit.stageContractVersion || unit.stage_contract_version
+        ? { stageContractVersion: unit.stageContractVersion || unit.stage_contract_version }
+        : {}),
+      ...(sourceVersionKeyById
+        ? { sourceVersionKeys: ids.map((id) => sourceVersionKeyById[id]) }
+        : {}),
       ...(observationSessionIds && Object.keys(observationSessionIds).length === ids.length
         ? { observationSessionIds }
         : {}),
@@ -1180,20 +1383,68 @@ function splitMemoryUnit(unit, stableHash) {
   });
 }
 
-function skillPlan(sessions, stableHash) {
-  return sessions
-    .filter((session) => ['completed', 'done'].includes(session.status))
-    .filter((session) => usableSummary(session.summary))
-    .map((session, index) => ({
-      unit_id: `skill-${String(index + 1).padStart(4, '0')}`,
-      session_id: session.id,
-      source_ids: [session.id],
-      source_count: 1,
-      input_hash: stableHash({
-        session_id: session.id,
-        summary_hash: stableHash(summaryFields(session.summary)),
-      }),
-    }));
+async function skillPlan({ sessions, request, stableHash }) {
+  const ids = sessions.map((session) => session.id).filter(Boolean);
+  const units = []; const seen = new Set();
+  const blockRemaining = (offset, reason) => {
+    const sourceIds = ids.slice(offset);
+    units.push({
+      unit_id: `skill-eligibility-${offset}`,
+      source_ids: sourceIds,
+      source_count: sourceIds.length,
+      input_hash: stableHash(sourceIds),
+      block_reason: reason,
+    });
+  };
+  for (let offset = 0; offset < ids.length; offset += 100) {
+    const sessionIds = ids.slice(offset, offset + 100);
+    let response;
+    try { response = await request('/agentmemory/full/skill-extract-eligibility', { sessionIds }); }
+    catch {
+      blockRemaining(offset, 'skill_extract_eligibility_unavailable');
+      break;
+    }
+    const data = responseData(response);
+    const partitions = ['eligible', 'terminal', 'sourceCorrection', 'claimed', 'reconciliation', 'ineligible'];
+    if (response?.ok === false || !data?.success || partitions.some((key) => !Array.isArray(data[key]))) {
+      blockRemaining(offset, 'skill_extract_eligibility_response_invalid');
+      break;
+    }
+    const pageSeen = new Set();
+    let partitionInvalid = false;
+    for (const key of partitions) for (const item of data[key]) {
+      if (!sessionIds.includes(item?.sessionId) || pageSeen.has(item.sessionId) || seen.has(item.sessionId)) {
+        partitionInvalid = true;
+        break;
+      }
+      pageSeen.add(item.sessionId);
+      seen.add(item.sessionId);
+      const base = {
+        unit_id: `skill-${String(offset + units.length + 1).padStart(4, '0')}`,
+        session_id: item.sessionId, source_ids: [item.sessionId], source_count: 1,
+        stageContractVersion: item.stageContractVersion,
+        sourceVersionKey: item.sourceVersionKey,
+        sourceSnapshotHash: item.sourceSnapshotHash,
+        input_hash: stableHash({ session_id: item.sessionId, source_version_key: item.sourceVersionKey, source_snapshot_hash: item.sourceSnapshotHash }),
+      };
+      if (key === 'eligible') units.push(base);
+      else if (key === 'terminal' || key === 'ineligible') units.push({ ...base, skip_reason: key === 'terminal' ? 'skill_extract_terminal_verified' : item.reason || 'skill_extract_ineligible' });
+      else if (key === 'sourceCorrection') units.push({ ...base, isolate_reason: item.reason || 'skill_extract_source_correction_requires_migration' });
+      else units.push({ ...base, block_reason: item.reason || 'skill_extract_contribution_reconciliation_required' });
+    }
+    if (partitionInvalid || pageSeen.size !== sessionIds.length) {
+      const goodSessionIds = new Set(pageSeen);
+      for (let index = units.length - 1; index >= 0; index -= 1) {
+        if (goodSessionIds.has(units[index].session_id)) units.splice(index, 1);
+      }
+      for (const sessionId of goodSessionIds) seen.delete(sessionId);
+      blockRemaining(offset, partitionInvalid
+        ? 'skill_extract_eligibility_partition_invalid'
+        : 'skill_extract_eligibility_partition_incomplete');
+      break;
+    }
+  }
+  return units.sort((left, right) => Number(Boolean(left.block_reason || left.isolate_reason)) - Number(Boolean(right.block_reason || right.isolate_reason)));
 }
 
 function memoryDescriptorPage(data) {
@@ -1235,10 +1486,14 @@ function memoryWindowPage(data) {
   };
 }
 
-async function memoryPlan({ request, runId, configHash, inventoryHash, config, stableHash }) {
+async function memoryPlan({ request, runId, configHash, inventoryHash, config, sessions, stableHash }) {
   const endpoint = '/agentmemory/full/memory-consolidate-windows/plan';
   const plannerId = stableHash(['memory-consolidate-plan-v2', runId, configHash, inventoryHash]);
-  const base = { charBudget: config.memory_consolidate_char_budget, plannerId };
+  const base = {
+    charBudget: config.memory_consolidate_char_budget,
+    plannerId,
+    sessionIds: sessions.map((session) => session.id),
+  };
   let response = await request(endpoint, { ...base, sessionOffset: 0, sessionLimit: 8 });
   if (response?.ok === false) throw new Error(failureCause(response) || 'memory_consolidate_plan_failed');
   let page = memoryDescriptorPage(responseData(response));
@@ -1304,6 +1559,7 @@ export async function runV2RemainingStages({
   inventoryHash,
   request,
   loadSelectedSessions,
+  loadSelectedSessionsForStage,
   stableHash,
   runSingleStage,
   runTwoPhaseStage,
@@ -1323,6 +1579,19 @@ export async function runV2RemainingStages({
     || { status: 'completed', acceptedCount: 0 }
   );
 
+  let sessionsPromise;
+  const stageSessions = new Map();
+  const selectedSessions = (stage) => {
+    sessionsPromise ||= loadSelectedSessions();
+    if (!loadSelectedSessionsForStage) return sessionsPromise;
+    if (!stageSessions.has(stage)) {
+      stageSessions.set(stage, sessionsPromise.then((sessions) => (
+        loadSelectedSessionsForStage(stage, sessions)
+      )));
+    }
+    return stageSessions.get(stage);
+  };
+
   if (eligible('memory_consolidate')) {
     remember('memory_consolidate', await runTwoPhaseStage({
     stage: 'memory_consolidate',
@@ -1332,6 +1601,7 @@ export async function runV2RemainingStages({
       configHash,
       inventoryHash,
       config,
+      sessions: await selectedSessions('memory_consolidate'),
       stableHash,
     }), 'no eligible memory consolidate windows', stableHash),
     adapter: twoPhaseAdapter({
@@ -1359,6 +1629,12 @@ export async function runV2RemainingStages({
           ? { observationSessionIds: unit.observationSessionIds || unit.observation_session_ids }
           : {}),
         charBudget: config.memory_consolidate_char_budget,
+        ...(unit.stageContractVersion || unit.stage_contract_version
+          ? { stageContractVersion: unit.stageContractVersion || unit.stage_contract_version }
+          : {}),
+        ...(firstArray(unit, ['sourceVersionKeys', 'source_version_keys']).length > 0
+          ? { sourceVersionKeys: firstArray(unit, ['sourceVersionKeys', 'source_version_keys']) }
+          : {}),
       }, options, 'memory_consolidate'),
       splitUnit: (unit) => splitMemoryUnit(unit, stableHash),
       adaptRecoveryEvidence: adaptMemoryConsolidateOperationEvidence,
@@ -1367,17 +1643,17 @@ export async function runV2RemainingStages({
     if (blocked()) return aggregate();
   }
 
-  let sessionsPromise;
-  const selectedSessions = () => {
-    sessionsPromise ||= loadSelectedSessions();
-    return sessionsPromise;
-  };
   if (eligible('semantic_rollup')) {
     remember('semantic_rollup', await runSingleStage({
     stage: 'semantic_rollup',
     plan: async () => planOrNone(
-      semanticPlan(await selectedSessions(), config, stableHash),
-      'no summarized sessions',
+      await semanticPlan({
+        sessions: await selectedSessions('semantic_rollup'),
+        config,
+        stableHash,
+        request,
+      }),
+      'no new summarized sessions',
       stableHash,
     ),
     adapter: singleAdapter({
@@ -1407,7 +1683,7 @@ export async function runV2RemainingStages({
     remember('skill_extract', await runTwoPhaseStage({
     stage: 'skill_extract',
     plan: async () => planOrNone(
-      skillPlan(await selectedSessions(), stableHash),
+      await skillPlan({ sessions: await selectedSessions('skill_extract'), request, stableHash }),
       'no completed summarized sessions',
       stableHash,
     ),
@@ -1424,6 +1700,8 @@ export async function runV2RemainingStages({
       buildPreparePayload: (unit) => modelBody({
         sessionId: unit.session_id,
         operationReceiptManaged: true,
+        stageContractVersion: unit.stageContractVersion,
+        sourceVersionKey: unit.sourceVersionKey,
       }, options, 'skill_extract'),
       adaptRecoveryEvidence: adaptSkillExtractOperationEvidence,
     }),
@@ -1448,10 +1726,22 @@ export async function runV2RemainingStages({
           ...unit,
           source_ids: actionIds,
           action_ids: actionIds,
+          ...(unit.isolateReason || unit.isolate_reason
+            ? { isolate_reason: unit.isolateReason || unit.isolate_reason }
+            : {}),
+          ...(unit.blockReason || unit.block_reason
+            ? { block_reason: unit.blockReason || unit.block_reason }
+            : {}),
           input_hash: stableHash({
             group_id: unit.unit_id,
             action_ids: actionIds,
             action_updated_ats: unit.action_updated_ats,
+            ...(unit.stageContractVersion || unit.stage_contract_version
+              ? { stage_contract_version: unit.stageContractVersion || unit.stage_contract_version }
+              : {}),
+            ...(firstArray(unit, ['sourceVersionKeys', 'source_version_keys']).length > 0
+              ? { source_version_keys: firstArray(unit, ['sourceVersionKeys', 'source_version_keys']) }
+              : {}),
           }),
         };
       }), 'no eligible actions', stableHash);
@@ -1469,6 +1759,12 @@ export async function runV2RemainingStages({
         groupId: unit.unit_id,
         actionIds: unit.action_ids,
         actionUpdatedAts: unit.action_updated_ats,
+        ...(unit.stageContractVersion || unit.stage_contract_version
+          ? { stageContractVersion: unit.stageContractVersion || unit.stage_contract_version }
+          : {}),
+        ...(firstArray(unit, ['sourceVersionKeys', 'source_version_keys']).length > 0
+          ? { sourceVersionKeys: firstArray(unit, ['sourceVersionKeys', 'source_version_keys']) }
+          : {}),
         ...(unit.project ? { project: unit.project } : {}),
       }, options, 'crystal'),
       idempotentCommit: true,
@@ -1481,13 +1777,34 @@ export async function runV2RemainingStages({
   if (eligible('consolidation_procedural')) {
     remember('consolidation_procedural', await runSingleStage({
     stage: 'consolidation_procedural',
-    plan: async () => planOrNone(await serverPlan({
-      request,
-      endpoint: '/agentmemory/full/consolidation-procedural-windows/plan',
-      body: {},
-      prefix: 'cpw',
-      stableHash,
-    }), 'no eligible pattern memories', stableHash),
+    plan: async () => {
+      const units = await serverPlan({
+        request,
+        endpoint: '/agentmemory/full/consolidation-procedural-windows/plan',
+        body: {},
+        prefix: 'cpw',
+        stableHash,
+      });
+      return planOrNone(units.map((unit) => {
+        const sourceVersionKeys = firstArray(unit, ['sourceVersionKeys', 'source_version_keys']);
+        const stageContractVersion = unit.stageContractVersion || unit.stage_contract_version;
+        return {
+          ...unit,
+          ...(unit.isolateReason || unit.isolate_reason
+            ? { isolate_reason: unit.isolateReason || unit.isolate_reason }
+            : {}),
+          ...(unit.blockReason || unit.block_reason
+            ? { block_reason: unit.blockReason || unit.block_reason }
+            : {}),
+          input_hash: stableHash({
+            window_id: unit.window_id || unit.unit_id,
+            memory_ids: firstArray(unit, ['memoryIds', 'memory_ids']),
+            stage_contract_version: stageContractVersion,
+            source_version_keys: sourceVersionKeys,
+          }),
+        };
+      }), 'no eligible pattern memories', stableHash);
+    },
     adapter: singleAdapter({
       stage: 'consolidation_procedural',
       endpoint: '/agentmemory/full/consolidation-procedural-window',
@@ -1507,6 +1824,13 @@ export async function runV2RemainingStages({
           'sourceIds',
           'source_ids',
         ]),
+        ...(unit.stageContractVersion || unit.stage_contract_version
+          ? { stageContractVersion: unit.stageContractVersion || unit.stage_contract_version }
+          : {}),
+        ...(firstArray(unit, ['sourceVersionKeys', 'source_version_keys']).length > 0
+          ? { sourceVersionKeys: firstArray(unit, ['sourceVersionKeys', 'source_version_keys']) }
+          : {}),
+        ...(unit.project ? { project: unit.project } : {}),
       }, options, 'consolidation_procedural'),
       adaptRecoveryEvidence: adaptConsolidationProceduralOperationEvidence,
     }),
@@ -1525,13 +1849,39 @@ export async function runV2RemainingStages({
   ) {
     remember('reflect_insight', await runSingleStage({
     stage: 'reflect_insight',
-    plan: async () => planOrNone(await serverPlan({
-      request,
-      endpoint: '/agentmemory/full/reflect-insight-windows/plan',
-      body: { useGraph: false, charBudget: config.reflect_insight_char_budget },
-      prefix: 'riw',
-      stableHash,
-    }), 'no eligible reflect insight windows', stableHash),
+    plan: async () => {
+      const units = await serverPlan({
+        request,
+        endpoint: '/agentmemory/full/reflect-insight-windows/plan',
+        body: { useGraph: false, charBudget: config.reflect_insight_char_budget },
+        prefix: 'riw',
+        stableHash,
+      });
+      return planOrNone(units.map((unit) => {
+        const semanticMemoryIds = firstArray(unit, ['semanticMemoryIds', 'semantic_memory_ids']);
+        const lessonIds = firstArray(unit, ['lessonIds', 'lesson_ids']);
+        const crystalIds = firstArray(unit, ['crystalIds', 'crystal_ids']);
+        const sourceVersionKeys = firstArray(unit, ['sourceVersionKeys', 'source_version_keys']);
+        const stageContractVersion = unit.stageContractVersion || unit.stage_contract_version;
+        return {
+          ...unit,
+          ...(unit.isolateReason || unit.isolate_reason
+            ? { isolate_reason: unit.isolateReason || unit.isolate_reason }
+            : {}),
+          ...(unit.blockReason || unit.block_reason
+            ? { block_reason: unit.blockReason || unit.block_reason }
+            : {}),
+          input_hash: stableHash({
+            window_id: unit.window_id || unit.unit_id,
+            semantic_memory_ids: semanticMemoryIds,
+            lesson_ids: lessonIds,
+            crystal_ids: crystalIds,
+            stage_contract_version: stageContractVersion,
+            source_version_keys: sourceVersionKeys,
+          }),
+        };
+      }), 'no eligible reflect insight windows', stableHash);
+    },
     adapter: singleAdapter({
       stage: 'reflect_insight',
       endpoint: '/agentmemory/full/reflect-insight-window',
@@ -1547,6 +1897,13 @@ export async function runV2RemainingStages({
         semanticMemoryIds: firstArray(unit, ['semanticMemoryIds', 'semantic_memory_ids']),
         lessonIds: firstArray(unit, ['lessonIds', 'lesson_ids']),
         crystalIds: firstArray(unit, ['crystalIds', 'crystal_ids']),
+        ...(unit.stageContractVersion || unit.stage_contract_version
+          ? { stageContractVersion: unit.stageContractVersion || unit.stage_contract_version }
+          : {}),
+        ...(firstArray(unit, ['sourceVersionKeys', 'source_version_keys']).length > 0
+          ? { sourceVersionKeys: firstArray(unit, ['sourceVersionKeys', 'source_version_keys']) }
+          : {}),
+        ...(unit.project ? { project: unit.project } : {}),
         charBudget: config.reflect_insight_char_budget,
       }, options, 'reflect_insight'),
       adaptRecoveryEvidence: adaptReflectInsightOperationEvidence,

@@ -336,3 +336,53 @@ test('an operator drain pause can record zero processed units', () => {
   assert.equal(status.run_status, 'paused');
   assert.equal(status.pause_reason_code, 'operator_drain_requested');
 });
+
+test('incremental contribution evidence is a second acceptance gate', () => {
+  const incrementalStatus = {
+    schema: 'agentmemory-incremental-extraction-status/v1',
+    run_id: 'incremental-gate-run',
+    acceptance_ready: false,
+    contribution_counts: { claimed: 1, committed: 0, no_effect: 0 },
+    reconciliation: {
+      state: 'not_required',
+      manifest_hash: null,
+      replacement_unit_count: 0,
+      unresolved_count: 0,
+    },
+    stages: [{
+      stage: 'summary',
+      acceptance_ready: false,
+      contributions: { claimed: 1, committed: 0, no_effect: 0 },
+      backlog: {
+        source_count: 0,
+        earliest_waiting_at: null,
+        status: 'not_applicable',
+        integrity_errors: 0,
+      },
+      contract_migration_required: false,
+      source_correction_requires_migration: 0,
+      duplicate_source_contributions: 0,
+      contribution_reconciliation_required: 0,
+      unreconciled_effects: 0,
+    }],
+  };
+  const status = projectSafeRecoveryStatus({
+    runId: 'incremental-gate-run',
+    controlEvents: [
+      event(0, 'run_started', { run_id: 'incremental-gate-run' }),
+      event(1, 'run_completed', { run_id: 'incremental-gate-run' }),
+    ],
+    stageEvents: { summary: completedStage('summary-a') },
+    requiredStages: ['summary'],
+    incrementalStatus,
+  });
+
+  assert.equal(status.acceptance_ready, false);
+  assert.equal(status.run_status, 'attention_required');
+  assert.equal(status.stages[0].acceptance_ready, false);
+  assert.deepEqual(status.incremental.contribution_counts, {
+    claimed: 1,
+    committed: 0,
+    no_effect: 0,
+  });
+});

@@ -85,6 +85,27 @@ export const KV = {
   skillExtractionProposals: "mem:skill-extraction-proposals",
   extractionOperationReceipt: (operationToken: string) =>
     `mem:extraction-operation-receipt:${operationToken}`,
+  extractionContributionContract: (stage: string) =>
+    `mem:extraction-contribution-contract:${stage}`,
+  extractionContributionRecords: (stage: string, contractVersion: string) =>
+    `mem:extraction-contribution-records:${stage}:${fingerprintId("contract", contractVersion)}`,
+  extractionContributionHeads: (stage: string, contractVersion: string) =>
+    `mem:extraction-contribution-heads:${stage}:${fingerprintId("contract", contractVersion)}`,
+  extractionAdoptedBaselineControl: "mem:extraction-adopted-baseline-control",
+  extractionAdoptedBaselineManifests: "mem:extraction-adopted-baseline-manifests",
+  extractionAdoptedBaselineCoverage: (baselineId: string, stage: string) =>
+    `mem:extraction-adopted-baseline-coverage:${fingerprintId("baseline", baselineId)}:${stage}`,
+  extractionAdoptedBaselineLessonSeeds: (baselineId: string) =>
+    `mem:extraction-adopted-baseline-lesson-seeds:${fingerprintId("baseline", baselineId)}`,
+  memoryConsolidationBacklog: (project?: string) =>
+    `mem:memory-consolidation-backlog:${fingerprintId("project", project?.trim() || "*")}`,
+  memoryConsolidationBacklogSourceIndex: (project?: string) =>
+    `mem:memory-consolidation-backlog-source-index:${fingerprintId("project", project?.trim() || "*")}`,
+  consolidationProceduralBacklog: "mem:consolidation-procedural-backlog",
+  consolidationProceduralBacklogSourceIndex:
+    "mem:consolidation-procedural-backlog-source-index",
+  reflectInsightBacklog: "mem:reflect-insight-backlog",
+  reflectInsightBacklogSourceIndex: "mem:reflect-insight-backlog-source-index",
   memoryConsolidationProposal: (proposalToken: string) =>
     `mem:memory-consolidation-proposal:${proposalToken}`,
   skillExtractionProposal: (proposalToken: string) =>

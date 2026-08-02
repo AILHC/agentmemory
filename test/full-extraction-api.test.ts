@@ -11,12 +11,34 @@ import {
   registerExtractionOperationReceiptFunctions,
 } from "../src/functions/extraction-operation-receipts.js";
 import { registerSummarizeFunction } from "../src/functions/summarize.js";
+import {
+  CRYSTAL_CONTRIBUTION_CONTRACT,
+  registerCrystallizeFunction,
+} from "../src/functions/crystallize.js";
+import { registerLessonsFunctions } from "../src/functions/lessons.js";
+import {
+  CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+  enqueueConsolidationProceduralBacklog,
+  registerConsolidationPipelineFunction,
+} from "../src/functions/consolidation-pipeline.js";
+import {
+  REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+  registerReflectFunctions,
+} from "../src/functions/reflect.js";
+import {
+  buildSkillExtractionSourceVersion,
+  registerSkillExtractFunctions,
+  SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+} from "../src/functions/skill-extract.js";
+import { ADOPTED_BASELINE_STAGE_CONTRACTS } from "../src/functions/extraction-baseline-preview.js";
 import { fingerprintId, KV } from "../src/state/schema.js";
 import { registerApiTriggers } from "../src/triggers/api.js";
 import {
   mainForTest as runFullExtractionV2,
   stableHash as stableV2Hash,
 } from "../ops/scripts/run-agentmemory-full-extraction.mjs";
+import { runV2RemainingStages } from "../ops/scripts/lib/full-extraction-stage-adapters-v2.mjs";
+import { runTwoPhaseStage as runRecoveryTwoPhaseStage } from "../ops/scripts/lib/recoverable-stage-v2.mjs";
 
 function mockKV() {
   const store = new Map<string, Map<string, unknown>>();
@@ -102,6 +124,217 @@ async function listen(handler: (request: IncomingMessage, response: ServerRespon
 }
 
 describe("full extraction REST wrappers", () => {
+  it("protects adopted baseline control and keeps an unsealed manifest inactive", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "test-secret");
+    const handler = sdk.getFunction("api::extraction-adopted-baseline");
+    const headers = { authorization: "Bearer test-secret" };
+
+    await expect(handler({ headers: {}, body: { action: "status" } }))
+      .resolves.toMatchObject({ status_code: 401 });
+    await expect(handler({
+      headers,
+      body: {
+        action: "prepare",
+        baselineId: "baseline-incomplete",
+        sourceRunId: "old-run",
+        retiredRunIds: ["old-run"],
+        decisionRef: "MYC-122",
+        expectedCoverage: {},
+        expectedLessonSeed: {
+          count: 0,
+          digest: createHash("sha256").update("[]").digest("hex"),
+        },
+      },
+    })).resolves.toMatchObject({ status_code: 400 });
+    const prepared = await handler({
+      headers,
+      body: {
+        action: "prepare",
+        baselineId: "baseline-1",
+        sourceRunId: "old-run",
+        retiredRunIds: ["old-run"],
+        decisionRef: "MYC-122",
+        expectedCoverage: Object.fromEntries(Object.entries(ADOPTED_BASELINE_STAGE_CONTRACTS)
+          .map(([stage, stageContractVersion]) => [stage, {
+            stageContractVersion,
+            count: 0,
+            digest: createHash("sha256").update("[]").digest("hex"),
+          }])),
+        expectedLessonSeed: {
+          count: 0,
+          digest: createHash("sha256").update("[]").digest("hex"),
+        },
+      },
+    });
+    expect(prepared).toMatchObject({
+      status_code: 200,
+      body: { success: true, manifest: { id: "baseline-1", state: "preparing" } },
+    });
+    await expect(handler({
+      headers,
+      body: {
+        action: "partition_sessions",
+        stage: "summary",
+        stageContractVersion: "summary/v1",
+        sessionIds: ["session-a"],
+      },
+    })).resolves.toMatchObject({
+      status_code: 200,
+      body: {
+        baselineId: null,
+        adoptedSessionIds: [],
+        openSessionIds: ["session-a"],
+      },
+    });
+  });
+
+  it("exposes bounded skill extraction eligibility without an operation receipt", async () => {
+    const sdk = mockSdk(async ({ function_id, payload }) => ({ success: true, function_id, payload }));
+    registerApiTriggers(sdk as never, mockKV() as never, "");
+    const handler = sdk.getFunction("api::skill-extract-eligibility");
+
+    await expect(handler({ headers: {}, body: { sessionIds: ["session-a", "session-b"] } }))
+      .resolves.toMatchObject({ status_code: 200, body: { success: true } });
+    expect(sdk.trigger).toHaveBeenLastCalledWith({
+      function_id: "mem::skill-extract-eligibility",
+      payload: { sessionIds: ["session-a", "session-b"] },
+    });
+
+    const invalidResponses = await Promise.all([
+      { sessionIds: [] },
+      { sessionIds: ["session-a", "session-a"] },
+      { sessionIds: Array.from({ length: 101 }, (_, index) => `session-${index}`) },
+      { sessionIds: ["session-a"], unexpected: true },
+    ].map((body) => handler({ headers: {}, body })));
+    expect(invalidResponses.map((response) => response.status_code)).toEqual([400, 400, 400, 400]);
+  });
+
+  it("exposes bounded semantic contribution eligibility without an operation receipt", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    registerApiTriggers(sdk as never, kv as never, "");
+    const handler = sdk.getFunction("api::semantic-rollup-eligibility");
+    const body = {
+      sessionIds: ["session-a", "session-b"],
+      sourceSummaryHashes: {
+        "session-a": "a".repeat(64),
+        "session-b": "b".repeat(64),
+      },
+    };
+
+    const response = await handler({ headers: {}, body });
+    expect(response).toMatchObject({ status_code: 200 });
+    expect(sdk.trigger).toHaveBeenCalledWith({
+      function_id: "mem::semantic-rollup-eligibility",
+      payload: body,
+    });
+    expect(await handler({ headers: {}, body: { ...body, unexpected: true } })).toMatchObject({
+      status_code: 400,
+    });
+    expect(await handler({
+      headers: {},
+      body: { ...body, sourceSummaryHashes: { ...body.sourceSummaryHashes, "session-b": "bad" } },
+    })).toMatchObject({ status_code: 400 });
+  });
+
+  it("takes committed structured memory no-effect through the shared two-phase runner and replays cleanly", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const provider = {
+      name: "structured-empty",
+      compress: vi.fn(async () =>
+        "<no_effect><reason_code>no_durable_memory</reason_code></no_effect>"),
+      summarize: vi.fn(),
+    };
+    registerExtractionOperationReceiptFunctions(sdk as never, kv as never);
+    registerConsolidateFunction(sdk as never, kv as never, provider as never);
+    registerApiTriggers(sdk as never, kv as never, "");
+    for (const id of Array.from({ length: 10 }, (_, index) => `empty-${index + 1}`)) {
+      await kv.set(KV.observations("structured-empty-session"), id, {
+        id,
+        sessionId: "structured-empty-session",
+        timestamp: "2026-08-02T00:00:00.000Z",
+        type: "decision",
+        title: `Empty candidate ${id}`,
+        facts: [],
+        narrative: `Evidence ${id}`,
+        concepts: ["structured-empty"],
+        files: [],
+        importance: 8,
+      });
+    }
+    const endpoints = new Map([
+      ["/agentmemory/full/memory-consolidate-windows/plan", "api::full-memory-consolidate-windows-plan"],
+      ["/agentmemory/full/memory-consolidate-window/prepare", "api::full-memory-consolidate-window-prepare"],
+      ["/agentmemory/full/memory-consolidate-window/commit", "api::full-memory-consolidate-window-commit"],
+    ]);
+    const request = async (endpoint: string, body: Record<string, unknown>) => {
+      if (endpoint === "/agentmemory/extraction-runs/record") {
+        return { ok: true, status_code: 200, data: { success: true } };
+      }
+      const functionId = endpoints.get(endpoint);
+      if (!functionId) throw new Error(`unexpected endpoint: ${endpoint}`);
+      const response = await sdk.getFunction(functionId)({ headers: {}, body });
+      return {
+        ok: response.status_code >= 200 && response.status_code < 300,
+        status_code: response.status_code,
+        data: response.body,
+      };
+    };
+    const events: Array<{ seq: number; type: string; payload: unknown }> = [];
+    let frozenPlan: unknown[] | undefined;
+    const execute = () => runV2RemainingStages({
+      options: { mark: "structured-empty" },
+      runId: "structured-empty-run",
+      config: {
+        semantic_window_size: 20,
+        semantic_rollup_target_prompt_chars: 64_000,
+        memory_consolidate_char_budget: 64_000,
+        reflect_insight_char_budget: 64_000,
+      },
+      configHash: "structured-empty-config",
+      inventoryHash: "structured-empty-inventory",
+      request,
+      stableHash,
+      eligibleStages: {
+        memory_consolidate: true,
+        semantic_rollup: false,
+        skill_extract: false,
+        crystal: false,
+        consolidation_procedural: false,
+        reflect_insight: false,
+      },
+      loadSelectedSessions: async () => [{ id: "structured-empty-session" }],
+      runTwoPhaseStage: async ({ plan, adapter }: { plan: () => Promise<unknown[]>; adapter: object }) => {
+        frozenPlan ??= await plan();
+        return runRecoveryTwoPhaseStage({
+          events,
+          plan: frozenPlan,
+          append: async (type: string, payload: unknown) => {
+            const event = { seq: events.length, type, payload };
+            events.push(event);
+            return event;
+          },
+          ...adapter,
+        });
+      },
+      runSingleStage: async () => ({ status: "failed" }),
+    });
+
+    await expect(execute()).resolves.toMatchObject({ status: "completed" });
+    await expect(execute()).resolves.toMatchObject({ status: "completed" });
+    expect(provider.compress).toHaveBeenCalledTimes(1);
+    expect(events.some((event) => event.type.includes("blocked") || event.type.includes("pending"))).toBe(false);
+    const contributions = await kv.list<{ state: string }>(KV.extractionContributionRecords(
+      "memory_consolidate",
+      "memory_consolidate/v1",
+    ));
+    expect(contributions).toHaveLength(10);
+    expect(contributions.every((record) => record.state === "no_effect")).toBe(true);
+  });
+
   it("replays a v2 memory prepare response with its proposal handle", async () => {
     const sdk = mockSdk(async () => ({
       success: true,
@@ -521,8 +754,99 @@ describe("full extraction REST wrappers", () => {
     expect(sdk.trigger).toHaveBeenCalledTimes(1);
   });
 
+  it("repairs the memory-to-procedural backlog handoff from the succeeded upstream receipt", async () => {
+    const sdk = mockSdk(async ({ function_id }) => {
+      expect(function_id).toBe("mem::full-memory-consolidate-window-commit");
+      return {
+        success: true,
+        status: "succeeded",
+        consolidated: 1,
+        memoryIds: ["handoff-pattern"],
+      };
+    });
+    const kv = mockKV();
+    await kv.set(KV.memories, "handoff-pattern", {
+      id: "handoff-pattern",
+      type: "pattern",
+      title: "Handoff pattern",
+      content: "Persist the downstream source before acknowledging the handoff",
+      concepts: ["recovery"],
+      files: [],
+      sessionIds: ["handoff-session-1", "handoff-session-2"],
+      sourceObservationIds: ["handoff-observation"],
+      strength: 5,
+      version: 1,
+      isLatest: true,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+    });
+    registerApiTriggers(sdk as never, kv as never, "");
+    const commitInputHash = stableHash({
+      prepareRunId: "handoff-prepare",
+      unitId: "handoff-window",
+      prepareInputHash: "handoff-prepare-input",
+      preparedHandle: "handoff-handle",
+      proposalHash: "handoff-proposal",
+    });
+    const body = {
+      runId: "handoff-commit",
+      stage: "memory_consolidate",
+      unitId: "handoff-window",
+      inputHash: commitInputHash,
+      prepareRunId: "handoff-prepare",
+      prepareInputHash: "handoff-prepare-input",
+      preparedHandle: "handoff-handle",
+      proposalHash: "handoff-proposal",
+    };
+    const originalSet = kv.set;
+    let interruptBacklogWrite = true;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (interruptBacklogWrite && scope === KV.consolidationProceduralBacklog) {
+        interruptBacklogWrite = false;
+        throw new Error("downstream backlog write interrupted");
+      }
+      return originalSet(scope, key, data);
+    };
+
+    const interrupted = await sdk.getFunction("api::full-memory-consolidate-window-commit")({
+      headers: {},
+      body,
+    });
+    expect(interrupted).toMatchObject({
+      status_code: 503,
+      body: {
+        success: false,
+        failure: { cause: "extraction_operation_reconciliation_required" },
+        operationReceipt: { status: "succeeded", runId: body.runId },
+      },
+    });
+    expect(sdk.trigger).toHaveBeenCalledTimes(1);
+
+    const resumed = await sdk.getFunction("api::full-memory-consolidate-window-commit")({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    });
+    expect(resumed).toMatchObject({ status_code: 200, body: { success: true } });
+    expect(sdk.trigger).toHaveBeenCalledTimes(2);
+    const [backlog] = await kv.list<{
+      memoryId: string;
+      upstreamReceiptRef?: { scope: string; key: string };
+    }>(KV.consolidationProceduralBacklog);
+    expect(backlog).toMatchObject({
+      memoryId: "handoff-pattern",
+      upstreamReceiptRef: {
+        scope: KV.extractionOperationReceipt(resumed.body.operationReceipt.key),
+        key: resumed.body.operationReceipt.key,
+      },
+    });
+  });
+
   it("re-enters an orphaned deterministic v2 memory commit", async () => {
-    const sdk = mockSdk();
+    const sdk = mockSdk(async () => ({
+      success: true,
+      status: "succeeded",
+      memoryIds: [],
+    }));
     const kv = mockKV();
     const commitInputHash = stableHash({
       prepareRunId: "prepare-1",
@@ -1002,12 +1326,30 @@ describe("full extraction REST wrappers", () => {
         configHash: "config-a",
         createdLessonIds: ["lesson-1"],
       }],
+      lessonEvidence: [{
+        runId: "lex-stable",
+        receiptKey: "lesson-receipt-1",
+        effectHash: "d".repeat(64),
+      }],
     }));
     const kv = mockKV();
     const startedAt = "2026-07-22T00:00:00.000Z";
     await kv.set(KV.sessions, "session-1", {
       id: "session-1",
       startedAt,
+    });
+    await kv.set(KV.lessons, "lesson-1", {
+      id: "lesson-1",
+      content: "Persist exact incremental lesson evidence",
+      context: "",
+      confidence: 0.8,
+      reinforcements: 0,
+      source: "extracted",
+      sourceIds: ["session-1"],
+      tags: ["incremental"],
+      createdAt: startedAt,
+      updatedAt: startedAt,
+      decayRate: 0.05,
     });
     registerApiTriggers(sdk as never, kv as never, "");
     const handler = sdk.getFunction("api::lesson-extract");
@@ -1029,6 +1371,10 @@ describe("full extraction REST wrappers", () => {
         inputHash: sessionInputHash("session-1", startedAt),
       },
     });
+    expect(await kv.list<{ sourceType: string; sourceId: string }>(KV.reflectInsightBacklog))
+      .toEqual([
+        expect.objectContaining({ sourceType: "lesson", sourceId: "lesson-1" }),
+      ]);
   });
 
   it("forwards only exact lessons failed-receipt retry evidence", async () => {
@@ -1524,6 +1870,7 @@ describe("full extraction REST wrappers", () => {
           "--state-dir", stateDir,
           "--run-id", `phase-${testCase.phase}`,
           "--run-state-format", "v2",
+          "--pending-policy", "exit",
         ];
         const dependencies = {
           v2RuntimeCheck: async () => ({ summarizeChunkConcurrency: 1 }),
@@ -1622,6 +1969,7 @@ describe("full extraction REST wrappers", () => {
       success: true,
       functionId: input.function_id,
       memoryIds: ["result-1"],
+      ...(input.function_id === "mem::semantic-rollup" ? { semanticMemoryIds: [] } : {}),
     }));
     const kv = mockKV();
     registerApiTriggers(sdk as never, kv as never, "");
@@ -1829,10 +2177,14 @@ describe("full extraction REST wrappers", () => {
       unitId: "skill-0001",
       inputHash: "input-1",
     };
+    const contribution = {
+      stageContractVersion: "skill_extract/v1",
+      sourceVersionKey: "skill_extract|session|ses-1|source-hash",
+    };
 
     const prepared = await sdk.getFunction("api::full-skill-extract-prepare")({
       headers: {},
-      body: { ...identity, sessionId: " ses-1 ", model: " skill-model " },
+      body: { ...identity, ...contribution, sessionId: " ses-1 ", model: " skill-model " },
     });
     expect(prepared.status_code).toBe(200);
     expect(sdk.trigger).toHaveBeenLastCalledWith({
@@ -1840,6 +2192,7 @@ describe("full extraction REST wrappers", () => {
       payload: {
         identity,
         sessionId: "ses-1",
+        ...contribution,
         model: "skill-model",
         operationReceiptManaged: true,
       },
@@ -1849,6 +2202,7 @@ describe("full extraction REST wrappers", () => {
       headers: {},
       body: {
         ...identity,
+        ...contribution,
         sessionId: "ses-1",
         requireExistingReceipt: true,
       },
@@ -1859,6 +2213,7 @@ describe("full extraction REST wrappers", () => {
       payload: {
         identity,
         sessionId: "ses-1",
+        ...contribution,
         operationReceiptManaged: true,
         requireExistingReceipt: true,
       },
@@ -1876,6 +2231,414 @@ describe("full extraction REST wrappers", () => {
         preparedHandle: "prepared-1",
       },
     });
+  });
+
+  it("repairs a committed skill contribution through the formal commit receipt", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        "<skill><trigger>When formal commit is interrupted</trigger><title>Repair formal skill</title><steps><step>Verify receipt</step><step>Reconcile contribution</step></steps><expected_outcome>One durable skill</expected_outcome><tags>recovery</tags></skill>",
+      ),
+    };
+    registerSkillExtractFunctions(sdk as never, kv as never, provider as never);
+    registerApiTriggers(sdk as never, kv as never, "");
+    const session = {
+      id: "skill-api-reconcile",
+      project: "repo",
+      status: "completed" as const,
+    };
+    const summary = {
+      sessionId: session.id,
+      title: "Formal skill recovery",
+      narrative: "Commit once and reconcile from its receipt",
+      keyDecisions: ["preserve the domain effect"],
+      filesModified: ["skill.ts"],
+      concepts: ["recovery"],
+    };
+    const observations = Array.from({ length: 3 }, (_, index) => ({
+      id: `skill-api-obs-${index}`,
+      sessionId: session.id,
+      timestamp: `2026-07-30T00:00:0${index}.000Z`,
+      type: "file_edit",
+      title: `Step ${index}`,
+      narrative: "Apply formal recovery step",
+      importance: 8,
+    }));
+    await kv.set(KV.sessions, session.id, session);
+    await kv.set(KV.summaries, session.id, summary);
+    for (const observation of observations) {
+      await kv.set(KV.observations(session.id), observation.id, observation);
+    }
+    const source = buildSkillExtractionSourceVersion(
+      session as never,
+      summary as never,
+      observations as never,
+    );
+    const prepareBody = {
+      runId: "skill-api-prepare",
+      stage: "skill_extract",
+      unitId: session.id,
+      inputHash: "runner-prepare-input",
+      sessionId: session.id,
+      stageContractVersion: SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+      sourceVersionKey: source.sourceVersionKey,
+    };
+    const prepared = await sdk.getFunction("api::full-skill-extract-prepare")({
+      headers: {},
+      body: prepareBody,
+    });
+    expect(prepared).toMatchObject({
+      status_code: 200,
+      body: {
+        success: true,
+        status: "prepared",
+        preparedHandle: expect.any(String),
+        proposalHash: expect.any(String),
+        inputHash: expect.any(String),
+      },
+    });
+    const commitBody = {
+      runId: "skill-api-commit",
+      stage: "skill_extract",
+      unitId: session.id,
+      inputHash: stableHash({
+        prepareRunId: prepareBody.runId,
+        unitId: session.id,
+        prepareInputHash: prepared.body.inputHash,
+        preparedHandle: prepared.body.preparedHandle,
+        proposalHash: prepared.body.proposalHash,
+      }),
+      prepareRunId: prepareBody.runId,
+      prepareInputHash: prepared.body.inputHash,
+      preparedHandle: prepared.body.preparedHandle,
+      proposalHash: prepared.body.proposalHash,
+    };
+    const originalSet = kv.set;
+    let failContributionWrite = true;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (
+        failContributionWrite
+        && scope === KV.extractionContributionRecords(
+          "skill_extract",
+          SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+        )
+        && (data as { state?: string }).state === "committed"
+      ) {
+        failContributionWrite = false;
+        throw new Error("contribution response lost");
+      }
+      return originalSet(scope, key, data);
+    };
+
+    const interrupted = await sdk.getFunction("api::full-skill-extract-commit")({
+      headers: {},
+      body: commitBody,
+    });
+    expect(interrupted).toMatchObject({
+      status_code: 503,
+      body: {
+        success: false,
+        failure: { cause: "extraction_operation_reconciliation_required" },
+        operationReceipt: { status: "succeeded", runId: commitBody.runId },
+      },
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    const contributionScope = KV.extractionContributionRecords(
+      "skill_extract",
+      SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+    );
+    expect(await kv.get<{ state: string }>(contributionScope, source.sourceVersionKey))
+      .toMatchObject({ state: "claimed" });
+
+    const resumed = await sdk.getFunction("api::full-skill-extract-commit")({
+      headers: {},
+      body: { ...commitBody, requireExistingReceipt: true },
+    });
+    expect(resumed).toMatchObject({ status_code: 200, body: { success: true } });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    expect(await kv.get<{ state: string }>(contributionScope, source.sourceVersionKey))
+      .toMatchObject({ state: "committed" });
+    expect(await kv.list(KV.procedural)).toHaveLength(1);
+    expect((await kv.list<{ operation: string }>(KV.audit))
+      .filter((entry) => entry.operation === "skill_extract")).toHaveLength(1);
+
+    const clean = await sdk.getFunction("api::full-skill-extract-prepare")({
+      headers: {},
+      body: {
+        ...prepareBody,
+        runId: "skill-api-clean",
+        inputHash: "clean-runner-input",
+      },
+    });
+    expect(clean).toMatchObject({ status_code: 200, body: { success: true, status: "succeeded" } });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+
+    await kv.set(KV.summaries, session.id, {
+      ...summary,
+      narrative: "Corrected after the original contribution",
+    });
+    const correction = await sdk.getFunction("api::skill-extract-eligibility")({
+      headers: {},
+      body: { sessionIds: [session.id] },
+    });
+    expect(correction).toMatchObject({
+      status_code: 200,
+      body: {
+        success: true,
+        eligible: [],
+        sourceCorrection: [{
+          sessionId: session.id,
+          reason: "terminal_source_version_changed",
+        }],
+      },
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    await kv.set(KV.summaries, session.id, summary);
+
+    const [skill] = await kv.list<{ id: string }>(KV.procedural);
+    await kv.delete(KV.procedural, skill.id);
+    const missingEffect = await sdk.getFunction("api::full-skill-extract-prepare")({
+      headers: {},
+      body: {
+        ...prepareBody,
+        runId: "skill-api-tampered",
+        inputHash: "tampered-runner-input",
+      },
+    });
+    expect(missingEffect).toMatchObject({
+      status_code: 200,
+      body: {
+        success: false,
+        failure: { cause: "skill_extract_terminal_reconciliation_required" },
+      },
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("repairs a procedural contribution after its receipt succeeds without another provider call", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        '<procedures><procedure name="Receipt repair" trigger="when a procedural commit is interrupted"><step>Verify the receipt</step><step>Repair the contribution</step></procedure></procedures>',
+      ),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    registerApiTriggers(sdk as never, kv as never, "");
+    const memories = [1, 2].map((index) => ({
+      id: `procedural-api-pattern-${index}`,
+      type: "pattern" as const,
+      title: `Procedural API pattern ${index}`,
+      content: `Use the same receipt repair workflow ${index}`,
+      concepts: ["recovery"],
+      files: [],
+      sessionIds: [`procedural-api-session-${index}-a`, `procedural-api-session-${index}-b`],
+      sourceObservationIds: [`procedural-api-observation-${index}`],
+      strength: 5,
+      version: 1,
+      isLatest: true,
+      project: "repo",
+      createdAt: "2026-08-02T00:00:00.000Z",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+    }));
+    for (const memory of memories) await kv.set(KV.memories, memory.id, memory);
+    await enqueueConsolidationProceduralBacklog({
+      kv: kv as never,
+      memoryIds: memories.map((memory) => memory.id),
+    });
+    const planned = await sdk.getFunction("api::full-consolidation-procedural-windows-plan")({
+      headers: {},
+      body: { project: "repo" },
+    });
+    expect(planned).toMatchObject({
+      status_code: 200,
+      body: {
+        success: true,
+        windows: [{
+          stageContractVersion: CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+          patternCount: 2,
+        }],
+      },
+    });
+    const [window] = planned.body.windows;
+    const body = {
+      runId: "procedural-api-attempt",
+      stage: "consolidation_procedural",
+      unitId: window.windowId,
+      inputHash: stableHash({ windowId: window.windowId, sources: window.sourceVersionKeys }),
+      project: window.project,
+      memoryIds: window.memoryIds,
+      stageContractVersion: window.stageContractVersion,
+      sourceVersionKeys: window.sourceVersionKeys,
+    };
+    const contributionScope = KV.extractionContributionRecords(
+      "consolidation_procedural",
+      CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+    );
+    const originalSet = kv.set;
+    let interruptContributionWrite = true;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (
+        interruptContributionWrite
+        && scope === contributionScope
+        && (data as { state?: string }).state === "committed"
+      ) {
+        interruptContributionWrite = false;
+        throw new Error("procedural contribution write interrupted");
+      }
+      return originalSet(scope, key, data);
+    };
+
+    const interrupted = await sdk.getFunction("api::full-consolidation-procedural-window")({
+      headers: {},
+      body,
+    });
+    expect(interrupted).toMatchObject({
+      status_code: 503,
+      body: {
+        success: false,
+        failure: { cause: "extraction_operation_reconciliation_required" },
+        operationReceipt: { status: "succeeded", runId: body.runId },
+      },
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    expect(await kv.list(KV.procedural)).toHaveLength(1);
+
+    const resumed = await sdk.getFunction("api::full-consolidation-procedural-window")({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    });
+    expect(resumed).toMatchObject({
+      status_code: 200,
+      body: { success: true, status: "succeeded" },
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    const records = await kv.list<{ state: string }>(contributionScope);
+    expect(records).toHaveLength(2);
+    expect(records.every((record) => record.state === "committed")).toBe(true);
+    expect(await kv.list(KV.consolidationProceduralBacklog)).toEqual([]);
+
+    const clean = await sdk.getFunction("api::full-consolidation-procedural-windows-plan")({
+      headers: {},
+      body: { project: "repo" },
+    });
+    expect(clean).toMatchObject({ status_code: 200, body: { success: true, windows: [] } });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+
+    const [procedure] = await kv.list<{ id: string; steps: string[] }>(KV.procedural);
+    await kv.set(KV.procedural, procedure.id, {
+      ...procedure,
+      steps: ["Tampered after commit"],
+    });
+    const driftedEffect = await sdk.getFunction("api::full-consolidation-procedural-window")({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    });
+    expect(driftedEffect).toMatchObject({
+      status_code: 409,
+      body: {
+        success: false,
+        failure: { cause: "consolidation_procedural_source_mutation_conflict" },
+      },
+    });
+    await kv.set(KV.procedural, procedure.id, procedure);
+    await kv.delete(KV.procedural, procedure.id);
+    const tampered = await sdk.getFunction("api::full-consolidation-procedural-window")({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    });
+    expect(tampered).toMatchObject({
+      status_code: 409,
+      body: {
+        success: false,
+        failure: { cause: "consolidation_procedural_source_mutation_conflict" },
+      },
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("commits and replays a strict procedural business-empty contribution", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue("<procedures></procedures>"),
+    };
+    registerConsolidationPipelineFunction(sdk as never, kv as never, provider as never);
+    registerApiTriggers(sdk as never, kv as never, "");
+    const memories = [1, 2].map((index) => ({
+      id: `procedural-empty-pattern-${index}`,
+      type: "pattern" as const,
+      title: `Procedural empty pattern ${index}`,
+      content: `Evidence that does not form a reusable procedure ${index}`,
+      concepts: ["empty"],
+      files: [],
+      sessionIds: [`procedural-empty-${index}-a`, `procedural-empty-${index}-b`],
+      strength: 5,
+      version: 1,
+      isLatest: true,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+    }));
+    for (const memory of memories) await kv.set(KV.memories, memory.id, memory);
+    await enqueueConsolidationProceduralBacklog({
+      kv: kv as never,
+      memoryIds: memories.map((memory) => memory.id),
+    });
+    const plan = await sdk.getFunction("api::full-consolidation-procedural-windows-plan")({
+      headers: {},
+      body: {},
+    });
+    const [window] = plan.body.windows;
+    const body = {
+      runId: "procedural-empty-attempt",
+      stage: "consolidation_procedural",
+      unitId: window.windowId,
+      inputHash: stableHash(window.sourceVersionKeys),
+      memoryIds: window.memoryIds,
+      stageContractVersion: window.stageContractVersion,
+      sourceVersionKeys: window.sourceVersionKeys,
+    };
+    const handler = sdk.getFunction("api::full-consolidation-procedural-window");
+
+    const first = await handler({ headers: {}, body });
+    const replay = await handler({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    });
+
+    expect(first).toMatchObject({
+      status_code: 200,
+      body: {
+        success: true,
+        status: "skipped",
+        proceduralMemoryIds: [],
+        proceduralRecoveryEvidence: {
+          kind: "no_effect",
+          observation: "business_empty",
+          reasonCode: "no_reusable_procedure",
+          proof: { kind: "committed_structured_no_effect" },
+        },
+      },
+    });
+    expect(replay).toMatchObject({ status_code: 200, body: { status: "skipped" } });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    const records = await kv.list<{ state: string; effectRefs?: unknown[] }>(
+      KV.extractionContributionRecords(
+        "consolidation_procedural",
+        CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+      ),
+    );
+    expect(records).toHaveLength(2);
+    expect(records.every((record) => record.state === "no_effect")).toBe(true);
+    expect(records.every((record) => record.effectRefs?.length === 0)).toBe(true);
+    expect(await kv.list(KV.consolidationProceduralBacklog)).toEqual([]);
   });
 
   it("full skill-extract whitelist error names operation identity fields", async () => {
@@ -2024,6 +2787,221 @@ describe("full extraction REST wrappers", () => {
     }
   });
 
+  it("repairs incremental reflect reconciliation without replaying the provider", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        '<insights><insight confidence="0.8" title="Incremental evidence">'
+          + "Exact new sources support a durable incremental insight."
+          + "</insight></insights>",
+      ),
+    };
+    registerReflectFunctions(sdk as never, kv as never, provider as never);
+    registerApiTriggers(sdk as never, kv as never, "");
+    await kv.set(KV.semantic, "sem-reflect-api", {
+      id: "sem-reflect-api",
+      fact: "Exact semantic evidence for incremental reflection",
+      confidence: 0.9,
+      sourceSessionIds: [],
+      sourceMemoryIds: [],
+      accessCount: 0,
+      lastAccessedAt: "2026-08-02T00:00:00.000Z",
+      strength: 0.9,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+    });
+    await kv.set(KV.lessons, "lsn-reflect-api", {
+      id: "lsn-reflect-api",
+      content: "Use exact lesson provenance for incremental reflection",
+      context: "",
+      confidence: 0.8,
+      reinforcements: 0,
+      source: "extracted",
+      sourceIds: [],
+      tags: ["incremental"],
+      createdAt: "2026-08-02T00:00:00.000Z",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+      decayRate: 0.05,
+    });
+    await kv.set(KV.crystals, "crys-reflect-api", {
+      id: "crys-reflect-api",
+      narrative: "Completed exact-source reflection handoff",
+      keyOutcomes: ["incremental"],
+      filesAffected: [],
+      lessons: ["retain provenance"],
+      sourceActionIds: [],
+      createdAt: "2026-08-02T00:00:00.000Z",
+    });
+
+    const planHandler = sdk.getFunction("api::full-reflect-insight-windows-plan");
+    const planned = await planHandler({
+      headers: {},
+      body: {
+        useGraph: false,
+        semanticMemoryIds: ["sem-reflect-api"],
+        lessonIds: ["lsn-reflect-api"],
+        crystalIds: ["crys-reflect-api"],
+      },
+    });
+    expect(planned.status_code).toBe(200);
+    const window = planned.body.windows[0] as {
+      windowId: string;
+      semanticMemoryIds: string[];
+      lessonIds: string[];
+      crystalIds: string[];
+      stageContractVersion: string;
+      sourceVersionKeys: string[];
+    };
+    expect(window).toMatchObject({
+      semanticMemoryIds: ["sem-reflect-api"],
+      lessonIds: ["lsn-reflect-api"],
+      crystalIds: ["crys-reflect-api"],
+      stageContractVersion: REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+    });
+    const body = {
+      runId: "reflect-api-run",
+      stage: "reflect_insight",
+      unitId: window.windowId,
+      inputHash: "a".repeat(64),
+      useGraph: false,
+      semanticMemoryIds: window.semanticMemoryIds,
+      lessonIds: window.lessonIds,
+      crystalIds: window.crystalIds,
+      stageContractVersion: window.stageContractVersion,
+      sourceVersionKeys: window.sourceVersionKeys,
+    };
+    const runHandler = sdk.getFunction("api::full-reflect-insight-window");
+    const originalSet = kv.set;
+    let interruptContributionWrite = true;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (
+        interruptContributionWrite
+        && scope === KV.extractionContributionRecords(
+          "reflect_insight",
+          REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+        )
+        && (data as { state?: string }).state === "committed"
+      ) {
+        interruptContributionWrite = false;
+        throw new Error("reflect contribution response lost");
+      }
+      return originalSet(scope, key, data);
+    };
+    const interrupted = await runHandler({ headers: {}, body });
+    const replay = await runHandler({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    });
+
+    expect(interrupted).toMatchObject({
+      status_code: 503,
+      body: {
+        success: false,
+        failure: { cause: "extraction_operation_reconciliation_required" },
+        operationReceipt: { status: "succeeded" },
+      },
+    });
+    expect(replay).toMatchObject({
+      status_code: 200,
+      body: { success: true, insightIds: [expect.stringMatching(/^ins_/)] },
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    expect(await planHandler({ headers: {}, body: { useGraph: false } }))
+      .toMatchObject({ status_code: 200, body: { windows: [], totalItems: 0 } });
+    expect(await kv.list<{ state: string }>(KV.extractionContributionRecords(
+      "reflect_insight",
+      REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+    ))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ state: "committed" }),
+      expect.objectContaining({ state: "committed" }),
+      expect.objectContaining({ state: "committed" }),
+    ]));
+  });
+
+  it("repairs a semantic-to-reflect handoff from the committed receipt without another provider effect", async () => {
+    const kv = mockKV();
+    let providerEffects = 0;
+    const sdk = mockSdk(async ({ function_id, payload }) => {
+      expect(function_id).toBe("mem::semantic-rollup");
+      const recoveryIdentity = (payload as Record<string, unknown>).recoveryIdentity as {
+        runId: string;
+        stage: "semantic_rollup";
+        unitId: string;
+        inputHash: string;
+      };
+      const key = buildExtractionOperationKey(recoveryIdentity);
+      const scope = KV.extractionOperationReceipt(key);
+      const receipt = await kv.get<Record<string, unknown>>(scope, key);
+      if (!(receipt as { semanticRecovery?: unknown })?.semanticRecovery) {
+        providerEffects += 1;
+        await kv.set(scope, key, {
+          ...receipt,
+          semanticRecovery: {
+            schema: "semantic-rollup-recovery/v1",
+            phase: "committed",
+            identity: {
+              runId: recoveryIdentity.runId,
+              unitId: recoveryIdentity.unitId,
+              receiptInputHash: recoveryIdentity.inputHash,
+            },
+          },
+        });
+      }
+      return {
+        success: true,
+        status: "succeeded",
+        semanticMemoryIds: ["sem-handoff-repair"],
+      };
+    });
+    registerApiTriggers(sdk as never, kv as never, "");
+    const handler = sdk.getFunction("api::semantic-rollup");
+    const body = {
+      runId: "semantic-handoff-run",
+      stage: "semantic_rollup",
+      unitId: "semantic-handoff-window",
+      inputHash: "b".repeat(64),
+      windowId: "semantic-handoff-window",
+      mark: "incremental",
+      kind: "window",
+      sessionIds: ["session-handoff"],
+      sourceSummaryHashes: { "session-handoff": "c".repeat(64) },
+    };
+
+    expect(await handler({ headers: {}, body })).toMatchObject({
+      status_code: 503,
+      body: {
+        failure: { cause: "extraction_operation_reconciliation_required" },
+        operationReceipt: { status: "succeeded" },
+      },
+    });
+    expect(providerEffects).toBe(1);
+    await kv.set(KV.semantic, "sem-handoff-repair", {
+      id: "sem-handoff-repair",
+      fact: "Committed semantic effect becomes visible to the handoff repair",
+      confidence: 0.9,
+      sourceSessionIds: ["session-handoff"],
+      sourceMemoryIds: [],
+      accessCount: 0,
+      lastAccessedAt: "2026-08-02T00:00:00.000Z",
+      strength: 0.9,
+      createdAt: "2026-08-02T00:00:00.000Z",
+      updatedAt: "2026-08-02T00:00:00.000Z",
+    });
+
+    expect(await handler({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    })).toMatchObject({ status_code: 200, body: { success: true } });
+    expect(providerEffects).toBe(1);
+    expect(await kv.list<{ sourceType: string; sourceId: string }>(KV.reflectInsightBacklog))
+      .toEqual([
+        expect.objectContaining({ sourceType: "semantic", sourceId: "sem-handoff-repair" }),
+      ]);
+  });
+
   it("full crystals auto delegates the whole run to mem::full-crystals-auto", async () => {
     const sdk = mockSdk();
     const kv = mockKV();
@@ -2058,6 +3036,8 @@ describe("full extraction REST wrappers", () => {
         groupId: "crystal-group:1:repo",
         actionIds: [" action-1 "],
         actionUpdatedAts: [" 2026-07-24T00:00:00.000Z "],
+        stageContractVersion: "crystal/v1",
+        sourceVersionKeys: [`crystal|action|action-1|${"a".repeat(64)}`],
       },
     });
 
@@ -2068,11 +3048,154 @@ describe("full extraction REST wrappers", () => {
         groupId: "crystal-group:1:repo",
         actionIds: ["action-1"],
         actionUpdatedAts: ["2026-07-24T00:00:00.000Z"],
+        stageContractVersion: "crystal/v1",
+        sourceVersionKeys: [`crystal|action|action-1|${"a".repeat(64)}`],
         runId: "crystal-attempt",
         unitId: "crystal-group:1:repo",
         inputHash: expect.stringMatching(/^[0-9a-f]{64}$/),
       },
     });
+  });
+
+  it("repairs a committed crystal contribution without another provider call", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        '{"narrative":"done","keyOutcomes":["shipped"],"filesAffected":["a.ts"],"lessons":["verify effects"]}',
+      ),
+    };
+    registerLessonsFunctions(sdk as never, kv as never);
+    registerCrystallizeFunction(sdk as never, kv as never, provider as never);
+    registerApiTriggers(sdk as never, kv as never, "");
+    const handler = sdk.getFunction("api::full-crystals-auto");
+    const action = {
+      id: "action-contribution",
+      title: "Finish contribution",
+      description: "Commit the durable result",
+      status: "done",
+      priority: 5,
+      createdAt: "2026-06-01T00:00:00.000Z",
+      updatedAt: "2026-06-02T00:00:00.000Z",
+      createdBy: "test",
+      project: "repo",
+      tags: ["release"],
+      sourceObservationIds: [],
+      sourceMemoryIds: [],
+      result: "complete",
+    };
+    await kv.set(KV.actions, action.id, action);
+
+    const planned = await handler({ headers: {}, body: { dryRun: true, project: "repo" } });
+    const group = planned.body.groups[0] as {
+      groupId: string;
+      actionIds: string[];
+      actionUpdatedAts: string[];
+      stageContractVersion: string;
+      sourceVersionKeys: string[];
+      project: string;
+    };
+    expect(group).toMatchObject({
+      actionIds: [action.id],
+      stageContractVersion: CRYSTAL_CONTRIBUTION_CONTRACT,
+      sourceVersionKeys: [expect.stringMatching(/^crystal\|action\|/)],
+    });
+    const body = {
+      runId: "crystal-contribution-run",
+      stage: "crystal",
+      unitId: group.groupId,
+      inputHash: "runner-crystal-input",
+      groupId: group.groupId,
+      actionIds: group.actionIds,
+      actionUpdatedAts: group.actionUpdatedAts,
+      stageContractVersion: group.stageContractVersion,
+      sourceVersionKeys: group.sourceVersionKeys,
+      project: group.project,
+    };
+    const originalSet = kv.set;
+    let failContributionWrite = true;
+    kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+      if (
+        failContributionWrite
+        && scope === KV.extractionContributionRecords(
+          "crystal",
+          CRYSTAL_CONTRIBUTION_CONTRACT,
+        )
+        && (data as { state?: string }).state === "committed"
+      ) {
+        failContributionWrite = false;
+        throw new Error("contribution response lost");
+      }
+      return originalSet(scope, key, data);
+    };
+
+    const interrupted = await handler({ headers: {}, body });
+    expect(interrupted).toMatchObject({
+      status_code: 503,
+      body: {
+        success: false,
+        failure: { cause: "extraction_operation_reconciliation_required" },
+        operationReceipt: { status: "succeeded" },
+      },
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    const contributionScope = KV.extractionContributionRecords(
+      "crystal",
+      CRYSTAL_CONTRIBUTION_CONTRACT,
+    );
+    expect(await kv.get<{ state: string }>(contributionScope, group.sourceVersionKeys[0]))
+      .toMatchObject({ state: "claimed" });
+
+    const resumed = await handler({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    });
+    expect(resumed).toMatchObject({ status_code: 200, body: { success: true } });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    expect(await kv.get<{ state: string }>(contributionScope, group.sourceVersionKeys[0]))
+      .toMatchObject({ state: "committed" });
+    expect(await kv.list(KV.crystals)).toHaveLength(1);
+    expect(await kv.list<{ sourceType: string; sourceId: string }>(KV.reflectInsightBacklog))
+      .toEqual([
+        expect.objectContaining({ sourceType: "crystal", sourceId: expect.stringMatching(/^crys_/) }),
+      ]);
+    expect((await kv.list<{ operation: string }>(KV.audit))
+      .filter((entry) => entry.operation === "crystallize")).toHaveLength(1);
+
+    const cleanPlan = await handler({ headers: {}, body: { dryRun: true, project: "repo" } });
+    expect(cleanPlan.body).toMatchObject({ success: true, groupCount: 0 });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+
+    const [crystal] = await kv.list<{ id: string }>(KV.crystals);
+    await kv.delete(KV.crystals, crystal.id);
+    const missingEffect = await handler({
+      headers: {},
+      body: { ...body, requireExistingReceipt: true },
+    });
+    expect(missingEffect.status_code).toBe(409);
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+
+    const committedAction = await kv.get<Record<string, unknown>>(KV.actions, action.id);
+    await kv.set(KV.actions, action.id, {
+      ...committedAction,
+      title: "Corrected after contribution",
+      updatedAt: "2026-06-03T00:00:00.000Z",
+    });
+    const correctionPlan = await handler({
+      headers: {},
+      body: { dryRun: true, project: "repo" },
+    });
+    expect(correctionPlan.body).toMatchObject({
+      success: true,
+      groupCount: 1,
+      groups: [{
+        actionIds: [action.id],
+        isolateReason: "crystal_source_correction_requires_migration",
+      }],
+    });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
   });
 
   it("full memory consolidate plan endpoint applies charBudget through the service planner", async () => {
@@ -2285,5 +3408,60 @@ describe("full extraction REST wrappers", () => {
         },
       }],
     });
+  });
+
+  it("binds incremental memory planning to explicit selected session ids", async () => {
+    const sdk = mockSdk();
+    const kv = mockKV();
+    for (let index = 0; index < 3; index++) {
+      await kv.set(KV.observations("selected-session"), `obs-${index}`, {
+        id: `obs-${index}`,
+        sessionId: "selected-session",
+        timestamp: "2026-08-02T00:00:00.000Z",
+        type: "decision",
+        title: `Observation ${index}`,
+        facts: [],
+        narrative: `Evidence ${index}`,
+        concepts: ["windows"],
+        files: [],
+        importance: 8,
+      });
+    }
+    const originalList = kv.list.bind(kv);
+    kv.list = vi.fn(async <T>(scope: string): Promise<T[]> => {
+      if (scope === KV.sessions) throw new Error("full_session_inventory_forbidden");
+      return originalList<T>(scope);
+    });
+    registerConsolidateFunction(
+      sdk as never,
+      kv as never,
+      { compress: vi.fn() } as never,
+    );
+    registerApiTriggers(sdk as never, kv as never, "");
+    const handler = sdk.getFunction("api::full-memory-consolidate-windows-plan");
+    const base = {
+      plannerId: "selected-plan",
+      sessionIds: ["selected-session"],
+      charBudget: 10_000,
+    };
+    const descriptorPage = await handler({
+      headers: {},
+      body: { ...base, sessionOffset: 0, sessionLimit: 8 },
+    });
+    expect(descriptorPage.status_code).toBe(200);
+    expect(descriptorPage.body).toMatchObject({ totalSessions: 1, nextSessionOffset: null });
+
+    const finalized = await handler({
+      headers: {},
+      body: {
+        ...base,
+        minObservationsPerConcept: 3,
+        windowOffset: 0,
+        windowLimit: 8,
+      },
+    });
+    expect(finalized.status_code).toBe(200);
+    expect(finalized.body.windows).toHaveLength(1);
+    expect(kv.list).not.toHaveBeenCalledWith(KV.sessions);
   });
 });

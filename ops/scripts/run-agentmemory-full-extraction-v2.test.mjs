@@ -17,12 +17,15 @@ import {
   buildConfigFromOptions,
   mainForTest,
   parseArgs,
+  partitionRunnerSessions,
   stableHash,
 } from './run-agentmemory-full-extraction.mjs';
 
 function mainForEarlyStages(argv, dependencies = {}) {
   return mainForTest(argv, {
     v2RuntimeCheck: async () => ({ summarizeChunkConcurrency: 1 }),
+    v2BaselineRunInspection: async () => ({ baselineId: null, retired: false }),
+    v2BaselinePartition: async ({ sessions }) => sessions,
     v2PendingWait: async () => {
       throw new Error('unexpected_v2_pending_wait');
     },
@@ -527,8 +530,14 @@ test('v2 operator drain rejects a request bound to another lock owner', async (c
 });
 
 test('new runner refuses business APIs while a fenced migration is incomplete', async (context) => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-fenced-runner-'));
-  context.after(() => fs.rm(stateDir, { recursive: true, force: true }));
+  context.after(async () => {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  });
   const runId = 'fenced-runner';
   const journal = new RunStateJournalV2({
     rootDir: path.join(stateDir, `${runId}.v2`),
@@ -794,6 +803,86 @@ test('default v2 runs the shared runtime concurrency gate before inventory acces
     if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
     else process.env.AGENTMEMORY_SECRET = previousSecret;
   }
+});
+
+test('v2 refuses a run retired by the active adopted baseline before writer lock acquisition', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-retired-baseline-'));
+  try {
+    await assert.rejects(
+      () => mainForEarlyStages([
+        '--base-url', 'http://127.0.0.1:1',
+        '--state-dir', stateDir,
+        '--run-id', 'retired-run',
+        '--run-state-format', 'v2',
+        '--resume',
+      ], {
+        v2BaselineRunInspection: async () => ({
+          baselineId: 'baseline-1',
+          retired: true,
+        }),
+        v2RuntimeCheck: async () => assert.fail('runtime gate must not run for retired run'),
+      }),
+      /v2_run_retired_by_adopted_baseline:baseline-1/,
+    );
+    await assert.rejects(
+      fs.access(path.join(stateDir, 'retired-run.v2', 'writer.lock.json')),
+      (error) => error?.code === 'ENOENT',
+    );
+  } finally {
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+    await fs.rm(stateDir, { recursive: true, force: true });
+  }
+});
+
+test('v2 baseline partition requires exact conservation of runner sessions', async () => {
+  const sessions = [{ id: 'adopted' }, { id: 'open' }];
+  await withServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    assert.deepEqual(body.sessionIds, ['adopted', 'open']);
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      success: true,
+      baselineId: 'baseline-1',
+      adoptedSessionIds: ['adopted'],
+      openSessionIds: ['open'],
+    }));
+  }, async (baseUrl) => {
+    const open = await partitionRunnerSessions({
+      baseUrl,
+      secret: 'test-secret',
+      stage: 'summary',
+      stageContractVersion: 'summary/v1',
+      sessions,
+      expectedBaselineId: 'baseline-1',
+      options: { requestTimeoutMs: 1_000 },
+    });
+    assert.deepEqual(open, [{ id: 'open' }]);
+  });
+
+  await withServer((_request, response) => {
+    response.setHeader('content-type', 'application/json');
+    response.end(JSON.stringify({
+      success: true,
+      baselineId: 'baseline-1',
+      adoptedSessionIds: ['adopted'],
+      openSessionIds: [],
+    }));
+  }, async (baseUrl) => {
+    await assert.rejects(() => partitionRunnerSessions({
+      baseUrl,
+      secret: 'test-secret',
+      stage: 'summary',
+      stageContractVersion: 'summary/v1',
+      sessions,
+      expectedBaselineId: 'baseline-1',
+      options: { requestTimeoutMs: 1_000 },
+    }), /v2_adopted_baseline_partition_invalid/);
+  });
 });
 
 test('v2 explicit resume takes over a dead writer lock for the same run', async () => {
@@ -2494,6 +2583,87 @@ test('v2 summary recovery appends each accepted outcome fact once across final b
   }
 });
 
+test('v2 summary clean rerun accepts a committed source proof without provider replay', async () => {
+  const previousSecret = process.env.AGENTMEMORY_SECRET;
+  process.env.AGENTMEMORY_SECRET = 'test-secret';
+  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), 'agentmemory-v2-summary-clean-rerun-'));
+  let providerCalls = 0;
+  let summaryCalls = 0;
+  let committed = null;
+  try {
+    await withServer((request, response) => {
+      assert.equal(request.url, '/agentmemory/sessions?agentId=*');
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        success: true,
+        sessions: [{ id: 's1', startedAt: '2026-07-22T00:00:00.000Z' }],
+      }));
+    }, async (baseUrl) => {
+      const summaryRemote = {
+        advance: async ({ attemptId, inputHash, operationUnitId }) => {
+          summaryCalls += 1;
+          if (!committed) {
+            providerCalls += 1;
+            committed = successfulSummaryResponse({ attemptId, inputHash }, 'committed summary').data;
+          }
+          return {
+            ok: true,
+            data: {
+              ...committed,
+              attemptId,
+              runnerInputHash: inputHash,
+              operationUnitId,
+            },
+          };
+        },
+        record: async () => {},
+      };
+      const lessonsRemote = {
+        start: async ({ attemptId }) => ({
+          ok: true,
+          data: { runs: [{ id: `lesson-${attemptId}`, status: 'succeeded' }] },
+        }),
+        record: async () => {},
+      };
+      const common = [
+        '--base-url', baseUrl,
+        '--state-dir', stateDir,
+        '--run-state-format', 'v2',
+      ];
+      assert.equal(await mainForEarlyStages([...common, '--run-id', 'summary-first'], {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: lessonsRemote,
+      }), 0);
+      assert.equal(await mainForEarlyStages([...common, '--run-id', 'summary-second'], {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: lessonsRemote,
+      }), 0);
+      assert.equal(await mainForEarlyStages([
+        ...common,
+        '--run-id', 'summary-second',
+        '--resume',
+      ], {
+        v2SummaryRemote: summaryRemote,
+        v2LessonsRemote: lessonsRemote,
+      }), 0);
+    });
+
+    assert.equal(providerCalls, 1);
+    assert.equal(summaryCalls, 2);
+    const events = (await fs.readFile(
+      path.join(stateDir, 'summary-second.v2', 'summary.jsonl'),
+      'utf8',
+    )).trim().split('\n').map(JSON.parse);
+    assert.equal(events.some((event) => event.type === 'unit_blocked'), false);
+    assert.equal(events.some((event) => event.type === 'unit_pending'), false);
+    assert.equal(events.filter((event) => event.type === 'unit_effect_committed').length, 1);
+  } finally {
+    await fs.rm(stateDir, { recursive: true, force: true });
+    if (previousSecret === undefined) delete process.env.AGENTMEMORY_SECRET;
+    else process.env.AGENTMEMORY_SECRET = previousSecret;
+  }
+});
+
 test('v2 recovery consumes the completed journal plan instead of a rebuilt live plan', async () => {
   const previousSecret = process.env.AGENTMEMORY_SECRET;
   process.env.AGENTMEMORY_SECRET = 'test-secret';
@@ -2687,6 +2857,12 @@ test('v2 default production adapters send stable summary and lesson identities',
           },
           operationReceipt: operationReceipt('memory_consolidate'),
         }));
+      } else if (request.url === '/agentmemory/full/semantic-rollup-eligibility') {
+        response.end(JSON.stringify({
+          success: true,
+          eligibleSessionIds: payload.sessionIds,
+          terminalSessionIds: [],
+        }));
       } else if (request.url === '/agentmemory/semantic-rollup') {
         const receipt = operationReceipt('semantic_rollup', 'a'.repeat(64));
         response.end(JSON.stringify({
@@ -2717,6 +2893,21 @@ test('v2 default production adapters send stable summary and lesson identities',
             sourceSummaryHashes: payload.sourceSummaryHashes,
           },
           operationReceipt: receipt,
+        }));
+      } else if (request.url === '/agentmemory/full/skill-extract-eligibility') {
+        response.end(JSON.stringify({
+          success: true,
+          eligible: payload.sessionIds.map((sessionId) => ({
+            sessionId,
+            stageContractVersion: 'skill_extract/v1',
+            sourceVersionKey: `skill_extract|session|${sessionId}|${'a'.repeat(64)}`,
+            sourceSnapshotHash: 'a'.repeat(64),
+          })),
+          terminal: [],
+          sourceCorrection: [],
+          claimed: [],
+          reconciliation: [],
+          ineligible: [],
         }));
       } else if (request.url === '/agentmemory/full/skill-extract/prepare') {
         response.end(JSON.stringify({
@@ -2806,11 +2997,16 @@ test('v2 default production adapters send stable summary and lesson identities',
         response.end(JSON.stringify({
           success: true,
           windows: [{
-            windowId: 'riw-1',
-            semanticMemoryIds: ['sem-1'],
-            lessonIds: ['lesson-1'],
-            crystalIds: ['crystal-1'],
-            inputHash: 'reflect-input-1',
+           windowId: 'riw-1',
+           semanticMemoryIds: ['sem-1'],
+           lessonIds: ['lesson-1'],
+           crystalIds: ['crystal-1'],
+            stageContractVersion: 'reflect_insight/v1',
+            sourceVersionKeys: [
+              `reflect_insight|semantic|sem-1|${'7'.repeat(64)}`,
+              `reflect_insight|lesson|lesson-1|${'8'.repeat(64)}`,
+              `reflect_insight|crystal|crystal-1|${'9'.repeat(64)}`,
+            ],
           }],
         }));
       } else if (request.url === '/agentmemory/full/reflect-insight-window') {
@@ -2818,6 +3014,7 @@ test('v2 default production adapters send stable summary and lesson identities',
         response.end(JSON.stringify({
           success: true,
           status: 'succeeded',
+          inputHash: receipt.inputHash,
           insightIds: ['insight-1'],
           reflectRecoveryEvidence: {
             schema: 'reflect-insight-commit/v1',
@@ -2826,6 +3023,11 @@ test('v2 default production adapters send stable summary and lesson identities',
             receiptVersion: 1,
             resultRef: `reflect-insight-recoveries:${receipt.key}`,
             effectHash: '4'.repeat(64),
+            identity: {
+              runId: payload.runId,
+              unitId: payload.unitId,
+              inputHash: receipt.inputHash,
+            },
           },
           operationReceipt: receipt,
         }));

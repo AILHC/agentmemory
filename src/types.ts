@@ -200,6 +200,143 @@ export type ExtractionOperationStage =
   | "consolidation_procedural"
   | "reflect_insight";
 
+export type ContributionState = "claimed" | "committed" | "no_effect";
+
+export interface StageContractVersion {
+  stage: ExtractionOperationStage;
+  version: string;
+  activatedAt: string;
+}
+
+export interface ContributionEffectRef {
+  scope: string;
+  key: string;
+  effectHash?: string;
+}
+
+export interface ContributionRecord {
+  stage: ExtractionOperationStage;
+  stageContractVersion: string;
+  sourceVersionKey: string;
+  state: ContributionState;
+  contributionId: string;
+  runId: string;
+  unitId: string;
+  claimedAt: string;
+  committedAt?: string;
+  operationReceiptRef?: ContributionEffectRef;
+  effectRefs?: ContributionEffectRef[];
+  noEffectProof?: {
+    kind: "strict_legal_empty";
+    receiptKey: string;
+    reasonCode: string;
+  };
+}
+
+export interface ContributionHead {
+  sourceVersionKey: string;
+  state: ContributionState;
+  contributionId: string;
+  updatedAt: string;
+}
+
+export type AdoptedBaselineStage =
+  | "summary"
+  | "lessons"
+  | "memory_consolidate"
+  | "semantic_rollup"
+  | "skill_extract";
+
+export interface AdoptedBaselineExpectedSet {
+  count: number;
+  digest: string;
+}
+
+export interface AdoptedBaselineCoverageRecord {
+  baselineId: string;
+  stage: AdoptedBaselineStage;
+  stageContractVersion: string;
+  sessionId: string;
+  normalizedContentHash: string;
+}
+
+export interface AdoptedBaselineLessonSeedRecord {
+  baselineId: string;
+  lessonId: string;
+  sourceVersionKey: string;
+  normalizedContentHash: string;
+}
+
+export interface AdoptedBaselineManifest {
+  version: 1;
+  id: string;
+  state: "preparing" | "sealed";
+  sourceRunId: string;
+  retiredRunIds: string[];
+  decisionRef: string;
+  expectedCoverage: Record<AdoptedBaselineStage, AdoptedBaselineExpectedSet & {
+    stageContractVersion: string;
+  }>>;
+  expectedLessonSeed: AdoptedBaselineExpectedSet;
+  naturalBoundaryStages: Array<"crystal" | "consolidation_procedural">;
+  createdAt: string;
+  updatedAt: string;
+  sealedAt?: string;
+}
+
+export interface AdoptedBaselineControl {
+  activeBaselineId: string;
+  updatedAt: string;
+}
+
+export interface MemoryConsolidationBacklogRecord {
+  sourceVersionKey: string;
+  observationId: string;
+  sessionId: string;
+  normalizedContentHash: string;
+  concepts: string[];
+  importance: number;
+  estimatedChars: number;
+  project?: string;
+  firstWaitingAt: string;
+  updatedAt: string;
+}
+
+export interface ConsolidationProceduralBacklogRecord {
+  sourceVersionKey: string;
+  memoryId: string;
+  normalizedContentHash: string;
+  project?: string;
+  firstWaitingAt: string;
+  updatedAt: string;
+  upstreamReceiptRef?: ContributionEffectRef;
+}
+
+export interface ReflectInsightBacklogRecord {
+  sourceVersionKey: string;
+  sourceType: "semantic" | "lesson" | "crystal";
+  sourceId: string;
+  normalizedContentHash: string;
+  project?: string;
+  firstWaitingAt: string;
+  updatedAt: string;
+  upstreamReceiptRef?: ContributionEffectRef;
+}
+
+export interface MemoryConsolidationDeltaEvidence {
+  observationIds: string[];
+  sessionIds: string[];
+  sourceVersionKeys: string[];
+}
+
+export interface MemoryConsolidationHistoricalContext {
+  memoryIds: string[];
+  memoryVersions: Array<{
+    memoryId: string;
+    versionHash: string;
+  }>;
+}
+
 export interface ExtractionOperationIdentity {
   runId: string;
   stage: ExtractionOperationStage;
@@ -256,7 +393,19 @@ export interface MemoryConsolidationProposal extends ExtractionOperationIdentity
   project?: string;
   concept: string;
   sourceObservationIds: string[];
-  parsed: Omit<Memory, "id" | "createdAt" | "updatedAt">;
+  parsed?: Omit<Memory, "id" | "createdAt" | "updatedAt">;
+  noEffectProof?: {
+    kind: "strict_legal_empty";
+    reasonCode: string;
+  };
+  stageContractVersion?: string;
+  contributionId?: string;
+  contributionReceiptRef?: ContributionEffectRef;
+  contributionEffectRefs?: ContributionEffectRef[];
+  sourceVersionKeys?: string[];
+  historicalContextMemoryIds?: string[];
+  deltaEvidence?: MemoryConsolidationDeltaEvidence;
+  historicalContext?: MemoryConsolidationHistoricalContext;
   totalObservations: number;
   promptChars: number;
   charBudget?: number;
@@ -268,12 +417,12 @@ export interface MemoryConsolidationProposal extends ExtractionOperationIdentity
   };
   response?: {
     success: true;
-    status: "succeeded";
-    consolidated: 1;
+    status: "succeeded" | "skipped";
+    consolidated: 0 | 1;
     totalObservations: number;
     memoryIds: string[];
-    action: "created" | "evolved";
-    memoryId: string;
+    action?: "created" | "evolved";
+    memoryId?: string;
     parentId?: string;
   };
 }
@@ -296,11 +445,18 @@ export interface SkillExtractionProposal extends ExtractionOperationIdentity {
   sourceObservationIds: string[];
   promptChars: number;
   responseMetadata: Record<string, unknown>;
+  /** 固化的技能提取来源版本；旧提案可能缺少，不能用于 contribution 对账。 */
+  stageContractVersion?: string;
+  sourceVersionKey?: string;
+  sourceSnapshotHash?: string;
+  contributionId?: string;
   commitIntent?: {
     resultId: string;
     auditId: string;
     createdAt: string;
     stableResultHash?: string;
+    contributionReceiptRef?: ContributionEffectRef;
+    contributionEffectRefs?: ContributionEffectRef[];
   };
   response?: {
     success: true;

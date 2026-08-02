@@ -172,7 +172,14 @@ async function runFaultScenario(fault?: StateKvFault) {
   let crashSnapshot: RuntimeSnapshot | null = null;
   try {
     runtime = await startRuntime({ stateDir: runtimeStateDir, fault: fault?.name });
-    const argv = ["--base-url", runtime.baseUrl, "--state-dir", stateDir, "--run-id", runId, "--mark", runId, "--run-state-format", "v2"];
+    const argv = [
+      "--base-url", runtime.baseUrl,
+      "--state-dir", stateDir,
+      "--run-id", runId,
+      "--mark", runId,
+      "--run-state-format", "v2",
+      "--pending-policy", "exit",
+    ];
     try {
       exitCodes.push(await invokeRunner(argv));
     } catch (error) {
@@ -353,7 +360,14 @@ describe("Lessons persistent StateKV substitute recovery seam", () => {
     const fault = faultingJournalFs(kind);
     try {
       runtime = await startRuntime({ stateDir: join(stateDir, "persistent-statekv-substitute") });
-      const argv = ["--base-url", runtime.baseUrl, "--state-dir", stateDir, "--run-id", runId, "--mark", runId, "--run-state-format", "v2"];
+      const argv = [
+        "--base-url", runtime.baseUrl,
+        "--state-dir", stateDir,
+        "--run-id", runId,
+        "--mark", runId,
+        "--run-state-format", "v2",
+        "--pending-policy", "exit",
+      ];
       await expect(invokeRunner(argv, testDependencies(fault.fsApi))).rejects.toThrow(kind === "write"
         ? /injected_journal_append_enospc/
         : kind === "sync"

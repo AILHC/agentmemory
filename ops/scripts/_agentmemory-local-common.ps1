@@ -867,18 +867,23 @@ function Write-AmDeploymentManifestSummary {
     Write-Output 'deployment.manifest=missing_or_invalid'
     return
   }
-  if ([int]$manifest.schemaVersion -ne 3) {
+  if ([int]$manifest.schemaVersion -ne 4) {
     Write-Output "deployment.schemaVersion=$($manifest.schemaVersion)"
     Write-Output 'deployment.manifest=unsupported'
     return
   }
   $hasContent = $null -ne $manifest.PSObject.Properties['content']
   $hasKeyFiles = $null -ne $manifest.PSObject.Properties['keyFiles']
+  $hasExtractionContracts = $null -ne $manifest.PSObject.Properties['extractionModelContracts']
   if ([string]$manifest.sourceCommit -notmatch '^[0-9a-f]{40}$' -or
       -not $hasContent -or
       [string]$manifest.content.sha256 -notmatch '^[0-9a-f]{64}$' -or
       -not $hasKeyFiles -or
-      -not ($manifest.keyFiles -is [array])) {
+      -not ($manifest.keyFiles -is [array]) -or
+      -not $hasExtractionContracts -or
+      [string]$manifest.extractionModelContracts.compatibility_basis -cne 'compatible_with_only' -or
+      -not ($manifest.extractionModelContracts.stages -is [array]) -or
+      $manifest.extractionModelContracts.stages.Count -ne 8) {
     Write-Output 'deployment.manifest=invalid'
     return
   }
@@ -895,8 +900,12 @@ function Write-AmDeploymentManifestSummary {
     'dist/worker-supervisor.mjs',
     'scripts/_agentmemory-local-common.ps1',
     'scripts/agentmemory-deployment-manifest.mjs',
+    'scripts/extraction-model-contracts-v1.json',
     'scripts/doctor-agentmemory-console.ps1',
     'scripts/doctor-agentmemory.ps1',
+    'scripts/lib/incremental-extraction-status-v1.mjs',
+    'scripts/preview-agentmemory-adopted-baseline.mjs',
+    'scripts/apply-agentmemory-adopted-baseline.mjs',
     'scripts/run-agentmemory-full-extraction.mjs',
     'scripts/start-agentmemory-console.ps1',
     'scripts/start-agentmemory.ps1',

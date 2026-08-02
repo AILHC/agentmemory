@@ -652,6 +652,7 @@ describe("consolidate full window helpers", () => {
     let maxActiveReads = 0;
     let observationBucketReads = 0;
     const kv = {
+      get: async (): Promise<null> => null,
       list: async <T>(scope: string): Promise<T[]> => {
         if (scope === KV.sessions) return sessions as T[];
         observationBucketReads += 1;
@@ -997,7 +998,7 @@ describe("consolidate full window helpers", () => {
     });
 
     expect(result.success).toBe(true);
-    expect(kv.get).toHaveBeenCalledTimes(2);
+    expect(kv.get).toHaveBeenCalledTimes(3);
     expect(kv.list).toHaveBeenCalledTimes(1);
     expect(kv.list).toHaveBeenCalledWith(KV.memories);
   });

@@ -33,6 +33,12 @@ import {
   type FailedExtractionOperationRetryAuthorization,
 } from "./extraction-operation-receipts.js";
 import {
+  buildSourceVersionKey,
+  claimBatch,
+  commitClaimedBatch,
+} from "./extraction-contributions.js";
+import { partitionAdoptedBaselineSessions } from "./extraction-baselines.js";
+import {
   SUMMARY_SYSTEM,
   buildSummaryPrompt,
   REDUCE_SYSTEM,
@@ -73,6 +79,7 @@ const MAX_SKIP_RATIO = 0.5;
 const TRANSIENT_RETRY_BASE_DELAY_MS = 31_000;
 const TRANSIENT_RETRY_JITTER_MS = 5_000;
 const SUMMARY_GENERATION_CONFIG_VERSION = 1;
+export const SUMMARY_CONTRIBUTION_CONTRACT = "summary/v1";
 
 type SummaryFailureCause =
   | "parse_failed"
@@ -279,6 +286,11 @@ type SummaryOperationReceiptProjection = {
   inputHash: string;
   runnerInputHash: string;
   startedAt: string;
+};
+
+type ClaimedSummaryContribution = {
+  contributionId: string;
+  sourceVersionKey: string;
 };
 
 type SummaryRecoveryEvidence =
@@ -869,7 +881,7 @@ function stripXmlWrappers(raw: string): string {
   return cleaned;
 }
 
-function parseSummaryXml(
+export function parseSummaryXml(
   xml: string,
   sessionId: string,
   project: string,
@@ -907,7 +919,7 @@ function stableStringify(value: unknown): string {
     .join(",")}}`;
 }
 
-function resumableSummaryInputHash(
+export function resumableSummaryInputHash(
   session: Session,
   compressed: CompressedObservation[],
 ): string {
@@ -1160,7 +1172,22 @@ function resumableSummaryRequestProof(
   };
 }
 
-function summaryEffectHash(summary: SessionSummary): string {
+function summaryContributionEffectHash(summary: SessionSummary): string {
+  return createHash("sha256")
+    .update(stableStringify({
+      sessionId: summary.sessionId,
+      project: summary.project,
+      title: summary.title,
+      narrative: summary.narrative,
+      keyDecisions: summary.keyDecisions,
+      filesModified: summary.filesModified,
+      concepts: summary.concepts,
+      observationCount: summary.observationCount,
+    }))
+    .digest("hex");
+}
+
+function summaryRecoveryEffectHash(summary: SessionSummary): string {
   return createHash("sha256")
     .update(stableStringify({
       title: summary.title,
@@ -1170,6 +1197,94 @@ function summaryEffectHash(summary: SessionSummary): string {
       concepts: summary.concepts,
     }))
     .digest("hex");
+}
+
+async function readVerifiedCommittedSummary(
+  kv: StateKV,
+  record: import("../types.js").ContributionRecord,
+  sessionId: string,
+): Promise<{
+  summary: SessionSummary;
+  receipt: ExtractionOperationReceipt<Record<string, unknown>>;
+  resumableRunId: string;
+} | null> {
+  const receiptRef = record.operationReceiptRef;
+  const effectRef = record.effectRefs?.find((ref) =>
+    ref.scope === KV.summaries && ref.key === sessionId && typeof ref.effectHash === "string",
+  );
+  if (
+    record.state !== "committed"
+    || !receiptRef
+    || receiptRef.scope !== KV.extractionOperationReceipt(receiptRef.key)
+    || !effectRef
+  ) {
+    return null;
+  }
+  const [receipt, summary] = await Promise.all([
+    kv.get<ExtractionOperationReceipt<Record<string, unknown>>>(receiptRef.scope, receiptRef.key),
+    kv.get<SessionSummary>(KV.summaries, sessionId),
+  ]);
+  const receiptResultRef = receipt?.response?.resultRef;
+  const resumableRunId = receiptResultRef && typeof receiptResultRef === "object"
+    && !Array.isArray(receiptResultRef)
+    ? (receiptResultRef as Record<string, unknown>).key
+    : undefined;
+  if (typeof resumableRunId !== "string") return null;
+  const run = await kv.get<ResumableSummaryRun>(KV.summaryResumableRuns, resumableRunId);
+  const sourceInputHash = record.sourceVersionKey.split("|").at(-1);
+  if (
+    receipt?.status !== "succeeded"
+    || receipt.key !== receiptRef.key
+    || receipt.stage !== "summary"
+    || !receiptResultRef
+    || typeof receiptResultRef !== "object"
+    || Array.isArray(receiptResultRef)
+    || (receiptResultRef as Record<string, unknown>).scope !== KV.summaryResumableRuns
+    || (receiptResultRef as Record<string, unknown>).key !== resumableRunId
+    || !summary
+    || !run
+    || run.id !== resumableRunId
+    || run.id !== record.runId
+    || run.status !== "succeeded"
+    || run.sessionId !== sessionId
+    || run.inputHash !== sourceInputHash
+    || !run.summary
+    || summaryContributionEffectHash(run.summary) !== summaryContributionEffectHash(summary)
+    || effectRef.effectHash !== summaryContributionEffectHash(summary)
+  ) {
+    return null;
+  }
+  return {
+    summary,
+    receipt,
+    resumableRunId,
+  };
+}
+
+async function commitSummaryContribution(
+  kv: StateKV,
+  contribution: ClaimedSummaryContribution,
+  summary: SessionSummary,
+  receipt: ExtractionOperationReceipt<Record<string, unknown>>,
+): Promise<void> {
+  if (receipt.status !== "succeeded") {
+    throw new Error("summary_contribution_receipt_not_succeeded");
+  }
+  await commitClaimedBatch(kv, {
+    stage: "summary",
+    stageContractVersion: SUMMARY_CONTRIBUTION_CONTRACT,
+    contributionId: contribution.contributionId,
+    sourceVersionKeys: [contribution.sourceVersionKey],
+    operationReceiptRef: {
+      scope: KV.extractionOperationReceipt(receipt.key),
+      key: receipt.key,
+    },
+    effectRefs: [{
+      scope: KV.summaries,
+      key: summary.sessionId,
+      effectHash: summaryContributionEffectHash(summary),
+    }],
+  });
 }
 
 function summaryCommittedRecoveryEvidence(
@@ -1197,7 +1312,7 @@ function summaryCommittedRecoveryEvidence(
     receiptKey: receipt.key,
     receiptVersion: receipt.version,
     resultRef: `${KV.summaryResumableRuns}:${run.id}`,
-    effectHash: summaryEffectHash(run.summary),
+    effectHash: summaryRecoveryEffectHash(run.summary),
   };
 }
 
@@ -1533,6 +1648,17 @@ async function runResumableSummaryStep(
           failure: { class: "hard", cause: "extraction_operation_input_hash_conflict" },
         });
       }
+      const baseline = await partitionAdoptedBaselineSessions(kv, {
+        stage: "summary",
+        stageContractVersion: SUMMARY_CONTRIBUTION_CONTRACT,
+        sessionIds: [sessionId],
+      });
+      if (baseline.adoptedSessionIds.length > 0) {
+        return resumableResponse("failed", 0, 0, 0, {
+          error: "summary_source_adopted_baseline",
+          failure: { class: "hard", cause: "summary_source_adopted_baseline" },
+        });
+      }
 
       const observations = await kv.list<CompressedObservation>(
         KV.observations(sessionId),
@@ -1561,6 +1687,7 @@ async function runResumableSummaryStep(
       let inputHash = "";
       let runId = "";
       let run: ResumableSummaryRun | null = null;
+      let contribution: ClaimedSummaryContribution | undefined;
       let active = await kv.get<ResumableSummaryActiveRun>(
         KV.summaryResumableActiveRuns,
         sessionId,
@@ -1615,8 +1742,10 @@ async function runResumableSummaryStep(
       }
 
       if (active && !run) {
-        await kv.delete(KV.summaryResumableActiveRuns, sessionId);
-        active = null;
+        if (!attemptId) {
+          await kv.delete(KV.summaryResumableActiveRuns, sessionId);
+          active = null;
+        }
       }
 
       if (!run) {
@@ -1696,6 +1825,114 @@ async function runResumableSummaryStep(
         return resumableResponse("failed", 0, totalChunks, 0, {
           error: "run_binding_mismatch",
         });
+      }
+
+      if (attemptId) {
+        const sourceVersionKey = buildSourceVersionKey(
+          "summary",
+          "session",
+          sessionId,
+          inputHash,
+        );
+        const claim = await claimBatch(kv, {
+          stage: "summary",
+          stageContractVersion: SUMMARY_CONTRIBUTION_CONTRACT,
+          runId,
+          unitId: `summary:${sessionId}`,
+          sourceVersionKeys: [sourceVersionKey],
+        });
+        if (claim.status === "claimed_by_other") {
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: "extraction_contribution_claimed_by_other",
+            failure: {
+              class: "transient_runtime",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            telemetry,
+          });
+        }
+        if (claim.status === "contract_migration_required") {
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: "summary_contract_migration_required",
+            failure: {
+              class: "hard",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            telemetry,
+          });
+        }
+        if (claim.status === "source_correction_requires_migration") {
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: "summary_source_correction_requires_migration",
+            failure: {
+              class: "hard",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            telemetry,
+          });
+        }
+        if (claim.status === "contribution_reconciliation_required") {
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: "summary_contribution_reconciliation_required",
+            failure: {
+              class: "hard",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            telemetry,
+          });
+        }
+        if (claim.status === "already_committed") {
+          const committed = await readVerifiedCommittedSummary(
+            kv,
+            claim.records[0],
+            sessionId,
+          );
+          if (!committed) {
+            return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+              error: "summary_contribution_effect_reconciliation_required",
+              failure: {
+                class: "hard",
+                cause: "extraction_operation_reconciliation_required",
+              },
+              telemetry,
+            });
+          }
+          return resumableResponse("succeeded", totalChunks, totalChunks, 0, {
+            summary: committed.summary,
+            advanced: "none",
+            operationUnitId: operationUnitId || undefined,
+            attemptId,
+            runnerInputHash: externalInputHash,
+            serviceInputHash: inputHash,
+            resumableRunId: committed.resumableRunId,
+            recoveryEvidence: {
+              kind: "committed",
+              receiptKey: committed.receipt.key,
+              receiptVersion: committed.receipt.version
+                ?? EXTRACTION_OPERATION_RECEIPT_VERSION,
+              resultRef: `${KV.summaryResumableRuns}:${committed.resumableRunId}`,
+              effectHash: summaryRecoveryEffectHash(committed.summary),
+            },
+            telemetry,
+          });
+        }
+        const claimedRecord = claim.records.find(
+          (record) => record.sourceVersionKey === sourceVersionKey,
+        );
+        if (!claimedRecord) {
+          return resumableResponse("failed", completedChunks, totalChunks, skippedChunks, {
+            error: "summary_contribution_claim_missing",
+            failure: {
+              class: "hard",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            telemetry,
+          });
+        }
+        contribution = {
+          contributionId: claimedRecord.contributionId,
+          sourceVersionKey,
+        };
       }
 
       if (!run) {
@@ -1897,6 +2134,9 @@ async function runResumableSummaryStep(
         const recoveryEvidence = recoveryReceipt
           ? summaryCommittedRecoveryEvidence(recoveryReceipt, run)
           : undefined;
+        if (contribution && recoveryReceipt) {
+          await commitSummaryContribution(kv, contribution, run.summary, recoveryReceipt);
+        }
         return resumableResponse(
           "succeeded",
           completedChunks,
@@ -2311,6 +2551,14 @@ async function runResumableSummaryStep(
               receipt.receipt as ExtractionOperationReceipt<Record<string, unknown>>,
               succeededRun,
             );
+            if (contribution && receipt.receipt) {
+              await commitSummaryContribution(
+                kv,
+                contribution,
+                succeededRun.summary,
+                receipt.receipt as ExtractionOperationReceipt<Record<string, unknown>>,
+              );
+            }
             return resumableResponse(
               "succeeded",
               succeededRun.completedChunks,
@@ -2700,6 +2948,14 @@ async function runResumableSummaryStep(
           receipt.receipt as ExtractionOperationReceipt<Record<string, unknown>>,
           succeededRun,
         );
+        if (contribution && receipt.receipt) {
+          await commitSummaryContribution(
+            kv,
+            contribution,
+            succeededRun.summary,
+            receipt.receipt as ExtractionOperationReceipt<Record<string, unknown>>,
+          );
+        }
         return resumableResponse(
           "succeeded",
           succeededRun.completedChunks,

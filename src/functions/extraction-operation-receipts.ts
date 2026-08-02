@@ -155,6 +155,7 @@ const STAGE_RECEIPT_RESPONSE_KEYS: Record<ExtractionOperationIdentity["stage"], 
     "memoryIds", "memory_ids", "consolidated", "totalObservations", "total_observations",
     "preparedHandle", "prepared_handle", "proposalHash", "proposal_hash",
     "domainEffectEvidence", "domain_effect_evidence",
+    "noEffectEvidence", "no_effect_evidence",
   ]),
   consolidation_procedural: new Set([
     "proceduralMemoryIds", "procedural_memory_ids", "memoryIds", "memory_ids",
@@ -292,6 +293,20 @@ function safeSemanticRecoveryEvidence(value: unknown): Record<string, unknown> |
 function safeReflectRecoveryEvidence(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
+  const identity = record.identity;
+  const rawIdentity = identity && typeof identity === "object" && !Array.isArray(identity)
+    ? identity as Record<string, unknown>
+    : null;
+  const projectedIdentity = rawIdentity
+    ? Object.fromEntries(
+        ["runId", "unitId", "inputHash"]
+          .filter((key) => typeof rawIdentity[key] === "string" && rawIdentity[key])
+          .map((key) => [key, rawIdentity[key]]),
+      )
+    : null;
+  const validIdentity = projectedIdentity && Object.keys(projectedIdentity).length === 3
+    ? projectedIdentity
+    : null;
   if (
     record.kind === "committed"
     && record.schema === "reflect-insight-commit/v1"
@@ -307,9 +322,45 @@ function safeReflectRecoveryEvidence(value: unknown): Record<string, unknown> | 
       receiptVersion: record.receiptVersion,
       resultRef: record.resultRef,
       effectHash: record.effectHash,
+      ...(validIdentity ? { identity: validIdentity } : {}),
     };
   }
   const proof = record.proof;
+  if (
+    validIdentity
+    && record.kind === "no_effect"
+    && record.observation === "business_empty"
+    && record.reasonCode === "no_novel_insight"
+    && proof && typeof proof === "object" && !Array.isArray(proof)
+    && Object.keys(proof).sort().join(",")
+      === "kind,proofHash,proposalHash,reasonCode,receiptKey,receiptVersion,schema"
+    && (proof as Record<string, unknown>).kind === "committed_structured_no_effect"
+    && typeof (proof as Record<string, unknown>).receiptKey === "string"
+    && (proof as Record<string, unknown>).receiptKey
+    && (proof as Record<string, unknown>).receiptVersion === 1
+    && (proof as Record<string, unknown>).schema === "reflect-insight-no-effect/v1"
+    && typeof (proof as Record<string, unknown>).proposalHash === "string"
+    && /^[0-9a-f]{64}$/.test((proof as Record<string, unknown>).proposalHash as string)
+    && (proof as Record<string, unknown>).reasonCode === record.reasonCode
+    && typeof (proof as Record<string, unknown>).proofHash === "string"
+    && /^[0-9a-f]{64}$/.test((proof as Record<string, unknown>).proofHash as string)
+  ) {
+    return {
+      kind: record.kind,
+      observation: record.observation,
+      reasonCode: record.reasonCode,
+      identity: validIdentity,
+      proof: {
+        kind: "committed_structured_no_effect",
+        receiptKey: (proof as Record<string, unknown>).receiptKey,
+        receiptVersion: 1,
+        schema: (proof as Record<string, unknown>).schema,
+        proposalHash: (proof as Record<string, unknown>).proposalHash,
+        reasonCode: (proof as Record<string, unknown>).reasonCode,
+        proofHash: (proof as Record<string, unknown>).proofHash,
+      },
+    };
+  }
   if (
     record.kind === "no_effect"
     && record.observation === "business_empty"
@@ -325,6 +376,7 @@ function safeReflectRecoveryEvidence(value: unknown): Record<string, unknown> | 
       kind: record.kind,
       observation: record.observation,
       reasonCode: record.reasonCode,
+      ...(validIdentity ? { identity: validIdentity } : {}),
       proof: {
         kind: "receipt_before_formal_effect",
         receiptKey: (proof as Record<string, unknown>).receiptKey,
@@ -371,6 +423,40 @@ function safeProceduralRecoveryEvidence(value: unknown): Record<string, unknown>
     };
   }
   const proof = record.proof;
+  if (
+    record.kind === "no_effect"
+    && record.observation === "business_empty"
+    && record.reasonCode === "no_reusable_procedure"
+    && proof && typeof proof === "object" && !Array.isArray(proof)
+    && Object.keys(proof).sort().join(",")
+      === "kind,proofHash,proposalHash,reasonCode,receiptKey,receiptVersion,schema"
+    && (proof as Record<string, unknown>).kind === "committed_structured_no_effect"
+    && typeof (proof as Record<string, unknown>).receiptKey === "string"
+    && (proof as Record<string, unknown>).receiptKey
+    && (proof as Record<string, unknown>).receiptVersion === 1
+    && (proof as Record<string, unknown>).schema === "consolidation-procedural-no-effect/v1"
+    && typeof (proof as Record<string, unknown>).proposalHash === "string"
+    && /^[0-9a-f]{64}$/.test((proof as Record<string, unknown>).proposalHash as string)
+    && (proof as Record<string, unknown>).reasonCode === record.reasonCode
+    && typeof (proof as Record<string, unknown>).proofHash === "string"
+    && /^[0-9a-f]{64}$/.test((proof as Record<string, unknown>).proofHash as string)
+  ) {
+    return {
+      kind: record.kind,
+      observation: record.observation,
+      reasonCode: record.reasonCode,
+      identity: projectedIdentity,
+      proof: {
+        kind: "committed_structured_no_effect",
+        receiptKey: (proof as Record<string, unknown>).receiptKey,
+        receiptVersion: 1,
+        schema: (proof as Record<string, unknown>).schema,
+        proposalHash: (proof as Record<string, unknown>).proposalHash,
+        reasonCode: (proof as Record<string, unknown>).reasonCode,
+        proofHash: (proof as Record<string, unknown>).proofHash,
+      },
+    };
+  }
   if (
     record.kind === "no_effect"
     && record.observation === "business_empty"
@@ -497,6 +583,26 @@ function safeDomainEffectEvidence(
   };
 }
 
+function safeMemoryNoEffectEvidence(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    Object.keys(record).sort().join(",") !== "proofHash,proposalHash,reasonCode,schema"
+    || record.schema !== "memory-consolidate-no-effect/v1"
+    || typeof record.proposalHash !== "string"
+    || record.proposalHash.length === 0
+    || record.reasonCode !== "no_durable_memory"
+    || typeof record.proofHash !== "string"
+    || !/^[0-9a-f]{64}$/.test(record.proofHash)
+  ) return undefined;
+  return {
+    schema: record.schema,
+    proposalHash: record.proposalHash,
+    reasonCode: record.reasonCode,
+    proofHash: record.proofHash,
+  };
+}
+
 function safeResponse<T>(stage: ExtractionOperationIdentity["stage"], response: T): T {
   if (!response || typeof response !== "object" || Array.isArray(response)) return {} as T;
   const allowed = STAGE_RECEIPT_RESPONSE_KEYS[stage];
@@ -522,6 +628,8 @@ function safeResponse<T>(stage: ExtractionOperationIdentity["stage"], response: 
       safe = safeCrystalRecoveryEvidence(raw);
     } else if (key === "domainEffectEvidence" || key === "domain_effect_evidence") {
       safe = safeDomainEffectEvidence(stage, raw);
+    } else if (key === "noEffectEvidence" || key === "no_effect_evidence") {
+      safe = stage === "memory_consolidate" ? safeMemoryNoEffectEvidence(raw) : undefined;
     } else if (key === "groups" || key === "items") {
       safe = Array.isArray(raw)
         ? raw.map((item) => safeUnitResponse(item)).filter((item) => item !== undefined)

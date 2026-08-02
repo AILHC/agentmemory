@@ -3,9 +3,11 @@ import { createHash } from "node:crypto";
 import type {
   AuditEntry,
   CompressedObservation,
+  ContributionRecord,
   ExtractionOperationIdentity,
   ExtractionOperationReceipt,
   Memory,
+  MemoryConsolidationBacklogRecord,
   MemoryConsolidationProposal,
   Session,
   MemoryProvider,
@@ -17,11 +19,19 @@ import { recordAudit } from "./audit.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { buildExtractionOperationKey } from "./extraction-operation-receipts.js";
 import {
+  buildSourceVersionKey,
+  claimBatch,
+  commitClaimedBatch,
+  markClaimedBatchNoEffect,
+  releaseClaimedBatch,
+} from "./extraction-contributions.js";
+import { partitionAdoptedBaselineSessions } from "./extraction-baselines.js";
+import {
   resolveOutputLanguage,
   withOutputLanguagePolicy,
 } from "../prompts/output-language.js";
 
-const CONSOLIDATION_SYSTEM = `You are a memory consolidation engine. Given a set of related observations from coding sessions, synthesize them into a single long-term memory.
+export const CONSOLIDATION_SYSTEM = `You are a memory consolidation engine. Given a set of related observations from coding sessions, synthesize them into a single long-term memory.
 
 Output XML:
 <memory>
@@ -35,7 +45,10 @@ Output XML:
     <file>relevant/file/path</file>
   </files>
   <strength>1-10 how confident/important this memory is</strength>
-</memory>`;
+</memory>
+
+When the observations contain no durable memory, output exactly:
+<no_effect><reason_code>no_durable_memory</reason_code></no_effect>`;
 
 import { getXmlTag, getXmlChildren } from "../prompts/xml.js";
 import { logger } from "../logger.js";
@@ -68,6 +81,13 @@ export interface ConsolidateObservationWindow {
   overBudget?: boolean;
   overBudgetReason?: "single_observation";
   inputHash: string;
+  stageContractVersion?: string;
+  sourceVersionKeys?: string[];
+  deltaEvidence?: {
+    observationIds: string[];
+    sessionIds: string[];
+    sourceVersionKeys: string[];
+  };
 }
 
 export interface ConsolidateObservationWindowOptions {
@@ -85,6 +105,8 @@ export interface ConsolidateObservationWindowOptions {
   model?: string;
   operationIdentity?: ExtractionOperationIdentity;
   operationReceiptManaged?: boolean;
+  stageContractVersion?: string;
+  sourceVersionKeys?: string[];
 }
 
 export interface ConsolidationObservationDescriptor {
@@ -93,7 +115,10 @@ export interface ConsolidationObservationDescriptor {
   concepts: string[];
   importance: number;
   estimatedChars: number;
+  sourceVersionKey?: string;
 }
+
+export const MEMORY_CONSOLIDATE_CONTRACT_VERSION = "memory_consolidate/v1";
 
 interface ConsolidationPlanBuffer {
   descriptors: ConsolidationObservationDescriptor[];
@@ -195,6 +220,94 @@ function parseMemoryXml(
     version: 1,
     isLatest: true,
   };
+}
+
+export function parseMemoryProviderResponse(
+  xml: string,
+  sessionIds: string[],
+  strictSingleRoot = false,
+):
+  | { kind: "memory"; parsed: Omit<Memory, "id" | "createdAt" | "updatedAt"> }
+  | { kind: "no_effect"; reasonCode: "no_durable_memory" }
+  | null {
+  if (strictSingleRoot) {
+    const trimmed = xml.trim();
+    const exactNoEffect = /^<no_effect>\s*<reason_code>\s*no_durable_memory\s*<\/reason_code>\s*<\/no_effect>$/i;
+    if (exactNoEffect.test(trimmed)) {
+      return { kind: "no_effect", reasonCode: "no_durable_memory" };
+    }
+    const singleMemoryRoot = /^<memory>[\s\S]*<\/memory>$/i.test(trimmed)
+      && (trimmed.match(/<memory>/gi)?.length ?? 0) === 1
+      && (trimmed.match(/<\/memory>/gi)?.length ?? 0) === 1
+      && !/<\/?no_effect\b/i.test(trimmed)
+      && hasWellNestedMemoryXmlTags(trimmed);
+    if (!singleMemoryRoot) return null;
+    const parsed = parseMemoryXml(trimmed, sessionIds);
+    return parsed ? { kind: "memory", parsed } : null;
+  }
+  const parsed = parseMemoryXml(xml, sessionIds);
+  if (parsed) return { kind: "memory", parsed };
+  const reasonCode = getXmlTag(xml, "reason_code");
+  if (reasonCode === "no_durable_memory" && /<no_effect\b[^>]*>/i.test(xml)) {
+    return { kind: "no_effect", reasonCode };
+  }
+  return null;
+}
+
+function hasWellNestedMemoryXmlTags(xml: string): boolean {
+  const allowed = new Set([
+    "memory", "type", "title", "content", "concepts", "concept",
+    "files", "file", "strength",
+  ]);
+  const stack: string[] = [];
+  const tag = /<(\/)?([a-z_][a-z0-9_-]*)\s*>/gi;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tag.exec(xml)) !== null) {
+    if (/[<>]/.test(xml.slice(cursor, match.index))) return false;
+    const name = match[2].toLowerCase();
+    if (!allowed.has(name)) return false;
+    if (match[1]) {
+      if (stack.pop() !== name) return false;
+    } else {
+      stack.push(name);
+    }
+    cursor = tag.lastIndex;
+  }
+  return stack.length === 0 && !/[<>]/.test(xml.slice(cursor));
+}
+
+function normalizedObservationHash(obs: CompressedObservation): string {
+  return createHash("sha256")
+    .update(stableStringify({
+      id: obs.id,
+      type: obs.type,
+      title: obs.title,
+      narrative: obs.narrative,
+      facts: obs.facts,
+      concepts: obs.concepts,
+      files: obs.files,
+      importance: obs.importance,
+    }))
+    .digest("hex");
+}
+
+function memoryConsolidationSourceVersionKey(obs: CompressedObservation): string {
+  return buildSourceVersionKey(
+    "memory_consolidate",
+    "observation",
+    obs.id,
+    normalizedObservationHash(obs),
+  );
+}
+
+export function memoryConsolidationSessionSnapshotHash(
+  observations: CompressedObservation[],
+): string {
+  return stableHash(observations
+    .filter((observation) => observation.title && observation.importance >= 5)
+    .map(memoryConsolidationSourceVersionKey)
+    .sort());
 }
 
 async function collectConsolidationObservations(
@@ -311,12 +424,134 @@ function observationDescriptor(
     concepts: obs.concepts,
     importance: obs.importance,
     estimatedChars: estimateObservationChars(obs),
+    sourceVersionKey: memoryConsolidationSourceVersionKey(obs),
   };
+}
+
+async function persistMemoryConsolidationBacklogCandidate(
+  kv: StateKV,
+  descriptor: ConsolidationObservationDescriptor,
+  project?: string,
+): Promise<boolean> {
+  const sourceVersionKey = descriptor.sourceVersionKey;
+  if (!sourceVersionKey) return true;
+  const contributionScope = KV.extractionContributionRecords(
+    "memory_consolidate",
+    MEMORY_CONSOLIDATE_CONTRACT_VERSION,
+  );
+  const contribution = await kv.get<ContributionRecord>(contributionScope, sourceVersionKey);
+  const backlogScope = KV.memoryConsolidationBacklog(project);
+  const backlogIndexScope = KV.memoryConsolidationBacklogSourceIndex(project);
+  if (contribution) {
+    if (contribution.state === "committed" || contribution.state === "no_effect") {
+      await kv.delete(backlogScope, sourceVersionKey);
+      const indexed = await kv.get<string>(backlogIndexScope, descriptor.id);
+      if (indexed === sourceVersionKey) await kv.delete(backlogIndexScope, descriptor.id);
+    }
+    return false;
+  }
+  const indexedSourceVersionKey = await kv.get<string>(backlogIndexScope, descriptor.id);
+  if (indexedSourceVersionKey && indexedSourceVersionKey !== sourceVersionKey) {
+    await kv.delete(backlogScope, indexedSourceVersionKey);
+  }
+  const existing = await kv.get<MemoryConsolidationBacklogRecord>(backlogScope, sourceVersionKey);
+  const now = new Date().toISOString();
+  const record: MemoryConsolidationBacklogRecord = {
+    sourceVersionKey,
+    observationId: descriptor.id,
+    sessionId: descriptor.sid,
+    normalizedContentHash: sourceVersionKey.split("|").at(-1)!,
+    concepts: descriptor.concepts,
+    importance: descriptor.importance,
+    estimatedChars: descriptor.estimatedChars,
+    ...(project ? { project } : {}),
+    firstWaitingAt: existing?.firstWaitingAt ?? now,
+    updatedAt: now,
+  };
+  await kv.set(backlogScope, sourceVersionKey, record);
+  await kv.set(backlogIndexScope, descriptor.id, sourceVersionKey);
+  return true;
+}
+
+async function collectMemoryConsolidationBacklogDescriptors(
+  kv: StateKV,
+  project?: string,
+): Promise<ConsolidationObservationDescriptor[]> {
+  const backlogScope = KV.memoryConsolidationBacklog(project);
+  const backlog = await kv.list<MemoryConsolidationBacklogRecord>(backlogScope);
+  const contributionScope = KV.extractionContributionRecords(
+    "memory_consolidate",
+    MEMORY_CONSOLIDATE_CONTRACT_VERSION,
+  );
+  const descriptors: ConsolidationObservationDescriptor[] = [];
+  for (let offset = 0; offset < backlog.length; offset += 32) {
+    const batch = backlog.slice(offset, offset + 32);
+    const baseline = await partitionAdoptedBaselineSessions(kv, {
+      stage: "memory_consolidate",
+      stageContractVersion: MEMORY_CONSOLIDATE_CONTRACT_VERSION,
+      sessionIds: [...new Set(batch.map((record) => record.sessionId))],
+    });
+    const adopted = new Set(baseline.adoptedSessionIds);
+    await Promise.all(batch
+      .filter((record) => adopted.has(record.sessionId))
+      .map((record) => removeMemoryConsolidationBacklogRecord(kv, record, project)));
+    const openBatch = batch.filter((record) => !adopted.has(record.sessionId));
+    const observations = await Promise.all(openBatch.map((record) =>
+      kv.get<CompressedObservation>(KV.observations(record.sessionId), record.observationId),
+    ));
+    for (let index = 0; index < openBatch.length; index++) {
+      const record = openBatch[index];
+      const observation = observations[index];
+      if (!observation || observation.importance < 5 || !observation.title) {
+        await removeMemoryConsolidationBacklogRecord(kv, record, project);
+        continue;
+      }
+      const sourceVersionKey = memoryConsolidationSourceVersionKey(observation);
+      const descriptor: ConsolidationObservationDescriptor = {
+        id: observation.id,
+        sid: record.sessionId,
+        concepts: observation.concepts,
+        importance: observation.importance,
+        estimatedChars: estimateObservationChars(observation),
+        sourceVersionKey,
+      };
+      const contribution = await kv.get<ContributionRecord>(
+        contributionScope,
+        sourceVersionKey,
+      );
+      if (contribution) {
+        if (contribution.state === "committed" || contribution.state === "no_effect") {
+          await removeMemoryConsolidationBacklogRecord(kv, record, project);
+          if (sourceVersionKey !== record.sourceVersionKey) {
+            await kv.delete(backlogScope, sourceVersionKey);
+          }
+        }
+        continue;
+      }
+      await persistMemoryConsolidationBacklogCandidate(kv, descriptor, project);
+      descriptors.push(descriptor);
+    }
+  }
+  return descriptors;
+}
+
+async function removeMemoryConsolidationBacklogRecord(
+  kv: StateKV,
+  record: MemoryConsolidationBacklogRecord,
+  project?: string,
+): Promise<void> {
+  await kv.delete(KV.memoryConsolidationBacklog(project), record.sourceVersionKey);
+  const indexScope = KV.memoryConsolidationBacklogSourceIndex(project);
+  const indexed = await kv.get<string>(indexScope, record.observationId);
+  if (indexed === record.sourceVersionKey) {
+    await kv.delete(indexScope, record.observationId);
+  }
 }
 
 export async function collectConsolidationObservationDescriptorPage(options: {
   kv: StateKV;
   project?: string;
+  sessionIds?: string[];
   minImportance?: number;
   sessionOffset?: number;
   sessionLimit?: number;
@@ -328,30 +563,48 @@ export async function collectConsolidationObservationDescriptorPage(options: {
   totalSessions: number;
   sessionInventoryHash: string;
 }> {
-  const sessions = await options.kv.list<Session>(KV.sessions);
+  const selectedSessionIds = options.sessionIds
+    ? [...new Set(options.sessionIds.map((sessionId) => sessionId.trim()).filter(Boolean))]
+    : undefined;
+  const sessions = selectedSessionIds
+    ? selectedSessionIds.map((id) => ({ id } as Session))
+    : await options.kv.list<Session>(KV.sessions);
   const scopedProject =
     typeof options.project === "string" && options.project.trim().length > 0
       ? options.project.trim()
       : undefined;
-  const filtered = scopedProject
+  const filtered = scopedProject && !selectedSessionIds
     ? sessions.filter((session) => session.project === scopedProject)
     : sessions;
   const sessionOffset = Math.max(0, options.sessionOffset ?? 0);
   const sessionLimit = Math.min(8, Math.max(1, options.sessionLimit ?? 8));
   const page = filtered.slice(sessionOffset, sessionOffset + sessionLimit);
+  const baseline = await partitionAdoptedBaselineSessions(options.kv, {
+    stage: "memory_consolidate",
+    stageContractVersion: MEMORY_CONSOLIDATE_CONTRACT_VERSION,
+    sessionIds: page.map((session) => session.id),
+  });
+  const openSessionIds = new Set(baseline.openSessionIds);
+  const openPage = page.filter((session) => openSessionIds.has(session.id));
   const observations = await Promise.all(
-    page.map((session) =>
-      options.kv
-        .list<CompressedObservation>(KV.observations(session.id))
-        .catch(() => [] as CompressedObservation[]),
-    ),
+    openPage.map((session) => {
+      const read = options.kv.list<CompressedObservation>(KV.observations(session.id));
+      return selectedSessionIds ? read : read.catch(() => [] as CompressedObservation[]);
+    }),
   );
   const minImportance = options.minImportance ?? 5;
   const descriptors: ConsolidationObservationDescriptor[] = [];
-  for (let index = 0; index < page.length; index++) {
+  for (let index = 0; index < openPage.length; index++) {
     for (const obs of observations[index]) {
       if (obs.title && obs.importance >= minImportance) {
-        descriptors.push(observationDescriptor(obs, page[index].id));
+        const descriptor = observationDescriptor(obs, openPage[index].id);
+        if (!selectedSessionIds || await persistMemoryConsolidationBacklogCandidate(
+          options.kv,
+          descriptor,
+          scopedProject,
+        )) {
+          descriptors.push(descriptor);
+        }
       }
     }
   }
@@ -378,6 +631,7 @@ async function collectBufferedConsolidationObservationDescriptorPage(options: {
   kv: StateKV;
   plannerId: string;
   project?: string;
+  sessionIds?: string[];
   minImportance?: number;
   sessionOffset?: number;
   sessionLimit?: number;
@@ -386,6 +640,7 @@ async function collectBufferedConsolidationObservationDescriptorPage(options: {
   const page = await collectConsolidationObservationDescriptorPage(options);
   const plannerInputHash = stableHash({
     project: options.project?.trim() || null,
+    sessionIds: options.sessionIds ?? null,
     minImportance: options.minImportance ?? 5,
   });
   const existing = consolidationPlanBuffers.get(options.plannerId);
@@ -439,6 +694,7 @@ async function finalizeBufferedConsolidationObservationPlan(options: {
   kv: StateKV;
   plannerId: string;
   project?: string;
+  sessionIds?: string[];
   minObservations?: number;
   minImportance?: number;
   minObservationsPerConcept?: number;
@@ -451,6 +707,7 @@ async function finalizeBufferedConsolidationObservationPlan(options: {
   const buffer = consolidationPlanBuffers.get(options.plannerId);
   const plannerInputHash = stableHash({
     project: options.project?.trim() || null,
+    sessionIds: options.sessionIds ?? null,
     minImportance: options.minImportance ?? 5,
   });
   const finalizeInputHash = stableHash({
@@ -495,7 +752,9 @@ async function finalizeBufferedConsolidationObservationPlan(options: {
     void _windowLimit;
     const plan = await planConsolidateObservationWindows({
       ...planOptions,
-      descriptors: buffer.descriptors,
+      descriptors: options.sessionIds
+        ? await collectMemoryConsolidationBacklogDescriptors(options.kv, options.project)
+        : buffer.descriptors,
     });
     const { windows, ...planSummary } = plan;
     buffer.descriptors = [];
@@ -597,35 +856,6 @@ async function descriptorChunksByBudgetCooperatively(
   return chunks;
 }
 
-function descriptorChunksByBudget(
-  descriptors: ConsolidationObservationDescriptor[],
-  maxObservationsPerWindow: number,
-  charBudget?: number,
-): ConsolidationObservationDescriptor[][] {
-  const chunks: ConsolidationObservationDescriptor[][] = [];
-  let current: ConsolidationObservationDescriptor[] = [];
-  let currentChars = 0;
-  const maxCount = Math.max(1, maxObservationsPerWindow);
-  for (const descriptor of descriptors) {
-    const descriptorChars = descriptor.estimatedChars
-      + (current.length > 0 ? CONSOLIDATION_OBSERVATION_SEPARATOR.length : 0);
-    const wouldExceedCount = current.length >= maxCount;
-    const wouldExceedBudget =
-      charBudget !== undefined
-      && current.length > 0
-      && currentChars + descriptorChars > charBudget;
-    if (wouldExceedCount || wouldExceedBudget) {
-      chunks.push(current);
-      current = [];
-      currentChars = 0;
-    }
-    current.push(descriptor);
-    currentChars += descriptorChars;
-  }
-  if (current.length > 0) chunks.push(current);
-  return chunks;
-}
-
 function consolidateWindowFromDescriptors(
   concept: string,
   descriptors: ConsolidationObservationDescriptor[],
@@ -634,6 +864,9 @@ function consolidateWindowFromDescriptors(
   windowKey = concept,
 ): ConsolidateObservationWindow {
   const observationIds = descriptors.map((descriptor) => descriptor.id);
+  const sourceVersionKeys = descriptors
+    .map((descriptor) => descriptor.sourceVersionKey)
+    .filter((key): key is string => Boolean(key));
   const sessionIds = [...new Set(descriptors.map((descriptor) => descriptor.sid))];
   const observationEstimatedChars = Object.fromEntries(
     descriptors.map((descriptor) => [descriptor.id, descriptor.estimatedChars]),
@@ -665,7 +898,24 @@ function consolidateWindowFromDescriptors(
     ...(overBudget && descriptors.length === 1
       ? { overBudget: true, overBudgetReason: "single_observation" as const }
       : {}),
-    inputHash: stableHash(["memory-consolidate", concept, observationIds, sessionIds, estimatedChars]),
+    inputHash: stableHash([
+      "memory-consolidate",
+      concept,
+      sourceVersionKeys.length === descriptors.length ? [...sourceVersionKeys].sort() : observationIds,
+      sessionIds,
+      estimatedChars,
+    ]),
+    ...(sourceVersionKeys.length === descriptors.length
+      ? {
+        stageContractVersion: MEMORY_CONSOLIDATE_CONTRACT_VERSION,
+        sourceVersionKeys,
+        deltaEvidence: {
+          observationIds,
+          sessionIds,
+          sourceVersionKeys,
+        },
+      }
+      : {}),
   };
 }
 
@@ -673,6 +923,7 @@ export async function planConsolidateObservationWindows(options: {
   kv: StateKV;
   descriptors?: ConsolidationObservationDescriptor[];
   project?: string;
+  sessionIds?: string[];
   minObservations?: number;
   minImportance?: number;
   minObservationsPerConcept?: number;
@@ -707,13 +958,14 @@ export async function planConsolidateObservationWindows(options: {
       ? {}
       : { maxObservationsPerWindow: Math.max(1, options.maxObservationsPerWindow) }),
   };
-  const descriptors = options.descriptors ?? (await (async () => {
+  let descriptors = options.descriptors ?? (await (async () => {
     const collected: ConsolidationObservationDescriptor[] = [];
     let sessionOffset = 0;
     while (true) {
       const page = await collectConsolidationObservationDescriptorPage({
         kv: options.kv,
         project: options.project,
+        sessionIds: options.sessionIds,
         minImportance,
         sessionOffset,
         sessionLimit: 8,
@@ -724,6 +976,18 @@ export async function planConsolidateObservationWindows(options: {
     }
     return collected;
   })());
+  if (options.sessionIds) {
+    const backlogDescriptors = await collectMemoryConsolidationBacklogDescriptors(
+      options.kv,
+      options.project,
+    );
+    descriptors = [...new Map(
+      [...descriptors, ...backlogDescriptors].map((descriptor) => [
+        descriptor.sourceVersionKey ?? `${descriptor.sid}:${descriptor.id}`,
+        descriptor,
+      ]),
+    ).values()];
+  }
   if (descriptors.length < minObs) {
     return {
       success: true,
@@ -740,6 +1004,7 @@ export async function planConsolidateObservationWindows(options: {
   }
 
   const groups = await groupItemsByConceptCooperatively(descriptors, minObs);
+  const incrementalPlan = Boolean(options.sessionIds);
   const windows: ConsolidateObservationWindow[] = [];
   const coveredObservationIds = new Set<string>();
   for (const [concept, obsGroup] of groups.entries()) {
@@ -755,8 +1020,10 @@ export async function planConsolidateObservationWindows(options: {
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
       if (chunk.length === 0) continue;
+      const window = consolidateWindowFromDescriptors(concept, chunk, i, charBudget);
+      if (incrementalPlan && window.overBudget) continue;
       for (const obs of chunk) coveredObservationIds.add(obs.id);
-      windows.push(consolidateWindowFromDescriptors(concept, chunk, i, charBudget));
+      windows.push(window);
       if ((i + 1) % 256 === 0) await yieldToConsolidationEventLoop();
     }
     await yieldToConsolidationEventLoop();
@@ -768,7 +1035,7 @@ export async function planConsolidateObservationWindows(options: {
     if ((index + 1) % 4_096 === 0) await yieldToConsolidationEventLoop();
   }
   remaining.sort((a, b) => b.importance - a.importance);
-  if (remaining.length > 0) {
+  if (remaining.length > 0 && !incrementalPlan) {
     const chunkSize = Math.max(1, options.maxObservationsPerWindow ?? remaining.length);
     const chunks = await descriptorChunksByBudgetCooperatively(remaining, chunkSize, charBudget);
     for (let i = 0; i < chunks.length; i++) {
@@ -905,15 +1172,41 @@ function sameJsonValue(left: unknown, right: unknown): boolean {
 
 function memoryProposalHash(proposal: Pick<
   MemoryConsolidationProposal,
-  "parsed" | "sourceObservationIds" | "project" | "concept"
+  "parsed" | "noEffectProof" | "sourceObservationIds" | "project" | "concept"
+  | "stageContractVersion" | "contributionId" | "sourceVersionKeys"
+  | "historicalContextMemoryIds"
+  | "deltaEvidence" | "historicalContext"
 >): string {
+  const hasIncrementalContract = Boolean(
+    proposal.noEffectProof
+    || proposal.stageContractVersion
+    || proposal.contributionId
+    || proposal.sourceVersionKeys
+    || proposal.historicalContextMemoryIds
+    || proposal.deltaEvidence
+    || proposal.historicalContext,
+  );
   return createHash("sha256")
-    .update(stableStringify([
-      proposal.parsed,
-      proposal.sourceObservationIds,
-      proposal.project,
-      proposal.concept,
-    ]))
+    .update(stableStringify(hasIncrementalContract
+      ? [
+        proposal.parsed,
+        proposal.noEffectProof,
+        proposal.sourceObservationIds,
+        proposal.project,
+        proposal.concept,
+        proposal.stageContractVersion,
+        proposal.contributionId,
+        proposal.sourceVersionKeys,
+        proposal.historicalContextMemoryIds,
+        proposal.deltaEvidence,
+        proposal.historicalContext,
+      ]
+      : [
+        proposal.parsed,
+        proposal.sourceObservationIds,
+        proposal.project,
+        proposal.concept,
+      ]))
     .digest("hex");
 }
 
@@ -923,6 +1216,15 @@ async function verifyCommittedMemoryProposal(
 ): Promise<Record<string, unknown> | null> {
   const intent = proposal.commitIntent;
   const response = proposal.response;
+  if (proposal.noEffectProof) {
+    if (!response) return committedMemoryFailure("memory_consolidate_committed_effect_missing");
+    return response.success === true
+      && response.status === "skipped"
+      && response.consolidated === 0
+      && response.memoryIds.length === 0
+      ? null
+      : committedMemoryFailure("memory_consolidate_committed_effect_conflict");
+  }
   if (!intent || !response) {
     return committedMemoryFailure("memory_consolidate_committed_effect_missing");
   }
@@ -939,7 +1241,7 @@ async function verifyCommittedMemoryProposal(
   const expectedAction = intent.parentId ? "evolved" : "created";
   const expectedAuditOperation = intent.parentId ? "evolve" : "remember";
   const expectedAuditAction = intent.parentId ? "evolve_memory" : "create_memory";
-  const parsed = proposal.parsed;
+  const parsed = proposal.parsed!;
   const stableFieldsMatch = (
     memory.id === intent.resultId
     && memory.createdAt === intent.createdAt
@@ -1016,6 +1318,24 @@ function memoryDomainEffectEvidence(
   };
 }
 
+function memoryNoEffectEvidence(
+  proposal: MemoryConsolidationProposal,
+): Record<string, unknown> {
+  return {
+    schema: "memory-consolidate-no-effect/v1",
+    proposalHash: proposal.proposalHash,
+    reasonCode: proposal.noEffectProof!.reasonCode,
+    proofHash: createHash("sha256")
+      .update(stableStringify([
+        proposal.key,
+        proposal.proposalHash,
+        proposal.noEffectProof!.reasonCode,
+        proposal.sourceVersionKeys ?? [],
+      ]))
+      .digest("hex"),
+  };
+}
+
 export async function findMemoryConsolidationProposalResult(
   kv: StateKV,
   identity: ExtractionOperationIdentity,
@@ -1048,11 +1368,18 @@ export async function findMemoryConsolidationProposalResult(
 
 async function storeMemoryConsolidationProposal(
   options: ConsolidateObservationWindowOptions,
-  parsed: Omit<Memory, "id" | "createdAt" | "updatedAt">,
+  parsedResult:
+    | { kind: "memory"; parsed: Omit<Memory, "id" | "createdAt" | "updatedAt"> }
+    | { kind: "no_effect"; reasonCode: "no_durable_memory" },
   concept: string,
   sourceObservationIds: string[],
   totalObservations: number,
   promptChars: number,
+  contributionId: string | undefined,
+  sourceVersionKeys: string[] | undefined,
+  historicalContextMemoryIds: string[],
+  historicalContextMemoryVersions: Array<{ memoryId: string; versionHash: string }>,
+  deltaSessionIds: string[],
 ): Promise<Record<string, unknown>> {
   const identity = options.operationIdentity!;
   const key = proposalKey(identity);
@@ -1082,10 +1409,34 @@ async function storeMemoryConsolidationProposal(
     return proposalResponse(existing);
   }
   const proposalHash = memoryProposalHash({
-    parsed,
+    ...(parsedResult.kind === "memory"
+      ? { parsed: parsedResult.parsed }
+      : {
+        noEffectProof: {
+          kind: "strict_legal_empty" as const,
+          reasonCode: parsedResult.reasonCode,
+        },
+      }),
     sourceObservationIds,
     project: options.project,
     concept,
+    ...(contributionId
+      ? {
+        stageContractVersion: options.stageContractVersion ?? MEMORY_CONSOLIDATE_CONTRACT_VERSION,
+        contributionId,
+        sourceVersionKeys,
+        historicalContextMemoryIds,
+        deltaEvidence: {
+          observationIds: sourceObservationIds,
+          sessionIds: deltaSessionIds,
+          sourceVersionKeys: sourceVersionKeys!,
+        },
+        historicalContext: {
+          memoryIds: historicalContextMemoryIds,
+          memoryVersions: historicalContextMemoryVersions,
+        },
+      }
+      : {}),
   });
   const proposal: MemoryConsolidationProposal = {
     ...identity,
@@ -1097,7 +1448,31 @@ async function storeMemoryConsolidationProposal(
     ...(options.project === undefined ? {} : { project: options.project }),
     concept,
     sourceObservationIds,
-    parsed,
+    ...(parsedResult.kind === "memory"
+      ? { parsed: parsedResult.parsed }
+      : {
+        noEffectProof: {
+          kind: "strict_legal_empty" as const,
+          reasonCode: parsedResult.reasonCode,
+        },
+      }),
+    ...(contributionId
+      ? {
+        stageContractVersion: options.stageContractVersion ?? MEMORY_CONSOLIDATE_CONTRACT_VERSION,
+        contributionId,
+        sourceVersionKeys,
+        historicalContextMemoryIds,
+        deltaEvidence: {
+          observationIds: sourceObservationIds,
+          sessionIds: deltaSessionIds,
+          sourceVersionKeys: sourceVersionKeys!,
+        },
+        historicalContext: {
+          memoryIds: historicalContextMemoryIds,
+          memoryVersions: historicalContextMemoryVersions,
+        },
+      }
+      : {}),
     totalObservations,
     promptChars,
     ...(options.charBudget === undefined ? {} : { charBudget: options.charBudget }),
@@ -1135,13 +1510,46 @@ export async function commitMemoryConsolidationProposal(options: {
     ) {
       return { success: false, status: "failed", failure: { class: "hard", cause: "proposal_identity_conflict" } };
     }
+    const frozenHistoricalContext = proposal.stageContractVersion
+      && proposal.status !== "committed"
+      && !proposal.commitIntent
+      ? await verifyFrozenHistoricalContext(options.kv, proposal)
+      : undefined;
+    if (proposal.stageContractVersion && proposal.status !== "committed" && !proposal.commitIntent
+      && frozenHistoricalContext === null) {
+      return committedMemoryFailure("memory_consolidate_historical_context_conflict");
+    }
     if (proposal.status === "committed") {
-      return await verifyCommittedMemoryProposal(options.kv, proposal)
-        ?? {
+      const verificationFailure = await verifyCommittedMemoryProposal(options.kv, proposal);
+      if (verificationFailure) return verificationFailure;
+      return proposal.noEffectProof
+        ? {
+          ...proposalResponse(proposal),
+          noEffectEvidence: memoryNoEffectEvidence(proposal),
+        }
+        : {
           ...proposalResponse(proposal),
           domainEffectEvidence: memoryDomainEffectEvidence(proposal),
         };
     }
+
+    if (proposal.noEffectProof) {
+      proposal.status = "committed";
+      proposal.response = {
+        success: true,
+        status: "skipped",
+        consolidated: 0,
+        totalObservations: proposal.totalObservations,
+        memoryIds: [],
+      };
+      await options.kv.set(KV.memoryConsolidationProposal(key), key, proposal);
+      return {
+        ...proposalResponse(proposal),
+        noEffectEvidence: memoryNoEffectEvidence(proposal),
+      };
+    }
+    const parsed = proposal.parsed;
+    if (!parsed) return committedMemoryFailure("memory_consolidate_proposal_missing_parsed_result");
 
     const deterministicResultId = fingerprintId(
       "mem",
@@ -1159,12 +1567,19 @@ export async function commitMemoryConsolidationProposal(options: {
       );
       const parent = recoveredResult
         ? null
-        : (await options.kv.list<Memory>(KV.memories)).find(
-            (memory) =>
-              memory.id !== deterministicResultId
-              && memory.title.toLowerCase() === proposal.parsed.title.toLowerCase()
+        : proposal.stageContractVersion
+          ? (frozenHistoricalContext ?? []).find((memory) =>
+              memory.isLatest === true
+              && memory.id !== deterministicResultId
+              && memory.title.toLowerCase() === parsed.title.toLowerCase()
               && (!proposal.project || !memory.project || memory.project === proposal.project),
-          );
+            ) ?? null
+          : (await options.kv.list<Memory>(KV.memories)).find(
+              (memory) =>
+                memory.id !== deterministicResultId
+                && memory.title.toLowerCase() === parsed.title.toLowerCase()
+                && (!proposal.project || !memory.project || memory.project === proposal.project),
+            );
       const parentId = recoveredResult?.parentId ?? parent?.id;
       const createdAt = recoveredResult?.createdAt ?? new Date().toISOString();
       intent = {
@@ -1191,7 +1606,7 @@ export async function commitMemoryConsolidationProposal(options: {
       id: intent.resultId,
       createdAt: intent.createdAt,
       updatedAt: intent.createdAt,
-      ...proposal.parsed,
+      ...parsed,
       version: parent ? (parent.version || 1) + 1 : 1,
       ...(parent ? {
         parentId: parent.id,
@@ -1238,6 +1653,218 @@ export async function commitMemoryConsolidationProposal(options: {
   });
 }
 
+async function relevantHistoricalMemories(
+  kv: StateKV,
+  concept: string,
+  project?: string,
+): Promise<Memory[]> {
+  const normalizedConcept = concept.toLowerCase();
+  return (await kv.list<Memory>(KV.memories))
+    .filter((memory) => memory.isLatest)
+    .filter((memory) => !project || !memory.project || memory.project === project)
+    .filter((memory) =>
+      memory.concepts.some((item) => item.toLowerCase() === normalizedConcept)
+      || memory.title.toLowerCase().includes(normalizedConcept)
+      || memory.content.toLowerCase().includes(normalizedConcept),
+    )
+    .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+    .slice(0, 5);
+}
+
+function historicalMemoryVersionHash(memory: Memory): string {
+  return createHash("sha256")
+    .update(stableStringify({
+      id: memory.id,
+      type: memory.type,
+      title: memory.title,
+      content: memory.content,
+      concepts: memory.concepts,
+      files: memory.files,
+      sessionIds: memory.sessionIds,
+      strength: memory.strength,
+      version: memory.version,
+      isLatest: memory.isLatest,
+      updatedAt: memory.updatedAt,
+      project: memory.project,
+      parentId: memory.parentId,
+      supersedes: memory.supersedes,
+      sourceObservationIds: memory.sourceObservationIds,
+    }))
+    .digest("hex");
+}
+
+function historicalContextMemoryVersions(
+  memories: Memory[],
+): Array<{ memoryId: string; versionHash: string }> {
+  return memories.map((memory) => ({
+    memoryId: memory.id,
+    versionHash: historicalMemoryVersionHash(memory),
+  }));
+}
+
+async function verifyFrozenHistoricalContext(
+  kv: StateKV,
+  proposal: MemoryConsolidationProposal,
+): Promise<Memory[] | null> {
+  const expectedIds = proposal.historicalContextMemoryIds;
+  const expectedVersions = proposal.historicalContext?.memoryVersions;
+  if (
+    !expectedIds
+    || !expectedVersions
+    || expectedIds.length !== expectedVersions.length
+    || !sameJsonValue(expectedIds, expectedVersions.map((entry) => entry.memoryId))
+  ) return null;
+  const memories = await Promise.all(expectedIds.map((memoryId) =>
+    kv.get<Memory>(KV.memories, memoryId),
+  ));
+  if (memories.some((memory) => !memory)) return null;
+  const present = memories as Memory[];
+  return present.every((memory, index) =>
+    memory.isLatest === true
+    && historicalMemoryVersionHash(memory) === expectedVersions[index].versionHash,
+  ) ? present : null;
+}
+
+function serializeHistoricalMemoryContext(memories: Memory[]): string {
+  if (memories.length === 0) return "(none)";
+  return memories.map((memory) =>
+    `[${memory.type}] ${memory.title}\n${memory.content}\nVersion: ${memory.version}; Strength: ${memory.strength}`,
+  ).join("\n\n");
+}
+
+async function terminalMemoryContributionIsVerified(
+  kv: StateKV,
+  records: ContributionRecord[],
+): Promise<boolean> {
+  for (const record of records) {
+    const key = proposalKey({
+      runId: record.runId,
+      stage: "memory_consolidate",
+      unitId: record.unitId,
+      inputHash: "proposal-key-does-not-bind-input-hash",
+    });
+    const proposal = await kv.get<MemoryConsolidationProposal>(
+      KV.memoryConsolidationProposal(key),
+      key,
+    );
+    if (
+      !proposal
+      || proposal.key !== key
+      || proposal.runId !== record.runId
+      || proposal.unitId !== record.unitId
+      || proposal.stage !== "memory_consolidate"
+      || proposal.status !== "committed"
+      || proposal.contributionId !== record.contributionId
+      || !proposal.sourceVersionKeys?.includes(record.sourceVersionKey)
+      || proposal.proposalHash !== memoryProposalHash(proposal)
+      || proposal.handle !== fingerprintId("mcph", `${key}:${proposal.proposalHash}`)
+      || await verifyCommittedMemoryProposal(kv, proposal)
+    ) return false;
+    const receiptRef = record.operationReceiptRef;
+    if (!receiptRef || receiptRef.scope !== KV.extractionOperationReceipt(receiptRef.key)) {
+      return false;
+    }
+    const receipt = await kv.get<ExtractionOperationReceipt<Record<string, unknown>>>(
+      receiptRef.scope,
+      receiptRef.key,
+    );
+    if (receipt?.status !== "succeeded") return false;
+    if (record.state === "no_effect") {
+      const expectedEvidence = memoryNoEffectEvidence(proposal);
+      if (
+        !proposal.noEffectProof
+        ||
+        record.noEffectProof?.kind !== "strict_legal_empty"
+        || record.noEffectProof.receiptKey !== receiptRef.key
+        || record.noEffectProof.reasonCode !== proposal.noEffectProof.reasonCode
+        || receipt.response?.status !== "skipped"
+        || receipt.response?.consolidated !== 0
+        || !sameJsonValue(receipt.response?.noEffectEvidence, expectedEvidence)
+      ) return false;
+      continue;
+    }
+    if (record.state !== "committed" || proposal.noEffectProof || !proposal.commitIntent) return false;
+    const effect = record.effectRefs?.find((ref) => ref.scope === KV.memories);
+    const receiptEvidence = receipt.response?.domainEffectEvidence;
+    const expectedEvidence = memoryDomainEffectEvidence(proposal);
+    if (
+      !effect
+      || !receiptEvidence
+      || typeof receiptEvidence !== "object"
+      || Array.isArray(receiptEvidence)
+      || effect.key !== proposal.commitIntent.resultId
+      || effect.effectHash !== expectedEvidence.effectHash
+      || !sameJsonValue(receiptEvidence, expectedEvidence)
+    ) return false;
+  }
+  return true;
+}
+
+export async function reconcileMemoryConsolidationContribution(
+  kv: StateKV,
+  prepareIdentity: ExtractionOperationIdentity,
+  commitIdentity: ExtractionOperationIdentity,
+): Promise<void> {
+  const key = proposalKey(prepareIdentity);
+  const proposal = await kv.get<MemoryConsolidationProposal>(
+    KV.memoryConsolidationProposal(key),
+    key,
+  );
+  if (
+    !proposal
+    || proposal.status !== "committed"
+    || !proposal.stageContractVersion
+    || !proposal.contributionId
+    || !proposal.sourceVersionKeys?.length
+  ) return;
+  const failure = await verifyCommittedMemoryProposal(kv, proposal);
+  if (failure) throw new Error("memory_consolidate_contribution_effect_conflict");
+  const receiptKey = buildExtractionOperationKey(commitIdentity);
+  const receiptScope = KV.extractionOperationReceipt(receiptKey);
+  const receipt = await kv.get<ExtractionOperationReceipt<Record<string, unknown>>>(
+    receiptScope,
+    receiptKey,
+  );
+  if (receipt?.status !== "succeeded") {
+    throw new Error("memory_consolidate_contribution_receipt_missing");
+  }
+  if (proposal.noEffectProof) {
+    if (!sameJsonValue(receipt.response?.noEffectEvidence, memoryNoEffectEvidence(proposal))) {
+      throw new Error("memory_consolidate_contribution_no_effect_proof_conflict");
+    }
+    await markClaimedBatchNoEffect(kv, {
+      stage: "memory_consolidate",
+      stageContractVersion: proposal.stageContractVersion,
+      contributionId: proposal.contributionId,
+      sourceVersionKeys: proposal.sourceVersionKeys,
+      operationReceiptRef: { scope: receiptScope, key: receiptKey },
+      receiptKey,
+      reasonCode: proposal.noEffectProof.reasonCode,
+    });
+  } else {
+    const evidence = memoryDomainEffectEvidence(proposal);
+    await commitClaimedBatch(kv, {
+      stage: "memory_consolidate",
+      stageContractVersion: proposal.stageContractVersion,
+      contributionId: proposal.contributionId,
+      sourceVersionKeys: proposal.sourceVersionKeys,
+      operationReceiptRef: { scope: receiptScope, key: receiptKey },
+      effectRefs: [{
+        scope: KV.memories,
+        key: proposal.commitIntent!.resultId,
+        effectHash: String(evidence.effectHash),
+      }],
+    });
+  }
+  await Promise.all(proposal.sourceVersionKeys.flatMap((sourceVersionKey) => [
+    kv.delete(KV.memoryConsolidationBacklog(proposal.project), sourceVersionKey),
+    kv.delete(
+      KV.memoryConsolidationBacklogSourceIndex(proposal.project),
+      decodeURIComponent(sourceVersionKey.split("|")[2]),
+    ),
+  ]));
+}
+
 export async function runConsolidateObservationWindow(
   options: ConsolidateObservationWindowOptions,
 ): Promise<Record<string, unknown>> {
@@ -1252,6 +1879,12 @@ export async function runConsolidateObservationWindow(
     telemetry: sortProviderCallTelemetry(telemetry),
     ...extra,
   });
+  let claimedContribution: {
+    contributionId: string;
+    sourceVersionKeys: string[];
+    stageContractVersion: string;
+  } | undefined;
+  let proposalPersisted = false;
   try {
     resolveOutputLanguage();
     if (!options.provider?.compress) {
@@ -1356,13 +1989,37 @@ export async function runConsolidateObservationWindow(
 
     const sorted = [...obsGroup].sort((a, b) => b.importance - a.importance);
     const sessionIds = [...new Set(sorted.map((o) => o.sid))];
+    const baseline = await partitionAdoptedBaselineSessions(options.kv, {
+      stage: "memory_consolidate",
+      stageContractVersion: MEMORY_CONSOLIDATE_CONTRACT_VERSION,
+      sessionIds,
+    });
+    if (baseline.adoptedSessionIds.length > 0) {
+      return {
+        success: false,
+        status: "failed",
+        failure: { class: "hard", cause: "memory_consolidate_source_adopted_baseline" },
+      };
+    }
     const prompt = serializeConsolidationObservationPrompt(sorted);
+    const computedSourceVersionKeys = sorted.map(memoryConsolidationSourceVersionKey).sort();
+    const incrementalContributionRequested = Boolean(
+      options.stageContractVersion || options.sourceVersionKeys?.length,
+    );
+    const requestedSourceVersionKeys = [...(options.sourceVersionKeys ?? computedSourceVersionKeys)].sort();
+    if (!sameJsonValue(computedSourceVersionKeys, requestedSourceVersionKeys)) {
+      return {
+        success: false,
+        status: "failed",
+        failure: { class: "hard", cause: "memory_consolidate_source_version_conflict" },
+      };
+    }
     if (options.operationIdentity) {
       const sourceObservationIds = sorted.map((observation) => observation.id);
       const plannedInputHash = stableHash([
         "memory-consolidate",
         concept ?? "observation-window",
-        sourceObservationIds,
+        options.sourceVersionKeys?.length ? requestedSourceVersionKeys : sourceObservationIds,
         sessionIds,
         prompt.length,
       ]);
@@ -1399,6 +2056,69 @@ export async function runConsolidateObservationWindow(
         }),
       };
     }
+    if (options.operationIdentity && incrementalContributionRequested) {
+      const stageContractVersion = options.stageContractVersion
+        ?? MEMORY_CONSOLIDATE_CONTRACT_VERSION;
+      const claim = await claimBatch(options.kv, {
+        stage: "memory_consolidate",
+        stageContractVersion,
+        runId: options.operationIdentity.runId,
+        unitId: options.operationIdentity.unitId,
+        sourceVersionKeys: requestedSourceVersionKeys,
+      });
+      if (claim.status === "already_committed") {
+        if (!await terminalMemoryContributionIsVerified(options.kv, claim.records)) {
+          return {
+            success: false,
+            failure: {
+              class: "hard",
+              cause: "memory_consolidate_contribution_effect_reconciliation_required",
+            },
+            ...responseMetadata("failed"),
+          };
+        }
+        return {
+          success: true,
+          consolidated: 0,
+          reason: "already_contributed",
+          totalObservations: sorted.length,
+          replayed: true,
+          ...responseMetadata("skipped"),
+        };
+      }
+      if (claim.status === "claimed_by_other") {
+        return {
+          success: false,
+          failure: {
+            class: "transient_runtime",
+            cause: "extraction_operation_reconciliation_required",
+          },
+          ...responseMetadata("failed"),
+        };
+      }
+      if (claim.status === "contract_migration_required") {
+        return {
+          success: false,
+          failure: {
+            class: "hard",
+            cause: "memory_consolidate_contract_migration_required",
+          },
+          ...responseMetadata("failed"),
+        };
+      }
+      claimedContribution = {
+        contributionId: claim.records[0].contributionId,
+        sourceVersionKeys: requestedSourceVersionKeys,
+        stageContractVersion,
+      };
+    }
+    const historicalContext = incrementalContributionRequested
+      ? await relevantHistoricalMemories(
+        options.kv,
+        concept ?? "observation-window",
+        scopedProject,
+      )
+      : [];
     const callOptions = modelOptionsFromMemoryConsolidate(options.model);
     const timeoutMs = getMemoryConsolidateCompressTimeoutMs();
     const callIndex = nextCallIndex++;
@@ -1409,7 +2129,9 @@ export async function runConsolidateObservationWindow(
         compressWithOptions(
           options.provider,
           withOutputLanguagePolicy(CONSOLIDATION_SYSTEM),
-          `Concept: "${concept ?? "observation-window"}"\n\nObservations:\n${prompt}`,
+          incrementalContributionRequested
+            ? `Concept: "${concept ?? "observation-window"}"\n\nDelta evidence (the only new contribution):\n${prompt}\n\nHistorical context (read-only; do not count as new evidence):\n${serializeHistoricalMemoryContext(historicalContext)}`
+            : `Concept: "${concept ?? "observation-window"}"\n\nObservations:\n${prompt}`,
           callOptions,
           telemetry,
           callIndex,
@@ -1430,8 +2152,19 @@ export async function runConsolidateObservationWindow(
       }
       throw error;
     }
-    const parsed = parseMemoryXml(response, sessionIds);
-    if (!parsed) {
+    const parsedResult = parseMemoryProviderResponse(
+      response,
+      sessionIds,
+      incrementalContributionRequested,
+    );
+    if (!parsedResult) {
+      if (claimedContribution) {
+        await releaseClaimedBatch(options.kv, {
+          stage: "memory_consolidate",
+          ...claimedContribution,
+        });
+        claimedContribution = undefined;
+      }
       return {
         success: false,
         error: "failed to parse memory XML",
@@ -1445,19 +2178,35 @@ export async function runConsolidateObservationWindow(
     }
 
     if (options.operationIdentity) {
-      return storeMemoryConsolidationProposal(
+      const stored = await storeMemoryConsolidationProposal(
         options,
-        parsed,
+        parsedResult,
         concept ?? "observation-window",
         [...new Set(sorted.map((o) => o.id))],
         sorted.length,
         prompt.length,
+        claimedContribution?.contributionId,
+        claimedContribution?.sourceVersionKeys,
+        historicalContext.map((memory) => memory.id),
+        historicalContextMemoryVersions(historicalContext),
+        sessionIds,
       );
+      proposalPersisted = stored.success === true;
+      return stored;
+    }
+    if (parsedResult.kind === "no_effect") {
+      return {
+        success: true,
+        consolidated: 0,
+        reason: parsedResult.reasonCode,
+        totalObservations: sorted.length,
+        ...responseMetadata("skipped"),
+      };
     }
     const existingMemories = await options.kv.list<Memory>(KV.memories);
     const persisted = await persistConsolidatedMemory(
       options.kv,
-      parsed,
+      parsedResult.parsed,
       existingMemories,
       concept ?? "observation-window",
       [...new Set(sorted.map((o) => o.id))],
@@ -1476,6 +2225,33 @@ export async function runConsolidateObservationWindow(
       }),
     };
   } catch (err) {
+    if (claimedContribution && !proposalPersisted && options.operationIdentity) {
+      try {
+        proposalPersisted = Boolean(await options.kv.get<MemoryConsolidationProposal>(
+          KV.memoryConsolidationProposal(proposalKey(options.operationIdentity)),
+          proposalKey(options.operationIdentity),
+        ));
+      } catch {
+        proposalPersisted = true;
+      }
+    }
+    if (claimedContribution && !proposalPersisted) {
+      try {
+        await releaseClaimedBatch(options.kv, {
+          stage: "memory_consolidate",
+          ...claimedContribution,
+        });
+      } catch {
+        return {
+          success: false,
+          failure: {
+            class: "transient_runtime",
+            cause: "extraction_operation_reconciliation_required",
+          },
+          ...responseMetadata("failed"),
+        };
+      }
+    }
     if (isProviderPreflightError(err)) {
       const status = providerPreflightStatus(err);
       return { success: false, error: status, ...responseMetadata(status) };
@@ -1496,6 +2272,7 @@ export function registerConsolidateFunction(
     async (data: {
       plannerId?: string;
       project?: string;
+      sessionIds?: string[];
       descriptors?: ConsolidationObservationDescriptor[];
       minImportance?: number;
       minObservationsPerConcept?: number;
@@ -1513,6 +2290,7 @@ export function registerConsolidateFunction(
     async (data: {
       plannerId?: string;
       project?: string;
+      sessionIds?: string[];
       minImportance?: number;
       sessionOffset?: number;
       sessionLimit?: number;
@@ -1531,6 +2309,8 @@ export function registerConsolidateFunction(
       minObservations?: number;
       charBudget?: number;
       model?: string;
+      stageContractVersion?: string;
+      sourceVersionKeys?: string[];
     }) => withKeyedLock(
       "memory-consolidate-commit",
       () => runConsolidateObservationWindow({ kv, provider, ...data }),
@@ -1549,6 +2329,8 @@ export function registerConsolidateFunction(
       charBudget?: number;
       model?: string;
       operationReceiptManaged?: boolean;
+      stageContractVersion?: string;
+      sourceVersionKeys?: string[];
     }) => withKeyedLock(
       `memory-consolidate-prepare:${proposalKey(data.identity)}`,
       () => runConsolidateObservationWindow({

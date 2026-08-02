@@ -76,6 +76,48 @@ function noEffectResult() {
   };
 }
 
+function committedNoEffectResult() {
+  const key = receiptKey('attempt-1', 'cpw-1');
+  const proof = {
+    schema: 'consolidation-procedural-no-effect/v1',
+    proposalHash: 'e'.repeat(64),
+    reasonCode: 'no_reusable_procedure',
+  };
+  proof.proofHash = createHash('sha256').update(JSON.stringify({
+    proposalHash: proof.proposalHash,
+    reasonCode: proof.reasonCode,
+    schema: proof.schema,
+  })).digest('hex');
+  return {
+    success: true,
+    status: 'skipped',
+    inputHash: HASH,
+    proceduralMemoryIds: [],
+    operationReceipt: {
+      key,
+      version: 1,
+      status: 'succeeded',
+      runId: 'attempt-1',
+      stage: 'consolidation_procedural',
+      unitId: 'cpw-1',
+      inputHash: HASH,
+      runnerInputHash: RUNNER_HASH,
+    },
+    proceduralRecoveryEvidence: {
+      kind: 'no_effect',
+      observation: 'business_empty',
+      reasonCode: proof.reasonCode,
+      identity: { runId: 'attempt-1', unitId: 'cpw-1', inputHash: HASH },
+      proof: {
+        kind: 'committed_structured_no_effect',
+        receiptKey: key,
+        receiptVersion: 1,
+        ...proof,
+      },
+    },
+  };
+}
+
 test('procedural adapter only projects receipt-bound committed facts', () => {
   const adapted = adaptConsolidationProceduralOperationEvidence({
     result: { data: committedResult() },
@@ -118,6 +160,76 @@ test('procedural adapter projects receipt-bound business-empty evidence without 
     proof: {
       kind: 'receipt_before_formal_effect',
       receiptKey: receiptKey('attempt-1', 'cpw-1'),
+      receiptVersion: 1,
+      phase: 'candidate_staging',
+      commitPlanAbsent: true,
+    },
+  });
+  assert.equal(adapted.snapshot.receipt.formalEffect, false);
+});
+
+test('procedural adapter projects a receipt-bound committed structured no-effect', () => {
+  const result = committedNoEffectResult();
+  const adapted = adaptConsolidationProceduralOperationEvidence({
+    result,
+    unit: { unit_id: 'cpw-1', input_hash: RUNNER_HASH },
+    attemptId: 'attempt-1',
+  });
+  assert.deepEqual(adapted.candidateEvidence, {
+    kind: 'no_effect',
+    observation: 'business_empty',
+    reasonCode: 'no_reusable_procedure',
+    proof: result.proceduralRecoveryEvidence.proof,
+  });
+  assert.equal(adapted.snapshot.receipt.status, 'succeeded');
+  assert.deepEqual(adapted.snapshot.committedNoEffect, {
+    schema: result.proceduralRecoveryEvidence.proof.schema,
+    proposalHash: result.proceduralRecoveryEvidence.proof.proposalHash,
+    reasonCode: result.proceduralRecoveryEvidence.proof.reasonCode,
+    proofHash: result.proceduralRecoveryEvidence.proof.proofHash,
+  });
+});
+
+test('procedural adapter rejects a tampered committed structured no-effect proof', () => {
+  const result = committedNoEffectResult();
+  result.proceduralRecoveryEvidence.proof.proofHash = 'f'.repeat(64);
+  const adapted = adaptConsolidationProceduralOperationEvidence({
+    result,
+    unit: { unit_id: 'cpw-1', input_hash: RUNNER_HASH },
+    attemptId: 'attempt-1',
+  });
+  assert.equal(adapted.candidateEvidence.kind, 'unknown');
+});
+
+test('procedural adapter isolates a receipt-bound source drift after backlog replacement', () => {
+  const key = receiptKey('attempt-1', 'cpw-1');
+  const adapted = adaptConsolidationProceduralOperationEvidence({
+    result: {
+      failure: {
+        class: 'hard',
+        cause: 'consolidation_procedural_source_drifted_before_commit',
+      },
+      operationReceipt: {
+        key,
+        version: 1,
+        status: 'failed',
+        runId: 'attempt-1',
+        stage: 'consolidation_procedural',
+        unitId: 'cpw-1',
+        inputHash: HASH,
+        runnerInputHash: RUNNER_HASH,
+      },
+    },
+    unit: { unit_id: 'cpw-1', input_hash: RUNNER_HASH },
+    attemptId: 'attempt-1',
+  });
+  assert.deepEqual(adapted.candidateEvidence, {
+    kind: 'no_effect',
+    observation: 'business_rejected',
+    reasonCode: 'consolidation_procedural_source_drifted_before_commit',
+    proof: {
+      kind: 'receipt_before_formal_effect',
+      receiptKey: key,
       receiptVersion: 1,
       phase: 'candidate_staging',
       commitPlanAbsent: true,

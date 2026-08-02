@@ -324,3 +324,41 @@ test('generic adapter rejects unsupported stages without choosing a recovery act
   assert.equal(facts.candidateEvidence.reasonCode, 'safe_stage_adapter_input_invalid');
   assert.equal('decision' in facts, false);
 });
+
+test('memory consolidation binds committed structured no-effect to the commit receipt', () => {
+  const stage = 'memory_consolidate';
+  const currentUnit = unit(stage);
+  const context = commitContext(stage);
+  const facts = adaptMemoryConsolidateOperationEvidence({
+    unit: currentUnit,
+    attemptId,
+    safeFacts: {
+      receipt: {
+        key: receiptKey(stage, currentUnit.unit_id),
+        version: 1,
+        stage,
+        runId: attemptId,
+        unitId: currentUnit.unit_id,
+        inputHash: currentUnit.input_hash,
+        status: 'succeeded',
+      },
+      commitContext: context,
+      response: {
+        success: true,
+        status: 'skipped',
+        consolidated: 0,
+        memoryIds: [],
+        noEffectEvidence: {
+          schema: 'memory-consolidate-no-effect/v1',
+          proposalHash: context.proposalHash,
+          reasonCode: 'no_durable_memory',
+          proofHash: 'c'.repeat(64),
+        },
+      },
+    },
+  });
+  assert.equal(facts.candidateEvidence.kind, 'no_effect');
+  assert.equal(facts.candidateEvidence.proof.kind, 'committed_structured_no_effect');
+  assert.equal(facts.snapshot.receipt.status, 'succeeded');
+  assert.equal(resolveOperationRecovery({ ...facts }).decision.action, 'skipped');
+});

@@ -49,6 +49,31 @@ const proofCases = [
     },
   },
   {
+    name: 'committed structured no-effect',
+    proof: {
+      kind: 'committed_structured_no_effect',
+      receiptKey: 'receipt-no-effect',
+      receiptVersion: 1,
+      schema: 'memory-consolidate-no-effect/v1',
+      proposalHash: HASH,
+      reasonCode: 'provider_unavailable',
+      proofHash: 'b'.repeat(64),
+    },
+    snapshot: {
+      receipt: {
+        key: 'receipt-no-effect',
+        version: 1,
+        status: 'succeeded',
+      },
+      committedNoEffect: {
+        schema: 'memory-consolidate-no-effect/v1',
+        proposalHash: HASH,
+        reasonCode: 'provider_unavailable',
+        proofHash: 'b'.repeat(64),
+      },
+    },
+  },
+  {
     name: 'legacy lesson zero effect',
     proof: {
       kind: 'legacy_lessons_zero_effect',

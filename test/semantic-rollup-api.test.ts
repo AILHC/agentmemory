@@ -72,6 +72,7 @@ describe("semantic rollup REST wrappers", () => {
 
   it("validates and sends only sanitized semantic-rollup payload fields", async () => {
     const sdk = mockSdk();
+    sdk.trigger.mockResolvedValue({ success: true, semanticMemoryIds: [] });
     registerApiTriggers(sdk as never, mockKV() as never, "");
     const handler = sdk.getFunction("api::semantic-rollup");
 

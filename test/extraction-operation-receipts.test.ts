@@ -1033,6 +1033,97 @@ describe("extraction operation receipts", () => {
     });
   });
 
+  it("retains strict reflect identity and structured no-effect evidence", async () => {
+    const kv = mockKV();
+    const committedIdentity = {
+      ...identity,
+      stage: "reflect_insight" as const,
+      unitId: "reflect-committed",
+      inputHash: "e".repeat(64),
+    };
+    const committedEvidence = {
+      schema: "reflect-insight-commit/v1",
+      kind: "committed",
+      receiptKey: buildExtractionOperationKey(committedIdentity),
+      receiptVersion: 1,
+      resultRef: `reflect-insight-recoveries:${buildExtractionOperationKey(committedIdentity)}`,
+      effectHash: "f".repeat(64),
+      identity: {
+        runId: committedIdentity.runId,
+        unitId: committedIdentity.unitId,
+        inputHash: committedIdentity.inputHash,
+      },
+    };
+    const committed = await withExtractionOperationReceipt(
+      kv as never,
+      committedIdentity,
+      async () => ({
+        success: true,
+        status: "succeeded",
+        inputHash: committedIdentity.inputHash,
+        insightIds: ["ins-1"],
+        reflectRecoveryEvidence: {
+          ...committedEvidence,
+          arbitraryModelText: "must not survive",
+          identity: { ...committedEvidence.identity, arbitrary: "must not survive" },
+        },
+      }),
+    );
+    expect(committed.response).toEqual({
+      success: true,
+      status: "succeeded",
+      inputHash: committedIdentity.inputHash,
+      insightIds: ["ins-1"],
+      reflectRecoveryEvidence: committedEvidence,
+    });
+
+    const emptyIdentity = {
+      ...committedIdentity,
+      unitId: "reflect-empty",
+      inputHash: "a".repeat(64),
+    };
+    const noEffectEvidence = {
+      kind: "no_effect",
+      observation: "business_empty",
+      reasonCode: "no_novel_insight",
+      identity: {
+        runId: emptyIdentity.runId,
+        unitId: emptyIdentity.unitId,
+        inputHash: emptyIdentity.inputHash,
+      },
+      proof: {
+        kind: "committed_structured_no_effect",
+        receiptKey: buildExtractionOperationKey(emptyIdentity),
+        receiptVersion: 1,
+        schema: "reflect-insight-no-effect/v1",
+        proposalHash: "b".repeat(64),
+        reasonCode: "no_novel_insight",
+        proofHash: "c".repeat(64),
+      },
+    };
+    const empty = await withExtractionOperationReceipt(
+      kv as never,
+      emptyIdentity,
+      async () => ({
+        success: true,
+        status: "skipped",
+        inputHash: emptyIdentity.inputHash,
+        insightIds: [],
+        reflectRecoveryEvidence: {
+          ...noEffectEvidence,
+          arbitraryModelText: "must not survive",
+        },
+      }),
+    );
+    expect(empty.response).toEqual({
+      success: true,
+      status: "skipped",
+      inputHash: emptyIdentity.inputHash,
+      insightIds: [],
+      reflectRecoveryEvidence: noEffectEvidence,
+    });
+  });
+
   it("projects each write stage without retaining arbitrary model prose", async () => {
     const cases = [
       {
@@ -1152,6 +1243,58 @@ describe("extraction operation receipts", () => {
           inputHash: proceduralIdentity.inputHash,
         },
         proof: { receiptKey, commitPlanAbsent: true },
+      },
+    });
+    expect(JSON.stringify(result.response)).not.toContain("rawModelText");
+  });
+
+  it("projects only receipt-bound committed procedural no-effect evidence", async () => {
+    const kv = mockKV();
+    const proceduralIdentity = {
+      runId: "procedural-empty-run",
+      stage: "consolidation_procedural" as const,
+      unitId: "cpw-empty-1",
+      inputHash: "b".repeat(64),
+    };
+    const receiptKey = buildExtractionOperationKey(proceduralIdentity);
+    const result = await withExtractionOperationReceipt(kv as never, proceduralIdentity, async () => ({
+      success: true,
+      status: "skipped",
+      inputHash: proceduralIdentity.inputHash,
+      proceduralMemoryIds: [],
+      proceduralRecoveryEvidence: {
+        kind: "no_effect",
+        observation: "business_empty",
+        reasonCode: "no_reusable_procedure",
+        identity: {
+          runId: proceduralIdentity.runId,
+          unitId: proceduralIdentity.unitId,
+          inputHash: proceduralIdentity.inputHash,
+        },
+        proof: {
+          kind: "committed_structured_no_effect",
+          receiptKey,
+          receiptVersion: 1,
+          schema: "consolidation-procedural-no-effect/v1",
+          proposalHash: "c".repeat(64),
+          reasonCode: "no_reusable_procedure",
+          proofHash: "d".repeat(64),
+        },
+        rawModelText: "must not persist",
+      },
+    }));
+
+    expect(result.response).toMatchObject({
+      proceduralMemoryIds: [],
+      proceduralRecoveryEvidence: {
+        kind: "no_effect",
+        observation: "business_empty",
+        reasonCode: "no_reusable_procedure",
+        proof: {
+          kind: "committed_structured_no_effect",
+          receiptKey,
+          schema: "consolidation-procedural-no-effect/v1",
+        },
       },
     });
     expect(JSON.stringify(result.response)).not.toContain("rawModelText");
@@ -2486,4 +2629,53 @@ describe("extraction operation receipts", () => {
       expect(result.receipt.response).not.toHaveProperty("skill");
     },
   );
+
+  it("retains only a strict committed memory no-effect proof in the receipt projection", async () => {
+    const kv = mockKV();
+    const identity = {
+      runId: "memory-no-effect-run",
+      stage: "memory_consolidate" as const,
+      unitId: "memory-no-effect-unit",
+      inputHash: "memory-no-effect-input",
+    };
+    const key = buildExtractionOperationKey(identity);
+    await kv.set(KV.extractionOperationReceipt(key), key, {
+      ...identity,
+      key,
+      version: 1,
+      status: "succeeded",
+      startedAt: "2026-08-02T00:00:00.000Z",
+      completedAt: "2026-08-02T00:00:01.000Z",
+      response: { success: true, status: "skipped", consolidated: 0, memoryIds: [] },
+    });
+    const noEffectEvidence = {
+      schema: "memory-consolidate-no-effect/v1",
+      proposalHash: "proposal-no-effect",
+      reasonCode: "no_durable_memory",
+      proofHash: "b".repeat(64),
+    };
+    const verify = vi.fn(async () => ({
+      success: true,
+      status: "skipped",
+      consolidated: 0,
+      memoryIds: [],
+      noEffectEvidence,
+      sensitive: "must be dropped",
+    }));
+
+    const result = await withIdempotentCommitReceipt(
+      kv as never,
+      identity,
+      verify,
+      { requireExisting: true },
+    );
+
+    expect(result).toMatchObject({
+      replayed: true,
+      response: { noEffectEvidence },
+      receipt: { response: { noEffectEvidence } },
+    });
+    expect(result.response).not.toHaveProperty("sensitive");
+    expect(result.receipt.response).not.toHaveProperty("sensitive");
+  });
 });

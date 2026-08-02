@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "compatibility_basis": "compatible_with_only",
+  "audit_only_fields": [
+    "model",
+    "prompt_hash"
+  ],
+  "output_language": "zh-CN",
+  "stages": [
+    {
+      "stage": "summary",
+      "compatible_with": ["summary/v1"],
+      "model": "gpt-5.6-luna",
+      "prompt_hash": "f3ff552d73e159f2d5cf6c9b0efbe16ad6b8a6a43b4f2192c6b97d82f49ab1e2"
+    },
+    {
+      "stage": "lessons",
+      "compatible_with": ["lessons/v1"],
+      "model": "gpt-5.6-luna",
+      "prompt_hash": "f75e54514bb6b608e3f83671e600aaca998289b7ff17c044755d72ccf4185aac"
+    },
+    {
+      "stage": "memory_consolidate",
+      "compatible_with": ["memory_consolidate/v1"],
+      "model": "gpt-5.6-luna",
+      "prompt_hash": "9b7defb91148e915cc347e8310ac241d263f5b48154418327de2fd93f3435594"
+    },
+    {
+      "stage": "semantic_rollup",
+      "compatible_with": ["semantic-rollup/v1"],
+      "model": "gpt-5.6-terra",
+      "prompt_hash": "8efd3cf81cb5a80b8ba891b29a51c5d7e0fcc4d7787444d6d97611417d251565"
+    },
+    {
+      "stage": "skill_extract",
+      "compatible_with": ["skill_extract/v1"],
+      "model": "gpt-5.6-luna",
+      "prompt_hash": "308627eafa3a33cc7fda9b9996eb7a7dae3665a7f2f0da557693e423b5e97780"
+    },
+    {
+      "stage": "crystal",
+      "compatible_with": ["crystal/v1"],
+      "model": "gpt-5.6-luna",
+      "prompt_hash": "f71c27305abbb52613416c11045d0d714be811106b7e5efdf7c250ec9fab37b2"
+    },
+    {
+      "stage": "consolidation_procedural",
+      "compatible_with": ["consolidation_procedural/v1"],
+      "model": "gpt-5.6-terra",
+      "prompt_hash": "9936e4634db66970ac36be871f2ca19adbd0c7b7b6ae337b9cb39134db752c61"
+    },
+    {
+      "stage": "reflect_insight",
+      "compatible_with": ["reflect_insight/v1"],
+      "model": "gpt-5.6-terra",
+      "prompt_hash": "922590dc52fc585a3f7a3228b8b624cda4655f4dedc7699161c78e8a43e69ef4"
+    }
+  ]
+}

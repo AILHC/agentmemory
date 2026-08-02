@@ -24,6 +24,14 @@ export const RECOVERY_POLICY_DESCRIPTOR = Object.freeze({
         'phase:preflight|provider_call|candidate_staging',
         'commitPlanAbsent:true',
       ],
+      committed_structured_no_effect: [
+        'receiptKey',
+        'receiptVersion',
+        'schema',
+        'proposalHash',
+        'reasonCode',
+        'proofHash',
+      ],
       legacy_lessons_zero_effect: [
         'lessonRunId',
         'receiptKey',
@@ -170,6 +178,28 @@ function matchesReceiptBeforeFormalEffect(proof, snapshot) {
   );
 }
 
+function matchesCommittedStructuredNoEffect(proof, snapshot, reasonCode) {
+  const receipt = snapshot?.receipt;
+  const committed = snapshot?.committedNoEffect;
+  return (
+    isNonEmptyString(proof.receiptKey)
+    && Number.isSafeInteger(proof.receiptVersion)
+    && proof.receiptVersion > 0
+    && isNonEmptyString(proof.schema)
+    && isNonEmptyString(proof.proposalHash)
+    && isNonEmptyString(proof.reasonCode)
+    && EFFECT_HASH.test(proof.proofHash)
+    && same(proof.reasonCode, reasonCode)
+    && same(receipt?.key, proof.receiptKey)
+    && same(receipt?.version, proof.receiptVersion)
+    && ['succeeded', 'committed'].includes(receipt?.status)
+    && same(committed?.schema, proof.schema)
+    && same(committed?.proposalHash, proof.proposalHash)
+    && same(committed?.reasonCode, proof.reasonCode)
+    && same(committed?.proofHash, proof.proofHash)
+  );
+}
+
 function matchesLegacyLessonsZeroEffect(proof, snapshot) {
   const run = snapshot?.lessonRun;
   const receipt = snapshot?.receipt;
@@ -210,13 +240,16 @@ function matchesLegacySummaryBeforeFinalWrite(proof, snapshot) {
   );
 }
 
-function proofMatches(proof, snapshot) {
+function proofMatches(proof, snapshot, reasonCode) {
   if (!isObject(proof)) return false;
   if (proof.kind === 'request_not_dispatched') {
     return matchesRequestNotDispatched(proof, snapshot);
   }
   if (proof.kind === 'receipt_before_formal_effect') {
     return matchesReceiptBeforeFormalEffect(proof, snapshot);
+  }
+  if (proof.kind === 'committed_structured_no_effect') {
+    return matchesCommittedStructuredNoEffect(proof, snapshot, reasonCode);
   }
   if (proof.kind === 'legacy_lessons_zero_effect') {
     return matchesLegacyLessonsZeroEffect(proof, snapshot);
@@ -259,7 +292,7 @@ export function normalizeOperationEvidence(evidence, snapshot = {}) {
       || !isNonEmptyString(evidence.reasonCode)
       || !SAFE_CODE.test(evidence.reasonCode)
       || !validRetryHint(evidence.retryHint)
-      || !proofMatches(evidence.proof, snapshot)
+      || !proofMatches(evidence.proof, snapshot, evidence.reasonCode)
     ) {
       return unknownEvidence(evidence, snapshot, 'no_effect_unproven');
     }
@@ -333,6 +366,17 @@ function validProofShape(proof) {
       && proof.receiptVersion > 0
       && RECEIPT_PROOF_PHASES.has(proof.phase)
       && proof.commitPlanAbsent === true
+    );
+  }
+  if (proof.kind === 'committed_structured_no_effect') {
+    return (
+      isNonEmptyString(proof.receiptKey)
+      && Number.isSafeInteger(proof.receiptVersion)
+      && proof.receiptVersion > 0
+      && isNonEmptyString(proof.schema)
+      && isNonEmptyString(proof.proposalHash)
+      && isNonEmptyString(proof.reasonCode)
+      && EFFECT_HASH.test(proof.proofHash)
     );
   }
   if (proof.kind === 'legacy_lessons_zero_effect') {

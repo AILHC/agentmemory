@@ -1,6 +1,6 @@
 import type { ISdk } from "iii-sdk";
 import type { StateKV } from "../state/kv.js";
-import { KV, fingerprintId } from "../state/schema.js";
+import { KV, fingerprintId, generateId } from "../state/schema.js";
 import type {
   ExtractionOperationIdentity,
   ExtractionOperationReceipt,
@@ -36,6 +36,14 @@ import {
   reconcileLessonCommit,
   withLessonKeyLock,
 } from "./lesson-commit.js";
+import {
+  buildSourceVersionKey,
+  claimBatch,
+  commitClaimedBatch,
+  markClaimedBatchNoEffect,
+  releaseClaimedBatch,
+} from "./extraction-contributions.js";
+import { partitionAdoptedBaselineSessions } from "./extraction-baselines.js";
 
 const RETRYABLE_LESSON_PROVIDER_CODES = new Set([
   "rate_limited",
@@ -46,6 +54,7 @@ const RETRYABLE_LESSON_PROVIDER_CODES = new Set([
 const HARD_LESSON_PROVIDER_CODES = new Set(["auth_failed", "model_not_found"]);
 const SHA256_HEX = /^[0-9a-f]{64}$/;
 const ISO_TIMESTAMP = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
+export const LESSONS_CONTRIBUTION_CONTRACT = "lessons/v1";
 
 export interface FailedLessonRunRetryEvidence {
   status: "retryable";
@@ -166,6 +175,177 @@ function lessonRunFailure(run: LessonExtractionRun): {
     };
   }
   return { failure: { class: "unit", cause: "lesson_extraction_failed" } };
+}
+
+async function reconcileCommittedLessonContribution(
+  kv: StateKV,
+  input: {
+    contributionId: string;
+    sourceVersionKey: string;
+    run: LessonExtractionRun;
+  },
+): Promise<Record<string, unknown> | null> {
+  if (input.run.status !== "succeeded" || !input.run.candidateStagingId) return null;
+  const staging = await kv.get<LessonExtractionCandidateStaging>(
+    KV.lessonExtractionCandidates(input.run.id), input.run.candidateStagingId,
+  );
+  if (!staging) throw new Error("lesson_candidate_staging_missing");
+  const plan = await freezeLessonCommitPlan(kv, { staging });
+  if (await reconcileLessonCommit(kv, plan) === "conflict") {
+    throw new Error("lesson_commit_conflict");
+  }
+  const receipt = await executeLessonCommitPlan(kv, plan);
+  if (receipt.status !== "committed") throw new Error("lesson_commit_receipt_missing");
+  const operationReceiptRef = {
+    scope: KV.lessonCommitReceipts(input.run.id),
+    key: receipt.key,
+    effectHash: plan.effectHash,
+  };
+  if (plan.deltas.length === 0) {
+    await markClaimedBatchNoEffect(kv, {
+      stage: "lessons",
+      stageContractVersion: LESSONS_CONTRIBUTION_CONTRACT,
+      contributionId: input.contributionId,
+      sourceVersionKeys: [input.sourceVersionKey],
+      operationReceiptRef,
+      receiptKey: receipt.key,
+      reasonCode: "no_novel_lessons",
+    });
+    return {
+      kind: "no_effect",
+      runId: input.run.id,
+      stagingId: staging.id,
+      planId: plan.id,
+      receiptKey: receipt.key,
+      effectHash: plan.effectHash,
+      receiptVersion: receipt.version,
+      reasonCode: "no_novel_lessons",
+    };
+  }
+  await commitClaimedBatch(kv, {
+    stage: "lessons",
+    stageContractVersion: LESSONS_CONTRIBUTION_CONTRACT,
+    contributionId: input.contributionId,
+    sourceVersionKeys: [input.sourceVersionKey],
+    operationReceiptRef,
+    effectRefs: plan.deltas.map((delta) => ({
+      scope: KV.lessons,
+      key: delta.lessonId,
+      effectHash: plan.effectHash,
+    })),
+  });
+  return {
+    kind: "committed",
+    runId: input.run.id,
+    stagingId: staging.id,
+    planId: plan.id,
+    receiptKey: receipt.key,
+    effectHash: plan.effectHash,
+    receiptVersion: receipt.version,
+    resultRef: `lesson-commit-plans:${plan.id}`,
+  };
+}
+
+async function verifyCommittedLessonContribution(
+  kv: StateKV,
+  input: {
+    sourceVersionKey: string;
+    run: LessonExtractionRun | null;
+    proof: { operationReceiptRef?: { scope: string; key: string; effectHash?: string }; effectRefs?: Array<{ scope: string; key: string; effectHash?: string }> };
+  },
+): Promise<Record<string, unknown> | null> {
+  if (!input.run || input.run.status !== "succeeded" || !input.run.candidateStagingId) return null;
+  const receiptRef = input.proof.operationReceiptRef;
+  if (!receiptRef || receiptRef.scope !== KV.lessonCommitReceipts(input.run.id)) return null;
+  const receipt = await kv.get<{ status?: unknown; planId?: unknown; effectHash?: unknown; key?: unknown; version?: unknown }>(
+    receiptRef.scope, receiptRef.key,
+  );
+  if (!receipt || receipt.status !== "committed" || receipt.key !== receiptRef.key || receipt.effectHash !== receiptRef.effectHash || typeof receipt.planId !== "string") return null;
+  const plan = await kv.get<LessonCommitPlan>(KV.lessonCommitPlans(input.run.id), receipt.planId);
+  if (!plan || plan.effectHash !== receipt.effectHash || (await reconcileLessonCommit(kv, plan)) !== "committed") return null;
+  const expectedRefs = plan.deltas.map((delta) => ({ scope: KV.lessons, key: delta.lessonId, effectHash: plan.effectHash }));
+  if (JSON.stringify(input.proof.effectRefs ?? []) !== JSON.stringify(expectedRefs)) return null;
+  return {
+    kind: "committed", runId: input.run.id, stagingId: input.run.candidateStagingId,
+    planId: plan.id, receiptKey: receiptRef.key, effectHash: plan.effectHash,
+    receiptVersion: receipt.version, resultRef: `lesson-commit-plans:${plan.id}`,
+  };
+}
+
+async function verifyNoEffectLessonContribution(
+  kv: StateKV,
+  input: {
+    sessionId: string;
+    run: LessonExtractionRun | null;
+    proof: {
+      operationReceiptRef?: { scope: string; key: string };
+      noEffectProof?: { kind?: string; receiptKey?: string; reasonCode?: string };
+      effectRefs?: unknown[];
+    };
+  },
+): Promise<boolean> {
+  const receiptRef = input.proof.operationReceiptRef;
+  const noEffectProof = input.proof.noEffectProof;
+  if (
+    input.run?.status === "succeeded"
+    && Boolean(input.run.candidateStagingId)
+    && receiptRef?.scope === KV.lessonCommitReceipts(input.run.id)
+    && noEffectProof?.kind === "strict_legal_empty"
+    && noEffectProof.receiptKey === receiptRef.key
+    && noEffectProof.reasonCode === "no_novel_lessons"
+    && (input.proof.effectRefs?.length ?? 0) === 0
+  ) {
+    const receipt = await kv.get<{
+      status?: unknown;
+      planId?: unknown;
+      effectHash?: unknown;
+      key?: unknown;
+    }>(receiptRef.scope, receiptRef.key);
+    if (
+      !receipt
+      || receipt.status !== "committed"
+      || receipt.key !== receiptRef.key
+      || receipt.effectHash !== receiptRef.effectHash
+      || typeof receipt.planId !== "string"
+    ) return false;
+    const plan = await kv.get<LessonCommitPlan>(
+      KV.lessonCommitPlans(input.run.id),
+      receipt.planId,
+    );
+    return Boolean(
+      plan
+      && plan.effectHash === receipt.effectHash
+      && plan.deltas.length === 0
+      && await reconcileLessonCommit(kv, plan) === "committed"
+    );
+  }
+  if (
+    !input.run || input.run.status !== "skipped"
+    || !receiptRef || receiptRef.scope !== KV.extractionOperationReceipt(receiptRef.key)
+    || !noEffectProof || noEffectProof.kind !== "strict_legal_empty"
+    || noEffectProof.receiptKey !== receiptRef.key
+    || noEffectProof.reasonCode !== "lesson_run_skipped"
+    || (input.proof.effectRefs?.length ?? 0) !== 0
+  ) return false;
+  const receipt = await kv.get<ExtractionOperationReceipt<{ status?: unknown; runs?: unknown[] }>>(
+    receiptRef.scope, receiptRef.key,
+  );
+  return receipt?.status === "succeeded"
+    && receipt.stage === "lessons"
+    && receipt.unitId === input.sessionId
+    && receipt.response?.status === "skipped";
+}
+
+async function releaseLessonClaimIfUnstaged(
+  kv: StateKV,
+  input: { contributionId: string; sourceVersionKey: string; runId: string },
+): Promise<void> {
+  const run = await kv.get<LessonExtractionRun>(KV.lessonExtractionRuns, input.runId);
+  if (run?.candidateStagingId) return;
+  await releaseClaimedBatch(kv, {
+    stage: "lessons", stageContractVersion: LESSONS_CONTRIBUTION_CONTRACT,
+    contributionId: input.contributionId, sourceVersionKeys: [input.sourceVersionKey],
+  });
 }
 
 function reinforceLesson(lesson: Lesson): void {
@@ -585,12 +765,27 @@ export function registerLessonsFunctions(
         timeoutMs: data.timeoutMs,
         model: data.model,
       });
+      const baseline = await partitionAdoptedBaselineSessions(kv, {
+        stage: "lessons",
+        stageContractVersion: LESSONS_CONTRIBUTION_CONTRACT,
+        sessionIds,
+      });
+      if (baseline.openSessionIds.length === 0) {
+        return {
+          success: true,
+          runs: [],
+          lessonEvidence: [],
+          baselineId: baseline.baselineId,
+          adoptedBaselineSessionIds: baseline.adoptedSessionIds,
+        };
+      }
 
       const runs: LessonExtractionRun[] = [];
       const lessonEvidence: Array<Record<string, unknown>> = [];
       const now = new Date();
+      const legacyContributionAttemptId = attemptId || generateId("lesson-attempt");
 
-      for (const sessionId of sessionIds) {
+      for (const sessionId of baseline.openSessionIds) {
         const inspection = await inspectLlmLessonExtractionRun({
           kv,
           sessionId,
@@ -598,6 +793,56 @@ export function registerLessonsFunctions(
         });
 
         if (!attemptId) {
+          const sourceVersionKey = buildSourceVersionKey(
+            "lessons",
+            "session_experience",
+            sessionId,
+            inspection.inputHash,
+          );
+          const contribution = await claimBatch(kv, {
+            stage: "lessons",
+            stageContractVersion: LESSONS_CONTRIBUTION_CONTRACT,
+            runId: legacyContributionAttemptId,
+            unitId: sessionId,
+            sourceVersionKeys: [sourceVersionKey],
+          });
+          if (contribution.status === "contract_migration_required") {
+            return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_contribution_contract_migration_required" } };
+          }
+          if (contribution.status === "claimed_by_other") {
+            return { success: false, status: "failed", failure: { class: "unit", cause: "lesson_contribution_reconciliation_required" } };
+          }
+          if (contribution.status === "already_committed" && contribution.records[0]?.state === "no_effect") {
+            if (!await verifyNoEffectLessonContribution(kv, {
+              sessionId, run: inspection.existing, proof: contribution.records[0]!,
+            })) {
+              return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_contribution_effect_unverifiable" } };
+            }
+            runs.push(inspection.existing);
+            continue;
+          }
+          if (contribution.status === "already_committed" && !inspection.existing) {
+            return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_contribution_effect_unverifiable" } };
+          }
+          if (contribution.status === "already_committed" && inspection.existing) {
+            try {
+              const evidence = await verifyCommittedLessonContribution(kv, {
+                sourceVersionKey,
+                run: inspection.existing,
+                proof: contribution.records[0]!,
+              });
+              if (!evidence) throw new Error("lesson_contribution_effect_unverifiable");
+              lessonEvidence.push(evidence);
+              runs.push(inspection.existing);
+              continue;
+            } catch (error) {
+              return {
+                success: false,
+                status: "failed",
+                failure: { class: "hard", cause: error instanceof Error ? error.message : "lesson_contribution_effect_unverifiable" },
+              };
+            }
+          }
           const baseRun = await enqueueLlmLessonExtractionRun({
             kv,
             sessionId,
@@ -607,15 +852,38 @@ export function registerLessonsFunctions(
             config,
             inspection,
           });
-          if (
+          const completedRun = (
             baseRun.status === "pending" ||
             baseRun.status === "retryable" ||
             isExpiredRunningRun(baseRun, now)
-          ) {
-            runs.push(await processLlmLessonExtractionRun({ kv, provider, runId: baseRun.id }));
-          } else {
-            runs.push(baseRun);
+          )
+            ? await processLlmLessonExtractionRun({ kv, provider, runId: baseRun.id })
+            : baseRun;
+          if (completedRun.status === "retryable" || completedRun.status === "failed") {
+            await releaseLessonClaimIfUnstaged(kv, {
+              contributionId: contribution.records[0]!.contributionId,
+              sourceVersionKey,
+              runId: completedRun.id,
+            });
           }
+          if (completedRun.status === "succeeded" && completedRun.candidateStagingId) {
+            try {
+              const evidence = await reconcileCommittedLessonContribution(kv, {
+                contributionId: contribution.records[0]!.contributionId,
+                sourceVersionKey,
+                run: completedRun,
+              });
+              if (!evidence) throw new Error("lesson_commit_receipt_missing");
+              lessonEvidence.push(evidence);
+            } catch (error) {
+              return {
+                success: false,
+                status: "failed",
+                failure: { class: "hard", cause: error instanceof Error ? error.message : "lesson_commit_receipt_missing" },
+              };
+            }
+          }
+          runs.push(completedRun);
           continue;
         }
 
@@ -641,6 +909,63 @@ export function registerLessonsFunctions(
               cause: "extraction_operation_input_hash_drifted_after_absence",
             },
           };
+        }
+        const sourceVersionKey = buildSourceVersionKey(
+          "lessons",
+          "session_experience",
+          sessionId,
+          inspection.inputHash,
+        );
+        const contribution = await claimBatch(kv, {
+          stage: "lessons",
+          stageContractVersion: LESSONS_CONTRIBUTION_CONTRACT,
+          runId: attemptId,
+          unitId: sessionId,
+          sourceVersionKeys: [sourceVersionKey],
+        });
+        if (contribution.status === "contract_migration_required") {
+          return {
+            success: false,
+            status: "failed",
+            failure: { class: "hard", cause: "lesson_contribution_contract_migration_required" },
+          };
+        }
+        if (contribution.status === "claimed_by_other") {
+          return {
+            success: false,
+            status: "failed",
+            failure: { class: "unit", cause: "lesson_contribution_reconciliation_required" },
+          };
+        }
+        if (contribution.status === "already_committed") {
+          const proof = contribution.records[0]!;
+          const evidence = proof.state === "committed"
+            ? await verifyCommittedLessonContribution(kv, {
+              sourceVersionKey, run: inspection.existing, proof,
+            })
+            : await verifyNoEffectLessonContribution(kv, {
+              sessionId, run: inspection.existing, proof,
+            })
+              ? { kind: "no_effect", runId: inspection.existing?.id }
+              : null;
+          if (!evidence) {
+            return {
+              success: false,
+              status: "failed",
+              failure: { class: "hard", cause: "lesson_contribution_effect_unverifiable" },
+            };
+          }
+          const operation = await completeModelOperationFromVerifiedResult(
+            kv,
+            receiptIdentity,
+            { success: true, status: inspection.existing!.status, runs: [inspection.existing] },
+            { allowMissing: true },
+          );
+          if (operation.failure) return { success: false, status: "failed", failure: operation.failure };
+          const persistedResponse = operation.response as { runs?: LessonExtractionRun[] } | undefined;
+          runs.push(persistedResponse?.runs?.[0] ?? inspection.existing!);
+          if (proof.state === "committed") lessonEvidence.push(evidence);
+          return { success: true, runs, lessonEvidence };
         }
         const legacyRetryAuthorized = failedReceiptRetryAuthorization
           && failedLessonRunEvidence
@@ -735,6 +1060,13 @@ export function registerLessonsFunctions(
           );
         }
         if (operation.failure) {
+          if (contribution.status === "claimed") {
+            await releaseLessonClaimIfUnstaged(kv, {
+              contributionId: contribution.records[0]!.contributionId,
+              sourceVersionKey,
+              runId: inspection.runId,
+            });
+          }
           const operationReceipt = lessonOperationReceiptProjection(
             operation.receipt,
             runnerInputHash,
@@ -764,39 +1096,51 @@ export function registerLessonsFunctions(
           return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_run_identity_conflict" } };
         }
         if (completedRun.status === "succeeded" && completedRun.candidateStagingId) {
-          const staging = await kv.get<LessonExtractionCandidateStaging>(
-            KV.lessonExtractionCandidates(completedRun.id),
-            completedRun.candidateStagingId,
-          );
-          if (!staging) {
-            return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_candidate_staging_missing" } };
+          try {
+            const evidence = await reconcileCommittedLessonContribution(kv, {
+              contributionId: contribution.records[0]!.contributionId,
+              sourceVersionKey,
+              run: completedRun,
+            });
+            if (!evidence) {
+              return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_commit_receipt_missing" } };
+            }
+            lessonEvidence.push(evidence);
+          } catch (error) {
+            const cause = error instanceof Error ? error.message : "lesson_commit_receipt_missing";
+            return { success: false, status: "failed", failure: { class: "hard", cause } };
           }
-          const plan = await freezeLessonCommitPlan(kv, { staging });
-          const reconciliation = await reconcileLessonCommit(kv, plan);
-          if (reconciliation === "conflict") {
-            return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_commit_conflict" } };
-          }
-          const receipt = await executeLessonCommitPlan(kv, plan);
-          if (!receipt || receipt.status !== "committed") {
-            return { success: false, status: "failed", failure: { class: "hard", cause: "lesson_commit_receipt_missing" } };
-          }
-          lessonEvidence.push({
-            kind: "committed",
-            runId: completedRun.id,
-            stagingId: staging.id,
-            planId: plan.id,
-            receiptKey: receipt.key,
-            effectHash: plan.effectHash,
-            receiptVersion: receipt.version,
-            resultRef: `lesson-commit-plans:${plan.id}`,
-          });
           runs.push(responseRun ?? completedRun);
           continue;
+        }
+        if (completedRun.status === "skipped" && operation.receipt?.status === "succeeded") {
+          await markClaimedBatchNoEffect(kv, {
+            stage: "lessons",
+            stageContractVersion: LESSONS_CONTRIBUTION_CONTRACT,
+            contributionId: contribution.records[0]!.contributionId,
+            sourceVersionKeys: [sourceVersionKey],
+            operationReceiptRef: {
+              scope: KV.extractionOperationReceipt(operation.receipt.key),
+              key: operation.receipt.key,
+            },
+            receiptKey: operation.receipt.key,
+            reasonCode: "lesson_run_skipped",
+          });
         }
         runs.push(responseRun ?? completedRun);
       }
 
-      return { success: true, runs, lessonEvidence };
+      return {
+        success: true,
+        runs,
+        lessonEvidence,
+        ...(baseline.adoptedSessionIds.length > 0
+          ? {
+              baselineId: baseline.baselineId,
+              adoptedBaselineSessionIds: baseline.adoptedSessionIds,
+            }
+          : {}),
+      };
     },
   );
 

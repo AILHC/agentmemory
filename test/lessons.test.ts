@@ -515,6 +515,66 @@ describe("Lessons", () => {
   });
 
   describe("mem::lessons::extract-llm", () => {
+    it("lets only one overlapping runner attempt claim a session experience", async () => {
+      let resolveProvider!: (value: string) => void;
+      const provider: MemoryProvider = {
+        name: "mock-llm",
+        compress: vi.fn(() => new Promise<string>((resolve) => { resolveProvider = resolve; })),
+        summarize: vi.fn(async () => ""),
+      };
+      registerLessonsFunctions(sdk as never, kv as never, provider);
+      await kv.set(KV.sessions, "session-overlap", {
+        id: "session-overlap", project: "project", cwd: "/tmp/project",
+        startedAt: "2026-07-24T00:00:00.000Z", status: "active", observationCount: 1,
+      });
+      await kv.set(KV.observations("session-overlap"), "obs-1", {
+        id: "obs-1", sessionId: "session-overlap", timestamp: "2026-07-24T00:00:01.000Z",
+        hookType: "user", userPrompt: "overlap", raw: {}, sourceEventIndex: 1,
+      });
+      const first = sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-overlap"], attemptId: "attempt-overlap-a", inputHash: "runner-a",
+      });
+      await vi.waitFor(() => expect(provider.compress).toHaveBeenCalledTimes(1));
+      const second = await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-overlap"], attemptId: "attempt-overlap-b", inputHash: "runner-b",
+      });
+      expect(second).toMatchObject({ success: false, failure: { cause: "lesson_contribution_reconciliation_required" } });
+      expect(provider.compress).toHaveBeenCalledTimes(1);
+      resolveProvider("<lessons><lesson><content>Owned once</content><confidence>0.8</confidence></lesson></lessons>");
+      expect(await first).toMatchObject({ success: true });
+    });
+
+    it("releases an unstaged provider failure for a later runner attempt", async () => {
+      const provider: MemoryProvider = {
+        name: "mock-llm",
+        compress: vi.fn()
+          .mockRejectedValueOnce(new Error("temporary provider failure"))
+          .mockResolvedValueOnce(
+            "<lessons><lesson><content>Recovered lesson</content><confidence>0.8</confidence></lesson></lessons>",
+          ),
+        summarize: vi.fn(async () => ""),
+      };
+      registerLessonsFunctions(sdk as never, kv as never, provider);
+      await kv.set(KV.sessions, "session-release", {
+        id: "session-release", project: "project", cwd: "/tmp/project",
+        startedAt: "2026-07-24T00:00:00.000Z", status: "active", observationCount: 1,
+      });
+      await kv.set(KV.observations("session-release"), "obs-release", {
+        id: "obs-release", sessionId: "session-release", timestamp: "2026-07-24T00:00:01.000Z",
+        hookType: "user", userPrompt: "release claim", raw: {}, sourceEventIndex: 1,
+      });
+
+      const failed = await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-release"], attemptId: "attempt-release-a", inputHash: "runner-release-a",
+      });
+      expect(failed).toMatchObject({ success: false });
+      const recovered = await sdk.trigger("mem::lessons::extract-llm", {
+        sessionIds: ["session-release"], attemptId: "attempt-release-b", inputHash: "runner-release-b",
+      });
+      expect(recovered).toMatchObject({ success: true, runs: [{ status: "succeeded" }] });
+      expect(provider.compress).toHaveBeenCalledTimes(2);
+    });
+
     it("fails when provider is missing", async () => {
       const result = (await sdk.trigger("mem::lessons::extract-llm", {
         sessionIds: ["session-1"],
@@ -527,7 +587,7 @@ describe("Lessons", () => {
     it("supports extract-runs and extract-run-get with active provider", async () => {
       const provider: MemoryProvider = {
         name: "mock-llm",
-        compress: vi.fn(async () => ""),
+        compress: vi.fn(async () => "<lessons></lessons>"),
         summarize: vi.fn(async () => ""),
       };
       registerLessonsFunctions(sdk as never, kv as never, provider);
@@ -614,6 +674,30 @@ describe("Lessons", () => {
 
       expect(first).toMatchObject({ success: true, runs: [{ status: "succeeded" }] });
       expect(replay).toEqual(first);
+      expect(provider.compress).toHaveBeenCalledTimes(1);
+
+      const cleanRerun = await sdk.trigger("mem::lessons::extract-llm", {
+        ...request,
+        attemptId: "attempt-v2-clean-rerun",
+        inputHash: "runner-session-freshness-clean-rerun",
+      });
+      expect(cleanRerun).toMatchObject({ success: true, runs: [{ status: "succeeded" }] });
+      expect(provider.compress).toHaveBeenCalledTimes(1);
+
+      const completedRun = (await kv.list<any>(KV.lessonExtractionRuns))[0];
+      const committedPlan = (await kv.list<any>(KV.lessonCommitPlans(completedRun.id)))[0];
+      const missingLessonId = committedPlan.deltas[0].lessonId;
+      await kv.delete(KV.lessons, missingLessonId);
+      const missingEffect = await sdk.trigger("mem::lessons::extract-llm", {
+        ...request,
+        attemptId: "attempt-v2-missing-effect",
+        inputHash: "runner-session-missing-effect",
+      });
+      expect(missingEffect).toMatchObject({
+        success: false,
+        failure: { class: "hard", cause: "lesson_contribution_effect_unverifiable" },
+      });
+      expect(await kv.get(KV.lessons, missingLessonId)).toBeNull();
       expect(provider.compress).toHaveBeenCalledTimes(1);
 
       await kv.set(KV.observations("session-v2"), "obs-2", {

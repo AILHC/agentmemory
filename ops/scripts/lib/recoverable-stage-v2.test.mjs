@@ -367,6 +367,70 @@ test('single-phase recovery reuses one attempt and only repeats idempotent bound
   ]);
 });
 
+test('two-phase prepare isolation records policy evidence and drains unrelated units', async () => {
+  const harness = makeHarness();
+  const prepared = [];
+  const committed = [];
+  const recorded = [];
+  const result = await runTwoPhaseStage({
+    events: harness.events,
+    plan: [
+      { unit_id: 'source-corrected', input_hash: 'input-source-corrected' },
+      { unit_id: 'eligible', input_hash: 'input-eligible' },
+    ],
+    append: harness.append,
+    recoverPrepare: true,
+    prepareAttemptIdForUnit: (unit) => `prepare-${unit.unit_id}`,
+    commitAttemptIdForUnit: ({ unit }) => `commit-${unit.unit_id}`,
+    prepare: async ({ unit, attemptId }) => {
+      prepared.push(unit.unit_id);
+      if (unit.unit_id === 'source-corrected') {
+        return {
+          status: 'failed',
+          recoveryCandidate: {
+            candidateEvidence: {
+              kind: 'no_effect',
+              observation: 'business_rejected',
+              reasonCode: 'source_correction_requires_migration',
+              proof: { kind: 'request_not_dispatched', attemptId, journalSeq: 0 },
+            },
+            snapshot: {
+              requestDispatch: {
+                state: 'not_dispatched', persisted: true, attemptId, journalSeq: 0,
+              },
+              receipt: { formalEffect: false },
+            },
+          },
+        };
+      }
+      return {
+        status: 'prepared',
+        prepared: {
+          prepared_handle: 'eligible-handle',
+          proposal_hash: 'eligible-proposal',
+          prepare_input_hash: 'eligible-prepare-input',
+        },
+      };
+    },
+    commit: async ({ unit }) => {
+      committed.push(unit.unit_id);
+      return { status: 'succeeded', payload: { result_ids: ['eligible-result'] } };
+    },
+    record: async ({ unit }) => recorded.push(unit.unit_id),
+  });
+
+  assert.equal(result.status, 'attention_required');
+  assert.deepEqual(prepared, ['source-corrected', 'eligible']);
+  assert.deepEqual(committed, ['eligible']);
+  assert.deepEqual(recorded, ['eligible']);
+  const isolated = harness.events.find((event) => event.type === 'unit_isolated');
+  assert.equal(isolated.payload.decision.action, 'isolate');
+  assert.equal(isolated.payload.evidence.observation, 'business_rejected');
+  assert.equal(harness.events.filter((event) => event.type === 'run_attention_required').length, 1);
+  assert.doesNotThrow(() => reduceRecoveryJournal(harness.events));
+  assert.doesNotThrow(() => validateTwoPhaseStage(harness.events));
+});
+
 test('single-phase reconciliation wait is durable and never becomes a failed terminal', async () => {
   const harness = makeHarness();
   let calls = 0;

@@ -655,7 +655,7 @@ describe("mem::semantic-rollup", () => {
     expect(provider.summarize).not.toHaveBeenCalled();
   });
 
-  it("uses run-aware semantic ids while keeping the input hash source-only", async () => {
+  it("uses source-version semantic ids across extraction runs", async () => {
     await kv.set(KV.summaries, "ses-a", summary("ses-a"));
 
     const first = (await sdk.trigger("mem::semantic-rollup", {
@@ -683,9 +683,108 @@ describe("mem::semantic-rollup", () => {
     expect(first.inputHash).toBe(second.inputHash);
     expect(first).toMatchObject({ runId: "run-a", windowId: "win-1" });
     expect(repeat.inputHash).toBe(first.inputHash);
-    expect(second.semanticMemoryIds[0]).not.toBe(first.semanticMemoryIds[0]);
+    expect(second.semanticMemoryIds[0]).toBe(first.semanticMemoryIds[0]);
     expect(repeat.semanticMemoryIds[0]).toBe(first.semanticMemoryIds[0]);
     expect(repeat.reused).toBe(true);
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps terminal summaries out of a mixed delta prompt", async () => {
+    await kv.set(KV.summaries, "old-session", summary("old-session"));
+    await kv.set(KV.summaries, "new-session", summary("new-session"));
+    provider.summarize = vi.fn()
+      .mockResolvedValueOnce('<facts><fact confidence="0.8">Old fact</fact></facts>')
+      .mockResolvedValueOnce('<facts><fact confidence="0.9">New fact</fact></facts>');
+
+    const oldResult = await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-old",
+      windowId: "window-old",
+      mark: "first",
+      kind: "window",
+      sessionIds: ["old-session"],
+    }) as { semanticMemoryIds: string[] };
+    const sourceSummaryHashes = Object.fromEntries(
+      ["old-session", "new-session"].map((sessionId) => {
+        const source = summary(sessionId);
+        return [sessionId, stableHash({
+          title: source.title,
+          narrative: source.narrative,
+          keyDecisions: source.keyDecisions,
+          filesModified: source.filesModified,
+          concepts: source.concepts,
+        })];
+      }),
+    );
+    expect(await sdk.trigger("mem::semantic-rollup-eligibility", {
+      sessionIds: ["old-session", "new-session"],
+      sourceSummaryHashes,
+    })).toEqual({
+      success: true,
+      eligibleSessionIds: ["new-session"],
+      terminalSessionIds: ["old-session"],
+    });
+    const mixedResult = await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-mixed",
+      windowId: "window-mixed",
+      mark: "second",
+      kind: "window",
+      sessionIds: ["old-session", "new-session"],
+    }) as { semanticMemoryIds: string[] };
+
+    expect(provider.summarize).toHaveBeenCalledTimes(2);
+    const mixedPrompt = (provider.summarize as ReturnType<typeof vi.fn>).mock.calls[1][1] as string;
+    expect(mixedPrompt).toContain("Summary new-session");
+    expect(mixedPrompt).not.toContain("Summary old-session");
+    const newMemory = await kv.get<SemanticMemory>(KV.semantic, mixedResult.semanticMemoryIds[0]);
+    expect(newMemory?.sourceSessionIds).toEqual(["new-session"]);
+
+    const historicalResult = await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-history",
+      windowId: "window-history",
+      mark: "third",
+      kind: "window",
+      sessionIds: ["old-session", "new-session"],
+    }) as { semanticMemoryIds: string[]; semanticMemoryCharSizes: Record<string, number> };
+    expect(provider.summarize).toHaveBeenCalledTimes(2);
+    expect(new Set(historicalResult.semanticMemoryIds)).toEqual(new Set([
+      ...oldResult.semanticMemoryIds,
+      ...mixedResult.semanticMemoryIds,
+    ]));
+    for (const size of Object.values(historicalResult.semanticMemoryCharSizes)) {
+      expect(size).toBeGreaterThan(0);
+    }
+  });
+
+  it("lets only one overlapping run claim a summary source before provider dispatch", async () => {
+    await kv.set(KV.summaries, "ses-a", summary("ses-a"));
+    let resolveProvider!: (value: string) => void;
+    provider.summarize = vi.fn(() => new Promise<string>((resolve) => { resolveProvider = resolve; }));
+    const first = sdk.trigger("mem::semantic-rollup", {
+      runId: "run-overlap-a", windowId: "win-overlap-a", mark: "full", kind: "window", sessionIds: ["ses-a"],
+    });
+    await vi.waitFor(() => expect(provider.summarize).toHaveBeenCalledTimes(1));
+    const second = await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-overlap-b", windowId: "win-overlap-b", mark: "full", kind: "window", sessionIds: ["ses-a"],
+    });
+    expect(second).toMatchObject({ success: false, error: "semantic_rollup_reconciliation_required" });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    resolveProvider('<facts><fact confidence="0.9">One owner</fact></facts>');
+    expect(await first).toMatchObject({ success: true });
+  });
+
+  it("releases an unstaged provider failure so a new run can claim the source", async () => {
+    await kv.set(KV.summaries, "ses-a", summary("ses-a"));
+    provider.summarize = vi.fn().mockRejectedValueOnce(new Error("temporary"))
+      .mockResolvedValueOnce('<facts><fact confidence="0.9">Recovered owner</fact></facts>');
+    const failed = await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-release-a", windowId: "win-release-a", mark: "full", kind: "window", sessionIds: ["ses-a"],
+    });
+    expect(failed).toMatchObject({ success: false, error: "provider_error" });
+    const recovered = await sdk.trigger("mem::semantic-rollup", {
+      runId: "run-release-b", windowId: "win-release-b", mark: "full", kind: "window", sessionIds: ["ses-a"],
+    });
+    expect(recovered).toMatchObject({ success: true });
+    expect(provider.summarize).toHaveBeenCalledTimes(2);
   });
 
   it("preserves runtime fields when an idempotent semantic write repeats", async () => {
@@ -775,7 +874,7 @@ describe("mem::semantic-rollup", () => {
     expect(await kv.list(KV.audit)).toHaveLength(2);
   });
 
-  it("fails closed when the same semantic input is retried with a different configuration", async () => {
+  it("reuses a terminal semantic contribution across compatible configuration changes", async () => {
     await kv.set(KV.summaries, "ses-a", summary("ses-a"));
     const input = {
       runId: "run-config",
@@ -785,16 +884,12 @@ describe("mem::semantic-rollup", () => {
       sessionIds: ["ses-a"],
     };
     await sdk.trigger("mem::semantic-rollup", { ...input, model: "model-a" });
-    const conflict = (await sdk.trigger("mem::semantic-rollup", {
+    const reused = (await sdk.trigger("mem::semantic-rollup", {
       ...input,
       model: "model-b",
     })) as { success: boolean; error: string };
 
-    expect(conflict).toEqual(expect.objectContaining({
-      success: false,
-      error: "configuration_identity_conflict",
-    }));
-    expectHardFailure(conflict, "configuration_identity_conflict");
+    expect(reused).toEqual(expect.objectContaining({ success: true, reused: true }));
     expect(provider.summarize).toHaveBeenCalledTimes(1);
   });
 
@@ -936,8 +1031,8 @@ describe("mem::semantic-rollup", () => {
     await kv.delete(KV.semantic, missingId);
     const replay = await sdk.trigger("mem::semantic-rollup", input) as any;
 
-    expect(replay.semanticMemoryIds).toEqual(first.semanticMemoryIds);
-    expect(await kv.get(KV.semantic, missingId)).not.toBeNull();
+    expectHardFailure(replay, "semantic_rollup_commit_conflict");
+    expect(await kv.get(KV.semantic, missingId)).toBeNull();
     expect(provider.summarize).toHaveBeenCalledTimes(1);
   });
 

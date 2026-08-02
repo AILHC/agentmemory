@@ -395,6 +395,7 @@ function Copy-AmReleaseScripts {
   $required = @(
     '_agentmemory-local-common.ps1',
     'agentmemory-deployment-manifest.mjs',
+    'extraction-model-contracts-v1.json',
     'validate-agentmemory-worker-supervision.mjs',
     'start-agentmemory-console.ps1',
     'stop-agentmemory-console.ps1',
@@ -408,6 +409,8 @@ function Copy-AmReleaseScripts {
     'create-agentmemory-recovery-evidence-snapshot.mjs',
     'migrate-agentmemory-recovery-frontier.mjs',
     'project-agentmemory-recovery-status.mjs',
+    'preview-agentmemory-adopted-baseline.mjs',
+    'apply-agentmemory-adopted-baseline.mjs',
     'status-agentmemory-full-extraction.ps1',
     'run-agentmemory-cli-import-batch.mjs',
     'run-agentmemory-full-extraction.mjs'
@@ -429,6 +432,7 @@ function Copy-AmReleaseScripts {
     'effect-state-recovery-stage-catalog-v1.mjs',
     'full-extraction-stage-adapters-v2.mjs',
     'iii-state-read-only-adapter-v1.mjs',
+    'incremental-extraction-status-v1.mjs',
     'legacy-lesson-safe-facts-collector-v1.mjs',
     'lesson-recovery-adapter-v1.mjs',
     'offline-statekv-snapshot-v1.mjs',

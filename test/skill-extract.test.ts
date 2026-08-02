@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const mockKv = {
@@ -25,7 +26,13 @@ vi.mock("../src/functions/audit.js", () => ({
   recordAudit: vi.fn(),
 }));
 
-import { registerSkillExtractFunctions } from "../src/functions/skill-extract.js";
+import {
+  buildSkillExtractionSourceVersion,
+  reconcileSkillContributionFromProposal,
+  registerSkillExtractFunctions,
+  SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+} from "../src/functions/skill-extract.js";
+import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
 import { KV } from "../src/state/schema.js";
 
 function canonical(value: unknown): unknown {
@@ -35,6 +42,10 @@ function canonical(value: unknown): unknown {
     .sort(([left], [right]) => left.localeCompare(right, "en"))
     .filter(([, child]) => child !== undefined)
     .map(([key, child]) => [key, canonical(child)]));
+}
+
+function stableHash(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
 }
 
 describe("skill-extract", () => {
@@ -941,6 +952,336 @@ describe("skill-extract", () => {
       success: true,
       status: "succeeded",
     });
+  });
+
+  it("uses a model- and run-independent source snapshot and claims before calling the provider", async () => {
+    const store = new Map<string, Map<string, any>>();
+    const put = (scope: string, key: string, value: any) => {
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, structuredClone(value));
+    };
+    const session = { id: "skill-source", project: "test", status: "completed" as const };
+    const summary = { sessionId: "skill-source", title: "Fix auth", narrative: "Repeatable fix", keyDecisions: ["check config"], filesModified: ["auth.ts"], concepts: ["auth"] };
+    const observations = Array.from({ length: 3 }, (_, index) => ({ id: `obs-${index}`, sessionId: "skill-source", timestamp: `2026-07-30T00:00:0${index}.000Z`, type: "file_edit", title: `Step ${index}`, narrative: "Update auth", importance: 8 }));
+    put(KV.sessions, session.id, session);
+    put(KV.summaries, session.id, summary);
+    observations.forEach((observation) => put(KV.observations(session.id), observation.id, observation));
+    mockKv.get.mockImplementation(async (scope: string, key: string) => structuredClone(store.get(scope)?.get(key) ?? null));
+    mockKv.set.mockImplementation(async (scope: string, key: string, value: any) => { put(scope, key, value); return value; });
+    mockKv.list.mockImplementation(async (scope: string) => [...(store.get(scope)?.values() ?? [])].map((value) => structuredClone(value)));
+    mockKv.delete.mockImplementation(async (scope: string, key: string) => store.get(scope)?.delete(key) ?? false);
+    mockProvider.summarize.mockResolvedValue("<skill><trigger>When auth fails</trigger><title>Fix auth</title><steps><step>Inspect config</step><step>Apply fix</step></steps><expected_outcome>Auth works</expected_outcome><tags>auth</tags></skill>");
+    const source = buildSkillExtractionSourceVersion(session as any, summary as any, observations as any);
+    expect(buildSkillExtractionSourceVersion(session as any, summary as any, observations as any).sourceVersionKey).toBe(source.sourceVersionKey);
+    const prepare = handlers["mem::full-skill-extract-prepare"];
+    const input = { identity: { runId: "run-a", stage: "skill_extract", unitId: "skill-source", inputHash: "runner-a" }, sessionId: session.id, model: "model-a", stageContractVersion: SKILL_EXTRACT_CONTRIBUTION_CONTRACT, sourceVersionKey: source.sourceVersionKey, operationReceiptManaged: true };
+    const prepared = await prepare(input);
+    expect(prepared).toMatchObject({ success: true, status: "prepared" });
+    expect(mockProvider.summarize).toHaveBeenCalledTimes(1);
+    const proposal = [...store.values()].flatMap((entries) => [...entries.values()]).find((value) => value?.sourceSnapshotHash === source.snapshotHash);
+    expect(proposal).toMatchObject({ sourceSnapshotHash: source.snapshotHash, stageContractVersion: SKILL_EXTRACT_CONTRIBUTION_CONTRACT });
+    await expect(prepare({ ...input, model: "model-b" })).resolves.toMatchObject({ status: "prepared" });
+    expect(mockProvider.summarize).toHaveBeenCalledTimes(1);
+
+    put(KV.summaries, session.id, {
+      ...summary,
+      narrative: "Corrected before the prepared candidate contributed",
+    });
+    await expect(handlers["mem::full-skill-extract-commit"]({
+      identity: { ...input.identity, inputHash: prepared.inputHash },
+      preparedHandle: prepared.preparedHandle,
+      proposalHash: prepared.proposalHash,
+    })).resolves.toMatchObject({
+      success: false,
+      failure: { cause: "skill_extract_source_version_conflict" },
+    });
+    expect(store.get(KV.extractionContributionRecords(
+      "skill_extract",
+      SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+    ))?.size ?? 0).toBe(0);
+    expect(store.get(KV.extractionContributionHeads(
+      "skill_extract",
+      SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+    ))?.size ?? 0).toBe(0);
+    const replacement = await handlers["mem::skill-extract-eligibility"]({
+      sessionIds: [session.id],
+    });
+    expect(replacement).toMatchObject({
+      success: true,
+      eligible: [{ sessionId: session.id }],
+      reconciliation: [],
+      sourceCorrection: [],
+    });
+    expect(replacement.eligible[0].sourceVersionKey).not.toBe(source.sourceVersionKey);
+    expect(mockProvider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets only one overlapping formal prepare call the provider for a source version", async () => {
+    const store = new Map<string, Map<string, any>>();
+    const put = (scope: string, key: string, value: any) => {
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, structuredClone(value));
+    };
+    const session = { id: "skill-overlap", project: "test", status: "completed" as const };
+    const summary = {
+      sessionId: session.id,
+      title: "Overlap",
+      narrative: "Repeatable overlap fix",
+      keyDecisions: ["claim first"],
+      filesModified: ["overlap.ts"],
+      concepts: ["claim"],
+    };
+    const observations = Array.from({ length: 3 }, (_, index) => ({
+      id: `obs-${index}`,
+      sessionId: session.id,
+      timestamp: `2026-07-30T00:00:0${index}.000Z`,
+      type: "file_edit",
+      title: `Step ${index}`,
+      narrative: "Update overlap guard",
+      importance: 8,
+    }));
+    put(KV.sessions, session.id, session);
+    put(KV.summaries, session.id, summary);
+    observations.forEach((observation) => put(KV.observations(session.id), observation.id, observation));
+    mockKv.get.mockImplementation(async (scope: string, key: string) => structuredClone(store.get(scope)?.get(key) ?? null));
+    mockKv.set.mockImplementation(async (scope: string, key: string, value: any) => {
+      put(scope, key, value);
+      return value;
+    });
+    mockKv.list.mockImplementation(async (scope: string) => [...(store.get(scope)?.values() ?? [])]
+      .map((value) => structuredClone(value)));
+    mockKv.delete.mockImplementation(async (scope: string, key: string) => store.get(scope)?.delete(key) ?? false);
+    let resolveProvider!: (value: string) => void;
+    mockProvider.summarize.mockImplementation(() => new Promise<string>((resolve) => {
+      resolveProvider = resolve;
+    }));
+
+    const source = buildSkillExtractionSourceVersion(session as any, summary as any, observations as any);
+    const prepare = handlers["mem::full-skill-extract-prepare"];
+    const first = prepare({
+      identity: { runId: "overlap-a", stage: "skill_extract", unitId: session.id, inputHash: "runner-a" },
+      sessionId: session.id,
+      stageContractVersion: SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+      sourceVersionKey: source.sourceVersionKey,
+      operationReceiptManaged: true,
+    });
+    await vi.waitFor(() => expect(mockProvider.summarize).toHaveBeenCalledTimes(1));
+    const second = await prepare({
+      identity: { runId: "overlap-b", stage: "skill_extract", unitId: session.id, inputHash: "runner-b" },
+      sessionId: session.id,
+      stageContractVersion: SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+      sourceVersionKey: source.sourceVersionKey,
+      operationReceiptManaged: true,
+    });
+    expect(second).toMatchObject({
+      success: false,
+      failure: { cause: "skill_extract_contribution_claimed_by_other" },
+    });
+    expect(mockProvider.summarize).toHaveBeenCalledTimes(1);
+    resolveProvider("<skill><trigger>When overlap occurs</trigger><title>Guard overlap</title><steps><step>Claim source</step><step>Commit once</step></steps><expected_outcome>One owner</expected_outcome><tags>claim</tags></skill>");
+    await expect(first).resolves.toMatchObject({ success: true, status: "prepared" });
+  });
+
+  it("releases a formal claim after an ambiguous parse response", async () => {
+    const store = new Map<string, Map<string, any>>();
+    const put = (scope: string, key: string, value: any) => { if (!store.has(scope)) store.set(scope, new Map()); store.get(scope)!.set(key, structuredClone(value)); };
+    const session = { id: "skill-parse", project: "test", status: "completed" as const };
+    const summary = { sessionId: session.id, title: "Parse", narrative: "Parse", keyDecisions: [], filesModified: [], concepts: [] };
+    const observations = Array.from({ length: 3 }, (_, index) => ({ id: `obs-${index}`, sessionId: session.id, timestamp: `2026-07-30T00:00:0${index}.000Z`, type: "file_edit", title: `Step ${index}`, narrative: "Update", importance: 8 }));
+    put(KV.sessions, session.id, session); put(KV.summaries, session.id, summary); observations.forEach((observation) => put(KV.observations(session.id), observation.id, observation));
+    mockKv.get.mockImplementation(async (scope: string, key: string) => structuredClone(store.get(scope)?.get(key) ?? null));
+    mockKv.set.mockImplementation(async (scope: string, key: string, value: any) => { put(scope, key, value); return value; });
+    mockKv.list.mockImplementation(async (scope: string) => [...(store.get(scope)?.values() ?? [])].map((value) => structuredClone(value)));
+    mockKv.delete.mockImplementation(async (scope: string, key: string) => store.get(scope)?.delete(key) ?? false);
+    mockProvider.summarize.mockResolvedValue("<skill><trigger>When parsing truncates</trigger><title>Truncated</title><steps><step>One</step><step>Two</step></steps>");
+    const source = buildSkillExtractionSourceVersion(session as any, summary as any, observations as any);
+    const result = await handlers["mem::full-skill-extract-prepare"]({ identity: { runId: "parse-run", stage: "skill_extract", unitId: session.id, inputHash: "parse" }, sessionId: session.id, stageContractVersion: SKILL_EXTRACT_CONTRIBUTION_CONTRACT, sourceVersionKey: source.sourceVersionKey, operationReceiptManaged: true });
+    expect(result).toMatchObject({ success: false, status: "failed" });
+    expect(store.get(KV.extractionContributionRecords("skill_extract", SKILL_EXTRACT_CONTRIBUTION_CONTRACT))?.size ?? 0).toBe(0);
+  });
+
+  it("repairs a committed skill contribution without another provider call or domain effect", async () => {
+    const store = new Map<string, Map<string, any>>();
+    const put = (scope: string, key: string, value: any) => {
+      if (!store.has(scope)) store.set(scope, new Map());
+      store.get(scope)!.set(key, structuredClone(value));
+    };
+    const session = { id: "skill-reconcile", project: "test", status: "completed" as const };
+    const summary = {
+      sessionId: session.id,
+      title: "Reconcile",
+      narrative: "Repeatable recovery procedure",
+      keyDecisions: ["persist receipt before contribution"],
+      filesModified: ["reconcile.ts"],
+      concepts: ["recovery"],
+    };
+    const observations = Array.from({ length: 3 }, (_, index) => ({
+      id: `obs-${index}`,
+      sessionId: session.id,
+      timestamp: `2026-07-30T00:00:0${index}.000Z`,
+      type: "file_edit",
+      title: `Step ${index}`,
+      narrative: "Apply recovery step",
+      importance: 8,
+    }));
+    put(KV.sessions, session.id, session);
+    put(KV.summaries, session.id, summary);
+    observations.forEach((observation) => put(KV.observations(session.id), observation.id, observation));
+    let failContributionCommit = false;
+    mockKv.get.mockImplementation(async (scope: string, key: string) => structuredClone(store.get(scope)?.get(key) ?? null));
+    mockKv.set.mockImplementation(async (scope: string, key: string, value: any) => {
+      if (
+        failContributionCommit
+        && scope === KV.extractionContributionRecords("skill_extract", SKILL_EXTRACT_CONTRIBUTION_CONTRACT)
+        && value?.state === "committed"
+      ) {
+        failContributionCommit = false;
+        throw new Error("injected contribution commit failure");
+      }
+      put(scope, key, value);
+      return value;
+    });
+    mockKv.list.mockImplementation(async (scope: string) => [...(store.get(scope)?.values() ?? [])]
+      .map((value) => structuredClone(value)));
+    mockKv.delete.mockImplementation(async (scope: string, key: string) => store.get(scope)?.delete(key) ?? false);
+    mockProvider.summarize.mockResolvedValue("<skill><trigger>When contribution commit is interrupted</trigger><title>Repair contribution</title><steps><step>Verify receipt</step><step>Reconcile contribution</step></steps><expected_outcome>One durable effect</expected_outcome><tags>recovery</tags></skill>");
+
+    const source = buildSkillExtractionSourceVersion(session as any, summary as any, observations as any);
+    const prepareIdentity = {
+      runId: "reconcile-run",
+      stage: "skill_extract" as const,
+      unitId: session.id,
+      inputHash: "runner-input",
+    };
+    const prepared = await handlers["mem::full-skill-extract-prepare"]({
+      identity: prepareIdentity,
+      sessionId: session.id,
+      stageContractVersion: SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+      sourceVersionKey: source.sourceVersionKey,
+      operationReceiptManaged: true,
+    });
+    expect(prepared).toMatchObject({ success: true, status: "prepared" });
+    const verifiedPrepareIdentity = { ...prepareIdentity, inputHash: prepared.inputHash as string };
+    const commitIdentity = {
+      runId: "reconcile-commit-run",
+      stage: "skill_extract" as const,
+      unitId: prepareIdentity.unitId,
+      inputHash: stableHash({
+        prepareRunId: prepareIdentity.runId,
+        unitId: prepareIdentity.unitId,
+        prepareInputHash: prepared.inputHash,
+        preparedHandle: prepared.preparedHandle,
+        proposalHash: prepared.proposalHash,
+      }),
+    };
+    const committed = await handlers["mem::full-skill-extract-commit"]({
+      identity: verifiedPrepareIdentity,
+      preparedHandle: prepared.preparedHandle,
+      proposalHash: prepared.proposalHash,
+    });
+    expect(committed, JSON.stringify(committed)).toMatchObject({
+      success: true,
+      status: "succeeded",
+      extracted: true,
+    });
+    const operationKey = buildExtractionOperationKey(commitIdentity);
+    const operationReceiptRef = { scope: KV.extractionOperationReceipt(operationKey), key: operationKey };
+    const now = new Date().toISOString();
+    put(operationReceiptRef.scope, operationReceiptRef.key, {
+      ...commitIdentity,
+      key: operationKey,
+      version: 1,
+      status: "succeeded",
+      startedAt: now,
+      completedAt: now,
+      response: committed,
+    });
+
+    failContributionCommit = true;
+    await expect(reconcileSkillContributionFromProposal({
+      kv: mockKv as any,
+      prepareIdentity: verifiedPrepareIdentity,
+      commitIdentity,
+      operationReceiptRef,
+    })).resolves.toMatchObject({
+      success: false,
+      failure: { cause: "skill_extract_contribution_reconciliation_required" },
+    });
+    expect(failContributionCommit).toBe(false);
+    const repaired = await reconcileSkillContributionFromProposal({
+      kv: mockKv as any,
+      prepareIdentity: verifiedPrepareIdentity,
+      commitIdentity,
+      operationReceiptRef,
+    });
+    expect(repaired, JSON.stringify(repaired)).toMatchObject({ success: true, status: "succeeded" });
+
+    const skillId = committed.proceduralMemoryIds[0] as string;
+    const skill = store.get(KV.procedural)!.get(skillId);
+    expect(skill).toMatchObject({ frequency: 1, sourceSessionIds: [session.id] });
+    expect(store.get(KV.audit)?.size).toBe(1);
+    await expect(handlers["mem::full-skill-extract-prepare"]({
+      identity: { runId: "reconcile-clean", stage: "skill_extract", unitId: session.id, inputHash: "new-runner-input" },
+      sessionId: session.id,
+      stageContractVersion: SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+      sourceVersionKey: source.sourceVersionKey,
+      operationReceiptManaged: true,
+    })).resolves.toMatchObject({ success: true, status: "succeeded", extracted: true });
+    expect(mockProvider.summarize).toHaveBeenCalledTimes(1);
+    expect(store.get(KV.procedural)!.get(skillId)).toMatchObject({ frequency: 1, sourceSessionIds: [session.id] });
+    expect(store.get(KV.audit)?.size).toBe(1);
+
+    store.get(KV.procedural)!.delete(skillId);
+    await expect(handlers["mem::full-skill-extract-prepare"]({
+      identity: { runId: "reconcile-tampered", stage: "skill_extract", unitId: session.id, inputHash: "tampered-runner-input" },
+      sessionId: session.id,
+      stageContractVersion: SKILL_EXTRACT_CONTRIBUTION_CONTRACT,
+      sourceVersionKey: source.sourceVersionKey,
+      operationReceiptManaged: true,
+    })).resolves.toMatchObject({
+      success: false,
+      failure: { cause: "skill_extract_terminal_reconciliation_required" },
+    });
+    expect(mockProvider.summarize).toHaveBeenCalledTimes(1);
+    expect(store.get(KV.audit)?.size).toBe(1);
+  });
+
+  it("commits strict no-skill only after the managed prepare receipt and replays without a provider call", async () => {
+    const store = new Map<string, Map<string, any>>();
+    const put = (scope: string, key: string, value: any) => { if (!store.has(scope)) store.set(scope, new Map()); store.get(scope)!.set(key, structuredClone(value)); };
+    const session = { id: "skill-empty", project: "test", status: "completed" as const };
+    const summary = { sessionId: session.id, title: "Empty", narrative: "No procedure", keyDecisions: [], filesModified: [], concepts: [] };
+    const observations = Array.from({ length: 3 }, (_, index) => ({ id: `obs-${index}`, sessionId: session.id, timestamp: `2026-07-30T00:00:0${index}.000Z`, type: "file_read", title: `Read ${index}`, narrative: "Explore", importance: 8 }));
+    put(KV.sessions, session.id, session); put(KV.summaries, session.id, summary); observations.forEach((observation) => put(KV.observations(session.id), observation.id, observation));
+    mockKv.get.mockImplementation(async (scope: string, key: string) => structuredClone(store.get(scope)?.get(key) ?? null));
+    mockKv.set.mockImplementation(async (scope: string, key: string, value: any) => { put(scope, key, value); return value; });
+    mockKv.list.mockImplementation(async (scope: string) => [...(store.get(scope)?.values() ?? [])].map((value) => structuredClone(value)));
+    mockProvider.summarize.mockResolvedValue("<no-skill/>");
+    const source = buildSkillExtractionSourceVersion(session as any, summary as any, observations as any);
+    const input = { identity: { runId: "empty-run", stage: "skill_extract", unitId: session.id, inputHash: "empty" }, sessionId: session.id, stageContractVersion: SKILL_EXTRACT_CONTRIBUTION_CONTRACT, sourceVersionKey: source.sourceVersionKey, operationReceiptManaged: true };
+    await expect(handlers["mem::full-skill-extract-prepare"](input)).resolves.toMatchObject({ success: true, status: "skipped" });
+    const heads = store.get(KV.extractionContributionHeads("skill_extract", SKILL_EXTRACT_CONTRIBUTION_CONTRACT))!;
+    const head = heads.get(`session|${session.id}`);
+    heads.set(`session|${session.id}`, { ...head, state: "claimed" });
+    await expect(handlers["mem::full-skill-extract-prepare"]({ ...input, identity: { ...input.identity, runId: "empty-clean-rerun", inputHash: "different-run-input" }, model: "different-model" })).resolves.toMatchObject({ success: true, status: "skipped" });
+    expect(mockProvider.summarize).toHaveBeenCalledTimes(1);
+    expect([...store.get(KV.extractionContributionRecords("skill_extract", SKILL_EXTRACT_CONTRIBUTION_CONTRACT))!.values()]).toEqual([expect.objectContaining({ state: "no_effect" })]);
+    expect(heads.get(`session|${session.id}`)).toMatchObject({ state: "no_effect" });
+
+    const record = [...store.get(KV.extractionContributionRecords("skill_extract", SKILL_EXTRACT_CONTRIBUTION_CONTRACT))!.values()][0];
+    const receipt = store.get(record.operationReceiptRef.scope)!.get(record.operationReceiptRef.key);
+    put(record.operationReceiptRef.scope, record.operationReceiptRef.key, {
+      ...receipt,
+      response: { ...receipt.response, extracted: true },
+    });
+    await expect(handlers["mem::full-skill-extract-prepare"]({
+      ...input,
+      identity: { ...input.identity, runId: "empty-tampered-rerun", inputHash: "tampered-run-input" },
+    })).resolves.toMatchObject({
+      success: false,
+      failure: { cause: "skill_extract_terminal_reconciliation_required" },
+    });
+    expect(mockProvider.summarize).toHaveBeenCalledTimes(1);
   });
 
   it("skill-list returns sorted by strength", async () => {

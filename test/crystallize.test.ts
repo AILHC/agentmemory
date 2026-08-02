@@ -6,6 +6,7 @@ vi.mock("../src/logger.js", () => ({
 
 import {
   buildEligibleCrystalActionGroups,
+  CRYSTAL_CONTRIBUTION_CONTRACT,
   registerCrystallizeFunction,
 } from "../src/functions/crystallize.js";
 import { buildExtractionOperationKey } from "../src/functions/extraction-operation-receipts.js";
@@ -439,8 +440,21 @@ describe("Crystallize Functions", () => {
         groupKey: "proj",
         actionIds: ["act_group"],
         actionUpdatedAts: ["2026-06-01T00:00:00.000Z"],
+        stageContractVersion: CRYSTAL_CONTRIBUTION_CONTRACT,
+        sourceVersionKeys: [expect.stringMatching(/^crystal\|action\|act_group\|[0-9a-f]{64}$/)],
         actionCount: 1,
       });
+
+      await kv.set(KV.actions, action.id, {
+        ...action,
+        title: "Corrected action",
+        updatedAt: "2026-06-02T00:00:00.000Z",
+      });
+      const corrected = await buildEligibleCrystalActionGroups({
+        kv: kv as never,
+        olderThanDays: 7,
+      });
+      expect(corrected[0].sourceVersionKeys[0]).not.toBe(groups[0].sourceVersionKeys[0]);
     });
 
     it("does not include recently updated done actions even when created long ago", async () => {
@@ -748,6 +762,150 @@ describe("Crystallize Functions", () => {
       expect(await kv.list(KV.lessons)).toEqual([]);
       expect(await kv.list(KV.audit)).toEqual([]);
       expect(await kv.get<Action>(KV.actions, action.id)).toEqual(action);
+      expect(await kv.list(KV.extractionContributionRecords(
+        "crystal",
+        CRYSTAL_CONTRIBUTION_CONTRACT,
+      ))).toEqual([]);
+    });
+
+    it("rejects a truncated formal digest without consuming the action", async () => {
+      (provider.summarize as ReturnType<typeof vi.fn>)
+        .mockResolvedValue('{"narrative":"truncated"');
+      const action = makeAction({
+        id: "act_crystal_parse_failure",
+        status: "done",
+        project: "parse-failure",
+      });
+      await kv.set(KV.actions, action.id, action);
+      const payload = {
+        groupId: "crystal-group:parse-failure",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        project: action.project,
+        runId: "crystal-parse-failure",
+        unitId: "crystal-group:parse-failure",
+        inputHash: "f".repeat(64),
+      };
+      await seedRunningCrystalReceipt(kv, payload);
+
+      const result = await sdk.trigger("mem::full-crystals-auto", payload);
+
+      expect(result).toMatchObject({
+        success: false,
+        failure: { class: "unit", cause: "crystal_response_parse_failure" },
+      });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect(await kv.list(KV.crystals)).toEqual([]);
+      expect(await kv.list(KV.extractionContributionRecords(
+        "crystal",
+        CRYSTAL_CONTRIBUTION_CONTRACT,
+      ))).toEqual([]);
+      expect(await kv.get<Action>(KV.actions, action.id)).toEqual(action);
+    });
+
+    it("releases an old crystal candidate when its action changes before contribution", async () => {
+      const action = makeAction({
+        id: "act_crystal_precommit_drift",
+        status: "done",
+        project: "precommit-drift",
+      });
+      await kv.set(KV.actions, action.id, action);
+      (provider.summarize as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        await kv.set(KV.actions, action.id, {
+          ...action,
+          title: "Corrected before contribution",
+          updatedAt: new Date(Date.parse(action.updatedAt) + 1_000).toISOString(),
+        });
+        return '{"narrative":"stale","keyOutcomes":[],"filesAffected":[],"lessons":[]}';
+      });
+      const payload = {
+        groupId: "crystal-group:precommit-drift",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        project: action.project,
+        runId: "crystal-precommit-drift",
+        unitId: "crystal-group:precommit-drift",
+        inputHash: "9".repeat(64),
+      };
+      await seedRunningCrystalReceipt(kv, payload);
+
+      const result = await sdk.trigger("mem::full-crystals-auto", payload);
+
+      expect(result).toMatchObject({
+        success: false,
+        failure: { class: "hard", cause: "crystal_plan_drifted" },
+      });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect(await kv.list(KV.crystals)).toEqual([]);
+      expect(await kv.list(KV.lessons)).toEqual([]);
+      expect(await kv.list(KV.audit)).toEqual([]);
+      expect(await kv.list(KV.extractionContributionRecords(
+        "crystal",
+        CRYSTAL_CONTRIBUTION_CONTRACT,
+      ))).toEqual([]);
+      const replacement = await sdk.trigger("mem::full-crystals-auto", {
+        dryRun: true,
+        project: action.project,
+      }) as { groups: Array<{ actionIds: string[]; isolateReason?: string }> };
+      expect(replacement.groups).toEqual([
+        expect.objectContaining({ actionIds: [action.id] }),
+      ]);
+      expect(replacement.groups[0].isolateReason).toBeUndefined();
+    });
+
+    it("discards a staged crystal candidate when source drift precedes every domain effect", async () => {
+      const action = makeAction({
+        id: "act_crystal_staged_drift",
+        status: "done",
+        project: "staged-drift",
+      });
+      await kv.set(KV.actions, action.id, action);
+      const payload = {
+        groupId: "crystal-group:staged-drift",
+        actionIds: [action.id],
+        actionUpdatedAts: [action.updatedAt],
+        project: action.project,
+        runId: "crystal-staged-drift",
+        unitId: "crystal-group:staged-drift",
+        inputHash: "8".repeat(64),
+      };
+      const receiptKey = await seedRunningCrystalReceipt(kv, payload);
+      const originalSet = kv.set;
+      let driftAfterStage = true;
+      kv.set = async <T>(scope: string, key: string, data: T): Promise<T> => {
+        const written = await originalSet(scope, key, data);
+        if (
+          driftAfterStage
+          && (data as { crystalRecovery?: { phase?: string } }).crystalRecovery?.phase === "staged"
+        ) {
+          driftAfterStage = false;
+          await originalSet(KV.actions, action.id, {
+            ...action,
+            description: "Corrected after staging",
+            updatedAt: new Date(Date.parse(action.updatedAt) + 1_000).toISOString(),
+          });
+        }
+        return written;
+      };
+
+      const result = await sdk.trigger("mem::full-crystals-auto", payload);
+
+      expect(result).toMatchObject({
+        success: false,
+        failure: { class: "hard", cause: "crystal_plan_drifted" },
+      });
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
+      expect(await kv.list(KV.crystals)).toEqual([]);
+      expect(await kv.list(KV.lessons)).toEqual([]);
+      expect(await kv.list(KV.audit)).toEqual([]);
+      expect(await kv.list(KV.extractionContributionRecords(
+        "crystal",
+        CRYSTAL_CONTRIBUTION_CONTRACT,
+      ))).toEqual([]);
+      expect(await kv.get<{ crystalRecovery?: unknown }>(
+        KV.extractionOperationReceipt(receiptKey),
+        receiptKey,
+      )).not.toHaveProperty("crystalRecovery");
     });
 
     it("replays one pinned full-stage operation without repeating provider work", async () => {
@@ -994,7 +1152,7 @@ describe("Crystallize Functions", () => {
       expect(provider.summarize).toHaveBeenCalledTimes(1);
     });
 
-    it("serializes crystal effect commits across different recovery identities", async () => {
+    it("lets only one overlapping recovery identity call the provider", async () => {
       provider.summarize = vi.fn().mockResolvedValue(
         '{"narrative":"shared","keyOutcomes":["done"],"filesAffected":[],"lessons":[]}',
       );
@@ -1036,13 +1194,17 @@ describe("Crystallize Functions", () => {
         }
         return persisted;
       };
+      const stagedResults = [];
       for (const payload of payloads) {
-        const staged = (await sdk.trigger("mem::full-crystals-auto", payload)) as {
+        stagedResults.push((await sdk.trigger("mem::full-crystals-auto", payload)) as {
           success: boolean;
           retrySameIdentity?: boolean;
-        };
-        expect(staged).toMatchObject({ success: false, retrySameIdentity: true });
+          failure?: { class: string; cause: string };
+        });
       }
+      expect(stagedResults.filter((result) => result.retrySameIdentity)).toHaveLength(1);
+      expect(stagedResults.filter((result) =>
+        result.failure?.cause === "crystal_contribution_claimed_by_other")).toHaveLength(1);
 
       let activeCrystalWrites = 0;
       let maxConcurrentCrystalWrites = 0;
@@ -1069,7 +1231,7 @@ describe("Crystallize Functions", () => {
       expect(maxConcurrentCrystalWrites).toBe(1);
       expect(results.filter((result) => result.success)).toHaveLength(1);
       expect(results.filter(
-        (result) => result.failure?.cause === "crystal_formal_effect_conflict",
+        (result) => result.failure?.cause === "crystal_contribution_claimed_by_other",
       )).toHaveLength(1);
       const audits = (await kv.list<AuditEntry>(KV.audit))
         .filter((audit) => audit.operation === "crystallize");
@@ -1082,7 +1244,7 @@ describe("Crystallize Functions", () => {
       expect(receipts.filter(
         (receipt) => receipt?.crystalRecovery?.phase === "committed",
       )).toHaveLength(1);
-      expect(provider.summarize).toHaveBeenCalledTimes(2);
+      expect(provider.summarize).toHaveBeenCalledTimes(1);
     });
 
     it("resumes a projectless frozen plan after JSON persistence drops undefined fields", async () => {

@@ -45,14 +45,37 @@ export function projectSafeRecoveryStatus({
   controlEvents = [],
   stageEvents = {},
   requiredStages = [],
+  incrementalStatus = null,
 }) {
+  if (
+    incrementalStatus
+    && (
+      incrementalStatus.schema !== 'agentmemory-incremental-extraction-status/v1'
+      || incrementalStatus.run_id !== runId
+      || !Array.isArray(incrementalStatus.stages)
+    )
+  ) throw new Error('incremental_recovery_status_invalid');
   const controlLifecycle = reduceRunControlLifecycle(controlEvents);
   const normalizedRequiredStages = [...new Set(
     requiredStages.filter((stage) => typeof stage === 'string' && stage),
   )];
+  const incrementalByStage = new Map(
+    (incrementalStatus?.stages ?? []).map((stage) => [stage.stage, stage]),
+  );
   const stages = Object.keys(stageEvents)
     .sort((left, right) => left.localeCompare(right, 'en'))
-    .map((stage) => projectStage(stage, stageEvents[stage]));
+    .map((stage) => {
+      const projected = projectStage(stage, stageEvents[stage]);
+      const incremental = incrementalByStage.get(stage);
+      return incremental
+        ? {
+            ...projected,
+            acceptance_ready: projected.acceptance_ready
+              && incremental.acceptance_ready === true,
+            incremental,
+          }
+        : projected;
+    });
   const selectedStages = normalizedRequiredStages.length > 0
     ? stages.filter((entry) => normalizedRequiredStages.includes(entry.stage))
     : stages;
@@ -77,7 +100,7 @@ export function projectSafeRecoveryStatus({
     for (const key of Object.keys(counts)) counts[key] += stage.counts[key] || 0;
   }
   const runCompleted = controlLifecycle.state === 'completed';
-  const acceptanceReady = (
+  const recoveryAcceptanceReady = (
     selectedStages.length > 0
     && missingRequiredStages.length === 0
     && (
@@ -87,6 +110,8 @@ export function projectSafeRecoveryStatus({
     && selectedStages.every((stage) => stage.acceptance_ready)
     && (normalizedRequiredStages.length > 0 || runCompleted)
   );
+  const acceptanceReady = recoveryAcceptanceReady
+    && (!incrementalStatus || incrementalStatus.acceptance_ready === true);
   const lastProgressAt = latestTimestamp([
     ...controlEvents,
     ...Object.values(stageEvents).flat(),
@@ -94,11 +119,12 @@ export function projectSafeRecoveryStatus({
   const systemCodes = stages
     .map((stage) => stage.system_block_reason_code)
     .filter(Boolean);
+  const incrementalAttention = Boolean(incrementalStatus && !incrementalStatus.acceptance_ready);
   const status = counts.system_blocked > 0
     ? 'blocked'
     : controlLifecycle.state === 'paused'
       ? 'paused'
-      : counts.isolated > 0 || counts.dependency_blocked > 0
+      : counts.isolated > 0 || counts.dependency_blocked > 0 || incrementalAttention
         ? 'attention_required'
         : acceptanceReady
           ? 'completed'
@@ -135,6 +161,7 @@ export function projectSafeRecoveryStatus({
     acceptance_ready: acceptanceReady,
     missing_required_stages: missingRequiredStages,
     system_block_reason_codes: [...new Set(systemCodes)].sort(),
+    ...(incrementalStatus ? { incremental: incrementalStatus } : {}),
     stages,
   };
 }

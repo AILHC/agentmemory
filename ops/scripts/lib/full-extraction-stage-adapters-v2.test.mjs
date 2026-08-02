@@ -33,6 +33,218 @@ function stableHash(value) {
   return createHash('sha256').update(JSON.stringify(normalize(value))).digest('hex');
 }
 
+function semanticEligibilityResponse(body, eligibleSessionIds = body.sessionIds) {
+  const eligible = [...eligibleSessionIds];
+  const eligibleSet = new Set(eligible);
+  return {
+    ok: true,
+    data: {
+      success: true,
+      eligibleSessionIds: eligible,
+      terminalSessionIds: body.sessionIds.filter((sessionId) => !eligibleSet.has(sessionId)),
+    },
+  };
+}
+
+test('stage-specific baseline partitioning removes adopted sessions before skill planning', async () => {
+  let capturedPlan;
+  const allSessions = [{ id: 'adopted-session' }, { id: 'open-session' }];
+  await runV2RemainingStages({
+    options: { mark: 'baseline-partition' },
+    runId: 'baseline-partition-run',
+    config: {},
+    configHash: 'config',
+    inventoryHash: 'inventory',
+    stableHash,
+    loadSelectedSessions: async () => allSessions,
+    loadSelectedSessionsForStage: async (stage, sessions) => {
+      assert.equal(stage, 'skill_extract');
+      assert.deepEqual(sessions, allSessions);
+      return sessions.filter((session) => session.id === 'open-session');
+    },
+    eligibleStages: {
+      memory_consolidate: false,
+      semantic_rollup: false,
+      skill_extract: true,
+      crystal: false,
+      consolidation_procedural: false,
+      reflect_insight: false,
+    },
+    request: async (endpoint, body) => {
+      assert.equal(endpoint, '/agentmemory/full/skill-extract-eligibility');
+      assert.deepEqual(body.sessionIds, ['open-session']);
+      return {
+        ok: true,
+        data: {
+          success: true,
+          eligible: [],
+          terminal: [],
+          sourceCorrection: [],
+          claimed: [],
+          reconciliation: [],
+          ineligible: [{ sessionId: 'open-session', reason: 'session_not_eligible' }],
+        },
+      };
+    },
+    runTwoPhaseStage: async ({ plan }) => {
+      capturedPlan = await plan();
+      return { status: 'completed', acceptedCount: 0 };
+    },
+    runSingleStage: async () => assert.fail('no single-phase stage is enabled'),
+  });
+  assert.equal(capturedPlan.length, 1);
+  assert.deepEqual(capturedPlan[0].source_ids, ['open-session']);
+  assert.equal(capturedPlan[0].skip_reason, 'session_not_eligible');
+});
+
+test('skill eligibility pages 201 sessions and preserves all six partitions', async () => {
+  const sessions = Array.from({ length: 201 }, (_, index) => ({
+    id: `skill-session-${String(index + 1).padStart(3, '0')}`,
+    status: 'completed',
+  }));
+  const eligibilityPages = [];
+  let capturedPlan;
+  let capturedAdapter;
+  let prepareRequests = 0;
+  const partitionFor = (index) => [
+    'eligible', 'terminal', 'sourceCorrection', 'claimed', 'reconciliation', 'ineligible',
+  ][Math.floor(index / 34)] || 'ineligible';
+  const result = await runV2RemainingStages({
+    options: { mark: 'skill-page-test' },
+    runId: 'skill-page-run',
+    config: {},
+    configHash: 'config-skill-page',
+    inventoryHash: 'inventory-skill-page',
+    stableHash,
+    loadSelectedSessions: async () => sessions,
+    eligibleStages: {
+      memory_consolidate: false,
+      semantic_rollup: false,
+      skill_extract: true,
+      crystal: false,
+      consolidation_procedural: false,
+      reflect_insight: false,
+    },
+    request: async (endpoint, body) => {
+      if (endpoint === '/agentmemory/full/skill-extract-eligibility') {
+        eligibilityPages.push(body.sessionIds);
+        const partitions = Object.fromEntries([
+          'eligible', 'terminal', 'sourceCorrection', 'claimed', 'reconciliation', 'ineligible',
+        ].map((key) => [key, []]));
+        for (const sessionId of body.sessionIds) {
+          const index = Number(sessionId.slice(-3)) - 1;
+          const key = partitionFor(index);
+          partitions[key].push({
+            sessionId,
+            stageContractVersion: 'skill_extract/v1',
+            sourceVersionKey: `skill_extract|session|${sessionId}|${'a'.repeat(64)}`,
+            sourceSnapshotHash: 'a'.repeat(64),
+            ...(key === 'sourceCorrection' ? { reason: 'source_changed' } : {}),
+          });
+        }
+        return { ok: true, data: { success: true, ...partitions } };
+      }
+      if (endpoint === '/agentmemory/full/skill-extract/prepare') {
+        prepareRequests += 1;
+        return {
+          ok: true,
+          data: {
+            success: true,
+            status: 'prepared',
+            preparedHandle: 'eligible-handle',
+            proposalHash: 'eligible-proposal',
+            inputHash: 'eligible-input',
+          },
+        };
+      }
+      throw new Error(`unexpected endpoint: ${endpoint}`);
+    },
+    runTwoPhaseStage: async ({ stage, plan, adapter }) => {
+      assert.equal(stage, 'skill_extract');
+      capturedPlan = await plan();
+      capturedAdapter = adapter;
+      return { status: 'completed', acceptedCount: 0 };
+    },
+    runSingleStage: async () => assert.fail('no single-phase stage is enabled'),
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.deepEqual(eligibilityPages.map((page) => page.length), [100, 100, 1]);
+  assert.equal(capturedPlan.length, 201);
+  assert.equal(new Set(capturedPlan.flatMap((unit) => unit.source_ids)).size, 201);
+  assert.deepEqual(
+    capturedPlan.filter((unit) => !unit.skip_reason && !unit.block_reason && !unit.isolate_reason)
+      .map((unit) => unit.session_id).length,
+    34,
+  );
+  const terminalOrIneligible = capturedPlan.filter((unit) => unit.skip_reason);
+  for (const unit of terminalOrIneligible) {
+    const prepared = await capturedAdapter.prepare({
+      unit,
+      attemptId: capturedAdapter.prepareAttemptIdForUnit(unit),
+    });
+    assert.equal(prepared.status, 'skipped');
+  }
+  const sourceCorrection = capturedPlan.find((unit) => unit.isolate_reason);
+  const correctionResult = await capturedAdapter.prepare({
+    unit: sourceCorrection,
+    attemptId: capturedAdapter.prepareAttemptIdForUnit(sourceCorrection),
+  });
+  assert.equal(correctionResult.status, 'failed');
+  assert.equal(correctionResult.recoveryCandidate.candidateEvidence.observation, 'business_rejected');
+  assert.equal(prepareRequests, 0);
+});
+
+test('skill eligibility failure on a later page keeps prior eligible units', async () => {
+  const sessions = Array.from({ length: 101 }, (_, index) => ({ id: `session-${index + 1}` }));
+  let capturedPlan;
+  const result = await runV2RemainingStages({
+    options: { mark: 'skill-later-page-failure' },
+    runId: 'skill-later-page-failure-run',
+    config: {},
+    configHash: 'config-skill-later-page-failure',
+    inventoryHash: 'inventory-skill-later-page-failure',
+    stableHash,
+    loadSelectedSessions: async () => sessions,
+    eligibleStages: {
+      memory_consolidate: false,
+      semantic_rollup: false,
+      skill_extract: true,
+      crystal: false,
+      consolidation_procedural: false,
+      reflect_insight: false,
+    },
+    request: async (endpoint, body) => {
+      assert.equal(endpoint, '/agentmemory/full/skill-extract-eligibility');
+      if (body.sessionIds.length === 1) throw new Error('eligibility_service_unavailable');
+      return {
+        ok: true,
+        data: {
+          success: true,
+          eligible: body.sessionIds.map((sessionId) => ({
+            sessionId,
+            stageContractVersion: 'skill_extract/v1',
+            sourceVersionKey: `skill_extract|session|${sessionId}|${'b'.repeat(64)}`,
+            sourceSnapshotHash: 'b'.repeat(64),
+          })),
+          terminal: [], sourceCorrection: [], claimed: [], reconciliation: [], ineligible: [],
+        },
+      };
+    },
+    runTwoPhaseStage: async ({ plan }) => {
+      capturedPlan = await plan();
+      return { status: 'completed', acceptedCount: 0 };
+    },
+    runSingleStage: async () => assert.fail('no single-phase stage is enabled'),
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(capturedPlan.filter((unit) => !unit.block_reason).length, 100);
+  const blocked = capturedPlan.find((unit) => unit.block_reason);
+  assert.deepEqual(blocked.source_ids, ['session-101']);
+  assert.equal(blocked.block_reason, 'skill_extract_eligibility_unavailable');
+});
+
 test('remaining v2 stages are thin adapters over the two common recovery modes', async () => {
   const calls = [];
   const records = [];
@@ -41,7 +253,13 @@ test('remaining v2 stages are thin adapters over the two common recovery modes',
   const verifiedSkillInput = stableHash('verified-skill-input');
 
   const request = async (endpoint, body) => {
+    if (endpoint === '/agentmemory/full/skill-extract-eligibility') {
+      return { ok: true, data: { success: true, eligible: (body.sessionIds || []).map((sessionId, index) => ({ sessionId, stageContractVersion: 'skill_extract/v1', sourceVersionKey: `skill_extract|session|${sessionId}|${'a'.repeat(64)}`, sourceSnapshotHash: 'a'.repeat(64) })), terminal: [], sourceCorrection: [], claimed: [], reconciliation: [], ineligible: [] } };
+    }
     calls.push({ endpoint, body });
+    if (endpoint === '/agentmemory/full/semantic-rollup-eligibility') {
+      return semanticEligibilityResponse(body);
+    }
     if (endpoint === '/agentmemory/full/memory-consolidate-windows/plan') {
       if (body.sessionOffset !== undefined) {
         return {
@@ -121,6 +339,8 @@ test('remaining v2 stages are thin adapters over the two common recovery modes',
             groupId: 'cg-1',
             actionIds: ['action-1'],
             actionUpdatedAts: ['2026-07-24T00:00:00.000Z'],
+            stageContractVersion: 'crystal/v1',
+            sourceVersionKeys: [`crystal|action|action-1|${'a'.repeat(64)}`],
           }],
         },
       };
@@ -139,7 +359,15 @@ test('remaining v2 stages are thin adapters over the two common recovery modes',
         ok: true,
         data: {
           success: true,
-          windows: [{ windowId: 'cpw-1', memoryIds: ['pattern-1'], inputHash: 'procedural-input' }],
+          windows: [{
+            windowId: 'cpw-1',
+            memoryIds: ['pattern-1', 'pattern-2'],
+            stageContractVersion: 'consolidation_procedural/v1',
+            sourceVersionKeys: [
+              `consolidation_procedural|memory|pattern-1|${'e'.repeat(64)}`,
+              `consolidation_procedural|memory|pattern-2|${'f'.repeat(64)}`,
+            ],
+          }],
         },
       };
     }
@@ -314,6 +542,19 @@ test('remaining v2 stages are thin adapters over the two common recovery modes',
   assert.equal(crystalCall.groupId, 'cg-1');
   assert.deepEqual(crystalCall.actionIds, ['action-1']);
   assert.deepEqual(crystalCall.actionUpdatedAts, ['2026-07-24T00:00:00.000Z']);
+  assert.equal(crystalCall.stageContractVersion, 'crystal/v1');
+  assert.deepEqual(crystalCall.sourceVersionKeys, [
+    `crystal|action|action-1|${'a'.repeat(64)}`,
+  ]);
+
+  const proceduralCall = calls.find((call) =>
+    call.endpoint === '/agentmemory/full/consolidation-procedural-window').body;
+  assert.deepEqual(proceduralCall.memoryIds, ['pattern-1', 'pattern-2']);
+  assert.equal(proceduralCall.stageContractVersion, 'consolidation_procedural/v1');
+  assert.deepEqual(proceduralCall.sourceVersionKeys, [
+    `consolidation_procedural|memory|pattern-1|${'e'.repeat(64)}`,
+    `consolidation_procedural|memory|pattern-2|${'f'.repeat(64)}`,
+  ]);
 
   for (const call of calls.filter((entry) => [
     '/agentmemory/semantic-rollup',
@@ -431,7 +672,7 @@ test('an attention unit does not prevent independent remaining stages from drain
       skill_extract: false,
       reflect_insight: false,
     },
-    loadSelectedSessions: async () => assert.fail('summary-dependent planning must stay deferred'),
+    loadSelectedSessions: async () => [{ id: 'selected-memory-session' }],
     runTwoPhaseStage: async ({ stage, plan }) => {
       stages.push(stage);
       await plan();
@@ -452,10 +693,178 @@ test('an attention unit does not prevent independent remaining stages from drain
   assert.equal(result.status, 'attention_required');
 });
 
+test('crystal source correction is isolated before a formal provider request', async () => {
+  const calls = [];
+  const sourceVersionKey = `crystal|action|action-corrected|${'c'.repeat(64)}`;
+  const result = await runV2RemainingStages({
+    options: { mark: 'test-mark' },
+    runId: 'crystal-correction-run',
+    config: {
+      semantic_window_size: 20,
+      semantic_rollup_target_prompt_chars: 64000,
+      memory_consolidate_char_budget: 64000,
+      reflect_insight_char_budget: 64000,
+    },
+    configHash: 'config-1',
+    inventoryHash: 'inventory-1',
+    request: async (endpoint, body) => {
+      calls.push({ endpoint, body });
+      assert.equal(endpoint, '/agentmemory/full/crystals/auto');
+      assert.equal(body.dryRun, true);
+      return {
+        ok: true,
+        data: {
+          success: true,
+          groups: [{
+            groupId: 'crystal-correction:action-corrected',
+            actionIds: ['action-corrected'],
+            actionUpdatedAts: ['2026-06-01T00:00:00.000Z'],
+            stageContractVersion: 'crystal/v1',
+            sourceVersionKeys: [sourceVersionKey],
+            isolateReason: 'crystal_source_correction_requires_migration',
+          }],
+        },
+      };
+    },
+    loadSelectedSessions: async () => [],
+    stableHash,
+    eligibleStages: {
+      memory_consolidate: false,
+      semantic_rollup: false,
+      skill_extract: false,
+      crystal: true,
+      consolidation_procedural: false,
+      reflect_insight: false,
+    },
+    runTwoPhaseStage: async () => {
+      throw new Error('unexpected two-phase stage');
+    },
+    runSingleStage: async ({ plan, adapter }) => {
+      const [unit] = await plan();
+      assert.equal(unit.isolate_reason, 'crystal_source_correction_requires_migration');
+      assert.deepEqual(unit.sourceVersionKeys, [sourceVersionKey]);
+      let started = 0;
+      let completed = 0;
+      const outcome = await adapter.execute({
+        unit,
+        attemptId: 'crystal-correction-attempt',
+        recovered: false,
+        activeOperation: null,
+        completedOperations: [],
+        startOperation: async () => { started += 1; },
+        completeOperation: async () => { completed += 1; },
+        resolveOutcome: async ({ candidateEvidence, snapshot }) => ({
+          policyVersion: 'recovery-policy/v1',
+          policyHash: stableHash('policy'),
+          evidence: candidateEvidence,
+          snapshot,
+          decision: { action: 'isolate', reasonCode: candidateEvidence.reasonCode },
+          budget: { attemptsUsed: 0, maxAttempts: 0 },
+          normalization: { status: 'accepted' },
+        }),
+      });
+      assert.equal(outcome.status, 'failed');
+      assert.equal(outcome.recovery.decision.action, 'isolate');
+      assert.equal(started, 1);
+      assert.equal(completed, 1);
+      return { status: 'completed', acceptedCount: 1 };
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(calls.length, 1);
+});
+
+test('procedural source correction is isolated before a formal provider request', async () => {
+  const calls = [];
+  const sourceVersionKey = `consolidation_procedural|memory|pattern-corrected|${'e'.repeat(64)}`;
+  const result = await runV2RemainingStages({
+    options: { mark: 'test-mark' },
+    runId: 'procedural-correction-run',
+    config: {
+      semantic_window_size: 20,
+      semantic_rollup_target_prompt_chars: 64000,
+      memory_consolidate_char_budget: 64000,
+      reflect_insight_char_budget: 64000,
+    },
+    configHash: 'config-1',
+    inventoryHash: 'inventory-1',
+    request: async (endpoint, body) => {
+      calls.push({ endpoint, body });
+      assert.equal(endpoint, '/agentmemory/full/consolidation-procedural-windows/plan');
+      return {
+        ok: true,
+        data: {
+          success: true,
+          windows: [{
+            windowId: 'procedural-correction:pattern-corrected',
+            memoryIds: ['pattern-corrected'],
+            stageContractVersion: 'consolidation_procedural/v1',
+            sourceVersionKeys: [sourceVersionKey],
+            isolateReason: 'consolidation_procedural_source_correction_requires_migration',
+          }],
+        },
+      };
+    },
+    loadSelectedSessions: async () => [],
+    stableHash,
+    eligibleStages: {
+      memory_consolidate: false,
+      semantic_rollup: false,
+      skill_extract: false,
+      crystal: false,
+      consolidation_procedural: true,
+      reflect_insight: false,
+    },
+    runTwoPhaseStage: async () => {
+      throw new Error('unexpected two-phase stage');
+    },
+    runSingleStage: async ({ plan, adapter }) => {
+      const [unit] = await plan();
+      assert.equal(
+        unit.isolate_reason,
+        'consolidation_procedural_source_correction_requires_migration',
+      );
+      assert.deepEqual(unit.sourceVersionKeys, [sourceVersionKey]);
+      let started = 0;
+      let completed = 0;
+      const outcome = await adapter.execute({
+        unit,
+        attemptId: 'procedural-correction-attempt',
+        recovered: false,
+        activeOperation: null,
+        completedOperations: [],
+        startOperation: async () => { started += 1; },
+        completeOperation: async () => { completed += 1; },
+        resolveOutcome: async ({ candidateEvidence, snapshot }) => ({
+          policyVersion: 'recovery-policy/v1',
+          policyHash: stableHash('policy'),
+          evidence: candidateEvidence,
+          snapshot,
+          decision: { action: 'isolate', reasonCode: candidateEvidence.reasonCode },
+          budget: { attemptsUsed: 0, maxAttempts: 0 },
+          normalization: { status: 'accepted' },
+        }),
+      });
+      assert.equal(outcome.status, 'failed');
+      assert.equal(outcome.recovery.decision.action, 'isolate');
+      assert.equal(started, 1);
+      assert.equal(completed, 1);
+      return { status: 'completed', acceptedCount: 1 };
+    },
+  });
+
+  assert.equal(result.status, 'completed');
+  assert.equal(calls.length, 1);
+});
+
 test('semantic stage advances through the shared recovery kernel before acceptance', async () => {
   const events = [];
   let semanticResult;
   const request = async (endpoint, body) => {
+    if (endpoint === '/agentmemory/full/semantic-rollup-eligibility') {
+      return semanticEligibilityResponse(body);
+    }
     if (endpoint === '/agentmemory/semantic-rollup') {
       const domainInputHash = 'a'.repeat(64);
       const configHash = 'b'.repeat(64);
@@ -584,11 +993,135 @@ test('semantic stage advances through the shared recovery kernel before acceptan
   );
 });
 
+test('semantic planner dispatches only contribution-eligible summaries', async (context) => {
+  const common = {
+    options: { mark: 'incremental-semantic' },
+    runId: 'incremental-semantic-run',
+    config: {
+      semantic_window_size: 20,
+      semantic_rollup_target_prompt_chars: 64000,
+      memory_consolidate_char_budget: 64000,
+      reflect_insight_char_budget: 64000,
+    },
+    configHash: 'config-incremental',
+    inventoryHash: 'inventory-incremental',
+    stableHash,
+    eligibleStages: {
+      memory_consolidate: false,
+      semantic_rollup: true,
+      skill_extract: false,
+      crystal: false,
+      consolidation_procedural: false,
+      reflect_insight: false,
+    },
+    loadSelectedSessions: async () => [
+      { id: 'old-session', status: 'completed', summary: { title: 'Old summary' } },
+      { id: 'new-session', status: 'completed', summary: { title: 'New summary' } },
+    ],
+    runTwoPhaseStage: async () => assert.fail('two-phase stage must stay disabled'),
+  };
+
+  await context.test('mixed old and new sources dispatch only the new summary', async () => {
+    let executeCalls = 0;
+    const result = await runV2RemainingStages({
+      ...common,
+      request: async (endpoint, body) => {
+        if (endpoint === '/agentmemory/full/semantic-rollup-eligibility') {
+          return semanticEligibilityResponse(body, ['new-session']);
+        }
+        assert.equal(endpoint, '/agentmemory/semantic-rollup');
+        executeCalls += 1;
+        assert.deepEqual(body.sessionIds, ['new-session']);
+        assert.deepEqual(Object.keys(body.sourceSummaryHashes), ['new-session']);
+        return {
+          ok: true,
+          data: { success: true, status: 'succeeded', semanticMemoryIds: ['sem-new'] },
+        };
+      },
+      runSingleStage: async ({ plan, adapter }) => {
+        const units = await plan();
+        assert.equal(units.length, 1);
+        assert.deepEqual(units[0].source_session_ids, ['new-session']);
+        const terminal = await adapter.execute({
+          unit: units[0],
+          attemptId: adapter.attemptIdForUnit(units[0]),
+        });
+        assert.equal(terminal.status, 'succeeded');
+        return { status: 'completed', acceptedCount: 1 };
+      },
+    });
+    assert.equal(result.status, 'completed');
+    assert.equal(executeCalls, 1);
+  });
+
+  await context.test('pure history creates only a skipped plan unit', async () => {
+    let executeCalls = 0;
+    const result = await runV2RemainingStages({
+      ...common,
+      request: async (endpoint, body) => {
+        if (endpoint === '/agentmemory/full/semantic-rollup-eligibility') {
+          return semanticEligibilityResponse(body, []);
+        }
+        executeCalls += 1;
+        throw new Error(`unexpected endpoint: ${endpoint}`);
+      },
+      runSingleStage: async ({ plan, adapter }) => {
+        const units = await plan();
+        assert.equal(units.length, 1);
+        assert.equal(units[0].skip_reason, 'no new summarized sessions');
+        const terminal = await adapter.execute({
+          unit: units[0],
+          attemptId: adapter.attemptIdForUnit(units[0]),
+        });
+        assert.equal(terminal.status, 'skipped');
+        return { status: 'completed', acceptedCount: 1 };
+      },
+    });
+    assert.equal(result.status, 'completed');
+    assert.equal(executeCalls, 0);
+  });
+
+  await context.test('claimed source blocks before semantic execution', async () => {
+    let executeCalls = 0;
+    const result = await runV2RemainingStages({
+      ...common,
+      request: async (endpoint) => {
+        if (endpoint === '/agentmemory/full/semantic-rollup-eligibility') {
+          return {
+            ok: true,
+            data: {
+              success: false,
+              error: 'semantic_rollup_reconciliation_required',
+              blockedSessionIds: ['old-session'],
+            },
+          };
+        }
+        executeCalls += 1;
+        throw new Error(`unexpected endpoint: ${endpoint}`);
+      },
+      runSingleStage: async ({ plan, adapter }) => {
+        const units = await plan();
+        assert.equal(units.length, 1);
+        const terminal = await adapter.execute({
+          unit: units[0],
+          attemptId: adapter.attemptIdForUnit(units[0]),
+        });
+        assert.equal(terminal.status, 'blocked');
+        assert.equal(terminal.reason, 'semantic_rollup_reconciliation_required');
+        return terminal;
+      },
+    });
+    assert.equal(result.status, 'blocked');
+    assert.equal(executeCalls, 0);
+  });
+});
+
 test('memory commit advances through the same shared recovery kernel', async () => {
   const events = [];
   let memoryResult;
   const request = async (endpoint, body) => {
     if (endpoint === '/agentmemory/full/memory-consolidate-windows/plan') {
+      assert.deepEqual(body.sessionIds, ['selected-memory-session']);
       return body.sessionOffset !== undefined
         ? {
             ok: true,
@@ -688,7 +1221,7 @@ test('memory commit advances through the same shared recovery kernel', async () 
       consolidation_procedural: false,
       reflect_insight: false,
     },
-    loadSelectedSessions: async () => assert.fail('must stop before semantic planning'),
+    loadSelectedSessions: async () => [{ id: 'selected-memory-session' }],
     runTwoPhaseStage: async ({ plan, adapter }) => {
       const effectivePlan = await plan();
       memoryResult = await runRecoveryTwoPhaseStage({
@@ -944,7 +1477,7 @@ test('v2 remaining-stage adapters never promote an ambiguous response', async (c
         assert.equal(endpoint, '/agentmemory/full/memory-consolidate-window/prepare');
         return { ok: true, status_code: 200, data: null };
       },
-      loadSelectedSessions: async () => assert.fail('must stop after memory prepare'),
+      loadSelectedSessions: async () => [{ id: 'selected-memory-session' }],
       runTwoPhaseStage: async ({ plan, adapter }) => {
         const units = await plan();
         const prepared = await adapter.prepare({
@@ -974,7 +1507,10 @@ test('v2 remaining-stage adapters never promote an ambiguous response', async (c
         consolidation_procedural: false,
         reflect_insight: false,
       },
-      request: async (endpoint) => {
+      request: async (endpoint, body) => {
+        if (endpoint === '/agentmemory/full/semantic-rollup-eligibility') {
+          return semanticEligibilityResponse(body);
+        }
         assert.equal(endpoint, '/agentmemory/semantic-rollup');
         return { ok: true, status_code: 200, data: { status: 'future_status' } };
       },
@@ -1292,6 +1828,9 @@ test('memory and semantic adapters deterministically split oversized units', asy
   const memorySplits = [];
   const semanticSplits = [];
   const request = async (endpoint, body) => {
+    if (endpoint === '/agentmemory/full/semantic-rollup-eligibility') {
+      return semanticEligibilityResponse(body);
+    }
     if (endpoint === '/agentmemory/full/memory-consolidate-windows/plan') {
       return body.sessionOffset !== undefined
         ? {
@@ -1484,6 +2023,8 @@ function actualPlannerResponse(endpoint, body) {
           groupId: 'crystal-unit-integration',
           actionIds: ['action-integration'],
           actionUpdatedAts: ['2026-07-31T00:00:00.000Z'],
+          stageContractVersion: 'crystal/v1',
+          sourceVersionKeys: [`crystal|action|action-integration|${'b'.repeat(64)}`],
         }],
       },
     };
@@ -1495,8 +2036,12 @@ function actualPlannerResponse(endpoint, body) {
         success: true,
         windows: [{
           windowId: 'procedural-unit-integration',
-          memoryIds: ['pattern-integration'],
-          inputHash: stableHash('procedural-unit-integration'),
+          memoryIds: ['pattern-integration-1', 'pattern-integration-2'],
+          stageContractVersion: 'consolidation_procedural/v1',
+          sourceVersionKeys: [
+            `consolidation_procedural|memory|pattern-integration-1|${'c'.repeat(64)}`,
+            `consolidation_procedural|memory|pattern-integration-2|${'d'.repeat(64)}`,
+          ],
         }],
       },
     };
@@ -1511,7 +2056,12 @@ function actualPlannerResponse(endpoint, body) {
           semanticMemoryIds: ['semantic-integration'],
           lessonIds: ['lesson-integration'],
           crystalIds: ['crystal-integration'],
-          inputHash: stableHash('reflect-unit-integration'),
+          stageContractVersion: 'reflect_insight/v1',
+          sourceVersionKeys: [
+            `reflect_insight|semantic|semantic-integration|${'e'.repeat(64)}`,
+            `reflect_insight|lesson|lesson-integration|${'f'.repeat(64)}`,
+            `reflect_insight|crystal|crystal-integration|${'a'.repeat(64)}`,
+          ],
         }],
       },
     };
@@ -1689,8 +2239,13 @@ function successfulOperationResponse(stageCase, body, phase = 'execute') {
           kind: 'committed',
           receiptKey: operationReceipt.key,
           receiptVersion: 1,
-          resultRef: `insights:${stageCase.resultId}`,
+          resultRef: `reflect-insight-recoveries:${operationReceipt.key}`,
           effectHash: stableHash({ stage: body.stage, resultId: stageCase.resultId }),
+          identity: {
+            runId: body.runId,
+            unitId: body.unitId,
+            inputHash: operationReceipt.inputHash,
+          },
         },
       },
     };
@@ -1743,6 +2298,9 @@ async function runActualStageCase(stage, runLabel, operationRequest, exercise) {
   const journal = new RunStateJournalV2({ rootDir, runId });
   let exercised = 0;
   const request = async (endpoint, body) => {
+    if (endpoint === '/agentmemory/full/semantic-rollup-eligibility') {
+      return semanticEligibilityResponse(body);
+    }
     const planner = actualPlannerResponse(endpoint, body);
     if (planner) return planner;
     if (endpoint === '/agentmemory/extraction-runs/record') {
@@ -1843,6 +2401,7 @@ async function runActualStageCase(stage, runLabel, operationRequest, exercise) {
 }
 
 function phaseForTwoPhaseEndpoint(stageCase, endpoint) {
+  if (endpoint === '/agentmemory/full/skill-extract-eligibility') return 'eligibility';
   if (endpoint === stageCase.prepareEndpoint) return 'prepare';
   if (endpoint === stageCase.commitEndpoint) return 'commit';
   assert.fail(`unexpected two-phase endpoint: ${endpoint}`);
@@ -1871,6 +2430,7 @@ test('integration::two_phase_prepare_commit::receipt_protocol_conformance', asyn
         const targetCalls = [];
         const operationRequest = async (endpoint, body) => {
           const phase = phaseForTwoPhaseEndpoint(stageCase, endpoint);
+          if (phase === 'eligibility') return { ok: true, data: { success: true, eligible: (body.sessionIds || []).map((sessionId) => ({ sessionId, stageContractVersion: 'skill_extract/v1', sourceVersionKey: `skill_extract|session|${sessionId}|${'a'.repeat(64)}`, sourceSnapshotHash: 'a'.repeat(64) })), terminal: [], sourceCorrection: [], claimed: [], reconciliation: [], ineligible: [] } };
           if (phase !== targetPhase) {
             return successfulOperationResponse(stageCase, body, phase);
           }
@@ -1975,6 +2535,7 @@ test('integration::two_phase_prepare_commit::provider_boundaries_fail_closed', a
       const targetCalls = [];
       const operationRequest = async (endpoint, body) => {
         const phase = phaseForTwoPhaseEndpoint(stageCase, endpoint);
+        if (phase === 'eligibility') return { ok: true, data: { success: true, eligible: (body.sessionIds || []).map((sessionId) => ({ sessionId, stageContractVersion: 'skill_extract/v1', sourceVersionKey: `skill_extract|session|${sessionId}|${'a'.repeat(64)}`, sourceSnapshotHash: 'a'.repeat(64) })), terminal: [], sourceCorrection: [], claimed: [], reconciliation: [], ineligible: [] } };
         if (phase !== targetPhase) {
           return successfulOperationResponse(stageCase, body, phase);
         }
@@ -2059,6 +2620,7 @@ test('integration::two_phase_prepare_commit::persisted_progress_resumes_without_
     const phaseCalls = { prepare: [], commit: [] };
     const operationRequest = async (endpoint, body) => {
       const phase = phaseForTwoPhaseEndpoint(stageCase, endpoint);
+      if (phase === 'eligibility') return { ok: true, data: { success: true, eligible: (body.sessionIds || []).map((sessionId) => ({ sessionId, stageContractVersion: 'skill_extract/v1', sourceVersionKey: `skill_extract|session|${sessionId}|${'a'.repeat(64)}`, sourceSnapshotHash: 'a'.repeat(64) })), terminal: [], sourceCorrection: [], claimed: [], reconciliation: [], ineligible: [] } };
       phaseCalls[phase].push({ endpoint, body });
       return successfulOperationResponse(stageCase, body, phase);
     };

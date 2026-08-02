@@ -10,6 +10,9 @@ import type {
   ExtractionOperationReceipt,
   ExtractionOperationStage,
   StageFailure,
+  AdoptedBaselineExpectedSet,
+  AdoptedBaselineManifest,
+  AdoptedBaselineStage,
 } from "../types.js";
 import { withKeyedLock } from "../state/keyed-mutex.js";
 import { KV } from "../state/schema.js";
@@ -57,12 +60,44 @@ import {
   withIdempotentCommitReceipt,
   type FailedExtractionOperationRetryAuthorization,
 } from "../functions/extraction-operation-receipts.js";
-import { findMemoryConsolidationProposalResult } from "../functions/consolidate.js";
+import {
+  findMemoryConsolidationProposalResult,
+  reconcileMemoryConsolidationContribution,
+} from "../functions/consolidate.js";
 import {
   sanitizeLessonFailureDiagnostics,
   sanitizeStageFailureDiagnostics,
 } from "../functions/summarize.js";
 import { normalizeFailedLessonRunRetryEvidence } from "../functions/lessons.js";
+import { reconcileSkillContributionFromProposal } from "../functions/skill-extract.js";
+import { reconcileCrystalContributionFromReceipt } from "../functions/crystallize.js";
+import {
+  CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+  enqueueConsolidationProceduralBacklog,
+  reconcileConsolidationProceduralContribution,
+} from "../functions/consolidation-pipeline.js";
+import {
+  REFLECT_INSIGHT_CONTRIBUTION_CONTRACT,
+  enqueueReflectInsightBacklog,
+  reconcileReflectInsightContribution,
+} from "../functions/reflect.js";
+import {
+  appendAdoptedBaselineCoverage,
+  appendAdoptedBaselineLessonSeeds,
+  digestAdoptedBaselineCoverage,
+  digestAdoptedBaselineLessonSeeds,
+  inspectAdoptedBaselineRun,
+  partitionAdoptedBaselineSessions,
+  prepareAdoptedBaseline,
+  readActiveAdoptedBaseline,
+  sealAdoptedBaseline,
+} from "../functions/extraction-baselines.js";
+import {
+  ADOPTED_BASELINE_STAGE_CONTRACTS,
+  buildAdoptedBaselineCoverageRecords,
+  buildAdoptedBaselineLessonSeedRecords,
+  materializeAdoptedBaselineLessonSeeds,
+} from "../functions/extraction-baseline-preview.js";
 
 const SUMMARY_FAILURE_CLASSES = new Set([
   "transient_provider",
@@ -423,6 +458,10 @@ const allowedSemanticRollupKeys = new Set([
   "requireExistingReceipt",
   "expectedReceiptInputHash",
 ]);
+const allowedSemanticRollupEligibilityKeys = new Set([
+  "sessionIds",
+  "sourceSummaryHashes",
+]);
 const extractionOperationIdentityKeys = ["runId", "stage", "unitId", "inputHash"] as const;
 const allowedFullSkillExtractKeys = new Set([
   ...extractionOperationIdentityKeys,
@@ -431,7 +470,10 @@ const allowedFullSkillExtractKeys = new Set([
   "operationReceiptManaged",
   "requireExistingReceipt",
   "expectedReceiptInputHash",
+  "stageContractVersion",
+  "sourceVersionKey",
 ]);
+const allowedSkillExtractEligibilityKeys = new Set(["sessionIds"]);
 const allowedFullConsolidatePlanKeys = new Set([
   "project",
   "minImportance",
@@ -445,6 +487,7 @@ const allowedFullConsolidatePlanKeys = new Set([
   "windowLimit",
   "descriptors",
   "plannerId",
+  "sessionIds",
 ]);
 const allowedFullConsolidateWindowKeys = new Set([
   ...extractionOperationIdentityKeys,
@@ -457,6 +500,8 @@ const allowedFullConsolidateWindowKeys = new Set([
   "charBudget",
   "minObservations",
   "model",
+  "stageContractVersion",
+  "sourceVersionKeys",
   "requireExistingReceipt",
   "expectedReceiptInputHash",
 ]);
@@ -469,7 +514,11 @@ const allowedFullConsolidateCommitKeys = new Set([
   "requireExistingReceipt",
   "expectedReceiptInputHash",
 ]);
-const allowedFullProceduralPlanKeys = new Set(["project", "maxItemsPerWindow"]);
+const allowedFullProceduralPlanKeys = new Set([
+  "project",
+  "maxItemsPerWindow",
+  "memoryIds",
+]);
 const allowedFullProceduralWindowKeys = new Set([
   ...extractionOperationIdentityKeys,
   "windowId",
@@ -477,6 +526,8 @@ const allowedFullProceduralWindowKeys = new Set([
   "memoryIds",
   "maxItemsPerWindow",
   "model",
+  "stageContractVersion",
+  "sourceVersionKeys",
   "requireExistingReceipt",
   "expectedReceiptInputHash",
 ]);
@@ -485,6 +536,9 @@ const allowedFullReflectPlanKeys = new Set([
   "useGraph",
   "maxItemsPerWindow",
   "charBudget",
+  "semanticMemoryIds",
+  "lessonIds",
+  "crystalIds",
 ]);
 const allowedFullReflectWindowKeys = new Set([
   ...extractionOperationIdentityKeys,
@@ -497,6 +551,8 @@ const allowedFullReflectWindowKeys = new Set([
   "lessonIds",
   "crystalIds",
   "model",
+  "stageContractVersion",
+  "sourceVersionKeys",
   "requireExistingReceipt",
   "expectedReceiptInputHash",
 ]);
@@ -509,6 +565,8 @@ const allowedFullCrystalAutoKeys = new Set([
   "groupId",
   "actionIds",
   "actionUpdatedAts",
+  "stageContractVersion",
+  "sourceVersionKeys",
   "requireExistingReceipt",
   "expectedReceiptInputHash",
 ]);
@@ -772,6 +830,62 @@ function parseFailedReceiptRetryAuthorization(
 function requirePlainBody(raw: unknown): Record<string, unknown> | null {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   return raw as Record<string, unknown>;
+}
+
+const ADOPTED_BASELINE_STAGES = new Set<AdoptedBaselineStage>([
+  "summary",
+  "lessons",
+  "memory_consolidate",
+  "semantic_rollup",
+  "skill_extract",
+]);
+
+function parseAdoptedBaselineStage(value: unknown): AdoptedBaselineStage | null {
+  return typeof value === "string" && ADOPTED_BASELINE_STAGES.has(value as AdoptedBaselineStage)
+    ? value as AdoptedBaselineStage
+    : null;
+}
+
+function parseAdoptedBaselineExpectedSet(value: unknown): AdoptedBaselineExpectedSet | null {
+  const record = requirePlainBody(value);
+  if (
+    !record
+    || !hasOnlyKeys(record, new Set(["count", "digest"]))
+    || !Number.isSafeInteger(record.count)
+    || (record.count as number) < 0
+    || typeof record.digest !== "string"
+  ) return null;
+  return { count: record.count as number, digest: record.digest };
+}
+
+function parseAdoptedBaselineExpectedCoverage(
+  value: unknown,
+): AdoptedBaselineManifest["expectedCoverage"] | null {
+  const record = requirePlainBody(value);
+  if (!record) return null;
+  const parsed: Partial<AdoptedBaselineManifest["expectedCoverage"]> = {};
+  for (const [stageName, rawExpected] of Object.entries(record)) {
+    const stage = parseAdoptedBaselineStage(stageName);
+    const expectedRecord = requirePlainBody(rawExpected);
+    if (
+      !stage
+      || !expectedRecord
+      || !hasOnlyKeys(expectedRecord, new Set(["count", "digest", "stageContractVersion"]))
+      || typeof expectedRecord.stageContractVersion !== "string"
+    ) return null;
+    const expected = parseAdoptedBaselineExpectedSet({
+      count: expectedRecord.count,
+      digest: expectedRecord.digest,
+    });
+    if (!expected) return null;
+    parsed[stage] = {
+      ...expected,
+      stageContractVersion: expectedRecord.stageContractVersion,
+    };
+  }
+  return Object.keys(parsed).length === ADOPTED_BASELINE_STAGES.size
+    ? parsed as AdoptedBaselineManifest["expectedCoverage"]
+    : null;
 }
 
 function parseStringArray(value: unknown): string[] | null {
@@ -1145,10 +1259,53 @@ export function registerApiTriggers(
         inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
       };
       payload.recoveryIdentity = receiptIdentity;
-      return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
+      const response = await executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
         function_id: "mem::semantic-rollup",
         payload,
       }), body.requireExistingReceipt, body.expectedReceiptInputHash, identity.inputHash);
+      const responseBody = response.body as {
+        success?: unknown;
+        semanticMemoryIds?: unknown;
+        operationReceipt?: { key?: unknown };
+      };
+      if (response.status_code === 200 && responseBody?.success === true) {
+        const semanticMemoryIds = Array.isArray(responseBody.semanticMemoryIds)
+          && responseBody.semanticMemoryIds.every((value) => typeof value === "string" && value.trim())
+          && new Set(responseBody.semanticMemoryIds).size === responseBody.semanticMemoryIds.length
+          ? responseBody.semanticMemoryIds as string[]
+          : null;
+        const receiptKey = typeof responseBody.operationReceipt?.key === "string"
+          ? responseBody.operationReceipt.key
+          : null;
+        try {
+          if (!semanticMemoryIds || (semanticMemoryIds.length > 0 && !receiptKey)) {
+            throw new Error("semantic_rollup_reflect_handoff_invalid");
+          }
+          if (semanticMemoryIds.length > 0 && receiptKey) {
+            const handoff = await enqueueReflectInsightBacklog({
+              kv,
+              semanticMemoryIds,
+              upstreamReceiptRef: {
+                scope: KV.extractionOperationReceipt(receiptKey),
+                key: receiptKey,
+              },
+            });
+            if (handoff.ineligible.length > 0) {
+              throw new Error("semantic_rollup_reflect_handoff_invalid");
+            }
+          }
+        } catch {
+          return {
+            status_code: 503,
+            body: {
+              success: false,
+              failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" },
+              operationReceipt: responseBody.operationReceipt,
+            },
+          };
+        }
+      }
+      return response;
     },
   );
   sdk.registerTrigger({
@@ -1160,6 +1317,74 @@ export function registerApiTriggers(
       middleware_function_ids: ["middleware::api-auth"],
     },
   });
+
+  sdk.registerFunction("api::semantic-rollup-eligibility",
+    async (req: ApiRequest): Promise<Response> => {
+      const denied = checkAuth(req, secret);
+      if (denied) return denied;
+      const body = requirePlainBody(req.body);
+      if (!body || !hasOnlyKeys(body, allowedSemanticRollupEligibilityKeys)) {
+        return {
+          status_code: 400,
+          body: { error: "invalid semantic rollup eligibility payload" },
+        };
+      }
+      const sessionIds = parseStringArray(body.sessionIds);
+      const sourceSummaryHashes = parseStringRecord(body.sourceSummaryHashes);
+      if (
+        !sessionIds
+        || sessionIds.length === 0
+        || sessionIds.length > 100
+        || !sourceSummaryHashes
+        || Object.keys(sourceSummaryHashes).length !== sessionIds.length
+        || sessionIds.some((sessionId) =>
+          !/^[0-9a-f]{64}$/.test(sourceSummaryHashes[sessionId] ?? ""))
+      ) {
+        return {
+          status_code: 400,
+          body: { error: "semantic rollup eligibility sources are invalid" },
+        };
+      }
+      const result = await sdk.trigger({
+        function_id: "mem::semantic-rollup-eligibility",
+        payload: { sessionIds, sourceSummaryHashes },
+      });
+      return { status_code: 200, body: result };
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::semantic-rollup-eligibility",
+    config: {
+      api_path: "/agentmemory/full/semantic-rollup-eligibility",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::skill-extract-eligibility", async (req: ApiRequest): Promise<Response> => {
+    const denied = checkAuth(req, secret);
+    if (denied) return denied;
+    const body = requirePlainBody(req.body);
+    const rawSessionIds = body?.sessionIds;
+    const sessionIds = body && hasOnlyKeys(body, allowedSkillExtractEligibilityKeys)
+      ? parseStringArray(rawSessionIds)
+      : null;
+    if (
+      !sessionIds
+      || !Array.isArray(rawSessionIds)
+      || sessionIds.length === 0
+      || sessionIds.length > 100
+      || rawSessionIds.length !== sessionIds.length
+      || new Set(sessionIds).size !== sessionIds.length
+    ) {
+      return { status_code: 400, body: { error: "skill extract eligibility requires 1-100 unique sessionIds" } };
+    }
+    return { status_code: 200, body: await sdk.trigger({ function_id: "mem::skill-extract-eligibility", payload: { sessionIds } }) };
+  });
+  sdk.registerTrigger({ type: "http", function_id: "api::skill-extract-eligibility", config: {
+    api_path: "/agentmemory/full/skill-extract-eligibility", http_method: "POST", middleware_function_ids: ["middleware::api-auth"],
+  } });
 
   sdk.registerFunction("api::full-skill-extract", async (req: ApiRequest): Promise<Response> => {
     const denied = checkAuth(req, secret);
@@ -1216,6 +1441,8 @@ export function registerApiTriggers(
     }
     const identity = extractionOperationIdentity(body, "skill_extract");
     const sessionId = asNonEmptyString(body.sessionId);
+    const stageContractVersion = asNonEmptyString(body.stageContractVersion);
+    const sourceVersionKey = asNonEmptyString(body.sourceVersionKey);
     const model = optionalModelString(body);
     const operationReceiptManaged = parseOptionalBoolean(body.operationReceiptManaged);
     const requireExistingReceipt = parseOptionalStrictBoolean(body.requireExistingReceipt);
@@ -1223,7 +1450,7 @@ export function registerApiTriggers(
       body.expectedReceiptInputHash,
     );
     if (
-      !identity || !sessionId || model === null || operationReceiptManaged === null
+      !identity || !sessionId || !stageContractVersion || !sourceVersionKey || stageContractVersion !== "skill_extract/v1" || model === null || operationReceiptManaged === null
       || requireExistingReceipt === null
       || expectedReceiptInputHash === null
       || (requireExistingReceipt === true && expectedReceiptInputHash !== undefined)
@@ -1236,6 +1463,8 @@ export function registerApiTriggers(
       payload: {
         identity,
         sessionId,
+        stageContractVersion,
+        sourceVersionKey,
         ...(model ? { model } : {}),
         operationReceiptManaged: true,
         ...(requireExistingReceipt ? { requireExistingReceipt: true } : {}),
@@ -1310,10 +1539,24 @@ export function registerApiTriggers(
         },
       };
     }
-    return executeIdempotentCommitOperation(kv, identity, () => sdk.trigger({
+    const commitResponse = await executeIdempotentCommitOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-skill-extract-commit",
       payload: { identity: prepareIdentity, preparedHandle, proposalHash },
     }), body.requireExistingReceipt, body.expectedReceiptInputHash);
+    const responseBody = commitResponse.body as { success?: unknown; operationReceipt?: { key?: unknown } };
+    const receiptKey = typeof responseBody?.operationReceipt?.key === "string" ? responseBody.operationReceipt.key : null;
+    if (commitResponse.status_code === 200 && responseBody?.success === true && receiptKey) {
+      const reconciled = await reconcileSkillContributionFromProposal({
+        kv,
+        prepareIdentity,
+        commitIdentity: identity,
+        operationReceiptRef: { scope: KV.extractionOperationReceipt(receiptKey), key: receiptKey },
+      });
+      if (reconciled.success === false) {
+        return { status_code: 503, body: { success: false, failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" }, operationReceipt: responseBody.operationReceipt } };
+      }
+    }
+    return commitResponse;
   });
   sdk.registerTrigger({
     type: "http",
@@ -1347,6 +1590,9 @@ export function registerApiTriggers(
       ? undefined
       : parseConsolidationDescriptors(body.descriptors);
     const plannerId = optionalNonEmptyString(body, "plannerId");
+    const sessionIds = body.sessionIds === undefined
+      ? undefined
+      : parseStringArray(body.sessionIds);
     if (
       minImportance === null
       || minObservationsPerConcept === null
@@ -1358,6 +1604,7 @@ export function registerApiTriggers(
       || windowLimit === null
       || descriptors === null
       || plannerId === null
+      || sessionIds === null
       || (plannerId !== undefined && plannerId.length > 128)
       || (sessionLimit !== undefined && sessionOffset === undefined)
       || (windowLimit !== undefined && windowOffset === undefined)
@@ -1378,6 +1625,7 @@ export function registerApiTriggers(
     if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
     const payload: Record<string, unknown> = {};
     if (project !== undefined) payload.project = project;
+    if (sessionIds !== undefined) payload.sessionIds = sessionIds;
     if (minImportance !== undefined) payload.minImportance = minImportance;
     if (plannerId !== undefined) payload.plannerId = plannerId;
     if (sessionOffset !== undefined) {
@@ -1455,6 +1703,19 @@ export function registerApiTriggers(
     if (minObservations !== undefined) payload.minObservations = minObservations;
     if (charBudget !== undefined) payload.charBudget = charBudget;
     if (model) payload.model = model;
+    const stageContractVersion = optionalNonEmptyString(body, "stageContractVersion");
+    const sourceVersionKeys = body.sourceVersionKeys === undefined
+      ? undefined
+      : parseStringArray(body.sourceVersionKeys);
+    if (
+      stageContractVersion === null
+      || sourceVersionKeys === null
+      || (stageContractVersion !== undefined && stageContractVersion !== "memory_consolidate/v1")
+    ) {
+      return { status_code: 400, body: { error: "invalid memory consolidate contribution contract" } };
+    }
+    if (stageContractVersion !== undefined) payload.stageContractVersion = stageContractVersion;
+    if (sourceVersionKeys !== undefined) payload.sourceVersionKeys = sourceVersionKeys;
     return executeExtractionOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-memory-consolidate-window",
       payload,
@@ -1490,9 +1751,15 @@ export function registerApiTriggers(
     const minObservations = parseOptionalPositiveInt(body.minObservations);
     const charBudget = parseOptionalPositiveInt(body.charBudget);
     const model = optionalModelString(body);
+    const stageContractVersion = optionalNonEmptyString(body, "stageContractVersion");
+    const sourceVersionKeys = body.sourceVersionKeys === undefined
+      ? undefined
+      : parseStringArray(body.sourceVersionKeys);
     if (
       project === null || concept === null || observationIds === null || observationSessionIds === null
       || minObservations === null || charBudget === null || model === null
+      || stageContractVersion === null || sourceVersionKeys === null
+      || (stageContractVersion !== undefined && stageContractVersion !== "memory_consolidate/v1")
     ) {
       return { status_code: 400, body: { error: "invalid full memory consolidate prepare fields" } };
     }
@@ -1504,6 +1771,8 @@ export function registerApiTriggers(
     if (minObservations !== undefined) payload.minObservations = minObservations;
     if (charBudget !== undefined) payload.charBudget = charBudget;
     if (model) payload.model = model;
+    if (stageContractVersion !== undefined) payload.stageContractVersion = stageContractVersion;
+    if (sourceVersionKeys !== undefined) payload.sourceVersionKeys = sourceVersionKeys;
     const receiptIdentity: ExtractionOperationIdentity = {
       ...identity,
       inputHash: stableOperationHash({
@@ -1648,10 +1917,57 @@ export function registerApiTriggers(
         },
       };
     }
-    return executeIdempotentCommitOperation(kv, identity, () => sdk.trigger({
+    const response = await executeIdempotentCommitOperation(kv, identity, () => sdk.trigger({
       function_id: "mem::full-memory-consolidate-window-commit",
       payload: { identity: prepareIdentity, preparedHandle, proposalHash },
     }), body.requireExistingReceipt, body.expectedReceiptInputHash);
+    const responseBody = response.body as {
+      success?: unknown;
+      memoryIds?: unknown;
+      operationReceipt?: { key?: unknown };
+    };
+    if (
+      response.status_code === 200
+      && responseBody?.success === true
+    ) {
+      try {
+        await reconcileMemoryConsolidationContribution(kv, prepareIdentity, identity);
+        const memoryIds = Array.isArray(responseBody.memoryIds)
+          && responseBody.memoryIds.every((value) => typeof value === "string" && value.trim())
+          && new Set(responseBody.memoryIds).size === responseBody.memoryIds.length
+          ? responseBody.memoryIds as string[]
+          : null;
+        const receiptKey = typeof responseBody.operationReceipt?.key === "string"
+          ? responseBody.operationReceipt.key
+          : null;
+        if (!memoryIds || (memoryIds.length > 0 && !receiptKey)) {
+          throw new Error("memory_consolidate_procedural_handoff_invalid");
+        }
+        if (memoryIds.length > 0 && receiptKey) {
+          await enqueueConsolidationProceduralBacklog({
+            kv,
+            memoryIds,
+            upstreamReceiptRef: {
+              scope: KV.extractionOperationReceipt(receiptKey),
+              key: receiptKey,
+            },
+          });
+        }
+      } catch {
+        return {
+          status_code: 503,
+          body: {
+            success: false,
+            failure: {
+              class: "transient_runtime",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            operationReceipt: responseBody.operationReceipt,
+          },
+        };
+      }
+    }
+    return response;
   });
   sdk.registerTrigger({
     type: "http",
@@ -1676,10 +1992,18 @@ export function registerApiTriggers(
       return { status_code: 400, body: { error: "maxItemsPerWindow must be a positive integer" } };
     }
     const project = optionalNonEmptyString(body, "project");
+    const memoryIds = body.memoryIds === undefined ? undefined : parseStringArray(body.memoryIds);
     if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
+    if (
+      memoryIds === null
+      || (Array.isArray(body.memoryIds) && body.memoryIds.length !== memoryIds?.length)
+    ) {
+      return { status_code: 400, body: { error: "memoryIds must be a unique non-empty string array" } };
+    }
     const payload: Record<string, unknown> = {};
     if (project !== undefined) payload.project = project;
     if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
+    if (memoryIds !== undefined) payload.memoryIds = memoryIds;
     const result = await sdk.trigger({
       function_id: "mem::full-consolidation-procedural-windows-plan",
       payload,
@@ -1710,10 +2034,37 @@ export function registerApiTriggers(
     }
     const project = optionalNonEmptyString(body, "project");
     const memoryIds = body.memoryIds === undefined ? undefined : parseStringArray(body.memoryIds);
+    const stageContractVersion = optionalNonEmptyString(body, "stageContractVersion");
+    const sourceVersionKeys = body.sourceVersionKeys === undefined
+      ? undefined
+      : parseStringArray(body.sourceVersionKeys);
     const model = optionalModelString(body);
     if (model === null) return invalidModelResponse();
     if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
-    if (memoryIds === null) return { status_code: 400, body: { error: "memoryIds must be a string array" } };
+    const hasContributionIdentity = stageContractVersion !== undefined
+      || sourceVersionKeys !== undefined;
+    if (
+      memoryIds === null
+      || stageContractVersion === null
+      || sourceVersionKeys === null
+      || (hasContributionIdentity && (
+        stageContractVersion !== CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT
+        || !memoryIds
+        || memoryIds.length < 2
+        || !sourceVersionKeys
+        || sourceVersionKeys.length !== memoryIds.length
+        || (Array.isArray(body.memoryIds) && body.memoryIds.length !== memoryIds.length)
+        || (Array.isArray(body.sourceVersionKeys)
+          && body.sourceVersionKeys.length !== sourceVersionKeys.length)
+      ))
+    ) {
+      return {
+        status_code: 400,
+        body: {
+          error: "memoryIds and sourceVersionKeys must be unique non-empty arrays with the procedural stage contract",
+        },
+      };
+    }
     const identity = extractionOperationIdentity(body, "consolidation_procedural");
     if (!identity) return invalidExtractionOperationIdentityResponse("consolidation_procedural");
     const payload: Record<string, unknown> = {};
@@ -1721,15 +2072,69 @@ export function registerApiTriggers(
     if (memoryIds !== undefined) payload.memoryIds = memoryIds;
     if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
     if (model) payload.model = model;
+    if (stageContractVersion !== undefined) payload.stageContractVersion = stageContractVersion;
+    if (sourceVersionKeys !== undefined) payload.sourceVersionKeys = sourceVersionKeys;
     const receiptIdentity = {
       ...identity,
       inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
     };
-    payload.recoveryIdentity = receiptIdentity;
-    return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
+    payload.recoveryIdentity = {
+      runId: receiptIdentity.runId,
+      unitId: receiptIdentity.unitId,
+      inputHash: receiptIdentity.inputHash,
+    };
+    const response = await executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
       function_id: "mem::full-consolidation-procedural-window",
       payload,
     }), body.requireExistingReceipt, body.expectedReceiptInputHash, identity.inputHash);
+    const responseBody = response.body as {
+      success?: unknown;
+      operationReceipt?: { key?: unknown };
+    };
+    const receiptKey = typeof responseBody?.operationReceipt?.key === "string"
+      ? responseBody.operationReceipt.key
+      : null;
+    if (
+      response.status_code === 200
+      && responseBody?.success === true
+      && sourceVersionKeys
+    ) {
+      if (!receiptKey) {
+        return {
+          status_code: 503,
+          body: {
+            success: false,
+            failure: {
+              class: "transient_runtime",
+              cause: "extraction_operation_reconciliation_required",
+            },
+          },
+        };
+      }
+      const reconciled = await reconcileConsolidationProceduralContribution({
+        kv,
+        identity: receiptIdentity,
+        sourceVersionKeys,
+        operationReceiptRef: {
+          scope: KV.extractionOperationReceipt(receiptKey),
+          key: receiptKey,
+        },
+      });
+      if (reconciled.success === false) {
+        return {
+          status_code: 503,
+          body: {
+            success: false,
+            failure: {
+              class: "transient_runtime",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            operationReceipt: responseBody.operationReceipt,
+          },
+        };
+      }
+    }
+    return response;
   });
   sdk.registerTrigger({
     type: "http",
@@ -1760,11 +2165,27 @@ export function registerApiTriggers(
       return { status_code: 400, body: { error: "maxItemsPerWindow and charBudget must be positive integers" } };
     }
     const project = optionalNonEmptyString(body, "project");
+    const semanticMemoryIds = body.semanticMemoryIds === undefined
+      ? undefined
+      : parseStringArray(body.semanticMemoryIds);
+    const lessonIds = body.lessonIds === undefined ? undefined : parseStringArray(body.lessonIds);
+    const crystalIds = body.crystalIds === undefined ? undefined : parseStringArray(body.crystalIds);
     if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
+    if (
+      semanticMemoryIds === null
+      || lessonIds === null
+      || crystalIds === null
+      || (Array.isArray(body.semanticMemoryIds) && body.semanticMemoryIds.length !== semanticMemoryIds?.length)
+      || (Array.isArray(body.lessonIds) && body.lessonIds.length !== lessonIds?.length)
+      || (Array.isArray(body.crystalIds) && body.crystalIds.length !== crystalIds?.length)
+    ) return { status_code: 400, body: { error: "reflect insight source ids must be unique non-empty string arrays" } };
     const payload: Record<string, unknown> = { useGraph: false };
     if (project !== undefined) payload.project = project;
     if (maxItemsPerWindow !== undefined) payload.maxItemsPerWindow = maxItemsPerWindow;
     if (charBudget !== undefined) payload.charBudget = charBudget;
+    if (semanticMemoryIds !== undefined) payload.semanticMemoryIds = semanticMemoryIds;
+    if (lessonIds !== undefined) payload.lessonIds = lessonIds;
+    if (crystalIds !== undefined) payload.crystalIds = crystalIds;
     const result = await sdk.trigger({
       function_id: "mem::full-reflect-insight-windows-plan",
       payload,
@@ -1803,9 +2224,34 @@ export function registerApiTriggers(
     const semanticMemoryIds = body.semanticMemoryIds === undefined ? undefined : parseStringArray(body.semanticMemoryIds);
     const lessonIds = body.lessonIds === undefined ? undefined : parseStringArray(body.lessonIds);
     const crystalIds = body.crystalIds === undefined ? undefined : parseStringArray(body.crystalIds);
+    const stageContractVersion = optionalNonEmptyString(body, "stageContractVersion");
+    const sourceVersionKeys = body.sourceVersionKeys === undefined
+      ? undefined
+      : parseStringArray(body.sourceVersionKeys);
     if (project === null) return { status_code: 400, body: { error: "project must be a non-empty string" } };
-    if (semanticMemoryIds === null || lessonIds === null || crystalIds === null) {
-      return { status_code: 400, body: { error: "semanticMemoryIds, lessonIds, and crystalIds must be string arrays" } };
+    const sourceIds = [
+      ...(semanticMemoryIds ?? []),
+      ...(lessonIds ?? []),
+      ...(crystalIds ?? []),
+    ];
+    const hasContributionIdentity = stageContractVersion !== undefined || sourceVersionKeys !== undefined;
+    if (
+      semanticMemoryIds === null
+      || lessonIds === null
+      || crystalIds === null
+      || stageContractVersion === null
+      || sourceVersionKeys === null
+      || (hasContributionIdentity && (
+        stageContractVersion !== REFLECT_INSIGHT_CONTRIBUTION_CONTRACT
+        || sourceIds.length < 3
+        || new Set(sourceIds).size !== sourceIds.length
+        || !sourceVersionKeys
+        || sourceVersionKeys.length !== sourceIds.length
+        || (Array.isArray(body.sourceVersionKeys)
+          && body.sourceVersionKeys.length !== sourceVersionKeys.length)
+      ))
+    ) {
+      return { status_code: 400, body: { error: "reflect insight sources must match the incremental stage contract" } };
     }
     const model = optionalModelString(body);
     if (model === null) return invalidModelResponse();
@@ -1819,15 +2265,63 @@ export function registerApiTriggers(
     if (lessonIds !== undefined) payload.lessonIds = lessonIds;
     if (crystalIds !== undefined) payload.crystalIds = crystalIds;
     if (model) payload.model = model;
+    if (stageContractVersion !== undefined) payload.stageContractVersion = stageContractVersion;
+    if (sourceVersionKeys !== undefined) payload.sourceVersionKeys = sourceVersionKeys;
     const receiptIdentity = {
       ...identity,
       inputHash: stableOperationHash({ runnerInputHash: identity.inputHash, payload }),
     };
-    payload.recoveryIdentity = receiptIdentity;
-    return executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
+    payload.recoveryIdentity = {
+      runId: receiptIdentity.runId,
+      unitId: receiptIdentity.unitId,
+      inputHash: receiptIdentity.inputHash,
+    };
+    const response = await executeExtractionOperation(kv, receiptIdentity, () => sdk.trigger({
       function_id: "mem::full-reflect-insight-window",
       payload,
     }), body.requireExistingReceipt, body.expectedReceiptInputHash, identity.inputHash);
+    const responseBody = response.body as {
+      success?: unknown;
+      operationReceipt?: { key?: unknown };
+    };
+    const receiptKey = typeof responseBody.operationReceipt?.key === "string"
+      ? responseBody.operationReceipt.key
+      : null;
+    if (
+      response.status_code === 200
+      && responseBody.success === true
+      && sourceVersionKeys
+    ) {
+      if (!receiptKey) {
+        return {
+          status_code: 503,
+          body: {
+            success: false,
+            failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" },
+          },
+        };
+      }
+      const reconciled = await reconcileReflectInsightContribution({
+        kv,
+        identity: receiptIdentity,
+        sourceVersionKeys,
+        operationReceiptRef: {
+          scope: KV.extractionOperationReceipt(receiptKey),
+          key: receiptKey,
+        },
+      });
+      if (reconciled.success === false) {
+        return {
+          status_code: 503,
+          body: {
+            success: false,
+            failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" },
+            operationReceipt: responseBody.operationReceipt,
+          },
+        };
+      }
+    }
+    return response;
   });
   sdk.registerTrigger({
     type: "http",
@@ -1865,13 +2359,27 @@ export function registerApiTriggers(
         && body.actionUpdatedAts.every((value) => typeof value === "string" && value.trim())
         ? body.actionUpdatedAts.map((value) => (value as string).trim())
         : null;
+    const stageContractVersion = optionalNonEmptyString(body, "stageContractVersion");
+    const sourceVersionKeys = body.sourceVersionKeys === undefined
+      ? undefined
+      : parseStringArray(body.sourceVersionKeys);
+    const hasContributionIdentity = stageContractVersion !== undefined
+      || sourceVersionKeys !== undefined;
     const hasPinnedGroup = groupId !== undefined
       || actionIds !== undefined
-      || actionUpdatedAts !== undefined;
+      || actionUpdatedAts !== undefined
+      || hasContributionIdentity;
     if (
       groupId === null
       || actionIds === null
       || actionUpdatedAts === null
+      || stageContractVersion === null
+      || sourceVersionKeys === null
+      || (Array.isArray(body.sourceVersionKeys)
+        && sourceVersionKeys !== undefined
+        && body.sourceVersionKeys.length !== sourceVersionKeys.length)
+      || (hasContributionIdentity
+        && (!stageContractVersion || !sourceVersionKeys))
       || (
         hasPinnedGroup
         && (
@@ -1880,6 +2388,8 @@ export function registerApiTriggers(
           || actionIds.length === 0
           || !actionUpdatedAts
           || actionUpdatedAts.length !== actionIds.length
+          || (sourceVersionKeys !== undefined
+            && sourceVersionKeys.length !== actionIds.length)
           || (Array.isArray(body.actionIds) && body.actionIds.length !== actionIds.length)
         )
       )
@@ -1897,6 +2407,8 @@ export function registerApiTriggers(
     if (groupId !== undefined) payload.groupId = groupId;
     if (actionIds !== undefined) payload.actionIds = actionIds;
     if (actionUpdatedAts !== undefined) payload.actionUpdatedAts = actionUpdatedAts;
+    if (stageContractVersion !== undefined) payload.stageContractVersion = stageContractVersion;
+    if (sourceVersionKeys !== undefined) payload.sourceVersionKeys = sourceVersionKeys;
     if (dryRun === true) {
       const result = await sdk.trigger({
         function_id: "mem::full-crystals-auto",
@@ -1913,7 +2425,7 @@ export function registerApiTriggers(
     payload.runId = receiptIdentity.runId;
     payload.unitId = receiptIdentity.unitId;
     payload.inputHash = receiptIdentity.inputHash;
-    return executeIdempotentCommitOperation(
+    const commitResponse = await executeIdempotentCommitOperation(
       kv,
       receiptIdentity,
       async () => {
@@ -1934,6 +2446,79 @@ export function registerApiTriggers(
       body.expectedReceiptInputHash,
       identity.inputHash,
     );
+    const responseBody = commitResponse.body as {
+      success?: unknown;
+      crystalIds?: unknown;
+      crystalRecoveryEvidence?: unknown;
+      operationReceipt?: { key?: unknown };
+    };
+    const receiptKey = typeof responseBody?.operationReceipt?.key === "string"
+      ? responseBody.operationReceipt.key
+      : null;
+    if (
+      commitResponse.status_code === 200
+      && responseBody?.success === true
+      && Array.isArray(responseBody.crystalIds)
+      && responseBody.crystalIds.length === 1
+      && responseBody.crystalRecoveryEvidence !== undefined
+      && receiptKey
+      && groupId
+      && actionIds
+      && actionUpdatedAts
+    ) {
+      const reconciled = await reconcileCrystalContributionFromReceipt({
+        kv,
+        identity: receiptIdentity,
+        group: {
+          groupId,
+          actionIds,
+          actionUpdatedAts,
+          ...(project === undefined ? {} : { project }),
+          ...(sourceVersionKeys === undefined ? {} : { sourceVersionKeys }),
+        },
+        operationReceiptRef: {
+          scope: KV.extractionOperationReceipt(receiptKey),
+          key: receiptKey,
+        },
+      });
+      if (reconciled.success === false) {
+        return {
+          status_code: 503,
+          body: {
+            success: false,
+            failure: {
+              class: "transient_runtime",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            operationReceipt: responseBody.operationReceipt,
+          },
+        };
+      }
+      try {
+        const handoff = await enqueueReflectInsightBacklog({
+          kv,
+          crystalIds: responseBody.crystalIds as string[],
+          upstreamReceiptRef: {
+            scope: KV.extractionOperationReceipt(receiptKey),
+            key: receiptKey,
+          },
+        });
+        if (handoff.ineligible.length > 0) throw new Error("crystal_reflect_handoff_invalid");
+      } catch {
+        return {
+          status_code: 503,
+          body: {
+            success: false,
+            failure: {
+              class: "transient_runtime",
+              cause: "extraction_operation_reconciliation_required",
+            },
+            operationReceipt: responseBody.operationReceipt,
+          },
+        };
+      }
+    }
+    return commitResponse;
   });
   sdk.registerTrigger({
     type: "http",
@@ -2011,6 +2596,181 @@ export function registerApiTriggers(
     function_id: "api::extraction-run-record",
     config: {
       api_path: "/agentmemory/extraction-runs/record",
+      http_method: "POST",
+      middleware_function_ids: ["middleware::api-auth"],
+    },
+  });
+
+  sdk.registerFunction("api::extraction-adopted-baseline",
+    async (req: ApiRequest): Promise<Response> => {
+      const missingSecret = requireConfiguredSecret(secret, "extraction adopted baseline");
+      if (missingSecret) return missingSecret;
+      const denied = checkAuth(req, secret);
+      if (denied) return denied;
+      const body = requirePlainBody(req.body);
+      const action = body && typeof body.action === "string" ? body.action : null;
+      if (!body || !action) {
+        return { status_code: 400, body: { error: "action is required" } };
+      }
+      const baselineId = typeof body.baselineId === "string" && body.baselineId.trim()
+        ? body.baselineId.trim()
+        : null;
+      try {
+        if (action === "preview_coverage" || action === "append_coverage") {
+          const allowed = action === "preview_coverage"
+            ? new Set(["action", "baselineId", "stage", "sessionIds"])
+            : new Set(["action", "baselineId", "stage", "sessionIds", "expectedBatchDigest"]);
+          const stage = parseAdoptedBaselineStage(body.stage);
+          const sessionIds = parseStringArray(body.sessionIds);
+          if (
+            !hasOnlyKeys(body, allowed)
+            || !baselineId
+            || !stage
+            || !sessionIds
+            || sessionIds.length === 0
+            || sessionIds.length > 100
+            || (Array.isArray(body.sessionIds) && body.sessionIds.length !== sessionIds.length)
+          ) {
+            return { status_code: 400, body: { error: "invalid adopted baseline coverage request" } };
+          }
+          const records = await buildAdoptedBaselineCoverageRecords(kv, {
+            baselineId,
+            stage,
+            sessionIds,
+          });
+          const batchDigest = digestAdoptedBaselineCoverage(records);
+          if (action === "preview_coverage") {
+            return { status_code: 200, body: { success: true, records, batchDigest } };
+          }
+          if (typeof body.expectedBatchDigest !== "string" || body.expectedBatchDigest !== batchDigest) {
+            return { status_code: 409, body: { error: "adopted_baseline_preview_drift" } };
+          }
+          const result = await appendAdoptedBaselineCoverage(kv, baselineId, records);
+          return { status_code: 200, body: { success: true, batchDigest, ...result } };
+        }
+        if (action === "preview_lesson_seed" || action === "append_lesson_seed") {
+          const allowed = action === "preview_lesson_seed"
+            ? new Set(["action", "baselineId", "lessonIds"])
+            : new Set(["action", "baselineId", "lessonIds", "expectedBatchDigest"]);
+          const lessonIds = parseStringArray(body.lessonIds);
+          if (
+            !hasOnlyKeys(body, allowed)
+            || !baselineId
+            || !lessonIds
+            || lessonIds.length === 0
+            || lessonIds.length > 100
+            || (Array.isArray(body.lessonIds) && body.lessonIds.length !== lessonIds.length)
+          ) {
+            return { status_code: 400, body: { error: "invalid adopted baseline lesson seed request" } };
+          }
+          const records = await buildAdoptedBaselineLessonSeedRecords(kv, { baselineId, lessonIds });
+          const batchDigest = digestAdoptedBaselineLessonSeeds(records);
+          if (action === "preview_lesson_seed") {
+            return { status_code: 200, body: { success: true, records, batchDigest } };
+          }
+          if (typeof body.expectedBatchDigest !== "string" || body.expectedBatchDigest !== batchDigest) {
+            return { status_code: 409, body: { error: "adopted_baseline_preview_drift" } };
+          }
+          const result = await appendAdoptedBaselineLessonSeeds(kv, baselineId, records);
+          return { status_code: 200, body: { success: true, batchDigest, ...result } };
+        }
+        if (action === "prepare") {
+          if (!hasOnlyKeys(body, new Set([
+            "action",
+            "baselineId",
+            "sourceRunId",
+            "retiredRunIds",
+            "decisionRef",
+            "expectedCoverage",
+            "expectedLessonSeed",
+          ]))) {
+            return { status_code: 400, body: { error: "invalid adopted baseline prepare request" } };
+          }
+          const sourceRunId = typeof body.sourceRunId === "string" ? body.sourceRunId.trim() : "";
+          const decisionRef = typeof body.decisionRef === "string" ? body.decisionRef.trim() : "";
+          const retiredRunIds = parseStringArray(body.retiredRunIds);
+          const expectedCoverage = parseAdoptedBaselineExpectedCoverage(body.expectedCoverage);
+          const expectedLessonSeed = parseAdoptedBaselineExpectedSet(body.expectedLessonSeed);
+          if (!baselineId || !sourceRunId || !decisionRef || !retiredRunIds || !expectedCoverage || !expectedLessonSeed) {
+            return { status_code: 400, body: { error: "invalid adopted baseline prepare request" } };
+          }
+          for (const [stageName, expected] of Object.entries(expectedCoverage)) {
+            if (expected.stageContractVersion !== ADOPTED_BASELINE_STAGE_CONTRACTS[stageName as AdoptedBaselineStage]) {
+              return { status_code: 409, body: { error: "adopted_baseline_contract_migration_required" } };
+            }
+          }
+          const manifest = await prepareAdoptedBaseline(kv, {
+            id: baselineId,
+            sourceRunId,
+            retiredRunIds,
+            decisionRef,
+            expectedCoverage,
+            expectedLessonSeed,
+            naturalBoundaryStages: ["crystal", "consolidation_procedural"],
+          });
+          return { status_code: 200, body: { success: true, manifest } };
+        }
+        if (action === "seal") {
+          if (!hasOnlyKeys(body, new Set(["action", "baselineId"])) || !baselineId) {
+            return { status_code: 400, body: { error: "invalid adopted baseline seal request" } };
+          }
+          const manifest = await sealAdoptedBaseline(
+            kv,
+            baselineId,
+            (records) => materializeAdoptedBaselineLessonSeeds(kv, records),
+          );
+          return { status_code: 200, body: { success: true, manifest } };
+        }
+        if (action === "partition_sessions") {
+          const stage = parseAdoptedBaselineStage(body.stage);
+          const sessionIds = parseStringArray(body.sessionIds);
+          if (
+            !hasOnlyKeys(body, new Set(["action", "stage", "stageContractVersion", "sessionIds"]))
+            || !stage
+            || typeof body.stageContractVersion !== "string"
+            || !sessionIds
+            || (Array.isArray(body.sessionIds) && body.sessionIds.length !== sessionIds.length)
+          ) {
+            return { status_code: 400, body: { error: "invalid adopted baseline partition request" } };
+          }
+          const result = await partitionAdoptedBaselineSessions(kv, {
+            stage,
+            stageContractVersion: body.stageContractVersion,
+            sessionIds,
+          });
+          return { status_code: 200, body: { success: true, ...result } };
+        }
+        if (action === "inspect_run") {
+          const runId = typeof body.runId === "string" ? body.runId.trim() : "";
+          if (!hasOnlyKeys(body, new Set(["action", "runId"])) || !runId) {
+            return { status_code: 400, body: { error: "invalid adopted baseline run request" } };
+          }
+          const result = await inspectAdoptedBaselineRun(kv, runId);
+          return { status_code: 200, body: { success: true, ...result } };
+        }
+        if (action === "status") {
+          if (!hasOnlyKeys(body, new Set(["action", "baselineId"])) ) {
+            return { status_code: 400, body: { error: "invalid adopted baseline status request" } };
+          }
+          const active = await readActiveAdoptedBaseline(kv);
+          const requested = baselineId
+            ? await kv.get<AdoptedBaselineManifest>(KV.extractionAdoptedBaselineManifests, baselineId)
+            : null;
+          return { status_code: 200, body: { success: true, active, requested } };
+        }
+        return { status_code: 400, body: { error: "unknown adopted baseline action" } };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "adopted_baseline_failed";
+        const conflict = /conflict|mismatch|drift|migration|required|already_active|not_preparing/.test(message);
+        return { status_code: conflict ? 409 : 400, body: { error: message } };
+      }
+    },
+  );
+  sdk.registerTrigger({
+    type: "http",
+    function_id: "api::extraction-adopted-baseline",
+    config: {
+      api_path: "/agentmemory/full/extraction-baseline",
       http_method: "POST",
       middleware_function_ids: ["middleware::api-auth"],
     },
@@ -5324,6 +6084,16 @@ export function registerApiTriggers(
       failure?: StageFailure;
       operationReceipt?: Record<string, unknown>;
       operationReceiptAbsence?: Record<string, unknown>;
+      runs?: Array<{
+        id?: unknown;
+        status?: unknown;
+        createdLessonIds?: unknown;
+      }>;
+      lessonEvidence?: Array<{
+        runId?: unknown;
+        receiptKey?: unknown;
+        effectHash?: unknown;
+      }>;
     };
     if (result?.failure) {
       const reconciliationEvidence = result.operationReceiptAbsence
@@ -5339,6 +6109,45 @@ export function registerApiTriggers(
             : 503,
         body: result,
       };
+    }
+    if (result?.success === true) {
+      try {
+        for (const run of result.runs ?? []) {
+          if (run.status !== "succeeded") continue;
+          const lessonIds = Array.isArray(run.createdLessonIds)
+            && run.createdLessonIds.every((value) => typeof value === "string" && value.trim())
+            && new Set(run.createdLessonIds).size === run.createdLessonIds.length
+            ? run.createdLessonIds as string[]
+            : null;
+          if (!lessonIds) throw new Error("lessons_reflect_handoff_invalid");
+          if (lessonIds.length === 0) continue;
+          const evidence = result.lessonEvidence?.find((item) => item.runId === run.id);
+          if (
+            typeof run.id !== "string"
+            || typeof evidence?.receiptKey !== "string"
+            || typeof evidence.effectHash !== "string"
+          ) throw new Error("lessons_reflect_handoff_invalid");
+          const handoff = await enqueueReflectInsightBacklog({
+            kv,
+            lessonIds,
+            upstreamReceiptRef: {
+              scope: KV.lessonCommitReceipts(run.id),
+              key: evidence.receiptKey,
+              effectHash: evidence.effectHash,
+            },
+          });
+          if (handoff.ineligible.length > 0) throw new Error("lessons_reflect_handoff_invalid");
+        }
+      } catch {
+        return {
+          status_code: 503,
+          body: {
+            success: false,
+            failure: { class: "transient_runtime", cause: "extraction_operation_reconciliation_required" },
+            lessonEvidence: result.lessonEvidence,
+          },
+        };
+      }
     }
     return { status_code: 200, body: result };
   });

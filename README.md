@@ -1567,7 +1567,7 @@ Create `~/.agentmemory/.env`:
 
 <h2 id="api"><picture><source media="(prefers-color-scheme: dark)" srcset="assets/tags/light/section-api.svg"><img src="assets/tags/section-api.svg" alt="API" height="32" /></picture></h2>
 
-155 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
+158 endpoints on port `3111`. The REST API binds to `127.0.0.1` by default. Protected endpoints require `Authorization: Bearer <secret>` when `AGENTMEMORY_SECRET` is set, and mesh sync endpoints require `AGENTMEMORY_SECRET` on both peers.
 
 <details>
 <summary>Key endpoints</summary>
@@ -1620,6 +1620,14 @@ summarize status to query.
 
 Full extraction orchestration uses narrow REST endpoints:
 
+- `POST /agentmemory/full/extraction-baseline` is a protected control surface
+  for adopted cross-run baselines. It supports read-only coverage and lesson
+  seed previews, append-only prepare batches, exact-count/digest sealing,
+  stage-specific session partitioning, retired-run inspection, and status.
+  A preparing manifest is inert; only a successfully sealed manifest becomes
+  active. Operators use `ops/scripts/preview-agentmemory-adopted-baseline.mjs`
+  before the separately confirmed prepare and seal phases in
+  `ops/scripts/apply-agentmemory-adopted-baseline.mjs`.
 - `POST /agentmemory/full/memory-consolidate-window/prepare` performs the
   provider call and stores an idempotent proposal without changing memories.
   `POST /agentmemory/full/memory-consolidate-window/commit` applies that
@@ -1628,6 +1636,8 @@ Full extraction orchestration uses narrow REST endpoints:
   prompt and model call while storing an idempotent proposal.
   `POST /agentmemory/full/skill-extract/commit` applies proposals in runner
   order and reinforces a procedural skill at most once per source session.
+  `POST /agentmemory/full/skill-extract-eligibility` accepts up to 100 explicit
+  session ids and returns bounded eligible, terminal, isolated, and blocked partitions.
 - `GET /agentmemory/runtime-config` returns only redacted runtime facts:
   `summarizeChunkConcurrency`, `summarizeChunkSize`, `providerName`,
   `outputLanguageConfigured`, `outputLanguage`, and `modelRouting`.

@@ -19,12 +19,18 @@ vi.mock("../src/config.js", () => ({
 }));
 
 import {
+  buildConsolidationProceduralSourceVersion,
+  CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+  enqueueConsolidationProceduralBacklog,
+  planConsolidationProceduralWindows,
+  reconcileConsolidationProceduralContribution,
   registerConsolidationPipelineFunction,
   runConsolidationProceduralWindow,
 } from "../src/functions/consolidation-pipeline.js";
 import { isConsolidationEnabled, resolveStageModelCallOptions, resolveStageModelMetadata } from "../src/config.js";
 import type {
   AuditEntry,
+  ContributionRecord,
   SessionSummary,
   Memory,
   SemanticMemory,
@@ -103,6 +109,42 @@ function makePattern(i: number): Memory {
     version: 1,
     isLatest: true,
   };
+}
+
+async function seedProceduralReceipt(
+  kv: ReturnType<typeof mockKV>,
+  identity: { runId: string; unitId: string; inputHash: string },
+): Promise<string> {
+  const key = buildExtractionOperationKey({
+    ...identity,
+    stage: "consolidation_procedural",
+  });
+  await kv.set(KV.extractionOperationReceipt(key), key, {
+    ...identity,
+    stage: "consolidation_procedural",
+    key,
+    version: 1,
+    status: "running",
+    startedAt: "2026-08-02T00:00:00.000Z",
+  });
+  return key;
+}
+
+async function completeProceduralReceipt(
+  kv: ReturnType<typeof mockKV>,
+  key: string,
+  response: Record<string, unknown>,
+): Promise<void> {
+  const receipt = await kv.get<Record<string, unknown>>(
+    KV.extractionOperationReceipt(key),
+    key,
+  );
+  await kv.set(KV.extractionOperationReceipt(key), key, {
+    ...receipt,
+    status: "succeeded",
+    completedAt: "2026-08-02T00:01:00.000Z",
+    response,
+  });
 }
 
 describe("Consolidation Pipeline", () => {
@@ -620,6 +662,341 @@ describe("Consolidation Pipeline", () => {
     expect(stored[0].name).toBe("Full Procedure");
     expect(resolveStageModelMetadata).toHaveBeenCalledWith("procedural", provider, undefined);
     expect(resolveStageModelCallOptions).toHaveBeenCalledWith("procedural", undefined);
+  });
+
+  it("plans only the procedural backlog and waits without an empty contribution below threshold", async () => {
+    for (let index = 0; index < 100; index += 1) {
+      await kv.set(KV.memories, `historical-${index}`, {
+        ...makePattern(index),
+        id: `historical-${index}`,
+      });
+    }
+    const listSpy = vi.spyOn(kv, "list");
+    await enqueueConsolidationProceduralBacklog({
+      kv: kv as never,
+      memoryIds: ["historical-1"],
+    });
+
+    const waiting = await planConsolidationProceduralWindows({ kv: kv as never });
+    expect(waiting).toMatchObject({
+      success: true,
+      windows: [],
+      totalPatterns: 1,
+      reason: "fewer than 2 unconsumed recurring patterns",
+    });
+    expect(listSpy.mock.calls.some(([scope]) => scope === KV.memories)).toBe(false);
+    expect(await kv.list(KV.consolidationProceduralBacklog)).toHaveLength(1);
+    expect(await kv.list(KV.extractionContributionRecords(
+      "consolidation_procedural",
+      CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+    ))).toEqual([]);
+
+    await enqueueConsolidationProceduralBacklog({
+      kv: kv as never,
+      memoryIds: ["historical-2"],
+    });
+    const ready = await planConsolidationProceduralWindows({ kv: kv as never });
+    expect(ready.windows).toHaveLength(1);
+    expect(ready.windows[0]).toMatchObject({
+      memoryIds: ["historical-1", "historical-2"],
+      stageContractVersion: CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+      patternCount: 2,
+    });
+    expect(ready.windows[0].sourceVersionKeys).toHaveLength(2);
+  });
+
+  it("uses procedures only as history, commits new pattern contribution once, and isolates a later correction", async () => {
+    const sourceMemories = [
+      { ...makePattern(1), id: "incremental-pattern-1", project: "repo" },
+      { ...makePattern(2), id: "incremental-pattern-2", project: "repo" },
+    ];
+    for (const memory of sourceMemories) await kv.set(KV.memories, memory.id, memory);
+    await enqueueConsolidationProceduralBacklog({
+      kv: kv as never,
+      memoryIds: sourceMemories.map((memory) => memory.id),
+    });
+    await kv.set(KV.procedural, "existing-procedure", {
+      id: "existing-procedure",
+      name: "Existing Procedure",
+      steps: ["Old step"],
+      triggerCondition: "when old",
+      frequency: 4,
+      sourceSessionIds: [],
+      strength: 0.6,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    const [window] = (await planConsolidationProceduralWindows({
+      kv: kv as never,
+      project: "repo",
+    })).windows;
+    const identity = {
+      runId: "incremental-procedural-run",
+      unitId: window.windowId,
+      inputHash: "8".repeat(64),
+    };
+    const receiptKey = await seedProceduralReceipt(kv, identity);
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue(
+        '<procedures><procedure name="Existing Procedure" trigger="when new patterns recur"><step>Use new evidence</step></procedure></procedures>',
+      ),
+    };
+
+    const response = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      project: window.project,
+      memoryIds: window.memoryIds,
+      stageContractVersion: window.stageContractVersion,
+      sourceVersionKeys: window.sourceVersionKeys,
+      recoveryIdentity: identity,
+    });
+    expect(response).toMatchObject({ success: true, status: "succeeded" });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+    expect(provider.summarize.mock.calls[0][1]).toContain("Existing procedures (context only)");
+    expect(provider.summarize.mock.calls[0][1]).toContain("Existing Procedure");
+    await completeProceduralReceipt(kv, receiptKey, response);
+    const reconciled = await reconcileConsolidationProceduralContribution({
+      kv: kv as never,
+      identity: { ...identity, stage: "consolidation_procedural" },
+      sourceVersionKeys: window.sourceVersionKeys,
+      operationReceiptRef: {
+        scope: KV.extractionOperationReceipt(receiptKey),
+        key: receiptKey,
+      },
+    });
+    expect(reconciled).toMatchObject({ success: true, status: "succeeded" });
+    expect((await kv.get<ProceduralMemory>(KV.procedural, "existing-procedure"))?.frequency).toBe(5);
+    expect(await kv.list(KV.consolidationProceduralBacklog)).toEqual([]);
+    expect((await planConsolidationProceduralWindows({ kv: kv as never })).windows).toEqual([]);
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+
+    await kv.set(KV.memories, sourceMemories[0].id, {
+      ...sourceMemories[0],
+      content: "Corrected pattern content",
+      updatedAt: "2026-08-02T00:02:00.000Z",
+    });
+    await enqueueConsolidationProceduralBacklog({
+      kv: kv as never,
+      memoryIds: [sourceMemories[0].id],
+    });
+    const corrected = await planConsolidationProceduralWindows({ kv: kv as never });
+    expect(corrected.windows).toEqual([
+      expect.objectContaining({
+        memoryIds: [sourceMemories[0].id],
+        isolateReason: "consolidation_procedural_source_correction_requires_migration",
+      }),
+    ]);
+  });
+
+  it("persists a strict procedural no-effect and never re-invokes the provider", async () => {
+    const memories = [
+      { ...makePattern(1), id: "empty-pattern-1" },
+      { ...makePattern(2), id: "empty-pattern-2" },
+    ];
+    for (const memory of memories) await kv.set(KV.memories, memory.id, memory);
+    await enqueueConsolidationProceduralBacklog({
+      kv: kv as never,
+      memoryIds: memories.map((memory) => memory.id),
+    });
+    const [window] = (await planConsolidationProceduralWindows({ kv: kv as never })).windows;
+    const identity = {
+      runId: "empty-procedural-run",
+      unitId: window.windowId,
+      inputHash: "9".repeat(64),
+    };
+    const receiptKey = await seedProceduralReceipt(kv, identity);
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue("<procedures></procedures>"),
+    };
+    const response = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: window.memoryIds,
+      stageContractVersion: window.stageContractVersion,
+      sourceVersionKeys: window.sourceVersionKeys,
+      recoveryIdentity: identity,
+    });
+    expect(response).toMatchObject({
+      success: true,
+      status: "skipped",
+      proceduralMemoryIds: [],
+      proceduralRecoveryEvidence: {
+        kind: "no_effect",
+        observation: "business_empty",
+        reasonCode: "no_reusable_procedure",
+      },
+    });
+    await completeProceduralReceipt(kv, receiptKey, response);
+    expect(await reconcileConsolidationProceduralContribution({
+      kv: kv as never,
+      identity: { ...identity, stage: "consolidation_procedural" },
+      sourceVersionKeys: window.sourceVersionKeys,
+      operationReceiptRef: {
+        scope: KV.extractionOperationReceipt(receiptKey),
+        key: receiptKey,
+      },
+    })).toMatchObject({ success: true, status: "skipped" });
+    const records = await kv.list<ContributionRecord>(KV.extractionContributionRecords(
+      "consolidation_procedural",
+      CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+    ));
+    expect(records).toHaveLength(2);
+    expect(records.every((record) => record.state === "no_effect")).toBe(true);
+    expect(records.every((record) => record.effectRefs?.length === 0)).toBe(true);
+    expect(await kv.list(KV.procedural)).toEqual([]);
+    expect((await planConsolidationProceduralWindows({ kv: kv as never })).windows).toEqual([]);
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("allows only one provider call for overlapping formal procedural claims", async () => {
+    const memories = [
+      { ...makePattern(1), id: "overlap-pattern-1" },
+      { ...makePattern(2), id: "overlap-pattern-2" },
+    ];
+    for (const memory of memories) await kv.set(KV.memories, memory.id, memory);
+    await enqueueConsolidationProceduralBacklog({
+      kv: kv as never,
+      memoryIds: memories.map((memory) => memory.id),
+    });
+    const [window] = (await planConsolidationProceduralWindows({ kv: kv as never })).windows;
+    const firstIdentity = {
+      runId: "overlap-procedural-run-a",
+      unitId: window.windowId,
+      inputHash: "a".repeat(64),
+    };
+    const secondIdentity = {
+      runId: "overlap-procedural-run-b",
+      unitId: window.windowId,
+      inputHash: "b".repeat(64),
+    };
+    await seedProceduralReceipt(kv, firstIdentity);
+    await seedProceduralReceipt(kv, secondIdentity);
+    let releaseProvider!: () => void;
+    const providerGate = new Promise<void>((resolve) => { releaseProvider = resolve; });
+    const provider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(async () => {
+        await providerGate;
+        return '<procedures><procedure name="Single owner" trigger="when recurring"><step>Apply once</step></procedure></procedures>';
+      }),
+    };
+    const first = runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: window.memoryIds,
+      stageContractVersion: window.stageContractVersion,
+      sourceVersionKeys: window.sourceVersionKeys,
+      recoveryIdentity: firstIdentity,
+    });
+    await vi.waitFor(() => expect(provider.summarize).toHaveBeenCalledTimes(1));
+    const second = await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: provider as never,
+      memoryIds: window.memoryIds,
+      stageContractVersion: window.stageContractVersion,
+      sourceVersionKeys: window.sourceVersionKeys,
+      recoveryIdentity: secondIdentity,
+    });
+    expect(second).toMatchObject({
+      success: false,
+      failure: {
+        cause: "consolidation_procedural_contribution_reconciliation_required",
+      },
+    });
+    releaseProvider();
+    expect(await first).toMatchObject({ success: true, status: "succeeded" });
+    expect(provider.summarize).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases a malformed response claim and replaces a source that drifts before commit", async () => {
+    const memories = [
+      { ...makePattern(1), id: "drift-pattern-1" },
+      { ...makePattern(2), id: "drift-pattern-2" },
+    ];
+    for (const memory of memories) await kv.set(KV.memories, memory.id, memory);
+    await enqueueConsolidationProceduralBacklog({
+      kv: kv as never,
+      memoryIds: memories.map((memory) => memory.id),
+    });
+    const [window] = (await planConsolidationProceduralWindows({ kv: kv as never })).windows;
+    const malformedIdentity = {
+      runId: "malformed-procedural-run",
+      unitId: window.windowId,
+      inputHash: "c".repeat(64),
+    };
+    await seedProceduralReceipt(kv, malformedIdentity);
+    const malformedProvider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn().mockResolvedValue("<procedures><procedure"),
+    };
+    expect(await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: malformedProvider as never,
+      memoryIds: window.memoryIds,
+      stageContractVersion: window.stageContractVersion,
+      sourceVersionKeys: window.sourceVersionKeys,
+      recoveryIdentity: malformedIdentity,
+    })).toMatchObject({
+      success: false,
+      failure: { class: "unit", cause: "consolidation_procedural_response_parse_failure" },
+    });
+    expect(await kv.list(KV.extractionContributionRecords(
+      "consolidation_procedural",
+      CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+    ))).toEqual([]);
+
+    const driftIdentity = {
+      runId: "drifted-procedural-run",
+      unitId: window.windowId,
+      inputHash: "d".repeat(64),
+    };
+    await seedProceduralReceipt(kv, driftIdentity);
+    const driftProvider = {
+      name: "test",
+      compress: vi.fn(),
+      summarize: vi.fn(async () => {
+        await kv.set(KV.memories, memories[0].id, {
+          ...memories[0],
+          content: "Changed while the provider was running",
+          updatedAt: "2026-08-02T00:03:00.000Z",
+        });
+        return '<procedures><procedure name="Stale" trigger="when stale"><step>Do not commit</step></procedure></procedures>';
+      }),
+    };
+    expect(await runConsolidationProceduralWindow({
+      kv: kv as never,
+      provider: driftProvider as never,
+      memoryIds: window.memoryIds,
+      stageContractVersion: window.stageContractVersion,
+      sourceVersionKeys: window.sourceVersionKeys,
+      recoveryIdentity: driftIdentity,
+    })).toMatchObject({
+      success: false,
+      failure: {
+        class: "hard",
+        cause: "consolidation_procedural_source_drifted_before_commit",
+      },
+    });
+    expect(await kv.list(KV.procedural)).toEqual([]);
+    expect(await kv.list(KV.audit)).toEqual([]);
+    expect(await kv.list(KV.extractionContributionRecords(
+      "consolidation_procedural",
+      CONSOLIDATION_PROCEDURAL_CONTRIBUTION_CONTRACT,
+    ))).toEqual([]);
+    const replanned = await planConsolidationProceduralWindows({ kv: kv as never });
+    expect(replanned.windows).toHaveLength(1);
+    expect(replanned.windows[0].sourceVersionKeys[0]).toBe(
+      buildConsolidationProceduralSourceVersion(
+        (await kv.get<Memory>(KV.memories, memories[0].id))!,
+      ).sourceVersionKey,
+    );
   });
 
   it("recovers a frozen procedural commit without another model call or duplicate reinforcement", async () => {

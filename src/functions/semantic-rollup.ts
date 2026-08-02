@@ -30,10 +30,18 @@ import {
   type ProviderCallTelemetry,
 } from "../providers/provider-call-result.js";
 import { buildExtractionOperationKey } from "./extraction-operation-receipts.js";
+import {
+  buildSourceVersionKey,
+  claimBatch,
+  commitClaimedBatch,
+  releaseClaimedBatch,
+} from "./extraction-contributions.js";
+import { partitionAdoptedBaselineSessions } from "./extraction-baselines.js";
 
 const MAX_ROLLUP_SOURCE_IDS = 100;
 const SEMANTIC_ROLLUP_COMMIT_SCHEMA = "semantic-rollup-commit/v1";
 const SEMANTIC_ROLLUP_RECOVERY_SCHEMA = "semantic-rollup-recovery/v1";
+export const SEMANTIC_ROLLUP_CONTRIBUTION_CONTRACT = "semantic-rollup/v1";
 
 type SemanticRollupHardFailureCause =
   | "configuration_identity_conflict"
@@ -41,6 +49,7 @@ type SemanticRollupHardFailureCause =
   | "semantic_rollup_recovery_identity_conflict"
   | "semantic_rollup_recovery_receipt_unavailable"
   | "semantic_rollup_runner_input_hash_conflict"
+  | "semantic_rollup_source_adopted_baseline"
   | "semantic_rollup_source_summary_drifted";
 
 interface SemanticRollupInput {
@@ -57,8 +66,6 @@ interface SemanticRollupInput {
 }
 
 interface SemanticRollupCommitIdentity {
-  extractionRunId: string;
-  extractionWindowId: string;
   inputHash: string;
   configHash: string;
 }
@@ -174,7 +181,7 @@ function stableStringify(value: unknown): string {
     .join(",")}}`;
 }
 
-function summaryContentHash(summary: SessionSummary): string {
+export function summaryContentHash(summary: SessionSummary): string {
   return stableHash({
     title: summary.title || "",
     narrative: summary.narrative || "",
@@ -215,9 +222,6 @@ function semanticMemoryId(
   fact: string,
 ): string {
   return fingerprintId("sem", stableStringify({
-    runId: identity.extractionRunId,
-    windowId: identity.extractionWindowId,
-    mark,
     kind,
     inputHash: identity.inputHash,
     fact,
@@ -257,8 +261,6 @@ function isCommitIdentity(value: unknown): value is SemanticRollupCommitIdentity
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const identity = value as Record<string, unknown>;
   return [
-    "extractionRunId",
-    "extractionWindowId",
     "inputHash",
     "configHash",
   ].every((key) => typeof identity[key] === "string" && identity[key].length > 0);
@@ -317,9 +319,7 @@ function sameCommitIdentity(
   left: SemanticRollupCommitIdentity,
   right: SemanticRollupCommitIdentity,
 ): boolean {
-  return left.extractionRunId === right.extractionRunId
-    && left.extractionWindowId === right.extractionWindowId
-    && left.inputHash === right.inputHash
+  return left.inputHash === right.inputHash
     && left.configHash === right.configHash;
 }
 
@@ -341,8 +341,6 @@ function recoveryCommitIdentity(
   identity: SemanticRollupRecoveryIdentity,
 ): SemanticRollupCommitIdentity {
   return {
-    extractionRunId: identity.extractionRunId,
-    extractionWindowId: identity.extractionWindowId,
     inputHash: identity.inputHash,
     configHash: identity.configHash,
   };
@@ -451,9 +449,6 @@ function semanticMemoryMatchesPlan(
   return memory.id === expected.id
     && memory.fact === expected.fact
     && memory.confidence === expected.confidence
-    && memory.extractionRunId === identity.extractionRunId
-    && memory.extractionWindowId === identity.extractionWindowId
-    && memory.extractionMark === mark
     && memory.extractionInputHash === identity.inputHash
     && memory.extractionKind === kind
     && stableStringify(memory.sourceSessionIds) === stableStringify(sourceSessionIds)
@@ -612,6 +607,21 @@ export function registerSemanticRollupFunction(
         maxSourceIds: MAX_ROLLUP_SOURCE_IDS,
       });
     }
+    const baseline = await partitionAdoptedBaselineSessions(kv, {
+      stage: "semantic_rollup",
+      stageContractVersion: SEMANTIC_ROLLUP_CONTRIBUTION_CONTRACT,
+      sessionIds: sourceIds,
+    });
+    if (baseline.adoptedSessionIds.length > 0) {
+      return hardFailureDetails(
+        "semantic_rollup_source_adopted_baseline",
+        runId,
+        windowId,
+        mark,
+        kind,
+        requestHash,
+      );
+    }
 
     const missingSessionIds: string[] = [];
     const missingSemanticMemoryIds: string[] = [];
@@ -668,11 +678,87 @@ export function registerSemanticRollupFunction(
       );
     }
 
+    // Only summaries not yet terminal for this contract are new semantic input.
+    // Historical semantic rows are durable effects, not prompt material.
+    const allSourceVersionKeys = summaries.map((summary) => buildSourceVersionKey(
+      "semantic_rollup", "summary", summary.sessionId, summaryContentHash(summary),
+    ));
+    const existingContributions = await Promise.all(allSourceVersionKeys.map((key) =>
+      kv.get<import("../types.js").ContributionRecord>(
+        KV.extractionContributionRecords("semantic_rollup", SEMANTIC_ROLLUP_CONTRIBUTION_CONTRACT), key,
+      ),
+    ));
+    const foreignClaim = existingContributions.find((record) =>
+      record?.state === "claimed" && (record.runId !== runId || record.unitId !== windowId),
+    );
+    if (foreignClaim) {
+      return failureDetails(
+        "semantic_rollup_reconciliation_required", runId, windowId, mark, kind, requestHash,
+      );
+    }
+    const deltaIndexes = existingContributions
+      .map((record, index) => record?.state === "committed" || record?.state === "no_effect" ? -1 : index)
+      .filter((index) => index >= 0);
+    if (deltaIndexes.length === 0) {
+      const terminalSemanticMemoryIds: string[] = [];
+      const terminalSemanticMemoryCharSizes: Record<string, number> = {};
+      const terminalInputHash = stableHash({
+        kind,
+        sessionIds: summaries.map((summary) => summary.sessionId),
+        semanticMemoryIds: undefined,
+        summaries: summaries.map((summary) => ({
+          sessionId: summary.sessionId, title: summary.title, narrative: summary.narrative,
+          keyDecisions: summary.keyDecisions, filesModified: summary.filesModified, concepts: summary.concepts,
+        })),
+        semanticSources: [],
+      });
+      for (const record of existingContributions) {
+        if (!record?.operationReceiptRef) {
+          return hardFailureDetails("semantic_rollup_commit_conflict", runId, windowId, mark, kind, requestHash);
+        }
+        if (record.state === "no_effect") {
+          return hardFailureDetails("semantic_rollup_commit_conflict", runId, windowId, mark, kind, requestHash);
+        }
+        if (record.operationReceiptRef.scope !== KV.audit) {
+          return hardFailureDetails("semantic_rollup_commit_conflict", runId, windowId, mark, kind, requestHash);
+        }
+        const audit = await kv.get<{ operation?: unknown; functionId?: unknown; targetIds?: unknown; details?: unknown }>(
+          KV.audit, record.operationReceiptRef.key,
+        );
+        const recovered = audit ? readCommitAudit(audit) : null;
+        if (
+          !recovered || recovered.phase !== "committed"
+          || recovered.plan.effectHash !== record.operationReceiptRef.effectHash
+          || stableStringify(record.effectRefs ?? []) !== stableStringify(recovered.plan.expectedFacts.map((fact) => ({
+            scope: KV.semantic, key: fact.id, effectHash: recovered.plan.effectHash,
+          })) )
+        ) return hardFailureDetails("semantic_rollup_commit_conflict", runId, windowId, mark, kind, requestHash);
+        for (const expected of recovered.plan.expectedFacts) {
+          const memory = await kv.get<SemanticMemory>(KV.semantic, expected.id);
+          if (!memory || memory.fact !== expected.fact || memory.confidence !== expected.confidence) {
+            return hardFailureDetails("semantic_rollup_commit_conflict", runId, windowId, mark, kind, requestHash);
+          }
+          if (!terminalSemanticMemoryIds.includes(expected.id)) terminalSemanticMemoryIds.push(expected.id);
+          terminalSemanticMemoryCharSizes[expected.id] = memory.fact.length;
+        }
+      }
+      return {
+        success: true,
+        runId,
+        windowId,
+        semanticMemoryIds: terminalSemanticMemoryIds,
+        semanticMemoryCharSizes: terminalSemanticMemoryCharSizes,
+        inputHash: terminalInputHash,
+        status: "succeeded",
+        reused: true,
+        facts: [],
+      };
+    }
+    summaries = deltaIndexes.map((index) => summaries[index]);
+
     const inputHash = stableHash({
       kind,
-      mark,
-      windowId,
-      sessionIds: kind === "window" ? sessionIds : undefined,
+      sessionIds: summaries.map((summary) => summary.sessionId),
       semanticMemoryIds: undefined,
       summaries: summaries.map((summary) => ({
         sessionId: summary.sessionId,
@@ -706,8 +792,6 @@ export function registerSemanticRollupFunction(
       callOptions,
     });
     const commitIdentity: SemanticRollupCommitIdentity = {
-      extractionRunId: runId,
-      extractionWindowId: windowId,
       inputHash,
       configHash,
     };
@@ -732,6 +816,29 @@ export function registerSemanticRollupFunction(
       });
     }
 
+    const sourceVersionKeys = summaries.map((summary) => buildSourceVersionKey(
+      "semantic_rollup", "summary", summary.sessionId, summaryContentHash(summary),
+    ));
+    const contribution = await claimBatch(kv, {
+      stage: "semantic_rollup",
+      stageContractVersion: SEMANTIC_ROLLUP_CONTRIBUTION_CONTRACT,
+      runId,
+      unitId: windowId,
+      sourceVersionKeys,
+    });
+    if (contribution.status === "contract_migration_required") {
+      return hardFailureDetails(
+        "semantic_rollup_commit_conflict", runId, windowId, mark, kind, inputHash,
+        responseMetadata("reconciliation_required"),
+      );
+    }
+    if (contribution.status === "claimed_by_other") {
+      return failureDetails(
+        "semantic_rollup_reconciliation_required", runId, windowId, mark, kind, inputHash,
+        responseMetadata("reconciliation_required"),
+      );
+    }
+
     return withKeyedLock(
       `semantic-rollup:${stableHash(commitIdentity)}`,
       async () => {
@@ -744,16 +851,129 @@ export function registerSemanticRollupFunction(
         ]);
         let plan: SemanticRollupCommitPlan | null = null;
         let committedAuditId: string | null = null;
+        if (contribution.status === "already_committed") {
+          const proof = contribution.records[0];
+          if (
+            !proof?.operationReceiptRef
+            || proof.operationReceiptRef.scope !== KV.audit
+            || !proof.operationReceiptRef.key
+          ) {
+            return hardFailureDetails(
+              "semantic_rollup_commit_conflict", runId, windowId, mark, kind, inputHash,
+              responseMetadata("reconciliation_required"),
+            );
+          }
+          const audit = await kv.get<{
+            operation?: unknown; functionId?: unknown; targetIds?: unknown;
+            details?: unknown; id?: unknown;
+          }>(KV.audit, proof.operationReceiptRef.key);
+          const recovered = audit ? readCommitAudit(audit) : null;
+          if (
+            !recovered
+            || recovered.phase !== "committed"
+            || recovered.plan.effectHash !== proof.operationReceiptRef.effectHash
+            || !proof.effectRefs
+            || stableStringify(proof.effectRefs)
+              !== stableStringify(recovered.plan.expectedFacts.map((fact) => ({
+                scope: KV.semantic, key: fact.id, effectHash: recovered.plan.effectHash,
+              })))
+          ) {
+            return hardFailureDetails(
+              "semantic_rollup_commit_conflict", runId, windowId, mark, kind, inputHash,
+              responseMetadata("reconciliation_required"),
+            );
+          }
+          const deltaSessionIds = summaries.map((summary) => summary.sessionId);
+          for (const expected of recovered.plan.expectedFacts) {
+            const memory = await kv.get<SemanticMemory>(KV.semantic, expected.id);
+            if (memory && !semanticMemoryMatchesPlan(
+              memory, expected, recovered.plan.identity, mark, kind, deltaSessionIds,
+            )) {
+              return hardFailureDetails(
+                "semantic_rollup_commit_conflict", runId, windowId, mark, kind, inputHash,
+                responseMetadata("reconciliation_required"),
+              );
+            }
+            if (!memory) {
+              return hardFailureDetails(
+                "semantic_rollup_commit_conflict", runId, windowId, mark, kind, inputHash,
+                responseMetadata("reconciliation_required"),
+              );
+            }
+          }
+          let semanticRecoveryEvidence: Record<string, unknown>;
+          if (recoveryIdentity && recoveryPlanIdentity && sourceSummaryHashes) {
+            if (!outerReceipt || !semanticRecoveryReceiptMatches(outerReceipt, recoveryIdentity)) {
+              return hardFailureDetails(
+                "semantic_rollup_recovery_receipt_unavailable", runId, windowId, mark, kind, inputHash,
+                responseMetadata("reconciliation_required"),
+              );
+            }
+            const result = {
+              receiptKey: proof.operationReceiptRef.key,
+              receiptVersion: 1 as const,
+              resultRef: `mem:audit:${proof.operationReceiptRef.key}`,
+              semanticMemoryIds: recovered.plan.expectedFacts.map((fact) => fact.id),
+            };
+            const recoveredState: SemanticRollupRecoveryState = {
+              schema: SEMANTIC_ROLLUP_RECOVERY_SCHEMA,
+              phase: "committed",
+              identity: recoveryPlanIdentity,
+              mark,
+              kind: "window",
+              sessionIds: [...sessionIds!],
+              sourceSummaryHashes: { ...sourceSummaryHashes },
+              expectedFacts: recovered.plan.expectedFacts.map((fact) => ({ ...fact })),
+              effectHash: recovered.plan.effectHash,
+              result,
+            };
+            await kv.set(
+              KV.extractionOperationReceipt(outerReceipt.key), outerReceipt.key,
+              { ...outerReceipt, semanticRecovery: recoveredState },
+            );
+            semanticRecoveryEvidence = {
+              schema: SEMANTIC_ROLLUP_RECOVERY_SCHEMA,
+              phase: "committed",
+              receiptKey: outerReceipt.key,
+              receiptVersion: outerReceipt.version ?? 1,
+              resultRef: result.resultRef,
+              effectHash: recovered.plan.effectHash,
+              identity: recoveryPlanIdentity,
+              sourceSummaryHashes,
+            };
+          } else {
+            semanticRecoveryEvidence = {
+              schema: SEMANTIC_ROLLUP_COMMIT_SCHEMA,
+              kind: "committed",
+              receiptKey: proof.operationReceiptRef.key,
+              receiptVersion: 1,
+              resultRef: `mem:audit:${proof.operationReceiptRef.key}`,
+              effectHash: recovered.plan.effectHash,
+              identity: recovered.plan.identity,
+            };
+          }
+          return {
+            success: true,
+            runId,
+            windowId,
+            semanticMemoryIds: recovered.plan.expectedFacts.map((fact) => fact.id),
+            semanticMemoryCharSizes: Object.fromEntries(
+              recovered.plan.expectedFacts.map((fact) => [fact.id, fact.fact.length]),
+            ),
+            inputHash,
+            ...responseMetadata("succeeded", {
+              reused: true,
+              resumed: false,
+              semanticRecoveryEvidence,
+            }),
+            facts: recovered.plan.expectedFacts.map(({ fact, confidence }) => ({ fact, confidence })),
+          };
+        }
         for (const entry of auditEntries) {
           const recovered = readCommitAudit(entry);
           if (!recovered) continue;
           const candidate = recovered.plan;
-          if (
-            candidate.identity.extractionRunId === runId
-            && candidate.identity.extractionWindowId === windowId
-            && candidate.identity.inputHash === inputHash
-            && candidate.identity.configHash !== configHash
-          ) {
+          if (candidate.identity.inputHash === inputHash && candidate.identity.configHash !== configHash) {
             return hardFailureDetails(
               "configuration_identity_conflict",
               runId,
@@ -842,9 +1062,7 @@ export function registerSemanticRollupFunction(
         }
 
         const legacyMemories = semanticMemories.filter((memory) =>
-          memory.extractionRunId === runId
-          && memory.extractionWindowId === windowId
-          && memory.extractionMark === mark
+          memory.extractionMark === mark
           && memory.extractionKind === kind
           && memory.extractionInputHash === inputHash,
         );
@@ -891,6 +1109,12 @@ export function registerSemanticRollupFunction(
               telemetry,
             });
           } catch (error) {
+            await releaseClaimedBatch(kv, {
+              stage: "semantic_rollup",
+              stageContractVersion: SEMANTIC_ROLLUP_CONTRIBUTION_CONTRACT,
+              contributionId: contribution.records[0]!.contributionId,
+              sourceVersionKeys,
+            });
             if (isProviderPreflightError(error)) {
               const status = providerPreflightStatus(error);
               return failureDetails(status, runId, windowId, mark, kind, inputHash, responseMetadata(status));
@@ -899,6 +1123,12 @@ export function registerSemanticRollupFunction(
           }
           facts = parseFactResponse(response);
           if (facts.length === 0) {
+            await releaseClaimedBatch(kv, {
+              stage: "semantic_rollup",
+              stageContractVersion: SEMANTIC_ROLLUP_CONTRIBUTION_CONTRACT,
+              contributionId: contribution.records[0]!.contributionId,
+              sourceVersionKeys,
+            });
             return failureDetails("empty_facts", runId, windowId, mark, kind, inputHash, responseMetadata("failed", { parseFailures: 1 }));
           }
           const expectedFacts = normalizeExpectedFacts(facts, commitIdentity, mark, kind);
@@ -954,7 +1184,7 @@ export function registerSemanticRollupFunction(
         }
 
         const now = new Date().toISOString();
-        const sourceSessionIds = sessionIds!;
+        const sourceSessionIds = summaries.map((summary) => summary.sessionId);
         const sourceMemoryIds: string[] = [];
         const missingExpectedIds: string[] = [];
         for (const expected of plan.expectedFacts) {
@@ -966,7 +1196,7 @@ export function registerSemanticRollupFunction(
             commitIdentity,
             mark,
             kind,
-            sessionIds!,
+            sourceSessionIds,
           )) {
             return hardFailureDetails(
               "semantic_rollup_commit_conflict",
@@ -1102,6 +1332,23 @@ export function registerSemanticRollupFunction(
           };
         }
 
+        await commitClaimedBatch(kv, {
+          stage: "semantic_rollup",
+          stageContractVersion: SEMANTIC_ROLLUP_CONTRIBUTION_CONTRACT,
+          contributionId: contribution.records[0]!.contributionId,
+          sourceVersionKeys,
+          operationReceiptRef: {
+            scope: KV.audit,
+            key: commitAuditId,
+            effectHash: plan.effectHash,
+          },
+          effectRefs: plan.expectedFacts.map((fact) => ({
+            scope: KV.semantic,
+            key: fact.id,
+            effectHash: plan!.effectHash,
+          })),
+        });
+
         return {
           success: true,
           runId,
@@ -1120,5 +1367,70 @@ export function registerSemanticRollupFunction(
         };
       },
     );
+  });
+
+  sdk.registerFunction("mem::semantic-rollup-eligibility", async (data: {
+    sessionIds?: unknown;
+    sourceSummaryHashes?: unknown;
+  }) => {
+    const sessionIds = parseStringArray(data?.sessionIds);
+    const hashes = parseHashRecord(data?.sourceSummaryHashes);
+    if (
+      !sessionIds
+      || sessionIds.length === 0
+      || sessionIds.length > MAX_ROLLUP_SOURCE_IDS
+      || !hashes
+      || Object.keys(hashes).length !== sessionIds.length
+      || sessionIds.some((sessionId) => !hashes[sessionId])
+    ) {
+      return { success: false, error: "invalid_semantic_eligibility_input" };
+    }
+    const activeContract = await kv.get<import("../types.js").StageContractVersion>(
+      KV.extractionContributionContract("semantic_rollup"),
+      "active",
+    );
+    if (activeContract && activeContract.version !== SEMANTIC_ROLLUP_CONTRIBUTION_CONTRACT) {
+      return {
+        success: false,
+        error: "semantic_rollup_contract_migration_required",
+      };
+    }
+    const baseline = await partitionAdoptedBaselineSessions(kv, {
+      stage: "semantic_rollup",
+      stageContractVersion: SEMANTIC_ROLLUP_CONTRIBUTION_CONTRACT,
+      sessionIds,
+    });
+    const openSessionIds = baseline.openSessionIds;
+    const keys = openSessionIds.map((sessionId) => buildSourceVersionKey(
+      "semantic_rollup", "summary", sessionId, hashes[sessionId] ?? "",
+    ));
+    const records = await Promise.all(keys.map((key) => kv.get<import("../types.js").ContributionRecord>(
+      KV.extractionContributionRecords("semantic_rollup", SEMANTIC_ROLLUP_CONTRIBUTION_CONTRACT), key,
+    )));
+    const blockedSessionIds = openSessionIds.filter((_, index) => records[index]?.state === "claimed");
+    if (blockedSessionIds.length) {
+      return {
+        success: false,
+        error: "semantic_rollup_reconciliation_required",
+        blockedSessionIds,
+      };
+    }
+    return {
+      success: true,
+      ...(baseline.adoptedSessionIds.length > 0
+        ? {
+            baselineId: baseline.baselineId,
+            adoptedBaselineSessionIds: baseline.adoptedSessionIds,
+          }
+        : {}),
+      eligibleSessionIds: openSessionIds.filter((_, index) => !records[index]),
+      terminalSessionIds: [
+        ...baseline.adoptedSessionIds,
+        ...openSessionIds.filter((_, index) => {
+        const state = records[index]?.state;
+        return state === "committed" || state === "no_effect";
+        }),
+      ],
+    };
   });
 }

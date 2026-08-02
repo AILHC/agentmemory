@@ -6,7 +6,6 @@ import {
   inspectRecoveryMigrationGate,
   isSupersededLegacyVerifierBlock,
 } from './recovery-migration-contract-v1.mjs';
-
 const LARGE_EVENTS = new Set(['stage_plan_completed', 'unit_planned', 'unit_prepared', 'unit_split']);
 const MAX_NORMAL_LINE_BYTES = 64 * 1024;
 const MAX_LARGE_LINE_BYTES = 1024 * 1024;
